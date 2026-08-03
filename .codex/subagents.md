@@ -60,3 +60,34 @@
 | 昵称 | 任务与成功标准 | 允许范围 | 状态 | 实际结果与关闭动作 |
 | --- | --- | --- | --- | --- |
 | `delivery_metadata_carry_forward`（复用 `/root/benchmark_audit`） | 核对最终清零终审后仅文首状态元数据发生变化，并将终审结论承接到当前精确哈希；不得重新解释技术内容 | 只读：当前 Master Spec、上一终审哈希与 `git diff --check`；禁止写文件、Git 和配置 | `closed` | PASS：当前 SHA256 `B4839238...A6B67`、blob `d2931f6f...bec1b`、严格 UTF-8 和 `git diff --check` 均通过；在内存中将唯一状态文本还原后精确重建上一审核 SHA256 `A7912214...0AC27` 与 blob `f88b2f4d...f76c`，证明规范内容未变，终审结论继续有效，2026-08-03 21:21 关闭 |
+
+## 完整实施计划拆分审查（2026-08-03 21:35）
+
+本轮计划创建 3 个只读规划审查流，实际复用 3 个现有 agent；主 agent 独占计划文件写入。
+
+| 昵称 | 任务与成功标准 | 允许范围 | 状态 | 实际结果与关闭动作 |
+| --- | --- | --- | --- | --- |
+| `control_plane_plan_audit`（复用 `/root/durability_contract_audit`） | 将控制平面、领域契约、SQLite/对象存储、状态机、授权、恢复与事件链拆成有依赖顺序的实施任务；给出精确模块职责、TDD 门禁和阶段验收，覆盖规格相关测试 ID | 只读：冻结 Master Spec、仓库结构和 Git 历史；禁止修改文件、Git、配置或创建产物 | `closed` | 完成纯领域/ports/单 writer/状态授权/事件耐久/恢复的模块图和 S0→B9 依赖；强调权威状态即时事务与 Provider batch 共用唯一 writer、fake receipt 不得升级为完整 PASS。结果已纳入 Phase 0/1 与总计划，2026-08-03 22:03 关闭 |
+| `desktop_runner_plan_audit`（复用 `/root/state_resume_audit`） | 将 Tauri 桌面壳、React 时间线/终端、Windows Agent/IPC、WSL Runner、Claude/Codex Adapter、Git Object Bridge 拆成可集成任务；明确真实进程/状态/暂停恢复边界和前后端测试 | 只读：冻结 Master Spec、仓库结构和 Git 历史；禁止修改文件、Git、配置或创建产物 | `closed` | 完成 Tauri/React、双 Named Pipe、Rust WSL Broker、Provider stream、Git Bridge 的文件边界和 spike/批次；补充原生托盘 E2E、Broker 被杀后 Docker identity、真实 D 盘测试产物约束。结果已纳入 Phase 0/2/3/4，2026-08-03 22:03 关闭 |
+| `deploy_acceptance_plan_audit`（复用 `/root/benchmark_audit`） | 将 onboarding、路径/安全、服务器配置、镜像/PR/CI、Linux 发布、回滚、验收、性能与打包拆成后半程实施计划；核对完整交付而非单功能 MVP，并建立 47 项代表流程覆盖矩阵 | 只读：冻结 Master Spec、仓库结构和 Git 历史；禁止修改文件、Git、配置或创建产物 | `closed` | 完成 onboarding/security/profile、Git/OCI、release、acceptance/rollback、performance、packaging 和 final DoD 的依赖及 47 项覆盖核对；明确真实外部操作仍需当次授权、云厂商未实测不得认证。结果已纳入 Phase 4/5/6 与总计划，2026-08-03 22:03 关闭 |
+
+## 实施计划冻结快照独立终审（2026-08-03 22:13）
+
+审查对象为 8 个计划文件。初始 manifest SHA256 为 `9A32A51C28AF78D5BC6AB1C9FA5321AC9162A95E5C62D736FE9462D213B2519B`；写作规则只调整两处单位与空格后，当前 manifest SHA256 为 `671C716B03F4734B6318598ED26F390D2037A3F023029E7062787048A3F0421E`，技术语义未变，审查 agent 已收到精确变更说明。本轮计划复用 3 个只读 agent，任何 Critical/Important 均须修订后复审。
+
+| 昵称 | 任务与成功标准 | 允许范围 | 状态 | 实际结果与关闭动作 |
+| --- | --- | --- | --- | --- |
+| `plan_requirement_final_review`（复用 `/root/durability_contract_audit`） | 对照当前 Master Spec 逐项核对 8 个实施计划的需求覆盖、技术裁决和 47 条代表流程；无遗漏、范围缩减或 Critical/Important 才通过 | 只读：冻结 Master Spec、8 个计划和未提交 diff；禁止修改文件、Git、配置或创建产物 | `closed` | 复现 manifest 后完成全量核对，发现 `RESTORE_DRILL` 漏项 1 个 Critical，以及目录/命令、D 盘 wrapper、writer/mutex、脱敏参数、checkpoint、Verifier、控制/关机、回滚原子性、硬重启、调度性能、测试 ID 和局部 PASS 共 13 个 Important；结果已收集，2026-08-03 关闭 |
+| `plan_execution_final_review`（复用 `/root/state_resume_audit`） | 从实施者视角核对 66 个任务的依赖、文件创建/修改顺序、命令、测试、提交边界和跨语言接口；无不可执行或会导致返工的 Critical/Important 才通过 | 只读：8 个计划、仓库结构和未提交 diff；禁止修改文件、Git、配置或创建产物 | `closed` | 完成实施可达性检查，发现组合根未接线 1 个 Critical，以及合同包 manifest、命令路径、阶段依赖、writer 顺序、远端 helper、checkpoint、RPO 与 fixture 共 9 个 Important；结果已收集，2026-08-03 关闭 |
+| `plan_delivery_final_review`（复用 `/root/benchmark_audit`） | 核对桌面真实状态/终端、可选 target stage、Runner、Git、Linux 部署验收、安全性能、安装升级及 11 项 DoD 的完整闭环；无 Critical/Important 才通过 | 只读：冻结 Master Spec、8 个计划和未提交 diff；禁止修改文件、Git、配置或创建产物 | `closed` | 首次派发因 `agent thread limit reached` 未启动，容量释放后重试成功；完成终审并发现性能 ID、checkpoint、Agent 通知、Forge 凭据、OCI build broker、关机路径和 RPO 共 7 个 Important，无 Critical；结果已收集，2026-08-03 关闭 |
+
+## Critical/Important 修复后清零复审（2026-08-03 23:09）
+
+修订从 manifest `F5B5F340...`、`ACFD5C0F...` 继续经过 FINAL manifest 顺序、组合根、codegen 生命周期、目录树和 DoD 精确集合修复，最终冻结 manifest SHA256 为 `A43E8D1DF66891707E806FD344BC6D4BF5DC40FDAB0FCC7100A2EE7D88473F6B`。机器校验结果为 8 个计划、67 个顺序 Task、335 个 Task checklist、800 条文件声明、526 个唯一 Create、138 个唯一 Test、47 个规范测试 ID、11 个规范 DoD ID，结构/生命周期/脚本/UTF-8/Markdown/密钥启发式错误均为 0。本轮计划复用 3 个直接只读 agent；实际另有 1 个父 agent 内部只读覆盖检查，首次 delivery 终审派发因容量失败 1 次后重试成功，永久失败 0，现已全部关闭。
+
+| 昵称 | 任务与成功标准 | 允许范围 | 状态 | 实际结果与关闭动作 |
+| --- | --- | --- | --- | --- |
+| `plan_requirement_zero_review`（复用 `/root/durability_contract_audit`） | 逐项复核上一轮 1 Critical/13 Important 的修法，并检查需求覆盖与 47 项最终 owner/replay 没有新回归；无 Critical/Important 才 PASS | 只读：修订后 Master Spec、8 个计划和 diff；禁止修改文件、Git、配置或产物 | `closed` | 对最终 manifest `A43E8D1D...73F6B` 完成清零：公共 re-export、首次消费同 Task codegen、47/11 精确集合、事件耐久、owner/qualification 和 FINAL manifest 顺序均闭合，无 Critical/Important；2026-08-03 23:42 关闭 |
+| `plan_execution_zero_review`（复用 `/root/state_resume_audit`） | 逐项复核组合根、合同包、脚本、依赖、writer、remote helper、checkpoint、RPO/fixture 修法与全计划可执行顺序；无 Critical/Important 才 PASS | 只读：修订后 8 个计划、仓库结构和 diff；禁止修改文件、Git、配置或产物 | `closed` | 对最终 manifest `A43E8D1D...73F6B` 完成执行性清零：67 Task 文件生命周期、BuildKit 真 Broker 接线、Phase 2/4/5 组合根时点、重启演练 result/cleanup、Task 8 PARTIAL 与 Task 9 FINAL 顺序均通过，无 Critical/Important；2026-08-03 23:42 关闭 |
+| `plan_delivery_zero_review`（复用 `/root/benchmark_audit`） | 逐项复核测试 ID、Agent 通知、Forge 凭据、Build Broker、SHUTDOWN_FAST、RPO 与完整部署/DoD 闭环；无 Critical/Important 才 PASS | 只读：修订后 Master Spec、8 个计划和 diff；禁止修改文件、Git、配置或产物 | `closed` | 对最终 manifest `A43E8D1D...73F6B` 完成交付清零：47/47 final owner、11/11 DoD、凭据/通知/部署组合根、同 Task codegen、PARTIAL/FINAL 分离和 UTF-8/空白均通过，无 Critical/Important；2026-08-03 23:42 关闭 |
+| `coverage_matrix_check`（由 `/root/durability_contract_audit` 内部创建） | 独立交叉核对 47 项流程、owner/replay 和 DoD 覆盖，结果交由父审查 agent 汇总 | 只读：Master Spec 测试表、总计划 owner 表与 Phase 6；禁止写入 | `closed` | 完成只读覆盖核对，结果由父 agent 纳入终审；未产生文件或 Git 改动，已关闭 |
