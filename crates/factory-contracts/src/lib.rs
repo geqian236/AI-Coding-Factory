@@ -6,4 +6,8 @@
 
 pub mod generated;
 
+// Task 3：跨语言 canonical JSON 与计划身份算法模块。
+pub mod canonical;
+pub mod plan;
+
 pub use generated::*;

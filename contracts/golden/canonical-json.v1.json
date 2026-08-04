@@ -1,0 +1,113 @@
+{
+  "version": "canonical-json-v1",
+  "description": "RFC 8785 JCS + Unicode NFC 规范化跨语言 golden vectors (Phase 0 整数值数字子集)。",
+  "accept": [
+    {
+      "name": "key-sort-basic",
+      "inputJsonText": "{\"b\":1,\"a\":2}",
+      "expectedCanonical": "{\"a\":2,\"b\":1}"
+    },
+    {
+      "name": "int-one",
+      "inputJsonText": "1",
+      "expectedCanonical": "1"
+    },
+    {
+      "name": "float-one-point-zero",
+      "inputJsonText": "1.0",
+      "expectedCanonical": "1"
+    },
+    {
+      "name": "negative-zero",
+      "inputJsonText": "-0",
+      "expectedCanonical": "0"
+    },
+    {
+      "name": "exponent",
+      "inputJsonText": "1e2",
+      "expectedCanonical": "100"
+    },
+    {
+      "name": "max-safe-int",
+      "inputJsonText": "9007199254740991",
+      "expectedCanonical": "9007199254740991"
+    },
+    {
+      "name": "null-value",
+      "inputJsonText": "{\"x\":null}",
+      "expectedCanonical": "{\"x\":null}"
+    },
+    {
+      "name": "bool-values",
+      "inputJsonText": "{\"t\":true,\"f\":false}",
+      "expectedCanonical": "{\"f\":false,\"t\":true}"
+    },
+    {
+      "name": "nested-array",
+      "inputJsonText": "[3,{\"z\":1,\"a\":2},[]]",
+      "expectedCanonical": "[3,{\"a\":2,\"z\":1},[]]"
+    },
+    {
+      "name": "nfc-combining",
+      "inputJsonText": "{\"k\": \"e\\u0301\"}",
+      "expectedCanonical": "{\"k\":\"é\"}"
+    },
+    {
+      "name": "escape-quote-backslash",
+      "inputJsonText": "{\"s\": \"a\\\"b\\\\c\"}",
+      "expectedCanonical": "{\"s\":\"a\\\"b\\\\c\"}"
+    },
+    {
+      "name": "escape-control-tab-newline",
+      "inputJsonText": "{\"s\": \"\\t\\n\\r\\b\\f\"}",
+      "expectedCanonical": "{\"s\":\"\\t\\n\\r\\b\\f\"}"
+    },
+    {
+      "name": "escape-unit-separator",
+      "inputJsonText": "{\"s\": \"\\u001f\"}",
+      "expectedCanonical": "{\"s\":\"\\u001f\"}"
+    },
+    {
+      "name": "utf16-vs-z",
+      "inputJsonText": "{\"z\": 1, \"😀\": 2}",
+      "expectedCanonical": "{\"z\":1,\"😀\":2}"
+    },
+    {
+      "name": "utf16-surrogate-before-ffff",
+      "inputJsonText": "{\"￿\": 1, \"😀\": 2}",
+      "expectedCanonical": "{\"😀\":2,\"￿\":1}"
+    }
+  ],
+  "reject": [
+    {
+      "name": "duplicate-key",
+      "inputJsonText": "{\"a\":1,\"a\":2}",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "nan",
+      "inputJsonText": "NaN",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "infinity",
+      "inputJsonText": "Infinity",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "neg-infinity",
+      "inputJsonText": "-Infinity",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "non-integer-float",
+      "inputJsonText": "1.5",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "over-max-safe-int",
+      "inputJsonText": "9007199254740993",
+      "expectedErrorCode": "canonical-json-error"
+    }
+  ]
+}

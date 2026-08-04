@@ -2,8 +2,8 @@
 # AI Coding Factory — Rust workspace 根配置
 # 业务 crate 在各自子目录中维护，此处只声明 workspace 成员。
 members = [
-    # 合同层（Task 2 添加）
-    # "crates/factory-contracts",
+    # 合同层（Task 3 启用 canonical/plan 模块）
+    "crates/factory-contracts",
 ]
 resolver = "2"
 
@@ -12,3 +12,7 @@ version = "0.1.0"
 edition = "2021"
 authors  = ["AI Coding Factory"]
 license  = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
