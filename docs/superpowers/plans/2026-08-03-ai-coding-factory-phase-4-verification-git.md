@@ -129,7 +129,7 @@
 - [ ] 在同一 Task 登记 verifier schema/policy 分类，运行普通 codegen 和 `--check`；再运行 verifier integration/security，Expected: 三语言合同一致且确定性 gate 可复现。
 - [ ] 提交：`feat(verification): add isolated deterministic verifier`。
 
-## Task 6: 实现 Claude→Verifier→Codex 代码审核与自动修复
+## Task 6: 实现 Claude 编码与自审→Verifier→Codex 独立审核及自动修复
 
 **Files:**
 
@@ -137,14 +137,15 @@
 - Create: `apps/agent/src/factory_agent/harness/workflows/code_review.py`
 - Create: `apps/agent/src/factory_agent/harness/workflows/repair_loop.py`
 - Create: `apps/agent/src/factory_agent/prompts/claude_implement.md`
+- Create: `apps/agent/src/factory_agent/prompts/claude_self_review.md`
 - Create: `apps/agent/src/factory_agent/prompts/claude_repair.md`
 - Create: `apps/agent/src/factory_agent/prompts/codex_code_review.md`
 - Create: `contracts/fixtures/rubrics/code-review.v1.json`
 - Test: `tests/integration/workflows/test_code_review_loop.py`
 - Test: `tests/chaos/test_review_sha_drift.py`
 
-- [ ] 写 Claude 失败、Verifier finding、Codex reject、相同失败签名三次、六轮预算、审核后 SHA 漂移和 provider quota 测试。
-- [ ] Claude 是任务 worktree 的唯一源码写者并产生候选 hidden ref/commit；Verifier 先行，Codex 只在独立只读检出审核精确候选 SHA，不得直接修改源码或审核自己的改动；中文注释/日志 finding 必须引用 checker 的 rule ID、symbol 和 pass condition，任何修改使旧 Verifier/Codex receipt 及对应 GitHub Check Run 失效并回到 Claude 修复。
+- [ ] 写 Claude 实现失败、自审发现问题后自修复、自审 receipt 缺失/伪造/绑定旧 SHA、Verifier finding、Codex reject、Claude 自审企图关闭 Codex finding、相同失败签名三次、六轮预算、审核后 SHA 漂移和 provider quota 测试。
+- [ ] Claude 是任务 worktree 的唯一源码写者并产生候选 hidden ref/commit；它必须按 `claude-self-review.v1` 对精确 candidate SHA 自审并修复到 PASS，随后 Verifier 运行机械门禁，最后 Codex 在独立只读检出审核精确 candidate SHA、self-review 与 Verifier 证据。Claude self-review 不是独立 approval，不得关闭 Codex finding；Codex 不得直接修改源码。中文注释/日志 finding 必须引用 checker 的 rule ID、symbol 和 pass condition，任何修改使旧 self-review/Verifier/Codex receipt 及对应 GitHub Check Run 失效并回到 Claude 修复。
 - [ ] 修复预算按 Run 累计不重置，PlanRevision 上限独立；范围内重规划自动继续，越授权则 ACTION_REQUIRED。
 - [ ] 运行 `REVIEW-001`，Expected: finding 闭环、漂移重跑、预算耗尽状态正确。
 - [ ] 提交：`feat(workflow): add Claude verifier Codex repair loop`。
@@ -192,10 +193,10 @@
 - Test: `tests/chaos/test_forge_response_loss.py`
 - Test: `tests/security/test_forge_credentials.py`
 
-- [ ] 写未经授权 push、缺失/过期/撤销 credential、默认 C 盘凭据误用、PR 响应丢失、CI pending/fail、`reviewedHeadSha` 与 `ciTestMergeSha` 混淆、required workflow 未触发、`factory/codex-review` 缺失/错误 source App/绑定旧 SHA、reviewed head/base 漂移、Ruleset/会话解决拒绝、merge expected-head CAS 失败、merge 响应丢失和错误 parent/tree/merge SHA 测试。
-- [ ] 首版只认证 GitHub Adapter；核对 Phase 0 已冻结的 stage/node capability maps 包含 `pr.update/forge.observe.scoped/check.publish` 与 `ATTEST_REVIEW`，并运行三语言 codegen `--check`；缺失时 fail closed，禁止在本 Task 临时补合同。Publisher/Merger App 只有 metadata 只读与按阶段求交的 Contents/PR 写，Review Attester App 只有 Contents 只读与 Checks 写，Ruleset 将 check 绑定 expected Attester App ID；两者 credentialRef、scope、TTL、fingerprint 分开保存。仓库创建/Ruleset 管理由总计划 §1.4 的一次性 bootstrap admin 承担。PAT/SSH/device flow 不能冒充 Checks 能力；其他 Forge 返回 `UNSUPPORTED_OR_UNCERTIFIED`。
-- [ ] push/PR/Check Run/merge 使用短期 Broker session、稳定 idempotency identity 和 inspect；完成事实绑定 GitHub repository ID、PR number、base/candidate/reviewed/current-head/remote/merge SHA、`ciTestMergeSha`、Actions run/check IDs、expected source App ID、Codex receipt/rubric digest。PR 默认 draft；Codex 审核后由独立 Attester 发布 head-bound check，再用 `pr.update` 标 ready。merge 固定 `squash`，请求原子携带 expected reviewed head，Ruleset 要求分支与审核 base 一致；base 前移必须更新分支并重跑 Verifier/Codex/Actions/Attestation，成功后验证 merge parent/tree/SHA。每个外部请求遵守 pause policy，已发送请求必须 settle/reconcile 后才暂停。
-- [ ] Phase 4 Task 8 自身及之前 PR 使用“签名本地 Codex receipt + 独立 bootstrap reviewer 原生 approval”过渡门禁；本 Task 合并后安装 Attester、发布探测 check、把 `factory/codex-review + expected App ID` 加入 Ruleset并生成升级 receipt，之后禁止回退过渡模式。Actions `pull_request` receipt 记录 test-merge SHA 与 head/base SHA；required 聚合 job 始终产出，首版不启用 merge queue。
+- [ ] 写未经 Codex Delivery Orchestrator 授权的 push/PR/merge、Claude 直接创建 PR/合并、缺失/过期/撤销 credential、默认 C 盘凭据误用、PR 响应丢失、CI pending/fail、`reviewedHeadSha` 与 `ciTestMergeSha` 混淆、required workflow 未触发、`factory/codex-review` 缺失/错误 source App/绑定旧 SHA、reviewed head/base 漂移、Ruleset/会话解决拒绝、merge expected-head CAS 失败、merge 响应丢失和错误 parent/tree/merge SHA 测试。
+- [ ] 首版只认证 GitHub Adapter；核对 Phase 0 已冻结的 stage/node capability maps 包含 `pr.update/forge.observe.scoped/check.publish` 与 `ATTEST_REVIEW`，并运行三语言 codegen `--check`；缺失时 fail closed，禁止在本 Task 临时补合同。Publisher/Merger App 只有 metadata 只读与按阶段求交的 Contents/PR 写，Review Attester App 只有 Contents 只读与 Checks 写，Ruleset 将 check 绑定 expected Attester App ID，并冻结 required checks strict/up-to-date，使 base 前移在 GitHub merge 事务中被拒绝；两者 credentialRef、scope、TTL、fingerprint 分开保存。仓库创建/Ruleset 管理由总计划 §1.4 的一次性 bootstrap admin 承担。PAT/SSH/device flow 不能冒充 Checks 能力；其他 Forge 返回 `UNSUPPORTED_OR_UNCERTIFIED`。
+- [ ] push/PR/Check Run/merge 使用短期 Broker session、稳定 idempotency identity 和 inspect；`PUBLISH_PR/MERGE` 的 actor 必须是 Codex Delivery Orchestrator，Claude/Verifier/Reviewer Runner 均无该 capability。完成事实绑定 GitHub repository ID、PR number、base/candidate/reviewed/current-head/remote/merge SHA、`ciTestMergeSha`、Actions run/check IDs、expected source App ID、Claude self-review、Verifier 与 Codex receipt/rubric digest。只有 current receipts 有效且 `target_stage >= PR_READY` 时 Codex 才创建 draft PR；独立 Attester 发布 head-bound check，再由 Codex 用 `pr.update` 标 ready。只有 `target_stage >= MERGED` 时 Codex 才发起固定 `squash` merge，请求原子携带 expected reviewed head，服务端 strict/up-to-date Ruleset 负责拒绝 base 前移；base 漂移后必须更新分支并重跑 Claude 自审/Verifier/Codex/Actions/Attestation，成功后由 Codex 验证 merge parent/tree/SHA。每个外部请求遵守 pause policy，已发送请求必须 settle/reconcile 后才暂停。
+- [ ] Phase 4 Task 8 自身及之前 PR 由 Codex 创建；预检冻结与 Publisher/Merger 分离、可对 App-authored PR 提交有效 approval 的 `bootstrapReviewerActorId + credentialRef`，Codex 只在签名本地 review receipt 有效后通过 GitHub plugin 自动提交 approval。本 Task 合并后安装 Attester、发布探测 check、把 `factory/codex-review + expected App ID` 加入 Ruleset并生成升级 receipt，随后撤销 bootstrap reviewer credential；此后 required check 取代过渡 approval且禁止回退。Actions `pull_request` receipt 记录 test-merge SHA 与 head/base SHA；required 聚合 job 始终产出，首版不启用 merge queue。
 - [ ] 在同一 Task 登记 Forge schema 分类，运行普通 codegen 和 `--check`；再在真实隔离仓库运行 `GIT-001`、`STAGE-003..004` FINAL。`SIDEFX-001` 只生成 Forge subcheck，待 Phase 5 签发；secret scan 必须为 0。
 - [ ] 分两次提交：`feat(forge): add GitHub PR and CI identity adapter`、`feat(forge): add protected merge reconciliation`。
 
@@ -228,8 +229,8 @@
 - Modify: `scripts/test.ps1`
 - Test: `tests/e2e/test_composed_ai_delivery.py`
 
-- [ ] 对 Task 9 的 codegen 结果运行 `generate.py --check`；从已冻结的真实组合根创建任务穿过 Claude→Verifier→Codex→GitHub，再运行 contracts、Agent、Runner、Verifier、Git Bridge、Forge、chaos 和 desktop E2E，不得在 Gate 改业务接线。
-- [ ] 冻结 candidate/reviewed SHA 和所有 review/verification receipts；secret scan、中文注释和日志覆盖无 blocker。
+- [ ] 对 Task 9 的 codegen 结果运行 `generate.py --check`；从已冻结的真实组合根创建任务穿过 Claude 实现与自审→Verifier→Codex 独立审核→Codex 创建 PR/合并，再运行 contracts、Agent、Runner、Verifier、Git Bridge、Forge、chaos 和 desktop E2E，不得在 Gate 改业务接线。
+- [ ] 冻结 candidate/reviewed SHA、Claude self-review、Verifier、Codex review、Codex PR/merge actor 和全部 receipts；secret scan、中文注释和日志覆盖无 blocker。
 - [ ] 独立需求审查验证 `PLAN-001`、`BOOT-001`、`REVIEW-001`、`GIT-001`、`SIDEFX-001` 及 `STAGE-001..004`，并核验 Task 9 的 `CTRL-002` FINAL 与当前 source/codegen digest 一致。
 - [ ] Codex 对完整前半程做只读审核，无 blocker/high 后才承认内部自用里程碑。
 - [ ] 提交：`test(workflow): certify local AI development and Git delivery`。

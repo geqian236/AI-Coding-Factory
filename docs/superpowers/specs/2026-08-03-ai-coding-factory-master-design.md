@@ -10,12 +10,12 @@
 
 ## 1. 执行摘要
 
-AI Coding Factory 是一个单用户、Windows 常驻、可观察、可暂停、可恢复的 AI 软件研发流水线。用户只输入自然语言需求、选择项目和目标终点，不需要编写 Claude/Codex Prompt。系统自动完成需求结构化、方案设计、Claude Code 开发、确定性验证、Codex 独立审核、自动返工、Git/PR/合并，以及按任务选择执行的 Linux 部署、验收与回滚。
+AI Coding Factory 是一个单用户、Windows 常驻、可观察、可暂停、可恢复的 AI 软件研发流水线。用户只输入自然语言需求、选择项目和目标终点，不需要编写 Claude/Codex Prompt。系统自动完成需求结构化、方案设计、Claude Code 开发与自审、确定性验证、Codex 独立审核及 PR/合并编排、自动返工，以及按任务选择执行的 Linux 部署、验收与回滚。
 
 系统不是“调用两个 CLI 的脚本”，也不是播放预设日志的演示页面。它必须满足以下真实性要求：
 
-1. Claude Code 是主要开发执行者。
-2. Codex 使用独立只读检出进行方案、代码和发布证据审核。
+1. Claude Code 是主要开发执行者，并在每个候选 SHA 上完成结构化自审和自修复。
+2. Codex 使用独立只读检出进行方案、代码和发布证据审核；审核通过后由 Codex Delivery Orchestrator 通过受限 GitHub 身份创建 PR，并在目标阶段允许且全部门禁通过时执行合并。
 3. 每个运行状态、终端输出和完成结论都能追溯到真实进程、事件、Git 身份、镜像 digest 或验收证据。
 4. 正常执行期间不主动打扰用户；只有达到所选终点或遇到系统无法自行解决的阻塞才通知。
 5. 关闭桌面窗口不停止任务；暂停、崩溃、重启和网络中断均有明确恢复语义。
@@ -54,8 +54,8 @@ AI Coding Factory 是一个单用户、Windows 常驻、可观察、可暂停、
 
 - 用户只描述“做什么”，系统负责生成和维护内部 Prompt、RunSpec 与审核材料。
 - 支持已有仓库和新项目；所有写任务使用独立 Git worktree、分支和容器。执行 worktree 必须位于专用 Factory WSL2 distro 的原生 ext4 内，该 distro 的 VHDX 物理文件必须位于 `D:\codex项目` 下。
-- Claude Code 完成主要编码和结构化返工。
-- Codex 对设计、代码和部署证据做独立审核，不能修改候选代码。
+- Claude Code 完成主要编码、绑定候选 SHA 的结构化自审和返工；Claude 自审不能替代独立审核。
+- Codex 对设计、代码和部署证据做独立审核，不能修改候选代码；Codex Delivery Orchestrator 负责 PR 创建、状态推进和受保护合并，但不能绕过审核或确定性门禁。
 - 支持真实时间线、真实终端、Provider JSONL（强制脱敏）、进程身份和可展示的模型活动摘要。
 - 支持任务级及全局软暂停、立即停止、恢复和崩溃重建。
 - 支持按任务选择目标终点，并将目标终点映射为最小权限。
@@ -229,9 +229,9 @@ Tool Broker 优先使用内置 Git、Docker、Browser、SSH 和文件 Adapter，
 | target_stage | 完成条件 | `allowedCapabilitySetId` |
 | --- | --- | --- |
 | `DESIGN_APPROVED` | RunSpec 和技术方案通过 Codex 方案审核 | `stage-design-v1` |
-| `CODEX_APPROVED` | Claude 实现、确定性门禁和 Codex 代码审核通过 | `stage-codex-approved-v1` |
-| `PR_READY` | 精确候选提交已 push，并创建 PR | `stage-pr-ready-v1` |
-| `MERGED` | CI、review 和分支保护通过，提交已合并 | `stage-merged-v1` |
+| `CODEX_APPROVED` | Claude 实现与自审、确定性门禁和 Codex 独立代码审核通过 | `stage-codex-approved-v1` |
+| `PR_READY` | Codex Delivery Orchestrator 已将精确 reviewed SHA push 并创建通过远端门禁的 PR | `stage-pr-ready-v1` |
+| `MERGED` | Codex Delivery Orchestrator 已在 CI、review attestation 和分支保护通过后完成受保护合并 | `stage-merged-v1` |
 | `STAGING_ACCEPTED` | 同一镜像 digest 已在测试环境部署并验收 | `stage-staging-accepted-v1` |
 | `PRODUCTION_ACCEPTED` | 生产发布、真实验收和 Codex 证据复核通过 | `stage-production-accepted-v1` |
 
@@ -495,6 +495,10 @@ Claude 接收：
 
 Claude 只写当前任务 worktree。项目脚本、依赖安装、测试和构建不在持有模型登录信息的环境中执行；这些动作由 Tool Broker 转交给无模型凭据的 Verifier。
 
+Claude 在把候选交给 Verifier 或 Codex 前，必须按冻结 rubric 对精确 `base SHA + candidate SHA` 做一次结构化自审，覆盖 RunSpec/验收条件、diff、测试证据、错误处理、恢复路径、中文注释、结构化日志和秘密风险，并生成符合 `claude-self-review.v1` 的 receipt。receipt 至少包含 `result=pass|needs_fix`、`reviewedBaseSha`、`reviewedCandidateSha`、`rubricVersion`、带稳定 ID/evidence/passCondition 的 findings 和 `evidenceDigests`；只保存结论与可复核证据，不保存或展示隐藏思维链。存在 open finding 时 Claude 必须先修复并对新 SHA 重新自审，旧 receipt 立即失效。
+
+Claude 自审属于作者质量控制，不是独立 approval：它不能关闭 Codex finding，不能签发 `factory/codex-review`，也不能创建 PR 或执行合并。Policy Engine 只有在当前 candidate SHA 同时具备 Claude self-review PASS、Verifier PASS 和 Codex 独立 review PASS 时，才能成立 `CODEX_APPROVED`。
+
 ### 9.2 Deterministic Verifier
 
 Verifier 在干净容器中执行仓库已有命令或 RunSpec 中冻结的等价门禁：
@@ -518,6 +522,7 @@ Codex 使用与 Claude 不同的只读检出和运行会话，输入包括：
 - base/candidate 完整 Git SHA。
 - 精确 diff 和变更文件列表。
 - Verifier 原始证据和报告。
+- 当前 candidate SHA 的 Claude self-review receipt。
 - 相关架构、日志、中文注释和安全规则。
 
 Codex 输出结构化 review receipt：
@@ -550,11 +555,19 @@ Codex 的 `result` 是审核意见，最终 Gate 由模型外的 Policy Engine �
 - finding 只能由新的、引用原 finding ID 的复审 receipt 关闭，不能被原执行者自行删除。
 - Codex 审核后 candidate SHA 发生任何漂移，原 receipt 立即失效并重新验证、重新审核。
 
-Codex 不能修改候选代码。审核失败后，系统将 finding 原样结构化返回 Claude，修复后重新运行受影响门禁并再次审核。
+Codex 不能修改候选代码。审核失败后，系统将 finding 原样结构化返回 Claude；Claude 修复并重新自审后，系统重新运行受影响门禁并再次交给 Codex 审核。Claude 的新 self-review receipt 不能自行关闭原 Codex finding，只有绑定新 SHA 且引用原 finding ID 的 Codex 复审 receipt 才能关闭。
 
 `repairLoopUsed` 在失败 gate 触发新的 Claude 自动修复 Attempt 时递增；`autoReplanUsed` 在自动激活子 PlanRevision 时递增。二者在 PlanRevision 变化、暂停/恢复、Agent 重启、Provider 重试或相同失败签名变化后都不重置。默认 `repairLoopLimit=6`、`autoReplanLimit=2`；相同失败签名连续出现 3 次时，若仍有重规划预算，先在 IntentAuthorization 包络内生成新 PlanRevision。任一预算耗尽、仍未收敛或重规划越界时，停止自动派发并撤销未消费副作用授权，保持 `Task.lifecycle=ACTIVE`、设置 `Run.observed_state=BLOCKED`，向用户交付根因、已消耗预算、证据和明确处理选项。提高预算需要新的用户授权，已消耗计数不得清零。
 
 发布后 Codex 只审核证据：证据不完整先进入 `RECONCILING` 补证；真实运行缺陷阻止验收；安全缺陷或已满足 RollbackPlan 触发条件时触发回滚。Codex 不能单凭无法复核的主观意见直接执行生产动作。
+
+### 9.4 Codex Delivery Orchestrator 与 GitHub 交付
+
+Codex Delivery Orchestrator 与只读 Codex Reviewer 是不同 capability 会话。Reviewer 只产生绑定 SHA 的 review receipt；Delivery Orchestrator 不写候选源码、不修改 review 结果，只在 Policy Engine 已确认当前 SHA 的 Claude self-review、Verifier 和 Codex review 全部有效后，通过独立的 Publisher/Merger GitHub App 执行 `PUBLISH_PR` 或 `MERGE`。建设 Factory 自身时，当前 Codex 会话通过用户已连接的 GitHub plugin 承担同一编排职责；产品达到 Phase 4 后改由产品内 GitHub Adapter 执行，二者都必须生成相同的远端 identity/receipt，不能把插件返回文本当完成事实。
+
+当 `target_stage >= PR_READY` 时，Codex Delivery Orchestrator 负责 push 精确 reviewed SHA、创建或更新 draft PR、填写 Task/base/head/测试/self-review/Verifier/Codex receipt digest、等待 Actions 与 head-bound `factory/codex-review`，再把 PR 晋升 ready。Phase 4 bootstrap 期间，预检必须冻结一个与 Publisher/Merger App 不同的 `bootstrapReviewerActorId + credentialRef`，证明它能对 App 创建的 PR 提交可计数原生 approval；Codex 只在本地签名 review receipt 有效后通过用户已连接的 GitHub plugin 自动使用该 reviewer 身份，不要求用户逐 PR 点击。Attester 启用后以 expected App ID 的 required check 取代并撤销该临时 reviewer credential。任何 head/base 漂移都会使 self-review、Verifier、Codex receipt 和 check stale，并返回 Claude 自审与完整门禁闭环。
+
+只有 `target_stage >= MERGED` 且 Ruleset、required checks、会话解决和 SHA 保护全部通过时，Codex Delivery Orchestrator 才能以 `squash` 合并并核对远端 merge parent/tree/SHA。GitHub merge API 原子携带 expected reviewed head SHA；expected base SHA 是授权与 receipt 身份，不冒充 API 参数。`github-repository-policy.v1` 必须冻结服务端 required checks 的 strict/up-to-date 规则，使 GitHub 在 merge 事务中因 base 前移而拒绝请求；首版不启用 merge queue，也不允许用客户端“先读后写”冒充 base CAS。Delivery Orchestrator 没有 bypass Ruleset、force-push、直接写受保护 `main` 或把失败 check 改为成功的能力；目标仅到 `PR_READY` 时必须停在 PR，不能自动合并。
 
 ## 10. 可观察性与真实终端契约
 
@@ -874,7 +887,7 @@ Claude/Codex 单槽会使多个任务在 IMPLEMENTING/CODE_REVIEWING 阶段排�
 | --- | --- | --- |
 | Git push | repo ID + remote ref + candidate SHA | 远端 ref 精确指向 candidate SHA |
 | 创建 PR | repo ID + head SHA + target branch | 同一 head/base 的现有 PR ID 与状态 |
-| 合并 | PR ID + expected reviewed head SHA + expected base SHA + `squash` strategy | GitHub 请求原子携带 expected head；目标分支新 commit 的唯一 parent 是 expected base、tree 与 reviewed head tree 一致，merge receipt 与远端 merge SHA 一致；base/head 漂移先更新分支并重跑 Verifier/Codex/Checks |
+| 合并 | PR ID + expected reviewed head SHA + expected base SHA + `squash` strategy | GitHub 请求原子携带 expected head，服务端 strict/up-to-date Ruleset 在同一 merge 事务拒绝 base 前移；目标分支新 commit 的唯一 parent 是 expected base、tree 与 reviewed head tree 一致，merge receipt 与远端 merge SHA 一致；base/head 漂移先更新分支并重跑 Claude self-review/Verifier/Codex/Actions/Attestation |
 | Registry push | repository + image digest | registry manifest 可按 digest 读取且内容一致 |
 | 数据库迁移 | database profile revision + migration checksum + release ID | 远端 migration journal 与数据库版本/checksum |
 | Nginx 切流 | ServerProfile revision + release ID + upstream config hash | active upstream、配置 hash、reload receipt |
@@ -1164,8 +1177,8 @@ IntentAuthorization 必须冻结绝对 `expiresAt` 与 `autonomousExecutionBudge
 | `STREAM-PERF-BURST` | 签名 load generator 按固定三任务/事件/大小分布在 100 ms 内输入 12,000 events | 全链路无丢失/泄密，峰值/working-set 不越 `benchmark-profile.v1` 且从最后输入起 5 秒内清空；记录各段 p50/p95/p99 |
 | `STREAM-PERF-SUSTAINED` | 同一固定分布以三任务聚合 2,000 events/s（±0.5%）持续 60 秒 | SQLite commit p95 <1 秒、durable UI p95 <2 秒，queue slope/结束差/峰值均过 profile 阈值，覆盖脱敏/flush/SQLite/IPC/真实渲染 |
 | `STREAM-PERF-SPARSE` | 1–10 events/s、跨 chunk 不确定后缀和低流量 batch | 按 profile 算 nearest-rank p95/最大延迟与心跳间隔；不确定字节只保守脱敏或 fail closed |
-| `REVIEW-001` | Codex reject 后 Claude 修复；审核后 SHA 漂移 | finding 闭环；漂移使 receipt 失效并重跑 Verifier/Codex |
-| `GIT-001` | 含本地未 push base commit 的 Windows 仓库，经 Git Object Bridge 完成开发、PR、CI、merge | bundle/pack digest、base/candidate/reviewed/remote/merge SHA 一致；崩溃可恢复；用户 index/worktree/branch 不受污染 |
+| `REVIEW-001` | Claude 实现后自审并自修复，Verifier 通过后 Codex reject 再返工；审核后 SHA 漂移 | Claude self-review 与 Codex finding 分属不同 receipt；漂移使全部旧 receipt 失效并重跑自审/Verifier/Codex |
+| `GIT-001` | 含本地未 push base commit 的 Windows 仓库，经 Git Object Bridge 由 Codex 创建 PR、等待 CI/check 并合并 | bundle/pack digest、self-review/Verifier/Codex receipt、base/candidate/reviewed/remote/merge SHA 一致；崩溃可恢复；用户 index/worktree/branch 不受污染 |
 | `SIDEFX-001` | push/PR/registry 已成功但响应丢失 | reconcile 查到完成事实，不重复产生外部对象 |
 | `DEPLOY-001` | 可销毁 Linux 上生产等价成功发布 | digest 部署、迁移、切流、业务验收、soak、Codex 证据审核全部通过 |
 | `DEPLOY-002` | 切流前/后故障 | 按 RollbackPlan 恢复旧版本，验收通过，lifecycle=`ROLLED_BACK` |
@@ -1212,7 +1225,7 @@ IntentAuthorization 必须冻结绝对 `expiresAt` 与 `autonomousExecutionBudge
 5. **Deployment：**ServerProfile、SSH Compose、验收、回滚和证据复核。
 6. **Hardening：**Vault、安全、备份、安装包、文档和整体 E2E。
 
-工作流 1–4 集成后设置内部自用里程碑 `SELF_HOSTING_CODEX_APPROVED`：桌面壳、控制平面、状态/事件链、Claude→Verifier→Codex 闭环必须能用来开发本产品自身。该里程碑不包含 push/merge/部署，不等于首个完整版本交付，也不削减工作流 5–6 和最终 DoD；后半程发布链以该版本的真实使用证据继续验证。
+工作流 1–4 集成后设置内部自用里程碑 `SELF_HOSTING_CODEX_APPROVED`：桌面壳、控制平面、状态/事件链、Claude 实现与自审→Verifier→Codex 独立审核闭环必须能用来开发本产品自身。该里程碑不包含产品自身执行的 push/merge/部署，不等于首个完整版本交付，也不削减工作流 5–6 和最终 DoD；后半程发布链以该版本的真实使用证据继续验证。
 
 每个节点完成条件均为：实现、必要中文注释、结构化日志、相关测试、需求审查、代码审查和本地原子提交全部通过。
 
@@ -1226,9 +1239,9 @@ IntentAuthorization 必须冻结绝对 `expiresAt` 与 `autonomousExecutionBudge
 | `DOD-STAGE-001` | 执行 `STAGE-001..006` | 六个目标均真实止步且 capability 不越界 | 6 份 final task receipt |
 | `DOD-OBS-001` | 执行 `PROC-001`、`EVENT-HASH-001`、`STREAM-001..002`、`STREAM-DUR-001`、`STREAM-BP-001` | 真实进程、跨语言事件链、durable prefix、脱敏来源、背压、崩溃补录和回放全部匹配 | event-chain + durability receipt |
 | `DOD-PERF-001` | 执行三项 `STREAM-PERF-*` 与 `SCHED-PERF-001` | 持续/稀疏 SLO、burst 有界清空、队列斜率和三任务 ETA 基准全部通过 | performance benchmark receipt |
-| `DOD-AI-001` | 执行 `AUTH-001..002`、`PLAN-001`、`PLAN-HASH-001`、`BOOT-001`、`MCP-001`、`REVIEW-001` 和完整返工 | 授权/重规划、规划证据、跨语言 hash、工具拒绝、finding 闭环和 reviewed SHA 全部一致 | authorization + planner + verifier + review receipts |
+| `DOD-AI-001` | 执行 `AUTH-001..002`、`PLAN-001`、`PLAN-HASH-001`、`BOOT-001`、`MCP-001`、`REVIEW-001` 和完整返工 | 授权/重规划、规划证据、跨语言 hash、工具拒绝、Claude self-review、Codex finding 闭环和 reviewed SHA 全部一致 | authorization + planner + self-review + verifier + Codex review receipts |
 | `DOD-CTRL-001` | 执行 `STATE-001`、`LEASE-001`、`CTRL-001..002`、`SIDEFX-001`、`STORE-001`、`BUDGET-001`、`RETRY-001` | 暂停、停止、取消、副作用核对、预算、重试、崩溃和未知状态无假成功 | recovery/chaos report |
-| `DOD-GIT-001` | 新/旧项目、worktree、PR、merge；执行 `GIT-001` | 用户工作区零污染；Git Object Bridge 与身份链一致 | Git identity receipt |
+| `DOD-GIT-001` | 新/旧项目、worktree、Codex 创建 PR 和受保护 merge；执行 `GIT-001` | 用户工作区零污染；Git Object Bridge、Codex delivery actor 与远端身份链一致 | Git/PR/merge identity receipt |
 | `DOD-DEPLOY-001` | 可销毁、生产等价 Linux；执行 `DEPLOY-001..003`、`GUARD-001`、`DEPLOY-FENCE-001`、`NGINX-001`、`BACKUP-001`、`DEPLOY-RAM-001` | 发布、逐写 fencing、真实验收、soak、内存预检、备份、回滚和跨任务隔离/清除全部通过 | release/acceptance/rollback receipts |
 | `DOD-SEC-001` | 威胁测试、secret scan、`CLI-PROFILE-001`、`PATH-001..002`、`RUNTIME-001`、`WSL-IO-001` | 无明文凭据、无跨任务访问、可控写入都在严格 D 根、未知运行时 fail closed | security + path/runtime report |
 | `DOD-OPS-001` | 备份恢复、升级失败、诊断与 `COMPAT-001` 演练 | 达到本地 RTO/RPO；版本漂移安全阻断；Runbook 步骤可复现 | operations + compatibility drill receipt |
