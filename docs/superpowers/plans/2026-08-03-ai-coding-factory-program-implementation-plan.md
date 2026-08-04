@@ -19,7 +19,7 @@
 - 独立常驻 Agent、确定性状态机、授权、资源调度、事件链、Artifact、恢复和通知。
 - Factory 专用 WSL2/Docker Runner、Claude Developer、Codex Reviewer、Verifier 和 Release Runner。
 - 新旧仓库、Git Object Bridge、PR/CI/merge、镜像构建与 digest 身份链。
-- 本项目自身也使用 GitHub 私有仓库和逐 Task 分支/PR：Claude 实现并结构化自审，Verifier 做确定性检查，Codex 独立审核、创建 PR 并在门禁通过后合并；不能因为是在开发 Factory 自身就绕过产品要求的证据链。
+- 本项目自身使用 GitHub 公开仓库和逐 Task 分支/PR：当前 owner 为 GitHub Free，用户已明确选择公开仓库以启用 Ruleset；Claude 实现并结构化自审，Verifier 做确定性检查，Codex 独立审核、创建 PR 并在门禁通过后合并，不能因为是在开发 Factory 自身就绕过产品要求的证据链。
 - Linux SSH/Compose/Nginx/数据库迁移、验收、自动回滚和失败隔离。
 - 严格 D 盘存储合同、Vault、兼容性清单、安装升级、备份恢复和全链路 DoD。
 
@@ -36,7 +36,7 @@
 
 ### 1.4 本项目自身的 Claude、Codex 与 GitHub 协作合同
 
-实施启动先由 Codex 通过用户已连接的 GitHub plugin 做只读预检：核对 owner/套餐、私有仓库 Ruleset 可用性、admin 权限、基础/Attester App 可安装性、API 能力，以及一个与 Publisher/Merger App 分离且能对 App-authored PR 提交可计数 approval 的 bootstrap reviewer actor；任一不满足即 `BLOCKED`，不得先创建或推送半保护远端。预检通过后，Codex 在用户选定 owner 下创建默认名为 `AI-Coding-Factory` 的私有仓库；本计划修订本身不预先执行该外部变更。一次性 bootstrap 只允许 Codex 推送已核对的本地基准 `main`，随后立即启用“必须经 PR、禁止 force-push/删除、要求 squash 线性历史、会话解决、required checks strict/up-to-date”的基础 Ruleset，并记录 repository/ruleset ID、版本、bypass actor 和撤销条件。当前 Master Spec 与完整计划作为第一张文档 PR，由 Codex 创建；Codex 通过预授权的 bootstrap reviewer 身份自动提交原生 approval，再通过 Publisher/Merger App 合并，不要求用户逐 PR 点击。
+实施启动先由 Codex 通过用户已连接的 GitHub plugin 做只读预检：核对 owner/套餐、公开仓库 Ruleset 可用性、admin 权限、基础/Attester App 可安装性、API 能力，以及一个与 Publisher/Merger App 分离且能对 App-authored PR 提交可计数 approval 的 bootstrap reviewer actor；任一不满足即 `BLOCKED`，不得先创建或推送半保护远端。当前 owner `geqian236` 使用 GitHub Free，用户已明确选择公开仓库；预检通过后，Codex 在该 owner 下创建名为 `AI-Coding-Factory` 的公开仓库。一次性 bootstrap 只允许 Codex 推送已核对的本地基准 `main`，随后立即启用“必须经 PR、禁止 force-push/删除、要求 squash 线性历史、会话解决、required checks strict/up-to-date”的基础 Ruleset，并记录 repository/ruleset ID、版本、bypass actor 和撤销条件。当前 Master Spec 与完整计划作为第一张文档 PR，由 Codex 创建；Codex 通过预授权的 bootstrap reviewer 身份自动提交原生 approval，再通过 Publisher/Merger App 合并，不要求用户逐 PR 点击。
 
 每个实施 Task 默认对应一个远端 `factory/phase-<n>-task-<n>-<slug>` 分支和一张由 Codex 创建的 PR。Claude Developer 是任务 worktree 的唯一源码写者，并必须先对精确 candidate SHA 结构化自审、自行修复到 PASS；Verifier 再运行机械门禁；Codex Reviewer 只在独立只读检出中审核精确 candidate SHA、Claude self-review、测试证据、中文注释和日志。任何 Codex finding 仍交回 Claude，Claude 修复并重新自审后，旧 self-review/Verifier/Codex receipt 和远端 check 自动失效。只有当前 receipts 全部有效且 `target_stage >= PR_READY` 时，Codex Delivery Orchestrator 才通过 GitHub plugin（建设期）或产品内 GitHub Adapter（Phase 4 后）push 并创建/更新 PR。Phase 4 Task 8 合并前使用“签名本地 Codex receipt + Codex 自动调用独立 bootstrap reviewer 原生 approval”的过渡门禁；Task 8 合并后安装只读源码/Checks 写的 Review Attester App、发布首个 `factory/codex-review` 并把 check name + expected App ID 加入 Ruleset，以该 required check 取代并撤销 bootstrap reviewer credential。达到 `MERGED` 且全部门禁有效时由 Codex 执行 squash merge。正常进展不打扰用户，只在所选终点完成、权限越界、不可恢复 blocker 或需要新的外部授权时通知。
 
@@ -369,11 +369,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- powershel
 - [ ] 47 个展开后的 §20.2 测试 ID 均有 PASS receipt，且环境 manifest digest 一致。
 - [ ] 11 项 Definition of Done 全部 PASS；无 skipped 必检项、冲突或手工改成功。
 - [ ] Codex 对完整源码、安装包和证据做最终只读审核，无 open blocker/high。
-- [ ] GitHub 私有仓库、基础/强化 Ruleset、Claude self-review、由 Codex 创建的逐 Task PR、固定 required checks、`factory/codex-review` SHA 绑定和由 Codex 发起的远端 merge identity 均有可复核 receipt；不存在直接推送受保护 `main` 的未关闭例外。
+- [ ] GitHub 公开仓库、基础/强化 Ruleset、Claude self-review、由 Codex 创建的逐 Task PR、固定 required checks、`factory/codex-review` SHA 绑定和由 Codex 发起的远端 merge identity 均有可复核 receipt；不存在直接推送受保护 `main` 的未关闭例外。
 - [ ] Windows 安装、关闭 UI 后 Agent 继续、暂停恢复、Linux 发布、验收和回滚均有真实运行证据。
 - [ ] 源码、运行数据、日志、缓存、profile、WSL/Docker 数据和备份的可控写入均位于 `D:\codex项目`。
 - [ ] 文档、威胁模型、事件协议、接入手册、备份恢复、故障排查、发布回滚和升级 Runbook 与实现一致。
 
 ## 12. 执行入口
 
-正式实施前先由 Codex 执行 §1.4 的 GitHub 只读能力预检；通过后再确定 owner/仓库名/私有可见性，由 Codex 创建空远端、推送已核对基准、启用基础 Ruleset，并创建第一张文档 PR 合并 Master Spec 与本计划。该步骤需要实施当次的明确外部变更授权，预检或保护失败不得留下已推送但未保护的仓库。之后从 Phase 0 开始，按详细计划逐 Task 由 Claude 实现并自审、Verifier 检查、Codex 独立审核、创建 PR 并在目标阶段允许时合并。Phase 1 与 Phase 2 只按 §3 的任务级依赖并行；其余阶段只有前置集成 Gate 通过后才进入 ready 状态。任何实现发现需要改变 target stage、生产授权、信任边界、凭据、发布或回滚保证时，先回到 Master Spec 做变更审查，不能只在代码或本计划中悄悄放宽。
+正式实施前先由 Codex 执行 §1.4 的 GitHub 只读能力预检；当前已冻结 owner `geqian236`、仓库名 `AI-Coding-Factory` 和公开可见性，由 Codex 创建空远端、推送已核对基准、启用基础 Ruleset，并创建第一张文档 PR 合并 Master Spec 与本计划。该步骤需要实施当次的明确外部变更授权，预检或保护失败不得留下已推送但未保护的仓库。之后从 Phase 0 开始，按详细计划逐 Task 由 Claude 实现并自审、Verifier 检查、Codex 独立审核、创建 PR 并在目标阶段允许时合并。Phase 1 与 Phase 2 只按 §3 的任务级依赖并行；其余阶段只有前置集成 Gate 通过后才进入 ready 状态。任何实现发现需要改变 target stage、生产授权、信任边界、凭据、发布或回滚保证时，先回到 Master Spec 做变更审查，不能只在代码或本计划中悄悄放宽。
