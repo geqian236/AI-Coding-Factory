@@ -163,7 +163,7 @@
 - Test: `tests/agent/integration/objects/test_quarantine.py`
 - Test: `tests/support/fault_injection.py`
 
-- [ ] 写 flush、record、rename、父目录耐久、digest、SQLite reference 和 disk-full 每个切点的失败测试。
+- [ ] 写 flush、record、rename、父目录耐久、digest、SQLite reference 和 disk-full 每个切点的失败测试；固定“写完 `floor(eventCount/2)` 个完整 record 后且在 flush/rename/SQLite COMMIT 前崩溃”和“下一 record 写到中途形成 torn record 后崩溃”两个命名切点。
 - [ ] 实现 `tmp → flush → cross-check → content-addressed final rename → parent durability → SQLite reference`；COMMIT 后禁止移动对象。
 - [ ] 实现自描述 header/record/footer、完整对象补录、部分对象 quarantine 和已引用对象缺失 fail closed。
 - [ ] 在真实 NTFS/WSL ext4 probe 上运行 `python -m pytest tests/agent/integration/objects -q`，Expected: PASS；无法由 Python 证明的 Windows durable 操作调用 Phase 0 冻结的 Rust helper。
@@ -184,8 +184,8 @@
 - Test: `tests/agent/integration/events/test_backpressure.py`
 - Test: `tests/agent/chaos/test_stream_durability.py`
 
-- [ ] 写多 Task claim 全有或全无、同 Task 唯一 pending、批内连续链、竞争 head、COMMIT 前不可见和队列水位测试。
-- [ ] 实现单 writer group commit；阈值来自 manifest，`synchronous=NORMAL` 配置必须拒绝。
+- [ ] 写多 Task claim 全有或全无、同 Task 唯一 pending、批内连续链、竞争 head、COMMIT 前不可见、两个确定性中途 record 崩溃切点和队列水位测试。
+- [ ] 实现单 writer group commit；只从已验证 `compatibility-manifest.json.eventBatchParameters` 读取 `maxBatchEvents/maxBatchBytes/maxBatchAgeMs/synchronous/parameterTupleDigest/sqliteSpikeReceiptDigest`，重算 tuple digest 并核对 receipt 绑定的同一参数、schema/profile/environment digest；字段缺失、越界、receipt 输入不一致、组合未认证或 `synchronous != FULL` 均在打开 writer 前 fail closed。
 - [ ] 实现 75%/50% 高低水位、硬上限、安全 interrupt 和每 stream 8 MiB 应急排空；不得持久化未脱敏字节或静默丢事件。
 - [ ] 运行事件/chaos 测试，Expected: `EVENT-HASH-001` 可由其 Phase 1 final owner 生成 FINAL；`STREAM-DUR-001`、`STREAM-BP-001` 只生成控制平面 `qualification=PARTIAL` subcheck。
 - [ ] 分三次提交：`feat(events): add atomic prepared batches`、`feat(events): materialize durable event chains`、`feat(events): enforce bounded ingest backpressure`。
@@ -226,16 +226,19 @@
 - Create: `apps/agent/src/factory_agent/observability/metrics.py`
 - Create: `apps/agent/src/factory_agent/observability/audit.py`
 - Create: `apps/agent/src/factory_agent/application/task_service.py`
+- Create: `apps/agent/src/factory_agent/ports/repository_intake.py`
+- Create: `apps/agent/src/factory_agent/integrations/windows/repository_intake.py`
 - Create: `apps/agent/src/factory_agent/application/replay_service.py`
 - Create: `apps/agent/src/factory_agent/application/shutdown_service.py`
 - Create: `apps/agent/src/factory_agent/integrations/windows/session_events.py`
 - Test: `tests/agent/integration/ipc/test_authentication.py`
 - Test: `tests/agent/integration/ipc/test_subscriptions.py`
+- Test: `tests/agent/integration/ipc/test_task_intake.py`
 - Test: `tests/agent/e2e/test_agent_process.py`
 - Test: `tests/agent/integration/windows/test_shutdown_fast.py`
 
-- [ ] 写第二实例、错误 SID/PID/digest/version/nonce、慢订阅者、UI 断开、启动中途失败，以及 Windows logoff/shutdown 的 0–2 秒各强杀切点测试。
-- [ ] 组合 Task 1–8 的真实 control plane；实现独立 command/event Named Pipe。`SHUTDOWN_FAST` 在 2 秒预算内优先同事务持久化控制命令、writer/control epoch、durable cursor、活动 Attempt/receipt identity；超时写最小 receipt，重启后禁止宣称 PAUSED并直接 reconciliation。
+- [ ] 写第二实例、错误 SID/PID/digest/version/nonce、慢订阅者、UI 断开、启动中途失败、`create_task` 缺少 `task.create` 权限、客户端伪造 capability/risk/authorization 字段、D 路径/仓库模式错误、reparse/junction/卷身份替换、new 模式非空或已有 `.git`、existing 模式 repo identity/base ref 无效、重复 requestId，以及 Windows logoff/shutdown 的 0–2 秒各强杀切点测试。
+- [ ] 组合 Task 1–8 的真实 control plane；实现独立 command/event Named Pipe，并注册显式 `task-intake.v1` 的 `create_task` handler。schema 只校验不可信 Request；`task_service` 使用基于 Phase 0 StorageLocationContract 的 Windows `RepositoryIntakePort` adapter，以句柄约束/防跟随方式核对规范物理路径、D 卷、reparse/junction、目录与 Git mode，再由服务端求交 capability、预算、风险和资源 binding，生成 Accepted 与 IntentAuthorization。Task、IntentAuthorization、规范化 repository binding 和幂等 requestId 同事务持久化，不能信任 UI 风险摘要。首版不增加独立 `probe_repository` IPC；Phase 4 真正导入或 bootstrap 前必须重新核验，不能信任创建时快照。`SHUTDOWN_FAST` 在 2 秒预算内优先同事务持久化控制命令、writer/control epoch、durable cursor、活动 Attempt/receipt identity；超时写最小 receipt，重启后禁止宣称 PAUSED并直接 reconciliation。
 - [ ] 实现统一结构化日志/指标，包含关联 ID、操作、耗时、状态和脱敏错误码；secret fixture 扫描必须为 0。
 - [ ] 运行 IPC/process E2E，Expected: `PROC-001` 只生成 Agent 侧 `qualification=PARTIAL` subcheck，UI 关闭不影响 Agent；关机任一切点都无假 PAUSED。
 - [ ] 提交：`feat(agent): compose persistent authenticated control plane`。

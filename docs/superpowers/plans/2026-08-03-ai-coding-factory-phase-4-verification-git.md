@@ -28,8 +28,8 @@
 - Test: `tests/integration/git_bridge/test_inbound_bridge.py`
 - Test: `tests/security/test_git_source_pollution.py`
 
-- [ ] 写含未 push base commit、dirty worktree/index、linked worktree、可达性失败、bundle digest 漂移和 source repo 锁测试。
-- [ ] Windows adapter 使用 `GIT_OPTIONAL_LOCKS=0` 和只读 plumbing 导出精确 base SHA，不写用户 index/worktree/branch/ref/config。
+- [ ] 写含未 push base commit、dirty worktree/index、linked worktree、可达性失败、bundle digest 漂移、source repo 锁，以及当前 repo physical identity/规范路径/base SHA 与 `TaskIntakeAccepted` binding 漂移测试。
+- [ ] Windows adapter 使用 `GIT_OPTIONAL_LOCKS=0` 和只读 plumbing；导出前重新核对当前 repo physical identity、规范路径和 base SHA 与 `TaskIntakeAccepted` binding 完全一致，再导出精确 base SHA，不写用户 index/worktree/branch/ref/config，任何 TOCTOU 漂移 fail closed。
 - [ ] WSL 导入 Factory bare mirror，验证 repo identity、base 可达性和 bundle digest，再从 ext4 mirror 创建任务 worktree。
 - [ ] 在同一 Task 登记 Git object schema 分类，运行普通 codegen 和 `--check`；比较操作前后 status/index/HEAD/refs/config，Expected: 生成合同一致且用户仓库零污染。
 - [ ] 提交：`feat(git): import exact base through object bridge`。
@@ -44,7 +44,7 @@
 - Test: `tests/integration/git_bridge/test_bootstrap.py`
 - Test: `tests/integration/git_bridge/test_workspace_recovery.py`
 
-- [ ] 写非空目录、已有 `.git`、路径身份未知、并发 bootstrap 和崩溃中途测试。
+- [ ] 写非空目录、已有 `.git`、路径身份未知、与 `TaskIntakeAccepted` 的规范路径/physical identity 漂移、并发 bootstrap 和崩溃中途测试。
 - [ ] 只允许选定 D 盘空目录，创建 `.gitignore`、默认分支和可审计空提交；任何不确定情况 BLOCKED，不覆盖。
 - [ ] `workspaces` 持久化两端 repo identity、bundle/base/candidate/checkpoint ref、lease 和清理状态，恢复不按目录存在性猜测。
 - [ ] 运行 `BOOT-001`，Expected: fail-closed 场景均无用户文件变化。
@@ -144,7 +144,7 @@
 - Test: `tests/chaos/test_review_sha_drift.py`
 
 - [ ] 写 Claude 失败、Verifier finding、Codex reject、相同失败签名三次、六轮预算、审核后 SHA 漂移和 provider quota 测试。
-- [ ] Claude 产生候选 hidden ref/commit；Verifier 先行，Codex 只审核精确候选 SHA；中文注释/日志 finding 必须引用 checker 的 rule ID、symbol 和 pass condition，任何修改使旧 Verifier/Codex receipt 失效。
+- [ ] Claude 是任务 worktree 的唯一源码写者并产生候选 hidden ref/commit；Verifier 先行，Codex 只在独立只读检出审核精确候选 SHA，不得直接修改源码或审核自己的改动；中文注释/日志 finding 必须引用 checker 的 rule ID、symbol 和 pass condition，任何修改使旧 Verifier/Codex receipt 及对应 GitHub Check Run 失效并回到 Claude 修复。
 - [ ] 修复预算按 Run 累计不重置，PlanRevision 上限独立；范围内重规划自动继续，越授权则 ACTION_REQUIRED。
 - [ ] 运行 `REVIEW-001`，Expected: finding 闭环、漂移重跑、预算耗尽状态正确。
 - [ ] 提交：`feat(workflow): add Claude verifier Codex repair loop`。
@@ -172,6 +172,7 @@
 
 - Create: `apps/agent/src/factory_agent/ports/forge.py`
 - Create: `apps/agent/src/factory_agent/integrations/forge/github.py`
+- Create: `apps/agent/src/factory_agent/integrations/forge/github_review_attester.py`
 - Create: `apps/agent/src/factory_agent/integrations/forge/credential_session.py`
 - Create: `apps/agent/src/factory_agent/application/publication_service.py`
 - Create: `apps/agent/src/factory_agent/domain/forge_profiles.py`
@@ -179,17 +180,22 @@
 - Create: `apps/desktop/src/features/settings/ForgeProfiles.tsx`
 - Create: `contracts/schemas/forge-receipt.v1.schema.json`
 - Create: `contracts/schemas/forge-profile.v1.schema.json`
+- Create: `contracts/schemas/github-repository-policy.v1.schema.json`
+- Create: `contracts/schemas/review-attestation.v1.schema.json`
 - Modify: `contracts/codegen/catalog.v1.json`
 - Modify: `packages/factory-contracts/src/generated/contracts.ts`
 - Modify: `apps/agent/src/factory_agent/contracts/generated/models.py`
 - Modify: `crates/factory-contracts/src/generated/contracts.rs`
 - Test: `tests/integration/forge/test_github_adapter.py`
+- Test: `tests/integration/forge/test_github_ruleset.py`
+- Test: `tests/integration/forge/test_github_review_attester.py`
 - Test: `tests/chaos/test_forge_response_loss.py`
 - Test: `tests/security/test_forge_credentials.py`
 
-- [ ] 写未经授权 push、缺失/过期/撤销 credential、默认 C 盘凭据误用、PR 响应丢失、CI pending/fail、reviewed SHA 漂移、分支保护拒绝、merge 响应丢失和错误 merge SHA 测试。
-- [ ] 首版只认证 GitHub Adapter；`forge-profile.v1` 必须 `$ref` Phase 0 的 `credential-ref.v1`，ForgeProfile 只保存 D-backed 通用 Vault 的 credentialRef/scope/TTL/fingerprint，用户通过明确 GitHub App/device flow、PAT 或 SSH 接入完成登录；其他 Forge 返回 `UNSUPPORTED_OR_UNCERTIFIED`。
-- [ ] push/PR/merge 使用短期 Broker session、稳定 idempotency identity 和 inspect；完成事实绑定 base/candidate/reviewed/remote/merge SHA。每个外部请求遵守 pause policy，已发送请求必须 settle/reconcile 后才暂停。
+- [ ] 写未经授权 push、缺失/过期/撤销 credential、默认 C 盘凭据误用、PR 响应丢失、CI pending/fail、`reviewedHeadSha` 与 `ciTestMergeSha` 混淆、required workflow 未触发、`factory/codex-review` 缺失/错误 source App/绑定旧 SHA、reviewed head/base 漂移、Ruleset/会话解决拒绝、merge expected-head CAS 失败、merge 响应丢失和错误 parent/tree/merge SHA 测试。
+- [ ] 首版只认证 GitHub Adapter；核对 Phase 0 已冻结的 stage/node capability maps 包含 `pr.update/forge.observe.scoped/check.publish` 与 `ATTEST_REVIEW`，并运行三语言 codegen `--check`；缺失时 fail closed，禁止在本 Task 临时补合同。Publisher/Merger App 只有 metadata 只读与按阶段求交的 Contents/PR 写，Review Attester App 只有 Contents 只读与 Checks 写，Ruleset 将 check 绑定 expected Attester App ID；两者 credentialRef、scope、TTL、fingerprint 分开保存。仓库创建/Ruleset 管理由总计划 §1.4 的一次性 bootstrap admin 承担。PAT/SSH/device flow 不能冒充 Checks 能力；其他 Forge 返回 `UNSUPPORTED_OR_UNCERTIFIED`。
+- [ ] push/PR/Check Run/merge 使用短期 Broker session、稳定 idempotency identity 和 inspect；完成事实绑定 GitHub repository ID、PR number、base/candidate/reviewed/current-head/remote/merge SHA、`ciTestMergeSha`、Actions run/check IDs、expected source App ID、Codex receipt/rubric digest。PR 默认 draft；Codex 审核后由独立 Attester 发布 head-bound check，再用 `pr.update` 标 ready。merge 固定 `squash`，请求原子携带 expected reviewed head，Ruleset 要求分支与审核 base 一致；base 前移必须更新分支并重跑 Verifier/Codex/Actions/Attestation，成功后验证 merge parent/tree/SHA。每个外部请求遵守 pause policy，已发送请求必须 settle/reconcile 后才暂停。
+- [ ] Phase 4 Task 8 自身及之前 PR 使用“签名本地 Codex receipt + 独立 bootstrap reviewer 原生 approval”过渡门禁；本 Task 合并后安装 Attester、发布探测 check、把 `factory/codex-review + expected App ID` 加入 Ruleset并生成升级 receipt，之后禁止回退过渡模式。Actions `pull_request` receipt 记录 test-merge SHA 与 head/base SHA；required 聚合 job 始终产出，首版不启用 merge queue。
 - [ ] 在同一 Task 登记 Forge schema 分类，运行普通 codegen 和 `--check`；再在真实隔离仓库运行 `GIT-001`、`STAGE-003..004` FINAL。`SIDEFX-001` 只生成 Forge subcheck，待 Phase 5 签发；secret scan 必须为 0。
 - [ ] 分两次提交：`feat(forge): add GitHub PR and CI identity adapter`、`feat(forge): add protected merge reconciliation`。
 

@@ -55,8 +55,8 @@
 - Test: `tests/integration/windows/test_named_pipe_interop.py`
 - Create: `scripts/test-ipc-e2e.ps1`
 
-- [ ] 写错误 SID/PID/executable digest/protocol/nonce、重放 requestId、event pipe 堵塞但 control pipe 仍可用的失败测试。
-- [ ] 先用冻结 fixture 完成 Rust/Python 合同测试；真实 interop 明确依赖 Phase 1 Task 9 的集成提交。实现 challenge/nonce、安装会话密钥、当前用户 ACL、客户端身份校验和显式 schema；JS 只能调用 `get_snapshot/subscribe/control/query_artifact` 白名单。
+- [ ] 写错误 SID/PID/executable digest/protocol/nonce、重放 requestId、未授权 `task.create`、`create_task` DTO 漂移、event pipe 堵塞但 control pipe 仍可用的失败测试。
+- [ ] 先用冻结 fixture 完成 Rust/Python 合同测试；真实 interop 明确依赖 Phase 1 Task 9 的集成提交。实现 challenge/nonce、安装会话密钥、当前用户 ACL、客户端身份校验和显式 schema；JS 只能调用 `get_snapshot/subscribe/control/query_artifact/create_task` 白名单，`create_task` 单独要求 `task.create` 权限并消费三语言生成的 `task-intake.v1` 类型。
 - [ ] event bridge 只转发 committed cursor；连接断开立即丢弃内存投影队列，不影响 Agent。
 - [ ] 运行 `powershell -NoProfile -File scripts/test-ipc-e2e.ps1`，Expected: 正常/拒绝/重连场景全部 PASS。
 - [ ] 提交：`feat(ipc): add authenticated dual-pipe desktop bridge`。
@@ -92,8 +92,8 @@
 - Test: `apps/desktop/src/features/task-create/CreateTaskDialog.test.tsx`
 - Test: `tests/desktop-e2e/specs/create-task.spec.ts`
 
-- [ ] 写六种 target stage、已有/新仓库、D 路径错误、生产授权摘要和重复提交 requestId 测试。
-- [ ] 实现自然语言需求、项目、目标终点、环境/预算/risk summary；不要求用户编写 Claude/Codex Prompt。
+- [ ] 写六种 target stage、已有/新仓库、D 路径错误、生产授权摘要、重复提交 requestId，以及 UI 不得接收 lease/checkpoint/bundle 内部字段的测试。
+- [ ] 实现自然语言需求、项目、目标终点、环境/预算/risk summary；不要求用户编写 Claude/Codex Prompt。`RepositoryPicker` 只提交生成 DTO 中的 `mode/root/baseBranch`，权威文件系统/Git 校验由 Agent `create_task` handler 完成；首版不增加 `probe_repository`，未来只有出现分支/HEAD/dirty 状态预览需求时才另立只读合同，且不能替代提交时复核。
 - [ ] 生产目标明确展示一次性授权包络和回滚语义，但不得在创建任务时读取秘密。
 - [ ] 运行 component + browser E2E，Expected: 六种目标创建请求合同一致，更高 capability 不出现在较低阶段摘要。
 - [ ] 提交：`feat(desktop): add target-aware task creation`。

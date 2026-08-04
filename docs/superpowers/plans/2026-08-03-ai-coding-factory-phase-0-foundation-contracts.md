@@ -31,6 +31,10 @@
 - Create: `uv.lock`
 - Create: `.node-version`
 - Create: `.python-version`
+- Create: `.github/workflows/plan-validation.yml`
+- Create: `.github/workflows/ci.yml`
+- Create: `.github/pull_request_template.md`
+- Create: `docs/operations/github-development-workflow.md`
 - Create: `scripts/bootstrap-dev.ps1`
 - Create: `scripts/dev.ps1`
 - Create: `scripts/check.ps1`
@@ -57,6 +61,9 @@ def test_required_workspace_files_exist() -> None:
         "pyproject.toml",
         "uv.lock",
         ".node-version",
+        ".github/workflows/plan-validation.yml",
+        ".github/workflows/ci.yml",
+        ".github/pull_request_template.md",
         "scripts/bootstrap-dev.ps1",
         "scripts/dev.ps1",
         "scripts/check.ps1",
@@ -73,7 +80,7 @@ Expected: FAIL，报告缺少 workspace 文件。
 
 - [ ] **Step 3: 创建工程文件和 D 盘开发启动器**
 
-`scripts/bootstrap-dev.ps1` 复用 `scripts/dev.ps1` 的路径解析，不单独维护第二套环境规则。首次 compatibility probe 选定版本后，bootstrap 生成并校验 `.node-version`、`.python-version`、`rust-toolchain.toml`、`pnpm-lock.yaml`、`Cargo.lock` 和 `uv.lock`；计划不预猜会漂移的具体版本号。
+`scripts/bootstrap-dev.ps1` 复用 `scripts/dev.ps1` 的路径解析，不单独维护第二套环境规则。首次 compatibility probe 选定版本后，bootstrap 生成并校验 `.node-version`、`.python-version`、`rust-toolchain.toml`、`pnpm-lock.yaml`、`Cargo.lock` 和 `uv.lock`；计划不预猜会漂移的具体版本号。`plan-validation.yml` 与 `ci.yml` 使用 `pull_request` 触发；固定、始终产出的聚合 check 名称为 `plan-consistency/contracts/python/rust/desktop/security`，不得用 workflow/job 级 path filter 让 required check 消失，按路径跳过只能在 job 内产生明确 neutral/success 结论。receipt 同时记录 `reviewedHeadSha`、GitHub test-merge `ciTestMergeSha` 和 base SHA，不能把 Actions 的 `GITHUB_SHA` 当作审核 head；首版不启用 merge queue，未来启用前必须另加 `merge_group` 合同。PR 模板记录 Plan Task、上述 SHA、Verifier/Codex receipt、风险和恢复说明。仓库创建与基础 Ruleset 由总计划 §1.4 的一次性 bootstrap 完成，本 Task 合并后只把这些 Actions checks 加入 required checks；`factory/codex-review` 要等 Phase 4 Task 8 的独立 Attester 安装并完成升级 receipt 后才加入。
 
 - [ ] **Step 4: 运行仓库基线检查**
 
@@ -88,7 +95,7 @@ Expected: PASS。
 - [ ] **Step 5: 创建原子提交**
 
 ```powershell
-git add -- .editorconfig .gitattributes .env.example .gitignore README.md package.json pnpm-lock.yaml pnpm-workspace.yaml Cargo.toml Cargo.lock rust-toolchain.toml pyproject.toml uv.lock .node-version .python-version scripts/bootstrap-dev.ps1 scripts/dev.ps1 scripts/check.ps1 scripts/test.ps1 tests/contract/test_repository_layout.py
+git add -- .editorconfig .gitattributes .env.example .gitignore README.md package.json pnpm-lock.yaml pnpm-workspace.yaml Cargo.toml Cargo.lock rust-toolchain.toml pyproject.toml uv.lock .node-version .python-version .github/workflows/plan-validation.yml .github/workflows/ci.yml .github/pull_request_template.md docs/operations/github-development-workflow.md scripts/bootstrap-dev.ps1 scripts/dev.ps1 scripts/check.ps1 scripts/test.ps1 tests/contract/test_repository_layout.py
 git commit -m "chore: bootstrap multi-runtime workspace"
 ```
 
@@ -100,6 +107,7 @@ git commit -m "chore: bootstrap multi-runtime workspace"
 - Create: `contracts/schemas/plan-revision.v1.schema.json`
 - Create: `contracts/schemas/control-command.v1.schema.json`
 - Create: `contracts/schemas/credential-ref.v1.schema.json`
+- Create: `contracts/schemas/task-intake.v1.schema.json`
 - Create: `contracts/schemas/prepared-event.v2.schema.json`
 - Create: `contracts/schemas/prepared-batch.v2.schema.json`
 - Create: `contracts/schemas/durable-event.v2.schema.json`
@@ -133,14 +141,18 @@ git commit -m "chore: bootstrap multi-runtime workspace"
 def test_unknown_node_type_is_not_present_in_capability_catalog(catalog) -> None:
     assert set(catalog.node_types) == {
         "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT", "VERIFY",
-        "CODE_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT",
+        "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT",
         "DEPLOY_STAGING", "ACCEPT_STAGING", "DEPLOY_PRODUCTION",
         "ACCEPT_PRODUCTION", "ROLLBACK", "RECONCILE_TARGET",
         "RESTORE_DRILL",
     }
 ```
 
-测试还必须证明 stage capability 数组已完全展开并排序、未知字段拒绝、required test catalog 从 Master Spec 展开为 47 个唯一 ID。通用 `credential-ref.v1` 必须在此阶段冻结并生成三语言类型，后续 Forge/Server/Database Profile 只能 `$ref` 或导入该类型，不得另建不兼容副本。`RESTORE_DRILL` 固定需要 `db.restore`、`restore.validation.instance`、`db.check`，resource fingerprint 必须证明目标不是生产实例。测试 catalog 的每行还必须含总计划 §6 冻结的 `implementationContributors/finalPassOwner/requiredReplays/scenarioContractDigest`；node pause policy 必须覆盖每种 nodeType 的 safe point、grace、关键区和 UNKNOWN 处置。
+测试还必须证明 stage capability 数组已完全展开并排序、未知字段拒绝、required test catalog 从 Master Spec 展开为 47 个唯一 ID。通用 `credential-ref.v1` 必须在此阶段冻结并生成三语言类型，后续 Forge/Server/Database Profile 只能 `$ref` 或导入该类型，不得另建不兼容副本。
+
+`task-intake.v1` 必须严格区分客户端与服务端字段：`TaskIntakeRequest` 只允许自然语言需求、target stage、repository selection `mode/root/baseBranch`、环境选择、预算上限和用户风险确认；不得接受客户端自报的 capability digest、规范化 binding、风险判定或 IntentAuthorization 身份。`TaskIntakeAccepted` 只由 Agent 生成，包含 task/IntentAuthorization ID、规范化 repository binding、existing 模式的完整 base SHA 或 new 模式的 bootstrap pending 状态、服务端求交后的 `allowedCapabilitySetDigest`、有效预算/风险摘要和 `expiresAt`；两者都不得暴露 workspace lease、checkpoint namespace 或 bundle 内部路径。
+
+`compatibility-manifest.v1` 必须冻结单一路径 `eventBatchParameters.{maxBatchEvents,maxBatchBytes,maxBatchAgeMs,synchronous,parameterTupleDigest,sqliteSpikeReceiptDigest}`，其中 `synchronous` 只能为 `FULL`。SQLite spike receipt 必须绑定同一参数 tuple、manifest schema digest、`benchmarkProfileDigest` 和环境 digest；emitter、Phase 1 consumer 与 Phase 6 validator 都重算 tuple digest 并核对 receipt 输入，禁止只比较 receipt 文件名。`RESTORE_DRILL` 固定需要 `db.restore`、`restore.validation.instance`、`db.check`，resource fingerprint 必须证明目标不是生产实例。测试 catalog 的每行还必须含总计划 §6 冻结的 `implementationContributors/finalPassOwner/requiredReplays/scenarioContractDigest`；`STREAM-DUR-001` 的场景摘要必须包含稳定 crashPointId `record_prefix_mid_batch/record_torn_next`。node pause policy 必须覆盖每种 nodeType 的 safe point、grace、关键区和 UNKNOWN 处置。
 
 - [ ] **Step 2: 运行并确认 catalog 尚不存在**
 
@@ -169,7 +181,7 @@ Expected: PASS，root pnpm/Cargo workspace 能发现两个合同包，47 个测�
 - [ ] **Step 5: 创建原子提交**
 
 ```powershell
-git add -- pnpm-lock.yaml Cargo.lock contracts/schemas/run-spec.v1.schema.json contracts/schemas/plan-revision.v1.schema.json contracts/schemas/control-command.v1.schema.json contracts/schemas/credential-ref.v1.schema.json contracts/schemas/prepared-event.v2.schema.json contracts/schemas/prepared-batch.v2.schema.json contracts/schemas/durable-event.v2.schema.json contracts/schemas/ipc-envelope.v1.schema.json contracts/schemas/runner-protocol.v1.schema.json contracts/schemas/test-receipt.v1.schema.json contracts/schemas/compatibility-manifest.v1.schema.json contracts/policies/stage-capability-map.v1.json contracts/policies/node-capability-map.v1.json contracts/policies/node-pause-policy.v1.json contracts/testing/required-test-catalog.v1.json contracts/codegen/catalog.v1.json contracts/codegen/generate.py packages/factory-contracts/package.json packages/factory-contracts/tsconfig.json packages/factory-contracts/src/index.ts packages/factory-contracts/src/generated/contracts.ts apps/agent/src/factory_agent/contracts/generated/__init__.py apps/agent/src/factory_agent/contracts/generated/models.py crates/factory-contracts/Cargo.toml crates/factory-contracts/src/lib.rs crates/factory-contracts/src/generated/mod.rs crates/factory-contracts/src/generated/contracts.rs tests/contract/test_schema_catalog.py
+git add -- pnpm-lock.yaml Cargo.lock contracts/schemas/run-spec.v1.schema.json contracts/schemas/plan-revision.v1.schema.json contracts/schemas/control-command.v1.schema.json contracts/schemas/credential-ref.v1.schema.json contracts/schemas/task-intake.v1.schema.json contracts/schemas/prepared-event.v2.schema.json contracts/schemas/prepared-batch.v2.schema.json contracts/schemas/durable-event.v2.schema.json contracts/schemas/ipc-envelope.v1.schema.json contracts/schemas/runner-protocol.v1.schema.json contracts/schemas/test-receipt.v1.schema.json contracts/schemas/compatibility-manifest.v1.schema.json contracts/policies/stage-capability-map.v1.json contracts/policies/node-capability-map.v1.json contracts/policies/node-pause-policy.v1.json contracts/testing/required-test-catalog.v1.json contracts/codegen/catalog.v1.json contracts/codegen/generate.py packages/factory-contracts/package.json packages/factory-contracts/tsconfig.json packages/factory-contracts/src/index.ts packages/factory-contracts/src/generated/contracts.ts apps/agent/src/factory_agent/contracts/generated/__init__.py apps/agent/src/factory_agent/contracts/generated/models.py crates/factory-contracts/Cargo.toml crates/factory-contracts/src/lib.rs crates/factory-contracts/src/generated/mod.rs crates/factory-contracts/src/generated/contracts.rs tests/contract/test_schema_catalog.py
 git commit -m "feat(contracts): freeze schemas and policy catalogs"
 ```
 
@@ -322,7 +334,7 @@ git commit -m "feat(core): add D-root configuration and safe logging"
 
 - [ ] **Step 1: 写 manifest 漂移与 receipt 缺失失败测试**
 
-测试必须拒绝 schema/catalog/profile digest 不一致、未知 CLI/runtime、同一测试 ID 冲突结果、未映射 ID、缺环境 digest 和手工文本 PASS。
+测试必须拒绝 schema/catalog/profile digest 不一致、未知 CLI/runtime、同一测试 ID 冲突结果、未映射 ID、缺环境 digest、缺失/越界 `eventBatchParameters`、`synchronous != FULL`、参数 tuple/SQLite spike receipt 输入或 digest 不一致和手工文本 PASS。
 
 - [ ] **Step 2: 运行并确认聚合器尚未实现**
 
@@ -332,7 +344,7 @@ Expected: FAIL。
 
 - [ ] **Step 3: 实现签名输入模型和 fail-closed 聚合器**
 
-Phase 0 生成开发用未签名 manifest payload 和 digest；正式签名在 Phase 6。聚合器从 required test catalog 读取 47 个 ID，不从 Markdown 人工复制成功状态。
+Phase 0 生成开发用未签名 manifest payload 和 digest；`emit_manifest.py` 只从已验证 SQLite spike receipt 读取实际参数，重算 `parameterTupleDigest`，并写入完整 `eventBatchParameters`、`sqliteSpikeReceiptDigest` 和 `benchmarkProfileDigest`。receipt 的 tuple/schema/profile/environment 任一输入不匹配、字段缺失或组合未认证均 fail closed；正式签名在 Phase 6。聚合器从 required test catalog 读取 47 个 ID，不从 Markdown 人工复制成功状态。
 
 - [ ] **Step 4: 验证 manifest 与覆盖聚合**
 
@@ -386,7 +398,7 @@ Expected: FAIL，并列出尚未认证的 durable I/O、SQLite、clock、pipe、
 
 - [ ] **Step 3: 逐项实现并分别提交**
 
-固定验证内容：Windows/WSL flush→rename→父目录耐久；WAL/FULL/group commit/disk-full/kill；含睡眠 monotonic 与 boot identity；当前 SID ACL + Rust/Python 双 pipe + nonce 防重放；Broker 被杀后 Docker inspect/process set；Git bundle/pack 往返且用户 workspace 零污染；真实 WebView/Tauri 与原生托盘 E2E。Python 无法证明 Windows 目录耐久时，立即采用 Rust helper 并冻结合同。
+固定验证内容：Windows/WSL flush→rename→父目录耐久；WAL/FULL/group commit/disk-full/kill，并用 `eventBatchParameters` 的实际组合生成机器 receipt。该 receipt 明确保存参数 tuple 与 digest、manifest schema digest、`benchmarkProfileDigest`、环境 digest、WAL/FULL 事实和性能样本 digest，Task 6 emitter 验证后才回写开发 manifest；含睡眠 monotonic 与 boot identity；当前 SID ACL + Rust/Python 双 pipe + nonce 防重放；Broker 被杀后 Docker inspect/process set；Git bundle/pack 往返且用户 workspace 零污染；真实 WebView/Tauri 与原生托盘 E2E。Python 无法证明 Windows 目录耐久时，立即采用 Rust helper 并冻结合同。
 
 - [ ] **Step 4: 运行全部 spike**
 

@@ -239,7 +239,7 @@ Tool Broker 优先使用内置 Git、Docker、Browser、SSH 和文件 Adapter，
 
 - `stage-design-v1 = {repo.read, repo.bootstrap, git.local_commit}`；后两项只在 `repository.mode=new` 且目录合同通过时允许进入实际授权。
 - `stage-codex-approved-v1 = stage-design-v1 ∪ {worktree.write, test.exec.isolated, build.exec.isolated, network.egress.scoped}`。
-- `stage-pr-ready-v1 = stage-codex-approved-v1 ∪ {git.push, pr.create}`。
+- `stage-pr-ready-v1 = stage-codex-approved-v1 ∪ {git.push, pr.create, pr.update, forge.observe.scoped, check.publish}`。
 - `stage-merged-v1 = stage-pr-ready-v1 ∪ {repo.merge}`。
 - `stage-staging-accepted-v1 = stage-merged-v1 ∪ {registry.push, registry.observe.scoped, ssh.exec.scoped, remote.write.scoped, remote.observe.scoped, container.inspect.scoped, log.read.scoped, http.check.scoped, service.restart.scoped, nginx.switch, traffic.switch.scoped, acceptance.fixture.write, db.read, db.check, db.backup, db.migrate, db.restore, restore.validation.instance, rollback}`，所有远端 scope 强制绑定 staging 资源。
 - `stage-production-accepted-v1` 使用与 staging 相同的 capability 名称全集，但所有远端 scope 强制绑定 production 资源、生产风险上限和预声明 RollbackPlan，不能复用 staging 授权。
@@ -276,7 +276,10 @@ Tool Broker 优先使用内置 Git、Docker、Browser、SSH 和文件 Adapter，
 | --- | --- |
 | `repo.read`、`repo.bootstrap`、`worktree.write`、`git.local_commit` | repo ID、base/candidate SHA、允许路径；bootstrap 仅限选定 D 盘空目录 |
 | `test.exec.isolated`、`build.exec.isolated` | image digest、命令 ID、worktree 只读/写范围、CPU/RAM/timeout |
-| `git.push`、`pr.create`、`repo.merge` | remote URL、source ref、target branch、reviewed SHA、分支保护结果 |
+| `git.push`、`pr.create`、`pr.update` | GitHub repository ID、remote URL、source ref、target branch、candidate/reviewed head SHA、PR ID、允许的 draft/ready 转换 |
+| `forge.observe.scoped` | GitHub repository/PR ID、只读 Actions/Ruleset/conversation/ref 查询、响应字段/大小和脱敏规则 |
+| `check.publish` | repository/PR ID、固定 check name、expected source App ID、reviewed head SHA、Codex receipt/rubric digest、允许 conclusion；持有者不得有 Contents/merge 写权限 |
+| `repo.merge` | repository/PR ID、expected reviewed head SHA、expected base SHA、固定 merge method、Ruleset/required-check 结果和目标分支 |
 | `registry.push` | registry/repository、image digest、架构 |
 | `registry.observe.scoped` | registry/repository、manifest digest/ref、只读查询操作、credentialRef、响应大小和脱敏规则 |
 | `ssh.exec.scoped`、`remote.write.scoped` | ServerProfile revision、host key、允许命令族、remoteRoot |
@@ -298,11 +301,12 @@ Tool Broker 优先使用内置 Git、Docker、Browser、SSH 和文件 Adapter，
 | nodeType | requiredCapabilities 上界 |
 | --- | --- |
 | `PLAN`、`DESIGN_REVIEW`、`CODE_REVIEW` | `repo.read` |
+| `ATTEST_REVIEW` | `repo.read`、`check.publish` |
 | `BOOTSTRAP_REPOSITORY` | `repo.bootstrap`、`git.local_commit` |
 | `IMPLEMENT` | `repo.read`、`worktree.write`、`git.local_commit` |
 | `VERIFY` | `repo.read`、`test.exec.isolated`，按依赖计划可附加 `network.egress.scoped`；无 Git/部署写权限 |
-| `PUBLISH_PR` | `git.push`、`pr.create` |
-| `MERGE` | `repo.merge` |
+| `PUBLISH_PR` | `git.push`、`pr.create`、`pr.update`、`forge.observe.scoped` |
+| `MERGE` | `forge.observe.scoped`、`repo.merge` |
 | `BUILD_ARTIFACT` | `build.exec.isolated`；推送时另需 `registry.push` 与 `registry.observe.scoped` 核对 digest |
 | `DEPLOY_STAGING`、`DEPLOY_PRODUCTION` | 对应环境的 `ssh.exec.scoped`、`remote.write.scoped`，按计划可附加 `db.backup`、`db.migrate`、`nginx.switch` 或 `traffic.switch.scoped` |
 | `ACCEPT_STAGING`、`ACCEPT_PRODUCTION` | `http.check.scoped`、`network.egress.scoped`、`remote.observe.scoped`、`container.inspect.scoped`、`log.read.scoped`，按计划附加 `db.read`、`db.check`、`acceptance.fixture.write` 或 `service.restart.scoped` |
@@ -870,7 +874,7 @@ Claude/Codex 单槽会使多个任务在 IMPLEMENTING/CODE_REVIEWING 阶段排�
 | --- | --- | --- |
 | Git push | repo ID + remote ref + candidate SHA | 远端 ref 精确指向 candidate SHA |
 | 创建 PR | repo ID + head SHA + target branch | 同一 head/base 的现有 PR ID 与状态 |
-| 合并 | PR ID + reviewed head SHA + strategy | merge receipt 与目标分支 merge SHA |
+| 合并 | PR ID + expected reviewed head SHA + expected base SHA + `squash` strategy | GitHub 请求原子携带 expected head；目标分支新 commit 的唯一 parent 是 expected base、tree 与 reviewed head tree 一致，merge receipt 与远端 merge SHA 一致；base/head 漂移先更新分支并重跑 Verifier/Codex/Checks |
 | Registry push | repository + image digest | registry manifest 可按 digest 读取且内容一致 |
 | 数据库迁移 | database profile revision + migration checksum + release ID | 远端 migration journal 与数据库版本/checksum |
 | Nginx 切流 | ServerProfile revision + release ID + upstream config hash | active upstream、配置 hash、reload receipt |
@@ -1155,7 +1159,7 @@ IntentAuthorization 必须冻结绝对 `expiresAt` 与 `autonomousExecutionBudge
 | `EVENT-HASH-001` | Rust/Python/TypeScript 物化同一 PreparedBatchV2：同 Task 同批至少两事件、多 Task 交错、两个批次竞争同一旧 head，并测试 genesis、null/缺省、未知字段和前驱漂移 | 三端按冻结 event ID allocator/batchOrdinal 得到一致 DurableEventV2/taskSeq/digest；竞争批次仅一方 CAS 成功，非法或前驱不符输入拒绝 |
 | `STREAM-001` | JSONL 断行、重复、乱序、跨 chunk 秘密、重连 | 正确拼帧/去重/脱敏/重放；未脱敏原文不落盘 |
 | `STREAM-002` | CLI exit 0 但终止 frame、sourceSeq/transport span 或必需 Artifact 缺失 | fail closed，不能生成成功 Gate |
-| `STREAM-DUR-001` | 在多 Task claim 事务前/中/后、claim COMMIT 后首个 manifest byte 前、record write、文件 flush、最终 rename、父目录持久化、SQLite 引用 COMMIT 前后逐点杀 Agent，并覆盖 WSL VM/主机硬重启 | claim 全有或全无；无对象/部分对象/完整对象/事实冲突分别正确清除、quarantine、补录或 RECONCILING；无永久 pending、双批次、错误清除、缺对象引用或假成功 |
+| `STREAM-DUR-001` | 在多 Task claim 事务前/中/后、claim COMMIT 后首个 manifest byte 前、record write、文件 flush、最终 rename、父目录持久化、SQLite 引用 COMMIT 前后逐点杀 Agent；record write 必须包含稳定切点 `record_prefix_mid_batch`（写完 `floor(eventCount/2)` 个完整 record 后且在 flush/rename/SQLite COMMIT 前）和 `record_torn_next`（下一 record 中途 torn write），并覆盖 WSL VM/主机硬重启 | claim 全有或全无；无对象/部分对象/完整对象/事实冲突分别正确清除、quarantine、补录或 RECONCILING；完整前缀可补录、torn record 被隔离；无永久 pending、双批次、错误清除、缺对象引用或假成功 |
 | `STREAM-BP-001` | 注入 slow disk/flush stall 直到摄取队列跨过高水位和硬上限 | 停止新派发并产生 OS 背压；内存/应急排空有界；未脱敏字节不落盘、不丢事件、不生成成功 Gate；无法收尾时明确 LOST/RECONCILING |
 | `STREAM-PERF-BURST` | 签名 load generator 按固定三任务/事件/大小分布在 100 ms 内输入 12,000 events | 全链路无丢失/泄密，峰值/working-set 不越 `benchmark-profile.v1` 且从最后输入起 5 秒内清空；记录各段 p50/p95/p99 |
 | `STREAM-PERF-SUSTAINED` | 同一固定分布以三任务聚合 2,000 events/s（±0.5%）持续 60 秒 | SQLite commit p95 <1 秒、durable UI p95 <2 秒，queue slope/结束差/峰值均过 profile 阈值，覆盖脱敏/flush/SQLite/IPC/真实渲染 |

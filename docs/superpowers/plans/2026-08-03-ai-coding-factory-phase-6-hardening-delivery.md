@@ -50,7 +50,7 @@
 - Create: `tests/contract/test_manifest_drift.py`
 - Create: `tests/chaos/test_runtime_upgrade_drift.py`
 
-- [ ] 写 Windows/WebView2/WSL/Docker/CLI/schema/image/policy/profile/queue/clock/fsync/loadgen，以及 frame limits/redaction policy 任一 digest 漂移测试。
+- [ ] 写 Windows/WebView2/WSL/Docker/CLI/schema/image/policy/profile/queue/clock/fsync/loadgen，以及 `eventBatchParameters`、其 SQLite spike receipt、frame limits/redaction policy 任一字段/digest 漂移测试。
 - [ ] 把 Compatibility validator 注册到 bootstrap/dispatcher，实现启动、Attempt 派发前、Runner 启动后三级核对；未知版本停止新派发，运行 Attempt 安全停止/reconcile。
 - [ ] 候选升级先回放脱敏 JSONL、profile path、异常/截断/termination 和最小真实任务；全部通过才签 `qualification=CANDIDATE` manifest，失败保留旧版。Tasks 1–7 尚未全部提交前禁止签 FINAL manifest。
 - [ ] 运行 `COMPAT-001` 候选场景，Expected: 漂移不会产生成功 Gate，本任务只生成 PARTIAL subcheck；FINAL 必须在 Task 9 冻结全部实现后重放。
@@ -71,9 +71,9 @@
 - Test: `tests/chaos/durability/test_reboot_resume.py`
 - Test: `tests/chaos/durability/test_cleanup.py`
 
-- [ ] 写 controller 崩溃、runToken 篡改、重复 resume、错误 expectedBranch、未传 `-AllowHostReboot`、最终状态轮询超时，以及每个 claim/object/SQLite crash point与成功/失败/崩溃后的 Scheduled Task/token 残留测试。
+- [ ] 写 controller 崩溃、runToken 篡改、重复 resume、错误 expectedBranch、未传 `-AllowHostReboot`、最终状态轮询超时，以及每个 claim/object/SQLite crash point 与成功/失败/崩溃后的 Scheduled Task/token 残留测试。`stream-durability-crash-points.v1.json` 必须包含“写完 `floor(eventCount/2)` 个完整 record 后、flush/rename/SQLite COMMIT 前”和“下一 record 中途 torn write”两个必选切点。
 - [ ] 在 D-backed state 中持久化签名 `runToken/crashPoint/expectedBranch/manifestDigest`；恢复入口与 controller 都以 `try/finally` 注销本次 Scheduled Task、撤销 token、写 cleanup receipt。重启后把最终状态/exitCode 写入 `durability-runs/{runToken}/result.json`，原 PowerShell 进程或恢复 watcher 轮询该 Artifact 并返回同一退出码。
-- [ ] 先运行不带 `-AllowHostReboot` 的负例并确认零主机副作用；再在专用实验机运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- powershell -NoProfile -File scripts/run-durability-chaos.ps1 -Modes AgentKill,WslTerminate,WindowsReboot -AllowHostReboot -EmitReceipts`。Expected: 按签名 token 逐切点自动续跑并最终返回 0，不用人工改状态。
+- [ ] 先运行不带 `-AllowHostReboot` 的负例并确认零主机副作用；再在专用实验机运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- powershell -NoProfile -File scripts/run-durability-chaos.ps1 -Modes AgentKill,WslTerminate,WindowsReboot -AllowHostReboot -EmitReceipts`。`AgentKill` 必须与 manifest 中全部 claim/object/SQLite 切点做笛卡尔执行，不能只做一次泛化 kill；Expected: 按签名 token 逐切点自动续跑并最终返回 0，不用人工改状态。
 - [ ] 核对四分支、全 Task claim、对象引用、durable cursor、Attempt/Action reconciliation 和无永久 pending；`scripts/test.ps1 -Suite all` 必须机械调用或核验当前 qualification 对应的 durability receipt。本任务只生成候选 manifest PARTIAL，`STREAM-DUR-001` FINAL 必须在 Task 9 的最终 manifest 下重跑，并证明 Scheduled Task/token/临时状态全清理。
 - [ ] 提交：`test(durability): certify process WSL and Windows crash recovery`。
 
@@ -209,9 +209,9 @@
 - Create: `docs/release/known-boundaries.md`
 - Test: `tests/e2e/test_composed_complete_product.py`
 
-- [ ] 先完成本任务列出的测试、release 文档和 evidence slot index，运行全仓 Gate 并创建产品源码冻结 commit；基于该 commit 构建 Desktop/Agent/Runner/BuildKit/installer，再签覆盖 source/schema/policy/profile/loadgen/artifact digest 的 FINAL Compatibility Manifest。签名之后禁止再修改运行代码、测试或冻结输入。
+- [ ] 先完成本任务列出的测试、release 文档和 evidence slot index，运行全仓 Gate 并创建产品源码冻结 commit；基于该 commit 构建 Desktop/Agent/Runner/BuildKit/installer，再签覆盖 source/schema/policy/profile/loadgen/artifact digest、`eventBatchParameters` 和其 SQLite spike receipt digest 的 FINAL Compatibility Manifest。签名之后禁止再修改运行代码、测试或冻结输入。
 - [ ] 在 FINAL manifest 认证环境重新执行 Task 8 表中精确 47 个 ID 与 Task 7 冻结的精确 11 个 DoD ID，强制 `executedIds == specIds` 与 `dodMapIds == executedDoDIds == specDoDIds`；必须包含真实 Windows reboot durability、完整 UI/stream/scheduler 性能和 Linux 发布验收，只接受同一 manifest digest、正确 finalPassOwner 和 `qualification=FINAL` 的 committed receipt。
-- [ ] 从桌面创建六种目标任务并穿过当前组合根；Codex 在只读检出按冻结 rubric 审核完整源码、中文注释、结构化日志、测试、威胁模型、打包、47 项 receipt、11 项 DoD 和发布证据，无 blocker/high 才通过。
+- [ ] 从桌面创建六种目标任务并穿过当前组合根；Codex 在只读检出按冻结 rubric 审核完整源码、中文注释、结构化日志、测试、威胁模型、打包、47 项 receipt、11 项 DoD 和发布证据，无 blocker/high 才通过。最终证据还必须核对 GitHub repository ID、受保护 `main` Ruleset、逐 Task PR、Actions 的 `ciTestMergeSha/head/base`、独立 Publisher/Merger 与 Review Attester App 权限、绑定 current reviewed head 与 expected App ID 的 `factory/codex-review`、squash merge parent/tree/SHA，以及不存在未关闭的 bootstrap bypass 或过渡 approval 模式。
 - [ ] 有 open blocker/high 或任一代码/Artifact/digest 变化时，立即作废 FINAL manifest 与受影响 receipt，回到所属 Phase 修复，并从本任务第一步重新构建、重签、重跑；不得修改 rubric 或降低阈值。
 - [ ] 审核通过后只生成 D-backed 运行时交接 Artifact 和本地 tag 建议，不再改冻结 commit；验证 Git 工作树干净、所有子 agent 关闭、无秘密/本地数据库/log/大型生成物误入提交。push、merge、代码签名发布或真实部署仍需用户当次明确授权。
 

@@ -6,7 +6,7 @@
 
 **Architecture:** 使用 Tauri 2 + React/TypeScript 实现桌面壳，独立 Python 3.12 `factory-agent.exe` 作为权威控制平面，通过认证 Windows Named Pipe 通信；Factory 专用 WSL2 distro + Docker Desktop 承载隔离 Runner。SQLite WAL/FULL、内容寻址对象存储、版本化合同、lease/fencing、追加 receipt 和 Reconciler 共同保证状态、事件与外部副作用可恢复且不可伪造。
 
-**Tech Stack:** Tauri 2、Rust、React、TypeScript、Vite、xterm.js、Python 3.12、Pydantic、pytest/Hypothesis、SQLite、Windows Named Pipe/Job Object、WSL2、Docker Desktop/Compose、Git bundle/pack、SSH、Nginx、OCI Registry、Playwright/Vitest/Cargo test。
+**Tech Stack:** Tauri 2、Rust、React、TypeScript、Vite、xterm.js、Python 3.12、Pydantic、pytest/Hypothesis、SQLite、Windows Named Pipe/Job Object、WSL2、Docker Desktop/Compose、Git bundle/pack、GitHub App/Actions/Rulesets、SSH、Nginx、OCI Registry、Playwright/Vitest/Cargo test。
 
 ---
 
@@ -19,6 +19,7 @@
 - 独立常驻 Agent、确定性状态机、授权、资源调度、事件链、Artifact、恢复和通知。
 - Factory 专用 WSL2/Docker Runner、Claude Developer、Codex Reviewer、Verifier 和 Release Runner。
 - 新旧仓库、Git Object Bridge、PR/CI/merge、镜像构建与 digest 身份链。
+- 本项目自身也使用 GitHub 私有仓库、逐 Task 分支/PR、Claude 实现、Verifier 确定性检查和 Codex 独立审核；不能因为是在开发 Factory 自身就绕过产品要求的证据链。
 - Linux SSH/Compose/Nginx/数据库迁移、验收、自动回滚和失败隔离。
 - 严格 D 盘存储合同、Vault、兼容性清单、安装升级、备份恢复和全链路 DoD。
 
@@ -32,6 +33,12 @@
 ### 1.3 完整交付与内部里程碑
 
 实施分阶段是为了控制集成风险，不改变最终范围。Phase 0–4 达到 `SELF_HOSTING_CODEX_APPROVED` 后允许 Factory 用自身闭环继续开发后半程，但只有 Phase 0–6、全部 47 个代表流程和 11 项 DoD 全部通过，才允许宣称首个完整版本交付。
+
+### 1.4 本项目自身的 Claude、Codex 与 GitHub 协作合同
+
+实施启动先只读预检 GitHub owner/套餐、私有仓库 Ruleset 可用性、admin 权限、基础/Attester App 可安装性和 API 能力；任一不满足即 `BLOCKED`，不得先创建或推送半保护远端。预检通过后在用户选定 owner 下创建默认名为 `AI-Coding-Factory` 的私有仓库；本计划不预先执行该外部变更。一次性 bootstrap 只允许推送已核对的本地基准 `main`，随后立即启用“必须经 PR、至少一个独立 reviewer approval、dismiss stale approval、禁止 force-push/删除、要求 squash 线性历史和会话解决”的基础 Ruleset，并记录 repository/ruleset ID、版本、bypass actor 和撤销条件。当前 Master Spec 与完整计划作为第一张文档 PR，由 Codex 生成绑定精确 head SHA 的签名本地 receipt，并通过与 Publisher 分离的 bootstrap reviewer 身份提交原生 GitHub approval 后合并。
+
+每个实施 Task 默认对应一个远端 `factory/phase-<n>-task-<n>-<slug>` 分支和一张 PR。Claude Developer 是任务 worktree 的唯一源码写者；Verifier 先运行机械门禁；Codex Reviewer 只在独立只读检出中审核精确 candidate SHA、测试证据、中文注释和日志。任何修复仍交回 Claude，修改后旧 Verifier/Codex receipt、原生 approval 和远端 check 自动失效。Phase 4 Task 8 合并前使用“签名本地 Codex receipt + 独立 bootstrap reviewer 原生 approval”的过渡门禁；Task 8 合并后安装只读源码/Checks 写的 Review Attester App、发布首个 `factory/codex-review` 并把 check name + expected App ID 加入 Ruleset，此后所有 Task 必须同时通过 Actions、独立 approval 和绑定当前 reviewed head SHA 的远端 check。正常进展不打扰用户，只在任务/阶段完成、权限越界、不可恢复 blocker 或需要新的外部授权时通知。
 
 ## 2. 冻结的工程结构
 
@@ -52,6 +59,11 @@ AI-Coding-Factory/
   .node-version
   .python-version
   .env.example
+  .github/
+    workflows/
+      plan-validation.yml
+      ci.yml
+    pull_request_template.md
   contracts/
     schemas/
     policies/
@@ -210,15 +222,17 @@ Phase 1 与 Phase 2 的纯 UI/fixture 工作可在 Phase 0 合同冻结后并行
 
 每个详细计划中的任务执行相同步骤：
 
-1. 在独立 `codex/session-*` worktree 中写一个失败测试或可机械失败的合同检查。
-2. 运行精确测试，保存预期失败证据。
-3. 实现满足该测试的最小完整行为，同时补中文注释和结构化日志。
-4. 运行模块测试、受影响集成测试、`scripts/check.ps1` 和秘密/路径扫描。
-5. 由需求审查和代码质量审查分别复核；任何 blocker 打回原任务。
-6. 只精确暂存该任务文件，创建一个本地原子提交并登记 source commit。
-7. 集成会话只消费 `ready_for_integration` 的精确提交，并在每次集成后重跑相关门禁。
+1. Codex 编排器从最新受保护 `main` 创建独立 task worktree、`factory/phase-<n>-task-<n>-<slug>` 分支和追踪记录；只有 Claude Developer 获得该 worktree 的写 capability，分支尚无差异时不得伪造 PR identity。
+2. Claude 先写失败测试或可机械失败的合同检查，运行并保存预期失败证据，再实现最小完整行为，同时补中文注释和结构化日志。
+3. 运行模块测试、受影响集成测试、`scripts/check.ps1`、秘密/路径扫描和 GitHub Actions 本地等价门禁；只精确暂存该 Task 文件并创建本地原子提交。
+4. Verifier 在无模型凭据的干净环境检查精确 candidate SHA；失败证据回传 Claude，不能由 Codex 主观意见替代机械门禁。
+5. Publisher 只在 Verifier 通过后把该精确 candidate SHA 推送到对应远端分支，并用 GitHub App 创建或更新 draft PR；PR body 记录 Task、base/candidate SHA、测试命令、receipt digest、风险和恢复说明，但此时不得标记 `PR_READY`。
+6. Codex Reviewer 在独立只读检出审核与当前 PR head 相同的 candidate SHA、RunSpec/验收条件、diff、Verifier Artifact、中文注释和日志；任何 blocker/high 打回 Claude，修复后重新执行步骤 2–6，任何新提交使旧审核和 Check Run 失效。
+7. Actions receipt 分别绑定 `ciTestMergeSha`、`reviewedHeadSha` 和 base SHA；Codex 审核始终绑定 `reviewedHeadSha`。Phase 4 Task 8 前由独立 bootstrap reviewer 用原生 approval 证明本地签名 receipt，Task 8 后由独立 Attester App 额外签发绑定同一 head 的 `factory/codex-review`；checks/approval pending 或 stale、SHA 漂移、未解决会话或 Ruleset 拒绝都不能把 draft PR 晋升为 `PR_READY/MERGED`。
+8. 获得 `MERGED` 授权的 Task 只允许以 `squash` 合并，并在 GitHub merge 请求原子携带 expected reviewed head SHA；当前 base 必须等于审核时 base。并行 PR 导致 base 前移时，先更新任务分支，再重跑 Claude 无冲突确认、Verifier、Codex、Actions/approval/Check。合并后核对 merge commit parent/tree/SHA，下一依赖 Task 才从新的受保护 `main` 启动。未授权到 `MERGED` 时停在用户选择的更早 target stage。
+9. 集成台账记录 source SHA、PR number/head SHA、Check Run ID、merge SHA 和验证结果；正常过程静默，只报告完成结果或 blocker。
 
-禁止把一个阶段的全部改动积压成一次提交，也禁止为了通过集成而跳过失败测试、日志、中文注释或恢复路径。
+Claude 不得审核或合并自己的改动，Codex 不得在审核检出中写源码，GitHub PR/Actions 也不得替代本地确定性验证。禁止把一个阶段的全部改动积压成一次提交，也禁止为了通过集成而跳过失败测试、日志、中文注释、恢复路径或 Ruleset。
 
 ## 6. 阶段验收与代表流程归属
 
@@ -246,7 +260,7 @@ Phase 1 与 Phase 2 的纯 UI/fixture 工作可在 Phase 0 合同冻结后并行
 | `EVENT-HASH-001` | Phase 0/1 | Phase 1 | Phase 6 跨语言竞争重放 |
 | `STREAM-001` | Phase 0/1/3 | Phase 3 | Phase 6 真实 UI 重放 |
 | `STREAM-002` | Phase 0/1/3 | Phase 3 | Phase 6 真实 UI 重放 |
-| `STREAM-DUR-001` | Phase 0/1/3/6 | Phase 6 | Agent/WSL/Windows 硬重启 |
+| `STREAM-DUR-001` | Phase 0/1/3/6 | Phase 6 | Agent 在全部 claim/object/SQLite 切点崩溃，并重放 WSL/Windows 硬重启 |
 | `STREAM-BP-001` | Phase 1/3 | Phase 3 | Phase 6 slow-disk 重放 |
 | `STREAM-PERF-BURST` | Phase 0/1/2/3 | Phase 3 | Phase 6 完整产品基准 |
 | `STREAM-PERF-SUSTAINED` | Phase 0/1/2/3 | Phase 3 | Phase 6 完整产品基准 |
@@ -282,8 +296,8 @@ Phase 1 与 Phase 2 的纯 UI/fixture 工作可在 Phase 0 合同冻结后并行
 | --- | --- | --- |
 | `DESIGN_APPROVED` | Phase 4 | 设计 barrier passed、RunSpec/Codex design receipt committed |
 | `CODEX_APPROVED` | Phase 4 | 候选 SHA、Verifier、Codex review 和无 blocking finding 全部一致 |
-| `PR_READY` | Phase 4 | reviewed SHA 已 push 且 PR identity 可核对 |
-| `MERGED` | Phase 4 | 分支保护/CI 通过，远端 merge SHA 可核对 |
+| `PR_READY` | Phase 4 | reviewed SHA 已 push，GitHub PR identity、当前 head SHA、Actions 与 `factory/codex-review` Check Run 可核对 |
+| `MERGED` | Phase 4 | GitHub Ruleset、required checks、会话解决和审核 SHA 均通过，远端 merge SHA 可核对 |
 | `STAGING_ACCEPTED` | Phase 5 | 同一镜像 digest 在 staging 通过全部 blocking AcceptancePlan |
 | `PRODUCTION_ACCEPTED` | Phase 5 | 生产验收、soak、Codex evidence review 和 release receipt committed |
 
@@ -340,6 +354,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- powershel
 ## 10. 安全与外部依赖处理
 
 - 本计划不读取或复制 `%USERPROFILE%\.claude`、`%USERPROFILE%\.codex` 凭据；首次接入只引导用户在 D-backed profile 登录。
+- GitHub 使用分离身份：Publisher/Merger App 只持 metadata 只读与按阶段求交的 Contents/PR 写权限，明确没有 Checks 写；Review Attester App 只持 Contents 只读和 Checks 写，明确没有 Contents/PR/merge 写。Ruleset 把 `factory/codex-review` 同时绑定固定 check name 与 expected Attester App ID。仓库创建/Ruleset 管理使用第三份独立、一次性 bootstrap admin 授权，完成后撤销。PAT/SSH/device flow 仅作显式兼容路径；未安装 Attester App 时最高只能停在过渡门禁允许的阶段或 fail closed，SSH/PAT 不能伪装成 Checks 发布能力。任何凭据都不能从默认 C 盘读取或写入仓库、Actions 日志、PR 评论和 receipt。
 - Docker backend/integration、WSL distro 导入、删除或迁移属于用户级全局变更；实现向导和 dry-run receipt，但只有用户明确授权后才执行。
 - 真实生产等价 Linux 验收需要用户提供可销毁 ServerProfile 或临时云服务器；未提供时该环境显示“未认证”，不能伪造 `DEPLOY-001..003` PASS。
 - Windows 代码签名证书不可用时只生成未签名测试包/便携包并明确警告；不能把它登记为签名发布。
@@ -354,10 +369,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- powershel
 - [ ] 47 个展开后的 §20.2 测试 ID 均有 PASS receipt，且环境 manifest digest 一致。
 - [ ] 11 项 Definition of Done 全部 PASS；无 skipped 必检项、冲突或手工改成功。
 - [ ] Codex 对完整源码、安装包和证据做最终只读审核，无 open blocker/high。
+- [ ] GitHub 私有仓库、基础/强化 Ruleset、逐 Task PR、固定 required checks、`factory/codex-review` SHA 绑定和远端 merge identity 均有可复核 receipt；不存在直接推送受保护 `main` 的未关闭例外。
 - [ ] Windows 安装、关闭 UI 后 Agent 继续、暂停恢复、Linux 发布、验收和回滚均有真实运行证据。
 - [ ] 源码、运行数据、日志、缓存、profile、WSL/Docker 数据和备份的可控写入均位于 `D:\codex项目`。
 - [ ] 文档、威胁模型、事件协议、接入手册、备份恢复、故障排查、发布回滚和升级 Runbook 与实现一致。
 
 ## 12. 执行入口
 
-从 Phase 0 开始，按详细计划逐任务执行。Phase 1 与 Phase 2 只按 §3 的任务级依赖并行；其余阶段只有前置集成 Gate 通过后才进入 ready 状态。任何实现发现需要改变 target stage、生产授权、信任边界、凭据、发布或回滚保证时，先回到 Master Spec 做变更审查，不能只在代码或本计划中悄悄放宽。
+正式实施前先执行 §1.4 的 GitHub 只读能力预检；通过后再确定 owner/仓库名/私有可见性、创建空远端、推送已核对基准、启用基础 Ruleset，并以第一张文档 PR 合并 Master Spec 与本计划。该步骤需要实施当次的明确外部变更授权，预检或保护失败不得留下已推送但未保护的仓库。之后从 Phase 0 开始，按详细计划逐 Task 由 Claude 实现、Verifier 检查、Codex 审核并通过 GitHub PR 交付。Phase 1 与 Phase 2 只按 §3 的任务级依赖并行；其余阶段只有前置集成 Gate 通过后才进入 ready 状态。任何实现发现需要改变 target stage、生产授权、信任边界、凭据、发布或回滚保证时，先回到 Master Spec 做变更审查，不能只在代码或本计划中悄悄放宽。
