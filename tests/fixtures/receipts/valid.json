@@ -1,0 +1,28 @@
+[
+  {
+    "receiptId": "rcpt-valid-planhash-001",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-cross-lang-hash-001",
+        "description": "执行 Python/Rust/TypeScript 跨语言 JCS/NFC golden vector 哈希对比",
+        "executedAt": "2026-08-04T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {"allHashesMatch": true, "languageCount": 3},
+    "actual": {"allHashesMatch": true, "languageCount": 3},
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-04T00:00:00Z",
+    "scenarioContractDigest": "placeholder-to-be-filled-by-implementer",
+    "implementationContributors": ["factory-contracts"],
+    "finalPassOwner": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  }
+]

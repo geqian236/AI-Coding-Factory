@@ -1,0 +1,21 @@
+[
+  {
+    "receiptId": "rcpt-missing-env-digest-001",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "",
+    "actions": [
+      {
+        "actionId": "act-placeholder-001",
+        "description": "placeholder action — environmentManifestDigest 故意留空以触发 MISSING_ENV_DIGEST 拒绝",
+        "executedAt": "2026-08-04T00:00:00Z"
+      }
+    ],
+    "expected": {"allHashesMatch": true},
+    "actual": {},
+    "sideEffectCount": 0,
+    "artifactDigests": [],
+    "result": "FAIL",
+    "failureReason": "environmentManifestDigest 为空，此 fixture 预期被 verify_receipts 拒绝",
+    "createdAt": "2026-08-04T00:00:00Z"
+  }
+]

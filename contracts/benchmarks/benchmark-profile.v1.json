@@ -1,0 +1,21 @@
+{
+  "generatorId": "factory-event-loadgen-v1",
+  "prngSeed": 20260803,
+  "taskDistribution": {"t1": 0.40, "t2": 0.35, "t3": 0.25},
+  "eventTypeDistribution": {
+    "stream": 0.70,
+    "provider_semantic": 0.15,
+    "tool": 0.10,
+    "state": 0.05
+  },
+  "payloadSizeDistribution": [
+    {"bytes": 512,  "fraction": 0.25},
+    {"bytes": 704,  "fraction": 0.50},
+    {"bytes": 1024, "fraction": 0.25}
+  ],
+  "sustainedTargetEventsPerSecond": 2000,
+  "sustainedToleranceFraction": 0.005,
+  "burstEventCount": 12000,
+  "burstWindowMs": 100,
+  "secretFraction": 0.01
+}
