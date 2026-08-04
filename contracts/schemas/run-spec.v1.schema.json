@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/run-spec.v1.schema.json",
+  "title": "RunSpec",
+  "description": "一次任务的不可变需求、范围、计划、验收和授权输入。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runSpecId", "taskId", "semanticPlanHash", "targetStage", "repositoryBinding", "intentAuthorizationId", "createdAt"],
+  "properties": {
+    "runSpecId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "RunSpec 唯一 ID"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联任务 ID"
+    },
+    "semanticPlanHash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "语义计划哈希（跨 revision 稳定）"
+    },
+    "targetStage": {
+      "type": "string",
+      "enum": ["DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR", "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION"],
+      "description": "目标终点阶段"
+    },
+    "repositoryBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "repositoryId"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["existing", "new"],
+          "description": "仓库模式"
+        },
+        "repositoryId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "仓库唯一标识"
+        },
+        "baseBranch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "基础分支名"
+        },
+        "baseCommitSha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "existing 模式的 base commit SHA"
+        },
+        "bootstrapPending": {
+          "type": "boolean",
+          "description": "new 模式：bootstrap 尚待完成"
+        }
+      }
+    },
+    "intentAuthorizationId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "IntentAuthorization 唯一 ID"
+    },
+    "allowedCapabilitySetDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "服务端求交后的 capability set 摘要"
+    },
+    "budgetMs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "自主执行预算（毫秒）"
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "授权绝对过期时间"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RunSpec 创建时间"
+    }
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/policies/stage-capability-map.v1.json",
+  "title": "StageCapabilityMapV1",
+  "description": "target_stage → capability 上限映射。每个 stage 的 capabilities 数组已完全展开并排序。",
+  "version": "1",
+  "specRef": "Master Design Spec §6.3",
+  "stageCapabilities": {
+    "DESIGN_REVIEW": {
+      "description": "目标：设计审核。只允许规划和设计类只读操作。",
+      "capabilities": [
+        "git.local_commit",
+        "repo.bootstrap",
+        "repo.read"
+      ]
+    },
+    "CODE_REVIEW": {
+      "description": "目标：代码审核。允许规划、设计、实现、验证、代码审核相关操作。",
+      "capabilities": [
+        "build.exec.isolated",
+        "git.local_commit",
+        "network.egress.scoped",
+        "repo.bootstrap",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "PUBLISH_PR": {
+      "description": "目标：发布 PR。在 CODE_REVIEW 基础上增加 push 和 PR 操作。",
+      "capabilities": [
+        "build.exec.isolated",
+        "check.publish",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "network.egress.scoped",
+        "pr.create",
+        "pr.update",
+        "repo.bootstrap",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "MERGE": {
+      "description": "目标：合并。在 PUBLISH_PR 基础上增加合并操作。",
+      "capabilities": [
+        "build.exec.isolated",
+        "check.publish",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "network.egress.scoped",
+        "pr.create",
+        "pr.update",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "ACCEPT_STAGING": {
+      "description": "目标：测试环境验收。在 MERGE 基础上增加构建、registry、部署和验收操作。",
+      "capabilities": [
+        "acceptance.fixture.write",
+        "build.exec.isolated",
+        "check.publish",
+        "container.inspect.scoped",
+        "db.backup",
+        "db.check",
+        "db.migrate",
+        "db.read",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "http.check.scoped",
+        "log.read.scoped",
+        "network.egress.scoped",
+        "nginx.switch",
+        "pr.create",
+        "pr.update",
+        "registry.observe.scoped",
+        "registry.push",
+        "remote.observe.scoped",
+        "remote.write.scoped",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "service.restart.scoped",
+        "ssh.exec.scoped",
+        "test.exec.isolated",
+        "traffic.switch.scoped",
+        "worktree.write"
+      ]
+    },
+    "ACCEPT_PRODUCTION": {
+      "description": "目标：生产环境验收。在 ACCEPT_STAGING 基础上增加回滚和生产恢复演练操作。target.guard.clear 不在普通 stage 上限内。",
+      "capabilities": [
+        "acceptance.fixture.write",
+        "build.exec.isolated",
+        "check.publish",
+        "container.inspect.scoped",
+        "db.backup",
+        "db.check",
+        "db.migrate",
+        "db.read",
+        "db.restore",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "http.check.scoped",
+        "log.read.scoped",
+        "network.egress.scoped",
+        "nginx.switch",
+        "pr.create",
+        "pr.update",
+        "registry.observe.scoped",
+        "registry.push",
+        "remote.observe.scoped",
+        "remote.write.scoped",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "restore.validation.instance",
+        "rollback",
+        "service.restart.scoped",
+        "ssh.exec.scoped",
+        "test.exec.isolated",
+        "traffic.switch.scoped",
+        "worktree.write"
+      ]
+    }
+  }
+}

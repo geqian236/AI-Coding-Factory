@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/runner-protocol.v1.schema.json",
+  "title": "RunnerProtocol",
+  "description": "Runner 协议消息，用于 Factory Runner 与执行 Adapter 之间的通信。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["messageId", "protocolMessageType", "attemptId", "executorId", "fencingToken", "controlEpoch", "payload", "timestamp"],
+  "properties": {
+    "messageId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "协议消息唯一 ID"
+    },
+    "protocolMessageType": {
+      "type": "string",
+      "enum": [
+        "START", "INSPECT", "INTERRUPT", "KILL",
+        "STATUS", "COMPLETED", "FAILED", "RECONCILING", "HEARTBEAT"
+      ],
+      "description": "协议消息类型"
+    },
+    "attemptId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Attempt 唯一 ID（每次派发不可复用）"
+    },
+    "executorId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "执行者唯一标识"
+    },
+    "fencingToken": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Fencing token，严格单调递增"
+    },
+    "controlEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "控制 epoch"
+    },
+    "processStartIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "进程启动身份（containerId/execId/PID等）",
+      "properties": {
+        "containerId": {"type": "string", "minLength": 1},
+        "execId": {"type": "string", "minLength": 1},
+        "pid": {"type": "integer", "minimum": 1}
+      }
+    },
+    "payload": {
+      "type": "object",
+      "description": "消息负载（按 protocolMessageType 定义结构）"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "消息时间戳"
+    }
+  }
+}

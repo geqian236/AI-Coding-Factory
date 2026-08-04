@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/policies/node-pause-policy.v1.json",
+  "title": "NodePausePolicyV1",
+  "description": "每种 nodeType 的安全暂停策略：safe point、grace 期、关键区和 UNKNOWN 处置。",
+  "version": "1",
+  "specRef": "Master Design Spec §12",
+  "policies": {
+    "PLAN": {
+      "safePoint": "任意工具调用返回后",
+      "graceMs": 5000,
+      "criticalSections": [],
+      "unknownDisposition": "RECONCILING",
+      "notes": "只读节点，随时可安全暂停"
+    },
+    "DESIGN_REVIEW": {
+      "safePoint": "任意工具调用返回后",
+      "graceMs": 5000,
+      "criticalSections": [],
+      "unknownDisposition": "RECONCILING",
+      "notes": "只读节点，随时可安全暂停"
+    },
+    "BOOTSTRAP_REPOSITORY": {
+      "safePoint": "git.local_commit 完成后",
+      "graceMs": 10000,
+      "criticalSections": ["git.local_commit 执行期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "本地写操作，commit 期间不可中断；commit 后安全"
+    },
+    "IMPLEMENT": {
+      "safePoint": "git.local_commit 完成后",
+      "graceMs": 15000,
+      "criticalSections": ["worktree.write+git.local_commit 期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "本地写，提交期间不可中断；可保存未跟踪文件到隐藏 ref"
+    },
+    "VERIFY": {
+      "safePoint": "测试容器退出后",
+      "graceMs": 30000,
+      "criticalSections": ["容器启动到测试框架初始化期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "隔离执行；容器需 Docker inspect 证明退出"
+    },
+    "CODE_REVIEW": {
+      "safePoint": "任意工具调用返回后",
+      "graceMs": 5000,
+      "criticalSections": [],
+      "unknownDisposition": "RECONCILING",
+      "notes": "只读节点，随时可安全暂停"
+    },
+    "ATTEST_REVIEW": {
+      "safePoint": "check.publish 完成或未发送前",
+      "graceMs": 10000,
+      "criticalSections": ["check.publish 发送期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "check.publish 发送后不可撤销；需核对远端 check 状态"
+    },
+    "PUBLISH_PR": {
+      "safePoint": "pr.create/pr.update 完成或未发送前",
+      "graceMs": 15000,
+      "criticalSections": ["git.push 期间", "pr.create/pr.update 发送期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "push/PR 操作有外部副作用；发送后需核对远端 ref/PR 状态"
+    },
+    "MERGE": {
+      "safePoint": "repo.merge 完成或未发送前",
+      "graceMs": 15000,
+      "criticalSections": ["repo.merge 发送期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "合并不可逆；发送后必须查远端 merge SHA"
+    },
+    "BUILD_ARTIFACT": {
+      "safePoint": "构建容器退出后",
+      "graceMs": 30000,
+      "criticalSections": ["registry.push 期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "push 有外部副作用；需核对 registry digest"
+    },
+    "DEPLOY_STAGING": {
+      "safePoint": "ssh.exec.scoped 命令完成后的已知状态",
+      "graceMs": 60000,
+      "criticalSections": [
+        "db.migrate 执行期间",
+        "nginx.switch/traffic.switch.scoped 执行期间"
+      ],
+      "unknownDisposition": "RECONCILING",
+      "notes": "远端写有外部副作用；任何中断都进入 RECONCILING"
+    },
+    "ACCEPT_STAGING": {
+      "safePoint": "http.check.scoped 请求完成后",
+      "graceMs": 30000,
+      "criticalSections": ["acceptance.fixture.write 期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "观察为主；fixture 写入需清理"
+    },
+    "DEPLOY_PRODUCTION": {
+      "safePoint": "ssh.exec.scoped 命令完成后的已知状态",
+      "graceMs": 120000,
+      "criticalSections": [
+        "db.migrate 执行期间",
+        "nginx.switch/traffic.switch.scoped 执行期间",
+        "任何生产流量切换期间"
+      ],
+      "unknownDisposition": "RECONCILING",
+      "notes": "生产部署不可轻易中断；任何不确定状态都进入 RECONCILING"
+    },
+    "ACCEPT_PRODUCTION": {
+      "safePoint": "http.check.scoped 请求完成后",
+      "graceMs": 60000,
+      "criticalSections": ["acceptance.fixture.write 期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "生产验收；fixture 写入需清理"
+    },
+    "ROLLBACK": {
+      "safePoint": "rollback 操作完成并核对后",
+      "graceMs": 120000,
+      "criticalSections": [
+        "db.restore 执行期间",
+        "nginx.switch/traffic.switch.scoped 回切期间"
+      ],
+      "unknownDisposition": "RECONCILING",
+      "notes": "回滚不可中断；中断后必须查远端状态确认是否完成"
+    },
+    "RESTORE_DRILL": {
+      "safePoint": "恢复验证实例销毁后",
+      "graceMs": 60000,
+      "criticalSections": ["db.restore 到 db.check 期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "隔离实例演练；必须在完成后强制销毁实例并生成 receipt"
+    },
+    "RECONCILE_TARGET": {
+      "safePoint": "观察操作完成后",
+      "graceMs": 30000,
+      "criticalSections": ["target.guard.clear CAS 执行期间"],
+      "unknownDisposition": "RECONCILING",
+      "notes": "以观察为主；target.guard.clear 是一次性 CAS，不可重放"
+    }
+  },
+  "unknownNodeTypeDisposition": {
+    "action": "RECONCILING",
+    "description": "未知 nodeType 一律进入 RECONCILING，禁止假定安全点，禁止自动继续执行"
+  }
+}

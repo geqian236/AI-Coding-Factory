@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/prepared-batch.v2.schema.json",
+  "title": "PreparedBatchV2",
+  "description": "预备事件批次，包含同一批次内所有待耐久化事件。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["batchId", "taskId", "batchOrdinal", "events", "previousHead", "preparedAt"],
+  "properties": {
+    "batchId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "批次唯一 ID"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属任务 ID"
+    },
+    "batchOrdinal": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "批次序号，用于稳定 identity 生成"
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "description": "批次内预备事件列表",
+      "items": {
+        "$ref": "prepared-event.v2.schema.json"
+      }
+    },
+    "previousHead": {
+      "type": ["string", "null"],
+      "description": "前驱批次 head 摘要（genesis 批次为 null）"
+    },
+    "claimEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "claim 时的 writer epoch，用于竞争检测"
+    },
+    "preparedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "批次预备时间"
+    }
+  }
+}

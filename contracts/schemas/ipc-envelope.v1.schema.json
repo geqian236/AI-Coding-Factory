@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/ipc-envelope.v1.schema.json",
+  "title": "IpcEnvelope",
+  "description": "Windows Named Pipe IPC 消息信封，用于 Broker↔Agent 通信。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["envelopeId", "messageType", "senderId", "recipientId", "nonce", "payload", "sentAt"],
+  "properties": {
+    "envelopeId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "信封唯一 ID（防重放）"
+    },
+    "messageType": {
+      "type": "string",
+      "enum": [
+        "CONTROL_COMMAND", "STATUS_UPDATE", "EVENT_BATCH",
+        "HEARTBEAT", "ACK", "ERROR", "RUNNER_PROTOCOL"
+      ],
+      "description": "消息类型"
+    },
+    "senderId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "发送方进程身份（含 SID）"
+    },
+    "recipientId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "接收方进程身份"
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 16,
+      "description": "随机 nonce，防重放攻击"
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联 ID，用于请求-响应匹配"
+    },
+    "payload": {
+      "type": "object",
+      "description": "消息负载（类型由 messageType 决定）"
+    },
+    "payloadDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "负载内容摘要，用于完整性验证"
+    },
+    "sentAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "发送时间"
+    }
+  }
+}

@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/task-intake.v1.schema.json",
+  "title": "TaskIntake",
+  "description": "任务接入合同。TaskIntakeRequest 只含用户输入；TaskIntakeAccepted 只由 Agent 生成。",
+  "definitions": {
+    "TaskIntakeRequest": {
+      "title": "TaskIntakeRequest",
+      "description": "用户提交的任务请求（仅允许用户可填写的字段，禁止客户端自报能力摘要、规范化绑定或风险判定）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirementText", "targetStage", "repositorySelection", "userRiskAcknowledged"],
+      "properties": {
+        "requirementText": {
+          "type": "string",
+          "minLength": 1,
+          "description": "用户自然语言需求描述"
+        },
+        "targetStage": {
+          "type": "string",
+          "enum": ["DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR", "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION"],
+          "description": "用户选择的目标终点阶段"
+        },
+        "repositorySelection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["existing", "new"],
+              "description": "仓库模式"
+            },
+            "root": {
+              "type": "string",
+              "minLength": 1,
+              "description": "new 模式：D 盘目标根目录"
+            },
+            "baseBranch": {
+              "type": "string",
+              "minLength": 1,
+              "description": "existing 模式：基础分支"
+            }
+          }
+        },
+        "environmentSelection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "serverProfileId": {
+              "type": "string",
+              "minLength": 1,
+              "description": "可选的 ServerProfile ID（部署类任务）"
+            }
+          }
+        },
+        "budgetCapMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "用户设定的自主执行预算上限（毫秒）"
+        },
+        "userRiskAcknowledged": {
+          "type": "boolean",
+          "const": true,
+          "description": "用户已确认风险"
+        }
+      }
+    },
+    "TaskIntakeAccepted": {
+      "title": "TaskIntakeAccepted",
+      "description": "Agent 生成的任务接受响应（仅由服务端填写，禁止包含工作区 lease、checkpoint namespace 或 bundle 内部路径）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "taskId",
+        "intentAuthorizationId",
+        "normalizedRepositoryBinding",
+        "allowedCapabilitySetDigest",
+        "effectiveBudgetMs",
+        "riskSummaryDigest",
+        "expiresAt",
+        "acceptedAt"
+      ],
+      "properties": {
+        "taskId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent 生成的任务唯一 ID"
+        },
+        "intentAuthorizationId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "IntentAuthorization 唯一 ID"
+        },
+        "normalizedRepositoryBinding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "repositoryId"],
+          "properties": {
+            "mode": {"type": "string", "enum": ["existing", "new"]},
+            "repositoryId": {"type": "string", "minLength": 1},
+            "baseBranch": {"type": "string", "minLength": 1},
+            "baseCommitSha": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$",
+              "description": "existing 模式的完整 base SHA"
+            },
+            "bootstrapPending": {
+              "type": "boolean",
+              "description": "new 模式 bootstrap 尚待完成"
+            }
+          }
+        },
+        "allowedCapabilitySetDigest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "服务端求交后的允许 capability set 摘要"
+        },
+        "effectiveBudgetMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "有效自主执行预算（毫秒）"
+        },
+        "riskSummaryDigest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "风险摘要内容的摘要（不含明文风险详情）"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "授权绝对过期时间"
+        },
+        "acceptedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "接受时间"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/definitions/TaskIntakeRequest"},
+    {"$ref": "#/definitions/TaskIntakeAccepted"}
+  ]
+}

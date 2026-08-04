@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/plan-revision.v1.schema.json",
+  "title": "PlanRevision",
+  "description": "计划修订版本，包含 DAG 节点、barrier、stage 映射和谱系信息。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["planRevisionId", "semanticPlanHash", "planRevisionDigest", "nodes", "barriers", "stageMaps", "createdAt"],
+  "properties": {
+    "planRevisionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本修订版本唯一 ID"
+    },
+    "parentRevisionId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "父修订版本 ID（范围内重规划时设置）"
+    },
+    "semanticPlanHash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "语义计划哈希，跨修订版本稳定"
+    },
+    "planRevisionDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本修订版本内容摘要"
+    },
+    "nodes": {
+      "type": "array",
+      "description": "DAG 节点列表",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logicalNodeId", "nodeType", "businessPhase", "dependencies", "hasSideEffect", "requiredArtifacts"],
+        "properties": {
+          "logicalNodeId": {"type": "string", "minLength": 1},
+          "nodeType": {
+            "type": "string",
+            "enum": [
+              "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+              "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+              "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+              "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+              "RECONCILE_TARGET", "RESTORE_DRILL"
+            ]
+          },
+          "businessPhase": {"type": "string", "minLength": 1},
+          "dependencies": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "hasSideEffect": {"type": "boolean"},
+          "requiredArtifacts": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "gate": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "barriers": {
+      "type": "array",
+      "description": "阶段屏障列表",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["barrierId", "businessPhase", "nodeIds"],
+        "properties": {
+          "barrierId": {"type": "string", "minLength": 1},
+          "businessPhase": {"type": "string", "minLength": 1},
+          "nodeIds": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "stageMaps": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "target_stage 到节点集合的映射",
+      "properties": {
+        "DESIGN_REVIEW":     {"type": "array", "items": {"type": "string"}},
+        "CODE_REVIEW":       {"type": "array", "items": {"type": "string"}},
+        "PUBLISH_PR":        {"type": "array", "items": {"type": "string"}},
+        "MERGE":             {"type": "array", "items": {"type": "string"}},
+        "ACCEPT_STAGING":    {"type": "array", "items": {"type": "string"}},
+        "ACCEPT_PRODUCTION": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

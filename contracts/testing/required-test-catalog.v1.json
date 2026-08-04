@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/testing/required-test-catalog.v1.json",
+  "title": "RequiredTestCatalogV1",
+  "description": "Master Spec §20.2 展开的 47 个必须通过的测试 ID。每行包含 implementationContributors/finalPassOwner/requiredReplays/scenarioContractDigest。",
+  "version": "1",
+  "specRef": "Master Design Spec §20.2",
+  "totalCount": 47,
+  "tests": [
+    {
+      "testId": "STAGE-001",
+      "scenario": "选择 target_stage=DESIGN_REVIEW，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STAGE-002",
+      "scenario": "选择 target_stage=CODE_REVIEW，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STAGE-003",
+      "scenario": "选择 target_stage=PUBLISH_PR，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STAGE-004",
+      "scenario": "选择 target_stage=MERGE，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STAGE-005",
+      "scenario": "选择 target_stage=ACCEPT_STAGING，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STAGE-006",
+      "scenario": "选择 target_stage=ACCEPT_PRODUCTION，枚举全部 required node",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "AUTH-001",
+      "scenario": "finding 触发范围内重规划，新 PlanRevision 自动继续",
+      "implementationContributors": ["control-plane", "policy-engine"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "AUTH-002",
+      "scenario": "服务器/数据库/不可逆风险或权限越界；授权过期/撤销",
+      "implementationContributors": ["control-plane", "policy-engine"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "PLAN-001",
+      "scenario": "PM/Architect 双角色规划与 capability 派生",
+      "implementationContributors": ["control-plane", "ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "PLAN-HASH-001",
+      "scenario": "Rust/Python/TypeScript 对含完整 nodes/barriers/stage map 的 JCS/NFC golden vectors 计算双 hash/barrier ID",
+      "implementationContributors": ["factory-contracts"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 3,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "BOOT-001",
+      "scenario": "新项目目录非空、已有 .git、路径归属不明",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "MCP-001",
+      "scenario": "注册无限制 shell、缺 capability/脱敏/副作用声明的 MCP",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STATE-001",
+      "scenario": "枚举合法/非法转换、同一 PlanRevision 多 Run、重规划复用 logical node、barrier settled/passed、UNKNOWN settle timeout 与 CAS 冲突",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "LEASE-001",
+      "scenario": "stale worker、双派发、旧 fencing token、继任者尝试消费前任授权",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "PROC-001",
+      "scenario": "Claude 运行时只杀死并重启 UI",
+      "implementationContributors": ["ai-harness", "desktop-shell"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "CTRL-001",
+      "scenario": "各 Step 类型软暂停、立即停止、取消和恢复",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "CTRL-002",
+      "scenario": "快速 PAUSE→RESUME、旧 executor 仍活；checkpoint 含未跟踪文件",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "EVENT-HASH-001",
+      "scenario": "Rust/Python/TypeScript 物化同一 PreparedBatchV2：同 Task 同批至少两事件、多 Task 交错、两个批次竞争同一旧 head",
+      "implementationContributors": ["factory-contracts"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 3,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-001",
+      "scenario": "JSONL 断行、重复、乱序、跨 chunk 秘密、重连",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-002",
+      "scenario": "CLI exit 0 但终止 frame、sourceSeq/transport span 或必需 Artifact 缺失",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-DUR-001",
+      "scenario": "逐点杀 Agent：record write 包含稳定切点 record_prefix_mid_batch 和 record_torn_next，覆盖 WSL VM/主机硬重启",
+      "crashPointIds": ["record_prefix_mid_batch", "record_torn_next"],
+      "implementationContributors": ["ai-harness", "control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 2,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-BP-001",
+      "scenario": "注入 slow disk/flush stall 直到摄取队列跨过高水位和硬上限",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-PERF-BURST",
+      "scenario": "签名 load generator 按固定三任务/事件/大小分布在 100 ms 内输入 12,000 events",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-PERF-SUSTAINED",
+      "scenario": "同一固定分布以三任务聚合 2,000 events/s（±0.5%）持续 60 秒",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STREAM-PERF-SPARSE",
+      "scenario": "1–10 events/s、跨 chunk 不确定后缀和低流量 batch",
+      "implementationContributors": ["ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "REVIEW-001",
+      "scenario": "Claude 实现后自审并自修复，Verifier 通过后 Codex reject 再返工；审核后 SHA 漂移",
+      "implementationContributors": ["ai-harness", "verification"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "GIT-001",
+      "scenario": "含本地未 push base commit 的 Windows 仓库，经 Git Object Bridge 由 Codex 创建 PR、等待 CI/check 并合并",
+      "implementationContributors": ["ai-harness", "control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "SIDEFX-001",
+      "scenario": "push/PR/registry 已成功但响应丢失",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "DEPLOY-001",
+      "scenario": "可销毁 Linux 上生产等价成功发布",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "DEPLOY-002",
+      "scenario": "切流前/后故障，按 RollbackPlan 恢复旧版本",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "DEPLOY-003",
+      "scenario": "回滚再次失败后，以新 Task 再次请求相同目标",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "GUARD-001",
+      "scenario": "ServerProfile、数据库、registry 分别进入 INTERVENTION_REQUIRED 后创建新 Profile revision/Task",
+      "implementationContributors": ["deployment", "control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "DEPLOY-FENCE-001",
+      "scenario": "只读预检后制造双 Release Runner，并在各点令旧 token 继续写",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "STORE-001",
+      "scenario": "SQLite/WAL 损坏、D 盘满、Artifact 原子 rename 失败",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "BUDGET-001",
+      "scenario": "修复、重规划、重启、合法长时间关机、系统睡眠、用户暂停、Provider 重试和同 boot 时钟前跳/回拨",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "RETRY-001",
+      "scenario": "短 Retry-After、订阅额度耗尽、请求发送后 SSH 断线",
+      "implementationContributors": ["control-plane", "ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "NOTIFY-001",
+      "scenario": "自动修复、完成、BLOCKED、已知发送失败、调用后结果未知和 Agent 重启",
+      "implementationContributors": ["desktop-shell", "control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "PATH-001",
+      "scenario": "干净 Windows 安装与全流程文件系统快照",
+      "implementationContributors": ["hardening"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "PATH-002",
+      "scenario": "D 缺失、E/F 回退、junction/SUBST/网络卷伪装",
+      "implementationContributors": ["hardening"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "CLI-PROFILE-001",
+      "scenario": "C 盘默认 profile 存在、Factory profile 为空",
+      "implementationContributors": ["hardening", "ai-harness"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "RUNTIME-001",
+      "scenario": "WSL2 simplified 单 distro、legacy 双 distro、Factory distro integration 未启用、Hyper-V 等布局",
+      "implementationContributors": ["hardening"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "WSL-IO-001",
+      "scenario": "执行依赖安装、Verifier 和构建",
+      "implementationContributors": ["hardening", "verification"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "NGINX-001",
+      "scenario": "第三方在 nginx -t/reload 前后修改配置",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "BACKUP-001",
+      "scenario": "每次发布轻量验证、drill receipt 过期、restore_required",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "DEPLOY-RAM-001",
+      "scenario": "候选栈会耗尽内存余量",
+      "implementationContributors": ["deployment"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "SCHED-PERF-001",
+      "scenario": "单 Claude/Codex 槽位下并发执行三个代表任务",
+      "implementationContributors": ["control-plane"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    },
+    {
+      "testId": "COMPAT-001",
+      "scenario": "CLI/Docker/WSL 自动更新造成 executable digest/schema/layout 漂移",
+      "implementationContributors": ["hardening"],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "placeholder-to-be-filled-by-implementer"
+    }
+  ]
+}

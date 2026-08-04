@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/durable-event.v2.schema.json",
+  "title": "DurableEventV2",
+  "description": "耐久化后的事件，包含 taskSeq、eventId、eventDigest 和 head（由物化器填写，不得由 Adapter 预填）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "taskId", "taskSeq", "batchOrdinal", "eventDigest", "head", "ingestEventId", "eventType", "sourceSeq", "payload", "durableAt"],
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "物化器分配的全局唯一事件 ID"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属任务 ID"
+    },
+    "taskSeq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "任务内单调递增序号（由物化器分配）"
+    },
+    "batchOrdinal": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "所属批次序号"
+    },
+    "eventDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "事件内容摘要（SHA-256 hex）"
+    },
+    "head": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本批次物化后的 head 摘要（链式验证用）"
+    },
+    "previousHead": {
+      "type": ["string", "null"],
+      "description": "前驱批次 head 摘要（genesis 为 null）"
+    },
+    "ingestEventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "原始摄取 ID（来自 PreparedEventV2）"
+    },
+    "eventType": {
+      "type": "string",
+      "enum": [
+        "stream", "provider-semantic", "tool", "state",
+        "gate", "receipt", "control", "heartbeat"
+      ],
+      "description": "事件类型"
+    },
+    "sourceSeq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "来源端序号"
+    },
+    "payload": {
+      "type": "object",
+      "description": "事件负载（已脱敏）"
+    },
+    "payloadDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "负载内容摘要"
+    },
+    "durableAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "耐久化完成时间"
+    }
+  }
+}
