@@ -1,0 +1,4 @@
+# AI Coding Factory uv.lock — 由 uv lock 自动生成，请勿手工编辑。
+# 初始锁文件（无业务依赖），后续 Task 按需更新。
+version = 1
+requires-python = ">=3.12"

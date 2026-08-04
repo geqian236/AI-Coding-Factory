@@ -1,0 +1,36 @@
+[project]
+# AI Coding Factory Python 项目配置（uv 管理）
+name = "ai-coding-factory"
+version = "0.1.0"
+description = "AI Coding Factory — Python monorepo 根配置"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = []
+
+[tool.uv]
+# 所有缓存/数据均在 D 盘，由 scripts/dev.ps1 环境包装器控制。
+dev-dependencies = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "hypothesis>=6.112.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "ANN", "S"]
+ignore  = ["ANN101", "ANN102"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths   = ["tests"]

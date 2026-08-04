@@ -1,0 +1,5 @@
+[toolchain]
+# AI Coding Factory 固定 Rust 工具链版本，确保跨环境构建一致性。
+channel  = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+targets  = ["x86_64-pc-windows-msvc"]

@@ -1,0 +1,4 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "tools/compat-probes/tauri_e2e"
