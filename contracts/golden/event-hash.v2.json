@@ -1,0 +1,434 @@
+{
+  "version": "event-hash-v2",
+  "description": "PreparedBatchV2 → DurableEventV2 物化 golden vectors；Python/TS/Rust 字节级一致。",
+  "genesisPredecessor": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "eventId": [
+    {
+      "name": "id-0",
+      "ingestEventId": "ingest-genesis-1",
+      "expected": "evt_9df47308a83b8fc8903b27bf90f33d1df479ee8df347f62aadeaa36bcb7999ef"
+    },
+    {
+      "name": "id-1",
+      "ingestEventId": "ingest-genesis-2",
+      "expected": "evt_92bb4aafb835efe93cb51a4606ea9f91aa1bc705822ef9c5dd9f559da2cb03cf"
+    },
+    {
+      "name": "id-2",
+      "ingestEventId": "重放-同一-id",
+      "expected": "evt_68dfc136a59b954fdaea760aa5bbaf0204d261a387c48f59d27e050f50ebe4d0"
+    },
+    {
+      "name": "id-3",
+      "ingestEventId": "ingest-b-1",
+      "expected": "evt_e9e9571aa98bca12d9ec74393cd485d475bf240d1c6c9bd802cedaad848ab42e"
+    }
+  ],
+  "payloadDigest": [
+    {
+      "name": "empty",
+      "payload": {},
+      "expected": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "basic",
+      "payload": {
+        "kind": "stream",
+        "n": 3
+      },
+      "expected": "sha256:935ba1137f0af86d4a2e98338868e7a64407e8af4f6039fa305eff36843ae280"
+    },
+    {
+      "name": "nested",
+      "payload": {
+        "a": {
+          "b": [
+            1,
+            2,
+            3
+          ]
+        },
+        "z": "结束"
+      },
+      "expected": "sha256:51b70d804f81cca326ae45dfef4375ea0e3cb09eeb81f00b043ee7f613a7d6cc"
+    }
+  ],
+  "materialize": [
+    {
+      "name": "genesis-two-events",
+      "batch": {
+        "batchId": "batch-a-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "ingest-genesis-1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {
+              "seg": 1
+            }
+          },
+          {
+            "ingestEventId": "ingest-genesis-2",
+            "eventType": "tool",
+            "sourceSeq": 1,
+            "payload": {
+              "seg": 2
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:00:00Z"
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:00:01Z",
+      "expected": [
+        {
+          "eventId": "evt_9df47308a83b8fc8903b27bf90f33d1df479ee8df347f62aadeaa36bcb7999ef",
+          "taskId": "task-a",
+          "taskSeq": 0,
+          "batchOrdinal": 0,
+          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "ingestEventId": "ingest-genesis-1",
+          "eventType": "stream",
+          "sourceSeq": 0,
+          "payload": {
+            "seg": 1
+          },
+          "payloadDigest": "sha256:9d9d0fa533c79791f57d6a9cea60140c0a4ba53a50da152b77792b805b3532cf",
+          "durableAt": "2026-08-04T00:00:01Z",
+          "eventDigest": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905",
+          "head": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905"
+        },
+        {
+          "eventId": "evt_92bb4aafb835efe93cb51a4606ea9f91aa1bc705822ef9c5dd9f559da2cb03cf",
+          "taskId": "task-a",
+          "taskSeq": 1,
+          "batchOrdinal": 0,
+          "previousHead": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905",
+          "ingestEventId": "ingest-genesis-2",
+          "eventType": "tool",
+          "sourceSeq": 1,
+          "payload": {
+            "seg": 2
+          },
+          "payloadDigest": "sha256:678ca9cc6ad7df7daa7f0e328419c6a60a7b54e4444ba4aaf0c01aac1ce3c73c",
+          "durableAt": "2026-08-04T00:00:01Z",
+          "eventDigest": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+          "head": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+        }
+      ]
+    },
+    {
+      "name": "task-a-second-batch",
+      "batch": {
+        "batchId": "batch-a-1",
+        "taskId": "task-a",
+        "batchOrdinal": 1,
+        "previousHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+        "events": [
+          {
+            "ingestEventId": "ingest-a-3",
+            "eventType": "state",
+            "sourceSeq": 2,
+            "payload": {
+              "seg": 3
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:01:00Z"
+      },
+      "anchor": {
+        "committedTaskSeq": 1,
+        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+      },
+      "durableAt": "2026-08-04T00:01:01Z",
+      "expected": [
+        {
+          "eventId": "evt_4f19ed65965ba45634a6a6f3d51bdad34defbd7464ae96fa59b7995648f6b9ef",
+          "taskId": "task-a",
+          "taskSeq": 2,
+          "batchOrdinal": 1,
+          "previousHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+          "ingestEventId": "ingest-a-3",
+          "eventType": "state",
+          "sourceSeq": 2,
+          "payload": {
+            "seg": 3
+          },
+          "payloadDigest": "sha256:349708f57264580cbe6ce3272988a4318f4f973b41634f02c6a36b3d8bcf781e",
+          "durableAt": "2026-08-04T00:01:01Z",
+          "eventDigest": "sha256:274d47d4ff81b061b913023bb6064f852b9e394e0ad207b6a3a493d9f5cc263f",
+          "head": "sha256:274d47d4ff81b061b913023bb6064f852b9e394e0ad207b6a3a493d9f5cc263f"
+        }
+      ]
+    },
+    {
+      "name": "task-b-genesis-interleaved",
+      "batch": {
+        "batchId": "batch-b-0",
+        "taskId": "task-b",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "ingest-b-1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {
+              "seg": "b1"
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:00:30Z"
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:00:31Z",
+      "expected": [
+        {
+          "eventId": "evt_e9e9571aa98bca12d9ec74393cd485d475bf240d1c6c9bd802cedaad848ab42e",
+          "taskId": "task-b",
+          "taskSeq": 0,
+          "batchOrdinal": 0,
+          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "ingestEventId": "ingest-b-1",
+          "eventType": "stream",
+          "sourceSeq": 0,
+          "payload": {
+            "seg": "b1"
+          },
+          "payloadDigest": "sha256:d52d890da585f19e06f3c10f4ebb629cf0931efece3f55c1e7de25fa0cb5d9b4",
+          "durableAt": "2026-08-04T00:00:31Z",
+          "eventDigest": "sha256:2833bedc5cc971b220622a39560b35e885f74ef02cd01704716bacf128199cf8",
+          "head": "sha256:2833bedc5cc971b220622a39560b35e885f74ef02cd01704716bacf128199cf8"
+        }
+      ]
+    },
+    {
+      "name": "explicit-null-payload-field",
+      "batch": {
+        "batchId": "batch-c-0",
+        "taskId": "task-c",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "ingest-c-1",
+            "eventType": "gate",
+            "sourceSeq": 0,
+            "payload": {
+              "note": null
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:02:00Z"
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:02:01Z",
+      "expected": [
+        {
+          "eventId": "evt_161c02d8e188ddcedfc130e98fa7f23e2c61fe60cad48cd5d0339c93aaf8c419",
+          "taskId": "task-c",
+          "taskSeq": 0,
+          "batchOrdinal": 0,
+          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "ingestEventId": "ingest-c-1",
+          "eventType": "gate",
+          "sourceSeq": 0,
+          "payload": {
+            "note": null
+          },
+          "payloadDigest": "sha256:0cd4101d3beb3cdd08a62cb8508f2a2a0942b290a02d6ba252d5fb481d3ce054",
+          "durableAt": "2026-08-04T00:02:01Z",
+          "eventDigest": "sha256:75457a3fdb2be889e954ba9c49d3395e14bb11cd7bbe52815fc782e5d3623d82",
+          "head": "sha256:75457a3fdb2be889e954ba9c49d3395e14bb11cd7bbe52815fc782e5d3623d82"
+        }
+      ]
+    }
+  ],
+  "reject": [
+    {
+      "name": "predecessor-drift",
+      "reason": "batch.previousHead 与 anchor.committedHead 不一致",
+      "batch": {
+        "batchId": "bad-0",
+        "taskId": "task-a",
+        "batchOrdinal": 5,
+        "previousHead": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "events": [
+          {
+            "ingestEventId": "x1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {}
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": 1,
+        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "competing-batch-cas-loser",
+      "reason": "第二批仍以 null 抢占，但 head 已前移到 task_a_head",
+      "batch": {
+        "batchId": "compete-0",
+        "taskId": "task-a",
+        "batchOrdinal": 9,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "c1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {}
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": 1,
+        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "empty-events",
+      "reason": "batch.events 为空",
+      "batch": {
+        "batchId": "e-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": []
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "duplicate-ingest-id",
+      "reason": "批内 ingestEventId 重复",
+      "batch": {
+        "batchId": "d-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "dup",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {}
+          },
+          {
+            "ingestEventId": "dup",
+            "eventType": "tool",
+            "sourceSeq": 1,
+            "payload": {}
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "task-id-mismatch",
+      "reason": "事件 taskId 与 batch.taskId 不一致",
+      "batch": {
+        "batchId": "m-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "m1",
+            "taskId": "task-OTHER",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {}
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "unknown-field",
+      "reason": "事件含 schema 未声明字段",
+      "batch": {
+        "batchId": "u-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "u1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {},
+            "eventDigest": "sha256:precooked"
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    },
+    {
+      "name": "missing-required-field",
+      "reason": "事件缺 sourceSeq",
+      "batch": {
+        "batchId": "r-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "r1",
+            "eventType": "stream",
+            "payload": {}
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-04T00:03:00Z"
+    }
+  ],
+  "invariants": {
+    "idempotentEventId": {
+      "a": "id-0",
+      "b": "id-0"
+    },
+    "interleavedTasksIndependent": {
+      "taskA": "genesis-two-events",
+      "taskB": "task-b-genesis-interleaved"
+    },
+    "predecessorDriftRejected": "predecessor-drift",
+    "competingBatchOnlyOneWins": "competing-batch-cas-loser"
+  }
+}

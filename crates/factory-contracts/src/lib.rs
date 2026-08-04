@@ -10,4 +10,7 @@ pub mod generated;
 pub mod canonical;
 pub mod plan;
 
+// Task 4：跨语言 PreparedBatchV2 → DurableEventV2 事件物化模块。
+pub mod event;
+
 pub use generated::*;

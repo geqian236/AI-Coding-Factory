@@ -11,3 +11,6 @@ export * from "./generated/contracts.js";
 // Task 3：跨语言 canonical JSON 与计划身份算法。
 export * from "./canonical.js";
 export * from "./plan.js";
+
+// Task 4：PreparedBatchV2 → DurableEventV2 事件身份与摘要链算法。
+export * from "./event.js";

@@ -1,0 +1,57 @@
+{
+  "version": "prepared-batch-v2",
+  "description": "PreparedBatchV2 canonical 字节向量（NFC + RFC 8785 JCS）。",
+  "cases": [
+    {
+      "name": "genesis-batch",
+      "batch": {
+        "batchId": "batch-a-0",
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "ingest-genesis-1",
+            "eventType": "stream",
+            "sourceSeq": 0,
+            "payload": {
+              "seg": 1
+            }
+          },
+          {
+            "ingestEventId": "ingest-genesis-2",
+            "eventType": "tool",
+            "sourceSeq": 1,
+            "payload": {
+              "seg": 2
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:00:00Z"
+      },
+      "expectedCanonical": "{\"batchId\":\"batch-a-0\",\"batchOrdinal\":0,\"events\":[{\"eventType\":\"stream\",\"ingestEventId\":\"ingest-genesis-1\",\"payload\":{\"seg\":1},\"sourceSeq\":0},{\"eventType\":\"tool\",\"ingestEventId\":\"ingest-genesis-2\",\"payload\":{\"seg\":2},\"sourceSeq\":1}],\"preparedAt\":\"2026-08-04T00:00:00Z\",\"previousHead\":null,\"taskId\":\"task-a\"}"
+    },
+    {
+      "name": "non-genesis-with-claim-epoch",
+      "batch": {
+        "batchId": "batch-a-1",
+        "taskId": "task-a",
+        "batchOrdinal": 1,
+        "previousHead": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "claimEpoch": 7,
+        "events": [
+          {
+            "ingestEventId": "ingest-a-3",
+            "eventType": "state",
+            "sourceSeq": 2,
+            "payload": {
+              "值": "结束"
+            }
+          }
+        ],
+        "preparedAt": "2026-08-04T00:01:00Z"
+      },
+      "expectedCanonical": "{\"batchId\":\"batch-a-1\",\"batchOrdinal\":1,\"claimEpoch\":7,\"events\":[{\"eventType\":\"state\",\"ingestEventId\":\"ingest-a-3\",\"payload\":{\"值\":\"结束\"},\"sourceSeq\":2}],\"preparedAt\":\"2026-08-04T00:01:00Z\",\"previousHead\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"taskId\":\"task-a\"}"
+    }
+  ]
+}
