@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     D 盘开发环境安全包装器 — 在执行任何开发工具前将所有缓存/工具链路径绑定到 D 盘，
     并在子进程退出后验证不产生受控 C 盘写入。
@@ -16,9 +16,10 @@
 .NOTES
     版本：1.0  |  不依赖父终端环境，所有路径均在此脚本内强制设定。
 #>
-[CmdletBinding()]
-param()
-
+# 注意：本脚本刻意不声明 [CmdletBinding()] 或 param() 块。
+# PowerShell 的 advanced script 会尝试把 `--` 当作参数名绑定并报
+# AmbiguousParameter，且 advanced script 不填充 $args；只有普通脚本
+# 才能让 `--` 原样进入 $args，这是本 wrapper 的调用协议所必需的。
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -99,12 +100,15 @@ if ($sepIdx -lt 0) {
     exit 1
 }
 
-$subCmd = $rawArgs[($sepIdx + 1)..($rawArgs.Length - 1)]
-
-if ($subCmd.Count -eq 0) {
+# 必须先判断 -- 之后是否还有元素，再做切片。
+# PowerShell 的 a..b 在 a > b 时是降序范围，$rawArgs[N..(N-1)] 会返回
+# 反转后的非空数组，使 "Count -eq 0" 守卫永远不触发并执行到垃圾命令。
+if ($sepIdx -ge ($rawArgs.Length - 1)) {
     Write-Error "[dev.ps1] -- 后未提供任何子命令。"
     exit 1
 }
+
+$subCmd = @($rawArgs[($sepIdx + 1)..($rawArgs.Length - 1)])
 
 # ── 6. 启动子进程并捕获退出码 ──────────────────────────────────────────────────
 $exe  = $subCmd[0]

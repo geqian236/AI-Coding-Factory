@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Phase 0 total gate script - 9 contract-layer checks, all must pass before commit.
 
