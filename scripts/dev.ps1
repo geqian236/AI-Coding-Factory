@@ -4,10 +4,12 @@
     并在子进程退出后验证不产生受控 C 盘写入。
 
 .DESCRIPTION
-    将 TEMP/TMP/CARGO_HOME/CARGO_TARGET_DIR/RUSTUP_HOME/PNPM_HOME/NPM_CONFIG_CACHE/
-    UV_CACHE_DIR/PIP_CACHE_DIR/PLAYWRIGHT_BROWSERS_PATH 全部解析为物理路径并重定向到
-    D:\codex项目\AI-Coding-Factory-Data\dev 下对应子目录。
-    路径不可信（指向 C 盘或符号链接/联接点最终落在 C 盘）时立即以非零退出。
+    将 TEMP/TMP/PNPM_HOME/NPM_CONFIG_CACHE/UV_CACHE_DIR/PIP_CACHE_DIR/
+    PLAYWRIGHT_BROWSERS_PATH 重定向到 D:\codex项目\AI-Coding-Factory-Data\dev；
+    Rust 三件套 CARGO_HOME/CARGO_TARGET_DIR/RUSTUP_HOME 单独重定向到纯 ASCII 根
+    D:\acf-dev（原因见 $RUST_ROOT 注释：GBK 代码页下 `ld` 无法打开含 CJK 的路径）。
+    所有路径解析为物理路径后校验：不落在 D 盘（含符号链接/联接点最终落在 C 盘）
+    时立即以非零退出；Rust 三件套额外要求纯 ASCII。cargo-home\bin 前置到 PATH。
     子进程以 -- 后的参数数组启动；子进程退出非零时 wrapper 同样返回非零。
 
 .PARAMETER args
@@ -26,13 +28,30 @@ $ErrorActionPreference = 'Stop'
 # ── 1. D 盘数据根目录 ──────────────────────────────────────────────────────────
 $DATA_ROOT = "D:\codex项目\AI-Coding-Factory-Data\dev"
 
-# 确保数据根目录存在
+# Rust 专用根目录：必须是纯 ASCII 路径。
+# 原因：中文 Windows（GBK ANSI 代码页）下，MinGW binutils 的 `ld` 用窄字符 API
+# 打开文件，无法解析含 CJK 字符的路径；若 rustup-home/cargo-target 落在
+# $DATA_ROOT（含“codex项目”）下，std 的 rlib 与 self-contained 系统库会以 CJK
+# 绝对路径传给 `ld`，链接阶段全部 "cannot find"，导致任何 Rust 构建失败。
+# 故将 RUSTUP_HOME/CARGO_HOME/CARGO_TARGET_DIR 单独绑定到此 ASCII 根，
+# 其余缓存（pnpm/npm/uv/pip/playwright）不受该限制，仍留在 $DATA_ROOT。
+$RUST_ROOT = "D:\acf-dev"
+
+# 确保数据根目录存在（非 Rust 缓存仍在 CJK DATA_ROOT 下）。
 $subDirs = @(
-    "tmp", "cargo-home", "cargo-target", "rustup-home",
-    "pnpm-home", "npm-cache", "uv-cache", "pip-cache", "playwright"
+    "tmp", "pnpm-home", "npm-cache", "uv-cache", "pip-cache", "playwright"
 )
 foreach ($d in $subDirs) {
     $path = Join-Path $DATA_ROOT $d
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Force $path | Out-Null
+    }
+}
+
+# 确保 Rust ASCII 根及其子目录存在。
+$rustSubDirs = @("cargo-home", "cargo-target", "rustup-home")
+foreach ($d in $rustSubDirs) {
+    $path = Join-Path $RUST_ROOT $d
     if (-not (Test-Path $path)) {
         New-Item -ItemType Directory -Force $path | Out-Null
     }
@@ -68,12 +87,25 @@ function Assert-OnDDrive {
     }
 }
 
+# 验证路径为纯 ASCII，否则 fail-closed。
+# Rust 工具链/构建产物路径若含非 ASCII 字符，GBK 代码页下 `ld` 会链接失败，
+# 且报错信息隐晦（大量 "cannot find"）。此处提前拦截，避免误配 $RUST_ROOT 后
+# 出现难以定位的链接错误。
+function Assert-Ascii {
+    param([string]$Label, [string]$Path)
+    if ($Path -match '[^\x00-\x7F]') {
+        Write-Error "[dev.ps1] 路径安全检查失败：$Label 的路径 '$Path' 含非 ASCII 字符，GBK 代码页下 Rust 链接会失败，拒绝执行。"
+        exit 1
+    }
+}
+
 # ── 3. 绑定所有环境变量到 D 盘 ────────────────────────────────────────────────
 $env:TEMP                     = Join-Path $DATA_ROOT "tmp"
 $env:TMP                      = $env:TEMP
-$env:CARGO_HOME               = Join-Path $DATA_ROOT "cargo-home"
-$env:CARGO_TARGET_DIR         = Join-Path $DATA_ROOT "cargo-target"
-$env:RUSTUP_HOME              = Join-Path $DATA_ROOT "rustup-home"
+# Rust 三件套绑定到 ASCII 根，规避 GBK 代码页下 `ld` 无法打开 CJK 路径的链接失败。
+$env:CARGO_HOME               = Join-Path $RUST_ROOT "cargo-home"
+$env:CARGO_TARGET_DIR         = Join-Path $RUST_ROOT "cargo-target"
+$env:RUSTUP_HOME              = Join-Path $RUST_ROOT "rustup-home"
 $env:PNPM_HOME                = Join-Path $DATA_ROOT "pnpm-home"
 $env:NPM_CONFIG_CACHE         = Join-Path $DATA_ROOT "npm-cache"
 $env:UV_CACHE_DIR             = Join-Path $DATA_ROOT "uv-cache"
@@ -90,6 +122,16 @@ Assert-OnDDrive "NPM_CONFIG_CACHE"         $env:NPM_CONFIG_CACHE
 Assert-OnDDrive "UV_CACHE_DIR"             $env:UV_CACHE_DIR
 Assert-OnDDrive "PIP_CACHE_DIR"            $env:PIP_CACHE_DIR
 Assert-OnDDrive "PLAYWRIGHT_BROWSERS_PATH" $env:PLAYWRIGHT_BROWSERS_PATH
+
+# Rust 三件套额外做纯 ASCII 校验：GBK 代码页下含 CJK 的路径会导致 `ld` 链接失败。
+Assert-Ascii "CARGO_HOME"       $env:CARGO_HOME
+Assert-Ascii "CARGO_TARGET_DIR" $env:CARGO_TARGET_DIR
+Assert-Ascii "RUSTUP_HOME"      $env:RUSTUP_HOME
+
+# 将 cargo-home\bin 前置到 PATH，使子进程能找到搬迁到 ASCII 根后的 cargo/rustc。
+# 前置而非追加：确保用本 wrapper 绑定的工具链，而非父环境里可能存在的其它 cargo。
+$cargoBin = Join-Path $env:CARGO_HOME "bin"
+$env:PATH = "$cargoBin;$env:PATH"
 
 # ── 5. 解析 -- 分隔符，提取子命令 ─────────────────────────────────────────────
 $rawArgs = $args
