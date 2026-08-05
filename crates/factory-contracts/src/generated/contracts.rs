@@ -301,27 +301,47 @@ pub struct PreparedEventV2 {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct PreparedBatchV2 {
-    /// 批次唯一 ID
-    #[serde(rename = "batchId")]
-    pub batch_id: String,
-    /// 所属任务 ID
-    #[serde(rename = "taskId")]
-    pub task_id: String,
-    /// 批次序号，用于稳定 identity 生成
-    #[serde(rename = "batchOrdinal")]
-    pub batch_ordinal: i64,
-    /// 批次内预备事件列表
-    pub events: Vec<serde_json::Value>,
-    /// 前驱批次 head 摘要（genesis 批次为 null）
-    #[serde(rename = "previousHead")]
-    pub previous_head: Option<String>,
-    /// claim 时的 writer epoch，用于竞争检测
-    #[serde(rename = "claimEpoch")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim_epoch: Option<i64>,
-    /// 批次预备时间
+    /// 批次唯一稳定 ID。
+    #[serde(rename = "preparedBatchId")]
+    pub prepared_batch_id: String,
+    /// claim 时的 writer epoch（用于竞争检测）。
+    #[serde(rename = "writerEpoch")]
+    pub writer_epoch: i64,
+    /// 批次状态机（§11 ingest_batches）。正常转换仅 CLAIMED → PREPARING → PREPARED → COMMITTED；旧 epoch pre-commit 状态只能由 Reconciler CAS 为 ABANDONED。COMMITTED/ABANDONED 均为终态。
+    pub state: String,
+    /// 按 batchOrdinal 排列的全量稳定 ingestEventId 列表（权威顺序）。
+    #[serde(rename = "orderedIngestIds")]
+    pub ordered_ingest_ids: Vec<String>,
+    /// 每个 Task 唯一的 expectedCommittedHead 锚点 + 批内 ordinal 范围（§11 ingest_batch_task_heads）。
+    #[serde(rename = "perTaskExpectedHeads")]
+    pub per_task_expected_heads: Vec<serde_json::Value>,
+    /// segment digest 列表。
+    #[serde(rename = "segmentDigests")]
+    pub segment_digests: Vec<serde_json::Value>,
+    /// 总事件数。
+    #[serde(rename = "eventCount")]
+    pub event_count: i64,
+    /// 总 payload 字节数。
+    #[serde(rename = "payloadBytes")]
+    pub payload_bytes: i64,
+    /// 本批首事件 batchOrdinal。
+    #[serde(rename = "firstBatchOrdinal")]
+    pub first_batch_ordinal: i64,
+    /// 本批末事件 batchOrdinal。
+    #[serde(rename = "lastBatchOrdinal")]
+    pub last_batch_ordinal: i64,
+    /// 本批最旧 ingestedAt。
+    #[serde(rename = "oldestIngestedAt")]
+    pub oldest_ingested_at: String,
+    /// 本批 prepared 完成时间。
     #[serde(rename = "preparedAt")]
     pub prepared_at: String,
+    /// PreparedBatch schema 版本。
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: String,
+    /// coordinator 版本（compatibility manifest 绑定）。
+    #[serde(rename = "coordinatorVersion")]
+    pub coordinator_version: String,
 }
 
 /// 由 generate.py 自动生成，禁止手动修改。
@@ -329,42 +349,99 @@ pub struct PreparedBatchV2 {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct DurableEventV2 {
-    /// 物化器分配的全局唯一事件 ID
+    /// 事件 schema 版本（v2）。Phase 1+ 字段集演进时升级。
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: String,
+    /// 耐久化等级（§10.4）：authoritative_state=内部权威 state.changed/lease/授权；side_effect_receipt=外部副作用 receipt；provider_source=Provider semantic/public frame；derived=UI summary/指标等可重建派生。
+    #[serde(rename = "durabilityClass")]
+    pub durability_class: String,
+    /// 物化器分配的全局唯一事件 ID（evt_<64 位小写十六进制>，SHA-256(JCS([factory-event-id-v2, ingestEventId]))）。崩溃重试得到同一身份。
     #[serde(rename = "eventId")]
     pub event_id: String,
-    /// 所属任务 ID
+    /// 所属任务 ID。
     #[serde(rename = "taskId")]
     pub task_id: String,
-    /// 任务内单调递增序号（由物化器分配）
+    /// 任务内单调递增序号（由物化器分配，CAS 持久）。UI cursor 用 (taskId, taskSeq)。
     #[serde(rename = "taskSeq")]
     pub task_seq: i64,
-    /// 所属批次序号
-    #[serde(rename = "batchOrdinal")]
-    pub batch_ordinal: i64,
-    /// 事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。
-    #[serde(rename = "eventDigest")]
-    pub event_digest: String,
-    /// 前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。
-    #[serde(rename = "previousEventDigest")]
-    pub previous_event_digest: Option<String>,
-    /// 原始摄取 ID（来自 PreparedEventV2）
+    /// 所属 Run ID。
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    /// 单 Run 内诊断序号（不能跨 Run 唯一）。
+    #[serde(rename = "runSeq")]
+    pub run_seq: i64,
+    /// 所属 Step ID。
+    #[serde(rename = "stepId")]
+    pub step_id: String,
+    /// 所属 Attempt ID。
+    #[serde(rename = "attemptId")]
+    pub attempt_id: String,
+    /// 事件来源 actor 身份。
+    pub source: String,
+    /// 原始摄取 ID（来自 PreparedEventV2）。
     #[serde(rename = "ingestEventId")]
     pub ingest_event_id: String,
-    /// 事件类型
+    /// 具体事件类型（§10.1）。model.summary 必带 summaryOrigin=provider_public + providerEventId + sanitizedProviderFrameRef + sanitizedProviderFrameDigest。
     #[serde(rename = "eventType")]
     pub event_type: String,
-    /// 来源端序号
+    /// Provider 事件 ID（model.summary 等 provider 源事件必填，普通事件 null）。
+    #[serde(rename = "providerEventId")]
+    pub provider_event_id: Option<String>,
+    /// Provider 来源端序号（用于去重与对齐）。
     #[serde(rename = "sourceSeq")]
     pub source_seq: i64,
-    /// 事件负载（已脱敏）
+    /// Provider stream 稳定 ID（stream.* 事件必填；非 stream 事件 null）。
+    #[serde(rename = "streamId")]
+    pub stream_id: Option<String>,
+    /// 所属 PreparedBatchV2 的 batchId。物化器先 claim 批次，再组装 PreparedBatch，最后逐条物化 DurableEvent。
+    #[serde(rename = "preparedBatchId")]
+    pub prepared_batch_id: String,
+    /// 所属 PreparedBatch 内的事件序号（与 manifest 的 orderedIngestIds 一致）。
+    #[serde(rename = "batchOrdinal")]
+    pub batch_ordinal: i64,
+    /// 源传输 span：内存中以原始传输字节精确计数。credential/secret/PII 仅存 providerEventId/sourceSeq 与诚实的 mappingPrecision（byte|field|frame|none），精确字节起止不能进普通事件。
+    #[serde(rename = "sourceTransportSpan")]
+    pub source_transport_span: serde_json::Value,
+    /// 脱敏后 span：精确指向持久化脱敏字节。脱敏改变长度时不得与 sourceTransportSpan 冒充同一坐标。
+    #[serde(rename = "sanitizedStreamSpan")]
+    pub sanitized_stream_span: serde_json::Value,
+    /// RFC3339 接收 wall time（仅用于显示，不能参与排序）。
+    #[serde(rename = "wallTime")]
+    pub wall_time: String,
+    /// 单调时钟纳秒。
+    #[serde(rename = "monotonicTimeNs")]
+    pub monotonic_time_ns: i64,
+    /// 完整 frame 闭合后写入脱敏器的时刻（首字节到闭合仅记录 frame_assembly_ms 不写入）。
+    #[serde(rename = "ingestedAt")]
+    pub ingested_at: String,
+    /// Provider CLI 上报版本。
+    #[serde(rename = "providerVersion")]
+    pub provider_version: String,
+    /// Adapter 自身 semver 版本。
+    #[serde(rename = "adapterVersion")]
+    pub adapter_version: String,
+    /// 受管进程身份（§10.1）：用于 RUNNING 真实性校验（PID/Job Object/WSL/container exec）。
+    #[serde(rename = "processIdentity")]
+    pub process_identity: serde_json::Value,
+    /// 事件负载（已脱敏，未脱敏原文不得落盘）。
     pub payload: serde_json::Value,
-    /// 负载内容摘要
+    /// 已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃。model.summary 必填，其它 null。
+    #[serde(rename = "sanitizedProviderFrameDigest")]
+    pub sanitized_provider_frame_digest: Option<String>,
+    /// 脱敏后 payload 的 JCS 摘要。
     #[serde(rename = "payloadDigest")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload_digest: Option<String>,
-    /// 耐久化完成时间
-    #[serde(rename = "durableAt")]
-    pub durable_at: String,
+    pub payload_digest: String,
+    /// 前驱事件 eventDigest（genesis 用 sha256:<64 个 0> 固定 predecessor）。
+    #[serde(rename = "previousEventDigest")]
+    pub previous_event_digest: String,
+    /// 本事件 SHA-256(JCS(去除 eventDigest 字段后完整对象))。previousEventDigest 仍参与计算。
+    #[serde(rename = "eventDigest")]
+    pub event_digest: String,
+    /// 本事件命中脱敏点列表（不含原文、低熵 hash 或可推断秘密长度的 redaction manifest）。
+    pub redactions: Vec<serde_json::Value>,
+    /// redactions 列表内容的 SHA-256 摘要。
+    #[serde(rename = "redactionManifestDigest")]
+    pub redaction_manifest_digest: String,
 }
 
 /// 由 generate.py 自动生成，禁止手动修改。

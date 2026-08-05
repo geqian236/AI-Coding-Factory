@@ -1,6 +1,6 @@
 {
   "version": "event-hash-v2",
-  "description": "PreparedBatchV2 → DurableEventV2 物化 golden vectors；Python/TS/Rust 字节级一致。",
+  "description": "PreparedBatchV2 → DurableEventV2 物化 golden vectors（§10.1 全字段集）。Python/TS/Rust 字节级一致。previousEventDigest 单链模型；跨批真接续（batch1 末 eventDigest 必为 batch2.anchor.committedHead）；batchOrdinal 为事件在批内序号（与 schema 一致）。",
   "genesisPredecessor": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "eventId": [
     {
@@ -57,196 +57,769 @@
     {
       "name": "genesis-two-events",
       "batch": {
-        "batchId": "batch-a-0",
         "taskId": "task-a",
+        "preparedBatchId": "batch-a-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "ingest-genesis-1",
-            "eventType": "stream",
+            "taskId": "task-a",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1000000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
             "payload": {
               "seg": 1
-            }
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           },
           {
             "ingestEventId": "ingest-genesis-2",
-            "eventType": "tool",
+            "taskId": "task-a",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "claude",
+            "eventType": "tool.call",
+            "providerEventId": null,
             "sourceSeq": 1,
+            "streamId": null,
+            "batchOrdinal": 1,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 100,
+              "endExclusive": 200
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1001000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
             "payload": {
               "seg": 2
-            }
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
-        ],
-        "preparedAt": "2026-08-04T00:00:00Z"
+        ]
       },
       "anchor": {
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:00:01Z",
+      "durableAt": "2026-08-05T00:00:01Z",
       "expected": [
         {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
           "eventId": "evt_9df47308a83b8fc8903b27bf90f33d1df479ee8df347f62aadeaa36bcb7999ef",
           "taskId": "task-a",
           "taskSeq": 0,
-          "batchOrdinal": 0,
-          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "claude",
           "ingestEventId": "ingest-genesis-1",
-          "eventType": "stream",
+          "eventType": "process.started",
+          "providerEventId": null,
           "sourceSeq": 0,
+          "streamId": null,
+          "preparedBatchId": "batch-a-0",
+          "batchOrdinal": 0,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 0,
+            "endExclusive": 100
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1000000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
           "payload": {
             "seg": 1
           },
+          "sanitizedProviderFrameDigest": null,
           "payloadDigest": "sha256:9d9d0fa533c79791f57d6a9cea60140c0a4ba53a50da152b77792b805b3532cf",
-          "durableAt": "2026-08-04T00:00:01Z",
-          "eventDigest": "sha256:41f664ff5d585cab22fb071aae12af7e9b906fac2766d58d1d6da98ed612044d"
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:27947645b1d6e70c9de323f7de0c6f7a3157e0e9ffac1a4ecd9926b0ca9ad514"
         },
         {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
           "eventId": "evt_92bb4aafb835efe93cb51a4606ea9f91aa1bc705822ef9c5dd9f559da2cb03cf",
           "taskId": "task-a",
           "taskSeq": 1,
-          "batchOrdinal": 0,
-          "previousEventDigest": "sha256:41f664ff5d585cab22fb071aae12af7e9b906fac2766d58d1d6da98ed612044d",
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "claude",
           "ingestEventId": "ingest-genesis-2",
-          "eventType": "tool",
+          "eventType": "tool.call",
+          "providerEventId": null,
           "sourceSeq": 1,
+          "streamId": null,
+          "preparedBatchId": "batch-a-0",
+          "batchOrdinal": 1,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 100,
+            "endExclusive": 200
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1001000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
           "payload": {
             "seg": 2
           },
+          "sanitizedProviderFrameDigest": null,
           "payloadDigest": "sha256:678ca9cc6ad7df7daa7f0e328419c6a60a7b54e4444ba4aaf0c01aac1ce3c73c",
-          "durableAt": "2026-08-04T00:00:01Z",
-          "eventDigest": "sha256:71c59b5b775765ed4ea4984ff522c761a9a2f5db05dfd149e1d35f5dfe7857d2"
+          "previousEventDigest": "sha256:27947645b1d6e70c9de323f7de0c6f7a3157e0e9ffac1a4ecd9926b0ca9ad514",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:76420ff2ef4a0ad3ec1ab7a509c2aab8360e535bb3dcc8d73b5c938d65f6d482"
         }
       ]
     },
     {
       "name": "task-a-second-batch",
       "batch": {
-        "batchId": "batch-a-1",
         "taskId": "task-a",
+        "preparedBatchId": "batch-a-1",
         "batchOrdinal": 1,
-        "previousHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+        "previousHead": "sha256:76420ff2ef4a0ad3ec1ab7a509c2aab8360e535bb3dcc8d73b5c938d65f6d482",
         "events": [
           {
             "ingestEventId": "ingest-a-3",
-            "eventType": "state",
+            "taskId": "task-a",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "claude",
+            "eventType": "state.changed",
+            "providerEventId": null,
             "sourceSeq": 2,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 200,
+              "endExclusive": 300
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1002000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
             "payload": {
               "seg": 3
-            }
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
-        ],
-        "preparedAt": "2026-08-04T00:01:00Z"
+        ]
       },
       "anchor": {
         "committedTaskSeq": 1,
-        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+        "committedHead": "sha256:76420ff2ef4a0ad3ec1ab7a509c2aab8360e535bb3dcc8d73b5c938d65f6d482"
       },
-      "durableAt": "2026-08-04T00:01:01Z",
+      "durableAt": "2026-08-05T00:00:02Z",
       "expected": [
         {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
           "eventId": "evt_4f19ed65965ba45634a6a6f3d51bdad34defbd7464ae96fa59b7995648f6b9ef",
           "taskId": "task-a",
           "taskSeq": 2,
-          "batchOrdinal": 1,
-          "previousEventDigest": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "claude",
           "ingestEventId": "ingest-a-3",
-          "eventType": "state",
+          "eventType": "state.changed",
+          "providerEventId": null,
           "sourceSeq": 2,
+          "streamId": null,
+          "preparedBatchId": "batch-a-1",
+          "batchOrdinal": 0,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 200,
+            "endExclusive": 300
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1002000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
           "payload": {
             "seg": 3
           },
+          "sanitizedProviderFrameDigest": null,
           "payloadDigest": "sha256:349708f57264580cbe6ce3272988a4318f4f973b41634f02c6a36b3d8bcf781e",
-          "durableAt": "2026-08-04T00:01:01Z",
-          "eventDigest": "sha256:4fa6bd1bda3496ed65b68754ee9fd2b6620db8b67dcc12548260ca05b5c3217e"
+          "previousEventDigest": "sha256:76420ff2ef4a0ad3ec1ab7a509c2aab8360e535bb3dcc8d73b5c938d65f6d482",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:ad8f4b2a341af5fd02c93090e8642e9716353a53546571a49f95476b13141db5"
         }
       ]
     },
     {
       "name": "task-b-genesis-interleaved",
       "batch": {
-        "batchId": "batch-b-0",
         "taskId": "task-b",
+        "preparedBatchId": "batch-b-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "ingest-b-1",
-            "eventType": "stream",
+            "taskId": "task-b",
+            "runId": "run-b",
+            "runSeq": 0,
+            "stepId": "step-b",
+            "attemptId": "att-b",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1000000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
             "payload": {
               "seg": "b1"
-            }
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
-        ],
-        "preparedAt": "2026-08-04T00:00:30Z"
+        ]
       },
       "anchor": {
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:00:31Z",
+      "durableAt": "2026-08-05T00:00:03Z",
       "expected": [
         {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
           "eventId": "evt_e9e9571aa98bca12d9ec74393cd485d475bf240d1c6c9bd802cedaad848ab42e",
           "taskId": "task-b",
           "taskSeq": 0,
-          "batchOrdinal": 0,
-          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "runId": "run-b",
+          "runSeq": 0,
+          "stepId": "step-b",
+          "attemptId": "att-b",
+          "source": "claude",
           "ingestEventId": "ingest-b-1",
-          "eventType": "stream",
+          "eventType": "process.started",
+          "providerEventId": null,
           "sourceSeq": 0,
+          "streamId": null,
+          "preparedBatchId": "batch-b-0",
+          "batchOrdinal": 0,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 0,
+            "endExclusive": 100
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1000000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
           "payload": {
             "seg": "b1"
           },
+          "sanitizedProviderFrameDigest": null,
           "payloadDigest": "sha256:d52d890da585f19e06f3c10f4ebb629cf0931efece3f55c1e7de25fa0cb5d9b4",
-          "durableAt": "2026-08-04T00:00:31Z",
-          "eventDigest": "sha256:e07058d0843c5a6a5035de7b72039816e6afcf0d5d0da028009055aa5223eeaa"
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:fd999945900d0d2eadcd54643814e373bfb8409672393a22e8793523c6e8499a"
+        }
+      ]
+    },
+    {
+      "name": "multi-task-single-batch",
+      "batch": {
+        "taskId": "task-c",
+        "preparedBatchId": "batch-mt-0",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "ingest-c-1",
+            "taskId": "task-c",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "codex",
+            "eventType": "stream.segment.committed",
+            "providerEventId": null,
+            "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1000000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
+            "payload": {
+              "note": "multi-task"
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
+          },
+          {
+            "ingestEventId": "ingest-c-2",
+            "taskId": "task-c",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "codex",
+            "eventType": "model.summary",
+            "providerEventId": null,
+            "sourceSeq": 1,
+            "streamId": null,
+            "batchOrdinal": 1,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 100,
+              "endExclusive": 200
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1001000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
+            "payload": {
+              "result": "ok"
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-05T00:00:04Z",
+      "expected": [
+        {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
+          "eventId": "evt_161c02d8e188ddcedfc130e98fa7f23e2c61fe60cad48cd5d0339c93aaf8c419",
+          "taskId": "task-c",
+          "taskSeq": 0,
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "codex",
+          "ingestEventId": "ingest-c-1",
+          "eventType": "stream.segment.committed",
+          "providerEventId": null,
+          "sourceSeq": 0,
+          "streamId": null,
+          "preparedBatchId": "batch-mt-0",
+          "batchOrdinal": 0,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 0,
+            "endExclusive": 100
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1000000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
+          "payload": {
+            "note": "multi-task"
+          },
+          "sanitizedProviderFrameDigest": null,
+          "payloadDigest": "sha256:8c4732bd0297d3c35390655b04d77672ef2d5ffde9ba5a01822f30344598a334",
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:e17d8e7e8d286495ec409ca569a676d293441db8e9ca338e05edbac59289daa6"
+        },
+        {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
+          "eventId": "evt_afe06cc46d3de80bdc4f2e5bda5f5f3e58eb9e777e85ef078604bedad07019cd",
+          "taskId": "task-c",
+          "taskSeq": 1,
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "codex",
+          "ingestEventId": "ingest-c-2",
+          "eventType": "model.summary",
+          "providerEventId": null,
+          "sourceSeq": 1,
+          "streamId": null,
+          "preparedBatchId": "batch-mt-0",
+          "batchOrdinal": 1,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 100,
+            "endExclusive": 200
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1001000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
+          "payload": {
+            "result": "ok"
+          },
+          "sanitizedProviderFrameDigest": null,
+          "payloadDigest": "sha256:1aad36b0fb02621b951649811957ba7ad67d4838c2932d02088f7d6e8db74313",
+          "previousEventDigest": "sha256:e17d8e7e8d286495ec409ca569a676d293441db8e9ca338e05edbac59289daa6",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:3de2dbc6c72d788dffd4b9517a42be7de1504fb35fef2e8e02e4cd202d6abd19"
         }
       ]
     },
     {
       "name": "explicit-null-payload-field",
       "batch": {
-        "batchId": "batch-c-0",
-        "taskId": "task-c",
+        "taskId": "task-d",
+        "preparedBatchId": "batch-c-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "ingest-c-1",
-            "eventType": "gate",
+            "taskId": "task-d",
+            "runId": "run-a",
+            "runSeq": 0,
+            "stepId": "step-a",
+            "attemptId": "att-a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "provider_transport_bytes",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "frame"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "seg-1",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1000000,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "cli-v1",
+            "adapterVersion": "1.0.0",
+            "processIdentity": {
+              "executorId": "exec-1",
+              "hostId": "host-fp",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1234,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "job-1"
+            },
             "payload": {
               "note": null
-            }
+            },
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
-        ],
-        "preparedAt": "2026-08-04T00:02:00Z"
+        ]
       },
       "anchor": {
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:02:01Z",
+      "durableAt": "2026-08-05T00:00:05Z",
       "expected": [
         {
+          "schemaVersion": 2,
+          "durabilityClass": "derived",
           "eventId": "evt_161c02d8e188ddcedfc130e98fa7f23e2c61fe60cad48cd5d0339c93aaf8c419",
-          "taskId": "task-c",
+          "taskId": "task-d",
           "taskSeq": 0,
-          "batchOrdinal": 0,
-          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "runId": "run-a",
+          "runSeq": 0,
+          "stepId": "step-a",
+          "attemptId": "att-a",
+          "source": "claude",
           "ingestEventId": "ingest-c-1",
-          "eventType": "gate",
+          "eventType": "process.started",
+          "providerEventId": null,
           "sourceSeq": 0,
+          "streamId": null,
+          "preparedBatchId": "batch-c-0",
+          "batchOrdinal": 0,
+          "sourceTransportSpan": {
+            "coordinate": "provider_transport_bytes",
+            "start": null,
+            "endExclusive": null,
+            "mappingPrecision": "frame"
+          },
+          "sanitizedStreamSpan": {
+            "segmentId": "seg-1",
+            "start": 0,
+            "endExclusive": 100
+          },
+          "wallTime": "2026-08-05T00:00:00Z",
+          "monotonicTimeNs": 1000000,
+          "ingestedAt": "2026-08-05T00:00:01Z",
+          "providerVersion": "cli-v1",
+          "adapterVersion": "1.0.0",
+          "processIdentity": {
+            "executorId": "exec-1",
+            "hostId": "host-fp",
+            "runtime": "local-windows",
+            "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "pid": 1234,
+            "processStartTime": "2026-08-05T00:00:00Z",
+            "jobObjectId": "job-1"
+          },
           "payload": {
             "note": null
           },
+          "sanitizedProviderFrameDigest": null,
           "payloadDigest": "sha256:0cd4101d3beb3cdd08a62cb8508f2a2a0942b290a02d6ba252d5fb481d3ce054",
-          "durableAt": "2026-08-04T00:02:01Z",
-          "eventDigest": "sha256:95948232304c16ed44e1d9c5d82e74061ab44a6380cd48aa43e917e900ba428e"
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "redactions": [],
+          "redactionManifestDigest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "eventDigest": "sha256:8a9febb92c680c4b882a12f088a053904c913fc5e28c7405d00da2be76706dc2"
         }
       ]
     }
@@ -256,54 +829,124 @@
       "name": "predecessor-drift",
       "reason": "batch.previousHead 与 anchor.committedHead 不一致",
       "batch": {
-        "batchId": "bad-0",
         "taskId": "task-a",
-        "batchOrdinal": 5,
+        "preparedBatchId": "bad-0",
+        "batchOrdinal": 0,
         "previousHead": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "events": [
           {
             "ingestEventId": "x1",
-            "eventType": "stream",
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
-            "payload": {}
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
         ]
       },
       "anchor": {
         "committedTaskSeq": 1,
-        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+        "committedHead": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
     },
     {
       "name": "competing-batch-cas-loser",
       "reason": "第二批仍以 null 抢占，但 head 已前移到 task_a_head",
       "batch": {
-        "batchId": "compete-0",
         "taskId": "task-a",
+        "preparedBatchId": "compete-0",
         "batchOrdinal": 9,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "c1",
-            "eventType": "stream",
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
-            "payload": {}
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
         ]
       },
       "anchor": {
         "committedTaskSeq": 1,
-        "committedHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+        "committedHead": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
     },
     {
       "name": "empty-events",
       "reason": "batch.events 为空",
       "batch": {
-        "batchId": "e-0",
         "taskId": "task-a",
+        "preparedBatchId": "e-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": []
@@ -312,28 +955,98 @@
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
     },
     {
       "name": "duplicate-ingest-id",
       "reason": "批内 ingestEventId 重复",
       "batch": {
-        "batchId": "d-0",
         "taskId": "task-a",
+        "preparedBatchId": "d-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "dup",
-            "eventType": "stream",
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
-            "payload": {}
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           },
           {
             "ingestEventId": "dup",
-            "eventType": "tool",
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "tool.call",
+            "providerEventId": null,
             "sourceSeq": 1,
-            "payload": {}
+            "streamId": null,
+            "batchOrdinal": 1,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 1,
+            "ingestedAt": "2026-08-05T00:00:02Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
         ]
       },
@@ -341,47 +1054,57 @@
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
     },
     {
       "name": "task-id-mismatch",
       "reason": "事件 taskId 与 batch.taskId 不一致",
       "batch": {
-        "batchId": "m-0",
         "taskId": "task-a",
+        "preparedBatchId": "m-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "m1",
             "taskId": "task-OTHER",
-            "eventType": "stream",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
             "sourceSeq": 0,
-            "payload": {}
-          }
-        ]
-      },
-      "anchor": {
-        "committedTaskSeq": null,
-        "committedHead": null
-      },
-      "durableAt": "2026-08-04T00:03:00Z"
-    },
-    {
-      "name": "unknown-field",
-      "reason": "事件含 schema 未声明字段",
-      "batch": {
-        "batchId": "u-0",
-        "taskId": "task-a",
-        "batchOrdinal": 0,
-        "previousHead": null,
-        "events": [
-          {
-            "ingestEventId": "u1",
-            "eventType": "stream",
-            "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
             "payload": {},
-            "eventDigest": "sha256:precooked"
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
         ]
       },
@@ -389,21 +1112,56 @@
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
     },
     {
       "name": "missing-required-field",
       "reason": "事件缺 sourceSeq",
       "batch": {
-        "batchId": "r-0",
         "taskId": "task-a",
+        "preparedBatchId": "r-0",
         "batchOrdinal": 0,
         "previousHead": null,
         "events": [
           {
             "ingestEventId": "r1",
-            "eventType": "stream",
-            "payload": {}
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 0
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
           }
         ]
       },
@@ -411,7 +1169,64 @@
         "committedTaskSeq": null,
         "committedHead": null
       },
-      "durableAt": "2026-08-04T00:03:00Z"
+      "durableAt": "2026-08-05T00:03:00Z"
+    },
+    {
+      "name": "missing-prepared-batch-id",
+      "reason": "batch 缺 preparedBatchId",
+      "batch": {
+        "taskId": "task-a",
+        "batchOrdinal": 0,
+        "previousHead": null,
+        "events": [
+          {
+            "ingestEventId": "p1",
+            "taskId": "task-a",
+            "runId": "r",
+            "stepId": "s",
+            "attemptId": "a",
+            "source": "claude",
+            "eventType": "process.started",
+            "providerEventId": null,
+            "sourceSeq": 0,
+            "streamId": null,
+            "batchOrdinal": 0,
+            "sourceTransportSpan": {
+              "coordinate": "none",
+              "start": null,
+              "endExclusive": null,
+              "mappingPrecision": "none"
+            },
+            "sanitizedStreamSpan": {
+              "segmentId": "s",
+              "start": 0,
+              "endExclusive": 100
+            },
+            "wallTime": "2026-08-05T00:00:00Z",
+            "monotonicTimeNs": 0,
+            "ingestedAt": "2026-08-05T00:00:01Z",
+            "providerVersion": "v",
+            "adapterVersion": "1",
+            "processIdentity": {
+              "executorId": "e",
+              "hostId": "h",
+              "runtime": "local-windows",
+              "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "pid": 1,
+              "processStartTime": "2026-08-05T00:00:00Z",
+              "jobObjectId": "j"
+            },
+            "payload": {},
+            "sanitizedProviderFrameDigest": null,
+            "redactions": []
+          }
+        ]
+      },
+      "anchor": {
+        "committedTaskSeq": null,
+        "committedHead": null
+      },
+      "durableAt": "2026-08-05T00:03:00Z"
     }
   ],
   "invariants": {
@@ -423,7 +1238,12 @@
       "taskA": "genesis-two-events",
       "taskB": "task-b-genesis-interleaved"
     },
+    "crossBatchChainLinked": {
+      "batch1": "genesis-two-events",
+      "batch2": "task-a-second-batch"
+    },
     "predecessorDriftRejected": "predecessor-drift",
+    "missingPreparedBatchIdRejected": "missing-prepared-batch-id",
     "competingBatchOnlyOneWins": "competing-batch-cas-loser"
   }
 }

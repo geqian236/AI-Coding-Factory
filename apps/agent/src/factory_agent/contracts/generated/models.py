@@ -201,47 +201,101 @@ class PreparedEventV2(TypedDict, total=False):
 
 class PreparedBatchV2(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
-    # 批次唯一 ID
-    batchId: str
-    # 所属任务 ID
-    taskId: str
-    # 批次序号，用于稳定 identity 生成
-    batchOrdinal: int
-    # 批次内预备事件列表
-    events: list[Any]
-    # 前驱批次 head 摘要（genesis 批次为 null）
-    previousHead: Optional[str]
-    # claim 时的 writer epoch，用于竞争检测
-    claimEpoch: Optional[int]
-    # 批次预备时间
+    # 批次唯一稳定 ID。
+    preparedBatchId: str
+    # claim 时的 writer epoch（用于竞争检测）。
+    writerEpoch: int
+    # 批次状态机（§11 ingest_batches）。正常转换仅 CLAIMED → PREPARING → PREPARED → COMMITTED；旧 epoch pre-commit 状态只能由 Reconciler CAS 为 ABANDONED。COMMITTED/ABANDONED 均为终态。
+    state: Literal["CLAIMED", "PREPARING", "PREPARED", "COMMITTED"]
+    # 按 batchOrdinal 排列的全量稳定 ingestEventId 列表（权威顺序）。
+    orderedIngestIds: list[str]
+    # 每个 Task 唯一的 expectedCommittedHead 锚点 + 批内 ordinal 范围（§11 ingest_batch_task_heads）。
+    perTaskExpectedHeads: list[dict[str, Any]]
+    # segment digest 列表。
+    segmentDigests: list[dict[str, Any]]
+    # 总事件数。
+    eventCount: int
+    # 总 payload 字节数。
+    payloadBytes: int
+    # 本批首事件 batchOrdinal。
+    firstBatchOrdinal: int
+    # 本批末事件 batchOrdinal。
+    lastBatchOrdinal: int
+    # 本批最旧 ingestedAt。
+    oldestIngestedAt: str
+    # 本批 prepared 完成时间。
     preparedAt: str
+    # PreparedBatch schema 版本。
+    schemaVersion: Literal[2]
+    # coordinator 版本（compatibility manifest 绑定）。
+    coordinatorVersion: str
 
 class DurableEventV2(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
-    # 物化器分配的全局唯一事件 ID
+    # 事件 schema 版本（v2）。Phase 1+ 字段集演进时升级。
+    schemaVersion: Literal[2]
+    # 耐久化等级（§10.4）：authoritative_state=内部权威 state.changed/lease/授权；side_effect_receipt=外部副作用 receipt；provider_source=Provider semantic/public frame；derived=UI summary/指标等可重建派生。
+    durabilityClass: Literal["authoritative_state", "side_effect_receipt", "provider_source", "derived"]
+    # 物化器分配的全局唯一事件 ID（evt_<64 位小写十六进制>，SHA-256(JCS([factory-event-id-v2, ingestEventId]))）。崩溃重试得到同一身份。
     eventId: str
-    # 所属任务 ID
+    # 所属任务 ID。
     taskId: str
-    # 任务内单调递增序号（由物化器分配）
+    # 任务内单调递增序号（由物化器分配，CAS 持久）。UI cursor 用 (taskId, taskSeq)。
     taskSeq: int
-    # 所属批次序号
-    batchOrdinal: int
-    # 事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。
-    eventDigest: str
-    # 前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。
-    previousEventDigest: Optional[str]
-    # 原始摄取 ID（来自 PreparedEventV2）
+    # 所属 Run ID。
+    runId: str
+    # 单 Run 内诊断序号（不能跨 Run 唯一）。
+    runSeq: int
+    # 所属 Step ID。
+    stepId: str
+    # 所属 Attempt ID。
+    attemptId: str
+    # 事件来源 actor 身份。
+    source: Literal["claude", "codex", "verifier", "release", "orchestrator"]
+    # 原始摄取 ID（来自 PreparedEventV2）。
     ingestEventId: str
-    # 事件类型
-    eventType: Literal["stream", "provider-semantic", "tool", "state", "gate", "receipt", "control", "heartbeat"]
-    # 来源端序号
+    # 具体事件类型（§10.1）。model.summary 必带 summaryOrigin=provider_public + providerEventId + sanitizedProviderFrameRef + sanitizedProviderFrameDigest。
+    eventType: Literal["process.started", "stream.segment.committed", "stream.terminated", "model.summary", "orchestrator.objective", "tool.call", "tool.result", "state.changed"]
+    # Provider 事件 ID（model.summary 等 provider 源事件必填，普通事件 null）。
+    providerEventId: Optional[str]
+    # Provider 来源端序号（用于去重与对齐）。
     sourceSeq: int
-    # 事件负载（已脱敏）
+    # Provider stream 稳定 ID（stream.* 事件必填；非 stream 事件 null）。
+    streamId: Optional[str]
+    # 所属 PreparedBatchV2 的 batchId。物化器先 claim 批次，再组装 PreparedBatch，最后逐条物化 DurableEvent。
+    preparedBatchId: str
+    # 所属 PreparedBatch 内的事件序号（与 manifest 的 orderedIngestIds 一致）。
+    batchOrdinal: int
+    # 源传输 span：内存中以原始传输字节精确计数。credential/secret/PII 仅存 providerEventId/sourceSeq 与诚实的 mappingPrecision（byte|field|frame|none），精确字节起止不能进普通事件。
+    sourceTransportSpan: dict[str, Any]
+    # 脱敏后 span：精确指向持久化脱敏字节。脱敏改变长度时不得与 sourceTransportSpan 冒充同一坐标。
+    sanitizedStreamSpan: dict[str, Any]
+    # RFC3339 接收 wall time（仅用于显示，不能参与排序）。
+    wallTime: str
+    # 单调时钟纳秒。
+    monotonicTimeNs: int
+    # 完整 frame 闭合后写入脱敏器的时刻（首字节到闭合仅记录 frame_assembly_ms 不写入）。
+    ingestedAt: str
+    # Provider CLI 上报版本。
+    providerVersion: str
+    # Adapter 自身 semver 版本。
+    adapterVersion: str
+    # 受管进程身份（§10.1）：用于 RUNNING 真实性校验（PID/Job Object/WSL/container exec）。
+    processIdentity: dict[str, Any]
+    # 事件负载（已脱敏，未脱敏原文不得落盘）。
     payload: dict[str, Any]
-    # 负载内容摘要
-    payloadDigest: Optional[str]
-    # 耐久化完成时间
-    durableAt: str
+    # 已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃。model.summary 必填，其它 null。
+    sanitizedProviderFrameDigest: Optional[str]
+    # 脱敏后 payload 的 JCS 摘要。
+    payloadDigest: str
+    # 前驱事件 eventDigest（genesis 用 sha256:<64 个 0> 固定 predecessor）。
+    previousEventDigest: str
+    # 本事件 SHA-256(JCS(去除 eventDigest 字段后完整对象))。previousEventDigest 仍参与计算。
+    eventDigest: str
+    # 本事件命中脱敏点列表（不含原文、低熵 hash 或可推断秘密长度的 redaction manifest）。
+    redactions: list[dict[str, Any]]
+    # redactions 列表内容的 SHA-256 摘要。
+    redactionManifestDigest: str
 
 class IpcEnvelope(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""

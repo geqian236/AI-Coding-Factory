@@ -2,71 +2,338 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/durable-event.v2.schema.json",
   "title": "DurableEventV2",
-  "description": "耐久化后的事件，包含 taskSeq、eventId、previousEventDigest 与 eventDigest。事件链使用 previousEventDigest 单链模型（Master Spec §10.1）：genesis 事件 previousEventDigest = sha256:<64 个 0>。eventDigest = SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的完整对象))，故 previousEventDigest 仍是计算输入的一部分，构成防篡改链。",
+  "description": "耐久化后的事件（Master Spec §10.1 字段集完整版）。事件链使用 previousEventDigest 单链：genesis 事件 previousEventDigest = sha256:<64 个 0>；eventDigest = SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的完整对象))，previousEventDigest 仍参与计算。additionalProperties:false 拒绝 schema 未声明字段混入 v2 hash。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["eventId", "taskId", "taskSeq", "batchOrdinal", "previousEventDigest", "eventDigest", "ingestEventId", "eventType", "sourceSeq", "payload", "durableAt"],
+  "required": [
+    "schemaVersion",
+    "durabilityClass",
+    "eventId",
+    "taskId",
+    "taskSeq",
+    "runId",
+    "runSeq",
+    "stepId",
+    "attemptId",
+    "source",
+    "ingestEventId",
+    "eventType",
+    "providerEventId",
+    "sourceSeq",
+    "streamId",
+    "preparedBatchId",
+    "batchOrdinal",
+    "sourceTransportSpan",
+    "sanitizedStreamSpan",
+    "wallTime",
+    "monotonicTimeNs",
+    "ingestedAt",
+    "providerVersion",
+    "adapterVersion",
+    "processIdentity",
+    "payload",
+    "sanitizedProviderFrameDigest",
+    "payloadDigest",
+    "previousEventDigest",
+    "eventDigest",
+    "redactions",
+    "redactionManifestDigest"
+  ],
   "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 2,
+      "description": "事件 schema 版本（v2）。Phase 1+ 字段集演进时升级。"
+    },
+    "durabilityClass": {
+      "type": "string",
+      "enum": [
+        "authoritative_state",
+        "side_effect_receipt",
+        "provider_source",
+        "derived"
+      ],
+      "description": "耐久化等级（§10.4）：authoritative_state=内部权威 state.changed/lease/授权；side_effect_receipt=外部副作用 receipt；provider_source=Provider semantic/public frame；derived=UI summary/指标等可重建派生。"
+    },
     "eventId": {
       "type": "string",
       "minLength": 1,
-      "description": "物化器分配的全局唯一事件 ID"
+      "description": "物化器分配的全局唯一事件 ID（evt_<64 位小写十六进制>，SHA-256(JCS([factory-event-id-v2, ingestEventId]))）。崩溃重试得到同一身份。"
     },
     "taskId": {
       "type": "string",
       "minLength": 1,
-      "description": "所属任务 ID"
+      "description": "所属任务 ID。"
     },
     "taskSeq": {
       "type": "integer",
       "minimum": 0,
-      "description": "任务内单调递增序号（由物化器分配）"
+      "description": "任务内单调递增序号（由物化器分配，CAS 持久）。UI cursor 用 (taskId, taskSeq)。"
     },
-    "batchOrdinal": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "所属批次序号"
-    },
-    "eventDigest": {
+    "runId": {
       "type": "string",
       "minLength": 1,
-      "description": "事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。"
+      "description": "所属 Run ID。"
     },
-    "previousEventDigest": {
-      "type": ["string", "null"],
-      "description": "前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。"
+    "runSeq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "单 Run 内诊断序号（不能跨 Run 唯一）。"
+    },
+    "stepId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 Step ID。"
+    },
+    "attemptId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 Attempt ID。"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["claude", "codex", "verifier", "release", "orchestrator"],
+      "description": "事件来源 actor 身份。"
     },
     "ingestEventId": {
       "type": "string",
       "minLength": 1,
-      "description": "原始摄取 ID（来自 PreparedEventV2）"
+      "description": "原始摄取 ID（来自 PreparedEventV2）。"
     },
     "eventType": {
       "type": "string",
       "enum": [
-        "stream", "provider-semantic", "tool", "state",
-        "gate", "receipt", "control", "heartbeat"
+        "process.started",
+        "stream.segment.committed",
+        "stream.terminated",
+        "model.summary",
+        "orchestrator.objective",
+        "tool.call",
+        "tool.result",
+        "state.changed"
       ],
-      "description": "事件类型"
+      "description": "具体事件类型（§10.1）。model.summary 必带 summaryOrigin=provider_public + providerEventId + sanitizedProviderFrameRef + sanitizedProviderFrameDigest。"
+    },
+    "providerEventId": {
+      "type": ["string", "null"],
+      "description": "Provider 事件 ID（model.summary 等 provider 源事件必填，普通事件 null）。"
     },
     "sourceSeq": {
       "type": "integer",
       "minimum": 0,
-      "description": "来源端序号"
+      "description": "Provider 来源端序号（用于去重与对齐）。"
+    },
+    "streamId": {
+      "type": ["string", "null"],
+      "description": "Provider stream 稳定 ID（stream.* 事件必填；非 stream 事件 null）。"
+    },
+    "preparedBatchId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 PreparedBatchV2 的 batchId。物化器先 claim 批次，再组装 PreparedBatch，最后逐条物化 DurableEvent。"
+    },
+    "batchOrdinal": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "所属 PreparedBatch 内的事件序号（与 manifest 的 orderedIngestIds 一致）。"
+    },
+    "sourceTransportSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate", "start", "endExclusive", "mappingPrecision"],
+      "description": "源传输 span：内存中以原始传输字节精确计数。credential/secret/PII 仅存 providerEventId/sourceSeq 与诚实的 mappingPrecision（byte|field|frame|none），精确字节起止不能进普通事件。",
+      "properties": {
+        "coordinate": {
+          "type": "string",
+          "enum": [
+            "provider_transport_bytes",
+            "provider_transport_chars",
+            "none"
+          ],
+          "description": "坐标轴。provider_transport_bytes=原始字节；provider_transport_chars=字符偏移；none=无意义。"
+        },
+        "start": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "起始字节/字符偏移（不含）。坐标轴=none 时必须为 null。"
+        },
+        "endExclusive": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "结束字节/字符偏移（不含）。坐标轴=none 时必须为 null。"
+        },
+        "mappingPrecision": {
+          "type": "string",
+          "enum": ["byte", "field", "frame", "none"],
+          "description": "精度（§10.4）：credential 默认不高于 field/frame；stream.segment.* 一般为 byte 或 frame。"
+        }
+      }
+    },
+    "sanitizedStreamSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["segmentId", "start", "endExclusive"],
+      "description": "脱敏后 span：精确指向持久化脱敏字节。脱敏改变长度时不得与 sourceTransportSpan 冒充同一坐标。",
+      "properties": {
+        "segmentId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "自描述脱敏 stream segment ID（指向 stream_segments 表）。"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "脱敏 segment 内字节偏移（不含）。"
+        },
+        "endExclusive": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "脱敏 segment 内字节偏移（不含）。"
+        }
+      }
+    },
+    "wallTime": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 接收 wall time（仅用于显示，不能参与排序）。"
+    },
+    "monotonicTimeNs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "单调时钟纳秒。"
+    },
+    "ingestedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "完整 frame 闭合后写入脱敏器的时刻（首字节到闭合仅记录 frame_assembly_ms 不写入）。"
+    },
+    "providerVersion": {
+      "type": "string",
+      "description": "Provider CLI 上报版本。"
+    },
+    "adapterVersion": {
+      "type": "string",
+      "description": "Adapter 自身 semver 版本。"
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executorId",
+        "hostId",
+        "runtime",
+        "executableDigest",
+        "pid",
+        "processStartTime",
+        "jobObjectId"
+      ],
+      "description": "受管进程身份（§10.1）：用于 RUNNING 真实性校验（PID/Job Object/WSL/container exec）。",
+      "properties": {
+        "executorId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "执行者稳定 ID。"
+        },
+        "hostId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "主机指纹。"
+        },
+        "runtime": {
+          "type": "string",
+          "enum": ["local-windows", "wsl-docker", "wsl-process", "container"],
+          "description": "运行时类型。"
+        },
+        "executableDigest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "description": "可执行文件 SHA-256（完整）。"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "进程 PID。"
+        },
+        "processStartTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "进程启动 wall time。"
+        },
+        "jobObjectId": {
+          "type": ["string", "null"],
+          "description": "Windows Job Object ID（local-windows 必填；wsl/container 可为 null）。"
+        },
+        "wslDistro": {
+          "type": ["string", "null"],
+          "description": "WSL distro 名（runtime=wsl-* 必填；否则 null）。"
+        },
+        "containerId": {
+          "type": ["string", "null"],
+          "description": "容器 ID（runtime=container 必填）。"
+        },
+        "imageDigest": {
+          "type": ["string", "null"],
+          "description": "容器镜像 digest（runtime=container 必填）。"
+        }
+      }
     },
     "payload": {
       "type": "object",
-      "description": "事件负载（已脱敏）"
+      "description": "事件负载（已脱敏，未脱敏原文不得落盘）。"
+    },
+    "sanitizedProviderFrameDigest": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃。model.summary 必填，其它 null。"
     },
     "payloadDigest": {
       "type": "string",
-      "minLength": 1,
-      "description": "负载内容摘要"
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "脱敏后 payload 的 JCS 摘要。"
     },
-    "durableAt": {
+    "previousEventDigest": {
       "type": "string",
-      "format": "date-time",
-      "description": "耐久化完成时间"
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "前驱事件 eventDigest（genesis 用 sha256:<64 个 0> 固定 predecessor）。"
+    },
+    "eventDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "本事件 SHA-256(JCS(去除 eventDigest 字段后完整对象))。previousEventDigest 仍参与计算。"
+    },
+    "redactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["patternId", "byteRange", "replacement"],
+        "properties": {
+          "patternId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "命中的脱敏规则 ID。"
+          },
+          "byteRange": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "endExclusive"],
+            "properties": {
+              "start": {"type": "integer", "minimum": 0},
+              "endExclusive": {"type": "integer", "minimum": 0}
+            }
+          },
+          "replacement": {
+            "type": "string",
+            "description": "替换值（[REDACTED] / [REDACTED:uncertain] / 类型化标记）。"
+          }
+        }
+      },
+      "description": "本事件命中脱敏点列表（不含原文、低熵 hash 或可推断秘密长度的 redaction manifest）。"
+    },
+    "redactionManifestDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "redactions 列表内容的 SHA-256 摘要。"
     }
   }
 }
