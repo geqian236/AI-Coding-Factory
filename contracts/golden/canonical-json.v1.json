@@ -1,6 +1,6 @@
 {
   "version": "canonical-json-v1",
-  "description": "RFC 8785 JCS + Unicode NFC 规范化跨语言 golden vectors (Phase 0 整数值数字子集)。",
+  "description": "RFC 8785 JCS + Unicode NFC 规范化跨语言 golden vectors（完整 ES6 数字序列化）。",
   "accept": [
     {
       "name": "key-sort-basic",
@@ -31,6 +31,51 @@
       "name": "max-safe-int",
       "inputJsonText": "9007199254740991",
       "expectedCanonical": "9007199254740991"
+    },
+    {
+      "name": "decimal-simple",
+      "inputJsonText": "1.5",
+      "expectedCanonical": "1.5"
+    },
+    {
+      "name": "decimal-negative",
+      "inputJsonText": "-2.5",
+      "expectedCanonical": "-2.5"
+    },
+    {
+      "name": "decimal-thousandths",
+      "inputJsonText": "0.001",
+      "expectedCanonical": "0.001"
+    },
+    {
+      "name": "decimal-mixed",
+      "inputJsonText": "1234.5",
+      "expectedCanonical": "1234.5"
+    },
+    {
+      "name": "exp-to-decimal",
+      "inputJsonText": "1e-6",
+      "expectedCanonical": "0.000001"
+    },
+    {
+      "name": "exp-stays-exp-neg7",
+      "inputJsonText": "1e-7",
+      "expectedCanonical": "1e-7"
+    },
+    {
+      "name": "exp-stays-exp-5e-8",
+      "inputJsonText": "5e-8",
+      "expectedCanonical": "5e-8"
+    },
+    {
+      "name": "exp-positive-collapses",
+      "inputJsonText": "1.25e2",
+      "expectedCanonical": "125"
+    },
+    {
+      "name": "float-integer-valued",
+      "inputJsonText": "3.0",
+      "expectedCanonical": "3"
     },
     {
       "name": "null-value",
@@ -100,13 +145,38 @@
       "expectedErrorCode": "canonical-json-error"
     },
     {
-      "name": "non-integer-float",
-      "inputJsonText": "1.5",
+      "name": "over-max-safe-int",
+      "inputJsonText": "9007199254740993",
       "expectedErrorCode": "canonical-json-error"
     },
     {
-      "name": "over-max-safe-int",
-      "inputJsonText": "9007199254740993",
+      "name": "over-range-float-exp",
+      "inputJsonText": "1e20",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "leading-zero",
+      "inputJsonText": "01",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "trailing-dot",
+      "inputJsonText": "1.",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "dot-then-exp",
+      "inputJsonText": "1.e5",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "no-int-part",
+      "inputJsonText": ".5",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "exp-no-digits",
+      "inputJsonText": "1e",
       "expectedErrorCode": "canonical-json-error"
     }
   ]

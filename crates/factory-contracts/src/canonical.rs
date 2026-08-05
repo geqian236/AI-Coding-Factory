@@ -12,9 +12,9 @@
 //!      与 UTF-16 code unit 序在补充平面字符上不同，故必须显式用
 //!      `encode_utf16()` 序列比较。
 //!   3. 输出无多余空白；字符串按 RFC 8785 §3.2.2.2 最小化转义。
-//!   4. 数字仅接受「有限整数值且落在 [-(2^53-1), 2^53-1]」者，
-//!      统一输出十进制整数字面量：1 与 1.0 → "1"；-0 → "0"；1e2 → "100"。
-//!      小数、NaN、Infinity、超范围整数一律拒绝（Phase 0 保守子集）。
+//!   4. 数字按 RFC 8785 §3.2.2.3（ES6 Number::toString）最短可往返序列化：
+//!      1 与 1.0 → "1"；-0 → "0"；1e2 → "100"；1.5 → "1.5"；1e-7 → "1e-7"。
+//!      仅拒绝 NaN、Infinity、超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1] 的数字。
 //!   5. 解析 JSON 文本时拒绝重复对象键（自定义 serde Visitor 检测）。
 //!
 //! 失败错误码：canonical-json-error
@@ -215,10 +215,55 @@ fn encode_string(out: &mut String, text: &str) {
     out.push('"');
 }
 
-/// 按 Phase 0 整数值数字规则编码数字并追加到 out。
+/// 按 ECMAScript Number::toString（RFC 8785 §3.2.2.3）格式化非负有效数字。
+/// digit_str 为最短、末位非零的有效数字串（长度 k≥1），n 满足
+/// value = int(digit_str) × 10^(n-k)。据 ECMA-262 分四种情形输出：
+///   - k ≤ n ≤ 21：digit_str 后补 (n-k) 个 0（纯整数）。
+///   - 0 < n ≤ 21：在第 n 位后插入小数点。
+///   - -6 < n ≤ 0："0." + (-n) 个 0 + digit_str。
+///   - 其余（n>21 或 n≤-6）：指数形式 d1[.d2..dk]e±(n-1)。
+fn es6_format(digit_str: &str, n: i64) -> String {
+    let k = digit_str.len() as i64;
+    if k <= n && n <= 21 {
+        // 纯整数：末尾补零。
+        let mut s = String::from(digit_str);
+        s.push_str(&"0".repeat((n - k) as usize));
+        return s;
+    }
+    if 0 < n && n <= 21 {
+        // 在第 n 位后插入小数点（digit_str 全 ASCII 数字，按字节切分安全）。
+        let n_us = n as usize;
+        return format!("{}.{}", &digit_str[..n_us], &digit_str[n_us..]);
+    }
+    if -6 < n && n <= 0 {
+        return format!("0.{}{}", "0".repeat((-n) as usize), digit_str);
+    }
+    // 指数形式：尾数首位后接小数点与其余位，指数为 n-1。
+    let (first, rest) = digit_str.split_at(1);
+    let mantissa = if rest.is_empty() {
+        String::from(first)
+    } else {
+        format!("{first}.{rest}")
+    };
+    let e = n - 1;
+    format!("{mantissa}e{}{}", if e >= 0 { "+" } else { "-" }, e.abs())
+}
+
+/// 按 RFC 8785 §3.2.2.3（ES6 Number::toString）序列化数字并追加到 out。
+/// 与 Python/TypeScript 字节一致：接受 I-JSON 可互操作范围内的小数/指数，
+/// 仅拒绝 NaN/Infinity/超范围。
 fn encode_number(out: &mut String, value: &CanonValue) -> Result<(), CanonicalJsonError> {
-    let int_value: i64 = match value {
-        CanonValue::Int(i) => *i,
+    match value {
+        CanonValue::Int(i) => {
+            if *i < MIN_SAFE || *i > MAX_SAFE {
+                return Err(CanonicalJsonError::new(
+                    "数字超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1]",
+                ));
+            }
+            // 范围内整数的 ES6 形式即其十进制，无指数。
+            out.push_str(&i.to_string());
+            Ok(())
+        }
         CanonValue::Float(f) => {
             if f.is_nan() {
                 return Err(CanonicalJsonError::new("拒绝 NaN"));
@@ -226,28 +271,35 @@ fn encode_number(out: &mut String, value: &CanonValue) -> Result<(), CanonicalJs
             if f.is_infinite() {
                 return Err(CanonicalJsonError::new("拒绝 Infinity"));
             }
-            if f.fract() != 0.0 {
-                return Err(CanonicalJsonError::new(format!(
-                    "Phase 0 仅接受整数值数字，收到非整数（version={CANONICAL_JSON_VERSION}）"
-                )));
-            }
-            // 先做范围判断再转 i64，避免超范围 f64 转换未定义。
             if *f < MIN_SAFE as f64 || *f > MAX_SAFE as f64 {
                 return Err(CanonicalJsonError::new(
                     "数字超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1]",
                 ));
             }
-            *f as i64
+            // -0.0 与 0.0 统一为 "0"。
+            if *f == 0.0 {
+                out.push('0');
+                return Ok(());
+            }
+            let sign = if *f < 0.0 { "-" } else { "" };
+            // Rust `{:e}` 给出最短可往返尾数（首位后带小数点）与十进制指数 E，
+            // 即 abs = D.ddd × 10^E，故有效数字串首位前恰有一位，n = E + 1。
+            let sci = format!("{:e}", f.abs());
+            let (mantissa, exp_str) = sci
+                .split_once('e')
+                .expect("Rust {:e} 输出必含 'e'");
+            let exp: i64 = exp_str.parse().expect("指数应为整数");
+            // 去掉小数点得到有效数字串，再去尾随零（保持最短，n=E+1 不受影响）。
+            let raw: String = mantissa.chars().filter(|c| *c != '.').collect();
+            let trimmed = raw.trim_end_matches('0');
+            let digit_str = if trimmed.is_empty() { "0" } else { trimmed };
+            let n = exp + 1;
+            out.push_str(sign);
+            out.push_str(&es6_format(digit_str, n));
+            Ok(())
         }
         _ => unreachable!("encode_number 仅处理 Int/Float"),
-    };
-    if int_value < MIN_SAFE || int_value > MAX_SAFE {
-        return Err(CanonicalJsonError::new(
-            "数字超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1]",
-        ));
     }
-    out.push_str(&int_value.to_string());
-    Ok(())
 }
 
 /// 递归将 CanonValue 编码为规范 JSON 字符串片段（无多余空白）。

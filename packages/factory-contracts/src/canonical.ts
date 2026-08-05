@@ -10,10 +10,12 @@
  *   2. 对象键按 UTF-16 code unit 序升序排列；JS 字符串原生即 UTF-16，
  *      默认字符串比较即按 code unit 序，故直接用默认比较器。
  *   3. 输出无多余空白；字符串按 RFC 8785 §3.2.2.2 最小化转义。
- *   4. 数字仅接受「有限整数值且落在 [-(2^53-1), 2^53-1]」者，
- *      统一输出十进制整数字面量：1 与 1.0 → "1"；-0 → "0"；1e2 → "100"。
- *      小数、NaN、Infinity、超范围整数一律拒绝（Phase 0 保守子集）。
- *   5. 解析 JSON 文本时拒绝重复对象键（手写严格解析器）。
+ *   4. 数字按 RFC 8785 §3.2.2.3（ECMAScript Number::toString，最短可往返）序列化：
+ *      1 与 1.0 → "1"；-0 → "0"；1e2 → "100"；1.5 → "1.5"；1e-7 → "1e-7"。
+ *      仅拒绝 NaN、Infinity 和超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1] 的数字。
+ *      JS 的 String(value) 原生即该算法，故直接使用。
+ *   5. 解析 JSON 文本时拒绝重复对象键，并严格遵循 RFC 8259 数字文法
+ *      （拒绝前导零 01、尾随小数点 1.、缺尾数指数 1.e5 等 Python/Rust 亦拒绝的形式）。
  *
  * 失败错误码：canonical-json-error
  */
@@ -72,8 +74,9 @@ function encodeString(text: string): string {
 }
 
 /**
- * 按 Phase 0 整数值数字规则编码数字。
- * @throws CanonicalJsonError 数字为 NaN/Infinity、非整数值或超出安全范围。
+ * 按 RFC 8785 §3.2.2.3（ECMAScript Number::toString）序列化数字。
+ * JS 的 String(value) 原生即该「最短可往返」算法，故仅需前置守卫。
+ * @throws CanonicalJsonError 数字为 NaN/Infinity 或超出 I-JSON 可互操作范围。
  */
 function encodeNumber(value: number): string {
   if (Number.isNaN(value)) {
@@ -82,15 +85,11 @@ function encodeNumber(value: number): string {
   if (!Number.isFinite(value)) {
     throw new CanonicalJsonError("拒绝 Infinity");
   }
-  if (!Number.isInteger(value)) {
-    throw new CanonicalJsonError(
-      `Phase 0 仅接受整数值数字，收到非整数（version=${CANONICAL_JSON_VERSION}）`,
-    );
-  }
   if (value < MIN_SAFE || value > MAX_SAFE) {
     throw new CanonicalJsonError("数字超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1]");
   }
-  // String(-0) === "0"，Number.isInteger(-0) === true，符合规则。
+  // String(-0) === "0"；String(1) === "1"；String(1.5) === "1.5"；
+  // String(1e-7) === "1e-7"，与 RFC 8785 §3.2.2.3 完全一致。
   return String(value);
 }
 
@@ -306,18 +305,43 @@ class StrictParser {
   }
 
   private parseNumber(): number {
+    // 严格 RFC 8259 数字文法，逐段消费，杜绝宽松 Number() 接受的非法形式
+    // （如 "01"、"1."、"1.e5"、单独 "-"、".5"）；Python json / Rust serde_json
+    // 天然按此文法拒绝，TS 必须对齐否则三语言解析不一致。
     const start = this.i;
+    const isDigit = (c: string): boolean => c >= "0" && c <= "9";
+
+    // 可选负号
     if (this.s[this.i] === "-") this.i++;
-    while (this.i < this.s.length && /[0-9]/.test(this.s[this.i])) this.i++;
+
+    // 整数部分：单个 '0' 或 [1-9][0-9]*（禁止前导零如 "01"）
+    if (this.s[this.i] === "0") {
+      this.i++;
+    } else if (isDigit(this.s[this.i])) {
+      while (this.i < this.s.length && isDigit(this.s[this.i])) this.i++;
+    } else {
+      throw new CanonicalJsonError(`非法数字：缺少整数位（位置 ${start}）`);
+    }
+
+    // 可选小数部分：'.' 后必须至少一位数字（禁止 "1."）
     if (this.s[this.i] === ".") {
       this.i++;
-      while (this.i < this.s.length && /[0-9]/.test(this.s[this.i])) this.i++;
+      if (!isDigit(this.s[this.i])) {
+        throw new CanonicalJsonError(`非法数字：小数点后缺数字（位置 ${start}）`);
+      }
+      while (this.i < this.s.length && isDigit(this.s[this.i])) this.i++;
     }
+
+    // 可选指数部分：e/E [+/-] 后必须至少一位数字（禁止 "1e"、"1.e5"）
     if (this.s[this.i] === "e" || this.s[this.i] === "E") {
       this.i++;
       if (this.s[this.i] === "+" || this.s[this.i] === "-") this.i++;
-      while (this.i < this.s.length && /[0-9]/.test(this.s[this.i])) this.i++;
+      if (!isDigit(this.s[this.i])) {
+        throw new CanonicalJsonError(`非法数字：指数缺数字（位置 ${start}）`);
+      }
+      while (this.i < this.s.length && isDigit(this.s[this.i])) this.i++;
     }
+
     const token = this.s.slice(start, this.i);
     const value = Number(token);
     if (Number.isNaN(value)) {

@@ -7,13 +7,14 @@
   1. 所有字符串（对象键与字符串值）先递归做 Unicode NFC 归一化。
   2. 对象键按 UTF-16 code unit 序列升序排列（RFC 8785 §3.2.3）。
   3. 输出无任何多余空白；字符串按 RFC 8785 §3.2.2.2 最小化转义。
-  4. 数字仅接受「有限且为整数值、且落在 I-JSON 可互操作范围
-     [-(2^53-1), 2^53-1] 内」者，统一以十进制整数字面量输出：
-       1 与 1.0 → "1"；-0 → "0"；1e2 → "100"。
-     小数（如 1.5）、NaN、Infinity、超范围整数一律拒绝。
-     这是 Phase 0 为保证三语言字节级确定性而采用的保守子集；
-     完整 ES6 最短浮点序列化留待具备 Rust 工具链后再引入。
-  5. 解析 JSON 文本时拒绝重复对象键。
+  4. 数字按 RFC 8785 §3.2.2.3 用 ECMAScript Number::toString 序列化：
+     取「最短且可精确往返」的十进制表示。1 与 1.0 → "1"；-0 → "0"；
+     1e2 → "100"；1.5 → "1.5"；1e-7 → "1e-7"；1e-6 → "0.000001"。
+     仅拒绝 NaN、Infinity 与超出 I-JSON 可互操作范围
+     [-(2^53-1), 2^53-1] 的数字（含大整数与大幅值浮点）；范围内的合法小数
+     与指数均接受。Python/Rust 复刻 ES6 算法以与 TypeScript 的 String() 字节一致。
+  5. 解析 JSON 文本时拒绝重复对象键，并按 RFC 8259 严格数字文法
+     （拒绝前导零、尾随小数点、缺数字指数等），与 Rust/TS 一致。
 
 失败错误码（不记录完整计划正文，只暴露稳定 error_code）：
   canonical-json-error
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from decimal import Decimal
 from typing import Any
 
 from factory_agent.errors import FactoryError
@@ -92,37 +94,84 @@ def _encode_string(text: str) -> str:
     return "".join(parts)
 
 
+def _es6_format(digit_str: str, n: int) -> str:
+    """按 ECMAScript Number::toString（RFC 8785 §3.2.2.3）格式化非负数字。
+
+    输入为「最短且末位非零」的有效数字串 digit_str（长度 k≥1）与整数 n，
+    满足 value = int(digit_str) × 10^(n-k)。据 ECMA-262 分四种情形输出：
+      - k ≤ n ≤ 21：digit_str 后补 (n-k) 个 0（纯整数）。
+      - 0 < n ≤ 21：在第 n 位后插入小数点。
+      - -6 < n ≤ 0："0." + (-n) 个 0 + digit_str。
+      - 其余（n>21 或 n≤-6）：指数形式 d1[.d2..dk]e±(n-1)。
+
+    Args:
+        digit_str: 最短有效数字串（无前导/尾随零，除单个 "0"）。
+        n:         使 value = int(digit_str) × 10^(n-len(digit_str)) 成立的整数。
+
+    Returns:
+        ES6 规范数字字面量（不含符号）。
+    """
+    k = len(digit_str)
+    if k <= n <= 21:
+        return digit_str + "0" * (n - k)
+    if 0 < n <= 21:
+        return digit_str[:n] + "." + digit_str[n:]
+    if -6 < n <= 0:
+        return "0." + "0" * (-n) + digit_str
+    # 指数形式：尾数首位后接小数点与其余位，指数为 n-1。
+    mantissa = digit_str[0] if k == 1 else f"{digit_str[0]}.{digit_str[1:]}"
+    e = n - 1
+    return f"{mantissa}e{'+' if e >= 0 else '-'}{abs(e)}"
+
+
 def _encode_number(value: int | float) -> str:
-    """按 Phase 0 整数值数字规则编码数字。
+    """按 RFC 8785 §3.2.2.3（ES6 Number::toString）序列化数字。
 
     Args:
         value: int 或 float（bool 已在上层排除）。
 
     Returns:
-        十进制整数字面量字符串。
+        最短可往返的十进制字面量字符串。
 
     Raises:
-        CanonicalJsonError: 数字为 NaN/Infinity、非整数值或超出安全范围。
+        CanonicalJsonError: 数字为 NaN/Infinity 或超出 I-JSON 可互操作范围。
     """
-    # float 需先排除 NaN / Infinity，再要求整数值
     if isinstance(value, float):
         if value != value:  # NaN 自不相等  # noqa: PLR0124
             raise CanonicalJsonError("拒绝 NaN")
         if value in (float("inf"), float("-inf")):
             raise CanonicalJsonError("拒绝 Infinity")
-        if not value.is_integer():
-            raise CanonicalJsonError(
-                f"Phase 0 仅接受整数值数字，收到非整数（version={CANONICAL_JSON_VERSION}）"
-            )
-        int_value = int(value)
-    else:
-        int_value = value
 
-    if int_value < _MIN_SAFE_INTEGER or int_value > _MAX_SAFE_INTEGER:
+    # I-JSON 可互操作范围：|value| ≤ 2^53-1（同时约束大整数与大幅值浮点）。
+    if value < _MIN_SAFE_INTEGER or value > _MAX_SAFE_INTEGER:
         raise CanonicalJsonError(
             "数字超出 I-JSON 可互操作范围 [-(2^53-1), 2^53-1]"
         )
-    return str(int_value)
+
+    # 整数直接输出十进制（范围内整数的 ES6 形式即其十进制，无指数）。
+    if isinstance(value, int):
+        return str(value)
+
+    # 浮点：-0.0 与 0.0 统一为 "0"。
+    if value == 0.0:
+        return "0"
+
+    sign = "-" if value < 0 else ""
+    # repr(float) 给出最短可往返表示；Decimal 提供精确有效数字与指数。
+    dec = Decimal(repr(abs(value))).as_tuple()
+    digits = list(dec.digits)
+    exp = dec.exponent
+    # 去尾随零（令有效数字串最短），同步调整指数。
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exp += 1
+    # 去前导零。
+    while len(digits) > 1 and digits[0] == 0:
+        digits.pop(0)
+    digit_str = "".join(str(d) for d in digits)
+    # value = int(digit_str) × 10^exp，故 n = exp + k。
+    n = exp + len(digit_str)
+    return sign + _es6_format(digit_str, n)
 
 
 def _encode(value: Any) -> str:
