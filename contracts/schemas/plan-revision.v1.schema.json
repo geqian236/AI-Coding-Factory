@@ -5,7 +5,7 @@
   "description": "计划修订版本，包含 DAG 节点、barrier、stage 映射和谱系信息。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["planRevisionId", "semanticPlanHash", "planRevisionDigest", "nodes", "barriers", "stageMaps", "createdAt"],
+  "required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash", "planRevisionDigest", "dagVersion", "nodeCapabilityMapVersion", "stageCapabilityMapVersion", "nodes", "barriers", "stageMaps", "createdAt"],
   "properties": {
     "planRevisionId": {
       "type": "string",
@@ -16,6 +16,36 @@
       "type": "string",
       "minLength": 1,
       "description": "父修订版本 ID（范围内重规划时设置）"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属任务 ID（§11 plan_revisions.task_id）"
+    },
+    "specRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "规格修订号，单调递增（§11 plan_revisions.spec_revision）"
+    },
+    "intentAuthorizationId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id）"
+    },
+    "dagVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "DAG 版本号（§11 plan_revisions.dag_version）"
+    },
+    "nodeCapabilityMapVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "node→capability 映射版本（§11 plan_revisions.node_capability_map_version）"
+    },
+    "stageCapabilityMapVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version）"
     },
     "semanticPlanHash": {
       "type": "string",

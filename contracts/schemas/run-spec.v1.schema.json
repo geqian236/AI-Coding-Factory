@@ -2,81 +2,253 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/run-spec.v1.schema.json",
   "title": "RunSpec",
-  "description": "一次任务的不可变需求、范围、计划、验收和授权输入。",
+  "description": "规划层生成的不可变、版本化 RunSpec：完整语义文档（Master Spec §8）。semanticPlanHash 从本文档的语义字段投影派生；写入后不可修改，修复只能新建子版本。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["runSpecId", "taskId", "semanticPlanHash", "targetStage", "repositoryBinding", "intentAuthorizationId", "createdAt"],
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "goal",
+    "assumptions",
+    "scope",
+    "constraints",
+    "acceptanceCriteria",
+    "targetStage",
+    "repository",
+    "workPlan",
+    "riskProfile",
+    "nodeCapabilityMapVersion",
+    "stageCapabilityMapVersion",
+    "intentAuthorizationId",
+    "semanticPlanHash"
+  ],
   "properties": {
-    "runSpecId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "RunSpec 唯一 ID"
+    "schemaVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "RunSpec schema 版本号"
+    },
+    "specRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "同一 taskId 下的规格修订序号"
+    },
+    "parentRevisionId": {
+      "type": ["string", "null"],
+      "description": "父 PlanRevision ID；genesis 修订为 null"
     },
     "taskId": {
       "type": "string",
       "minLength": 1,
       "description": "关联任务 ID"
     },
-    "semanticPlanHash": {
+    "goal": {
       "type": "string",
       "minLength": 1,
-      "description": "语义计划哈希（跨 revision 稳定）"
+      "description": "用户目标的结构化表达"
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "规划假设列表"
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include", "exclude"],
+      "description": "范围声明（§8：include/exclude）",
+      "properties": {
+        "include": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "纳入范围的路径/模块"
+        },
+        "exclude": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "排除范围的路径/模块"
+        }
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "约束条件列表"
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "验收条件列表"
     },
     "targetStage": {
       "type": "string",
-      "enum": ["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"],
-      "description": "目标终点阶段（Master Spec §6.1 权威 target_stage 集合）"
+      "enum": [
+        "DESIGN_APPROVED",
+        "CODEX_APPROVED",
+        "PR_READY",
+        "MERGED",
+        "STAGING_ACCEPTED",
+        "PRODUCTION_ACCEPTED"
+      ],
+      "description": "目标终点阶段（Master Spec §6.1 权威 6 阶段）"
     },
-    "repositoryBinding": {
+    "repository": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "repositoryId"],
+      "required": ["mode", "root", "baseBranch"],
+      "description": "仓库绑定（§8：mode/root/baseBranch/baseCommit）",
       "properties": {
         "mode": {
           "type": "string",
           "enum": ["existing", "new"],
           "description": "仓库模式"
         },
-        "repositoryId": {
+        "root": {
           "type": "string",
           "minLength": 1,
-          "description": "仓库唯一标识"
+          "description": "规范化后的 D 盘仓库根路径"
         },
         "baseBranch": {
           "type": "string",
           "minLength": 1,
           "description": "基础分支名"
         },
-        "baseCommitSha": {
+        "baseCommit": {
           "type": "string",
-          "pattern": "^[0-9a-f]{40}$",
-          "description": "existing 模式的 base commit SHA"
-        },
-        "bootstrapPending": {
-          "type": "boolean",
-          "description": "new 模式：bootstrap 尚待完成"
+          "pattern": "^[0-9a-f]{7,40}$",
+          "description": "existing 模式的可信 base commit SHA（new 模式 bootstrap 后填入）"
         }
       }
+    },
+    "workPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dagVersion", "nodes", "barriers"],
+      "description": "工作计划 DAG（§8：dagVersion/nodes/barriers）",
+      "properties": {
+        "dagVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "DAG 结构版本"
+        },
+        "nodes": {
+          "type": "array",
+          "description": "DAG 工作节点列表",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "logicalNodeId",
+              "businessPhase",
+              "barrierOrdinal",
+              "nodeType",
+              "required",
+              "dependsOn",
+              "sideEffectClass",
+              "requiredArtifacts",
+              "successPredicateId",
+              "timeoutMs",
+              "retryPolicyId"
+            ],
+            "properties": {
+              "logicalNodeId": {"type": "string", "minLength": 1},
+              "businessPhase": {"type": "string", "minLength": 1},
+              "barrierOrdinal": {"type": "integer", "minimum": 0},
+              "nodeType": {
+                "type": "string",
+                "enum": [
+                  "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+                  "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+                  "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+                  "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+                  "RECONCILE_TARGET", "RESTORE_DRILL"
+                ]
+              },
+              "required": {"type": "boolean"},
+              "dependsOn": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "sideEffectClass": {"type": "string", "minLength": 1},
+              "requiredArtifacts": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "successPredicateId": {"type": "string", "minLength": 1},
+              "timeoutMs": {"type": "integer", "minimum": 1},
+              "retryPolicyId": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "barriers": {
+          "type": "array",
+          "description": "阶段屏障列表",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "businessPhase",
+              "barrierOrdinal",
+              "requiredNodeIds",
+              "settleTimeoutMs",
+              "passPredicateId"
+            ],
+            "properties": {
+              "businessPhase": {"type": "string", "minLength": 1},
+              "barrierOrdinal": {"type": "integer", "minimum": 0},
+              "requiredNodeIds": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "settleTimeoutMs": {"type": "integer", "minimum": 1},
+              "passPredicateId": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "riskProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "reasons"],
+      "description": "风险画像（§8：level/reasons）",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"],
+          "description": "风险等级"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "风险原因列表"
+        }
+      }
+    },
+    "nodeCapabilityMapVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "node-capability-map 版本标识"
+    },
+    "stageCapabilityMapVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "stage-capability-map 版本标识"
     },
     "intentAuthorizationId": {
       "type": "string",
       "minLength": 1,
-      "description": "IntentAuthorization 唯一 ID"
+      "description": "关联 IntentAuthorization ID"
     },
-    "allowedCapabilitySetDigest": {
+    "semanticPlanHash": {
       "type": "string",
-      "minLength": 1,
-      "description": "服务端求交后的 capability set 摘要"
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "语义计划哈希（跨修订版本稳定，从语义字段投影派生）"
     },
-    "budgetMs": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "自主执行预算（毫秒）"
-    },
-    "expiresAt": {
+    "planRevisionDigest": {
       "type": "string",
-      "format": "date-time",
-      "description": "授权绝对过期时间"
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "完整不可变修订记录摘要（写入 PlanRevision 后填入）"
     },
     "createdAt": {
       "type": "string",

@@ -21,25 +21,44 @@ export interface CredentialRef {
 
 /** RunSpec — 由 generate.py 自动生成，禁止手动修改 */
 export interface RunSpec {
-  /** RunSpec 唯一 ID */
-  runSpecId: string;
+  /** RunSpec schema 版本号 */
+  schemaVersion: number;
+  /** 同一 taskId 下的规格修订序号 */
+  specRevision?: number;
+  /** 父 PlanRevision ID；genesis 修订为 null */
+  parentRevisionId?: string | null;
   /** 关联任务 ID */
   taskId: string;
-  /** 语义计划哈希（跨 revision 稳定） */
-  semanticPlanHash: string;
-  /** 目标终点阶段（Master Spec §6.1 权威 target_stage 集合） */
+  /** 用户目标的结构化表达 */
+  goal: string;
+  /** 规划假设列表 */
+  assumptions: string[];
+  /** 范围声明（§8：include/exclude） */
+  scope: Record<string, unknown>;
+  /** 约束条件列表 */
+  constraints: string[];
+  /** 验收条件列表 */
+  acceptanceCriteria: string[];
+  /** 目标终点阶段（Master Spec §6.1 权威 6 阶段） */
   targetStage: "DESIGN_APPROVED" | "CODEX_APPROVED" | "PR_READY" | "MERGED" | "STAGING_ACCEPTED" | "PRODUCTION_ACCEPTED";
-  repositoryBinding: Record<string, unknown>;
-  /** IntentAuthorization 唯一 ID */
+  /** 仓库绑定（§8：mode/root/baseBranch/baseCommit） */
+  repository: Record<string, unknown>;
+  /** 工作计划 DAG（§8：dagVersion/nodes/barriers） */
+  workPlan: Record<string, unknown>;
+  /** 风险画像（§8：level/reasons） */
+  riskProfile: Record<string, unknown>;
+  /** node-capability-map 版本标识 */
+  nodeCapabilityMapVersion: string;
+  /** stage-capability-map 版本标识 */
+  stageCapabilityMapVersion: string;
+  /** 关联 IntentAuthorization ID */
   intentAuthorizationId: string;
-  /** 服务端求交后的 capability set 摘要 */
-  allowedCapabilitySetDigest?: string;
-  /** 自主执行预算（毫秒） */
-  budgetMs?: number;
-  /** 授权绝对过期时间 */
-  expiresAt?: string;
+  /** 语义计划哈希（跨修订版本稳定，从语义字段投影派生） */
+  semanticPlanHash: string;
+  /** 完整不可变修订记录摘要（写入 PlanRevision 后填入） */
+  planRevisionDigest?: string;
   /** RunSpec 创建时间 */
-  createdAt: string;
+  createdAt?: string;
 }
 
 /** PlanRevision — 由 generate.py 自动生成，禁止手动修改 */
@@ -48,6 +67,18 @@ export interface PlanRevision {
   planRevisionId: string;
   /** 父修订版本 ID（范围内重规划时设置） */
   parentRevisionId?: string;
+  /** 所属任务 ID（§11 plan_revisions.task_id） */
+  taskId: string;
+  /** 规格修订号，单调递增（§11 plan_revisions.spec_revision） */
+  specRevision: number;
+  /** 关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id） */
+  intentAuthorizationId: string;
+  /** DAG 版本号（§11 plan_revisions.dag_version） */
+  dagVersion: number;
+  /** node→capability 映射版本（§11 plan_revisions.node_capability_map_version） */
+  nodeCapabilityMapVersion: string;
+  /** stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version） */
+  stageCapabilityMapVersion: string;
   /** 语义计划哈希，跨修订版本稳定 */
   semanticPlanHash: string;
   /** 本修订版本内容摘要 */

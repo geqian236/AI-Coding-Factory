@@ -34,38 +34,62 @@ pub struct CredentialRef {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct RunSpec {
-    /// RunSpec 唯一 ID
-    #[serde(rename = "runSpecId")]
-    pub run_spec_id: String,
+    /// RunSpec schema 版本号
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: i64,
+    /// 同一 taskId 下的规格修订序号
+    #[serde(rename = "specRevision")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_revision: Option<i64>,
+    /// 父 PlanRevision ID；genesis 修订为 null
+    #[serde(rename = "parentRevisionId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_revision_id: Option<String>,
     /// 关联任务 ID
     #[serde(rename = "taskId")]
     pub task_id: String,
-    /// 语义计划哈希（跨 revision 稳定）
-    #[serde(rename = "semanticPlanHash")]
-    pub semantic_plan_hash: String,
-    /// 目标终点阶段（Master Spec §6.1 权威 target_stage 集合）
+    /// 用户目标的结构化表达
+    pub goal: String,
+    /// 规划假设列表
+    pub assumptions: Vec<String>,
+    /// 范围声明（§8：include/exclude）
+    pub scope: serde_json::Value,
+    /// 约束条件列表
+    pub constraints: Vec<String>,
+    /// 验收条件列表
+    #[serde(rename = "acceptanceCriteria")]
+    pub acceptance_criteria: Vec<String>,
+    /// 目标终点阶段（Master Spec §6.1 权威 6 阶段）
     #[serde(rename = "targetStage")]
     pub target_stage: String,
-    #[serde(rename = "repositoryBinding")]
-    pub repository_binding: serde_json::Value,
-    /// IntentAuthorization 唯一 ID
+    /// 仓库绑定（§8：mode/root/baseBranch/baseCommit）
+    pub repository: serde_json::Value,
+    /// 工作计划 DAG（§8：dagVersion/nodes/barriers）
+    #[serde(rename = "workPlan")]
+    pub work_plan: serde_json::Value,
+    /// 风险画像（§8：level/reasons）
+    #[serde(rename = "riskProfile")]
+    pub risk_profile: serde_json::Value,
+    /// node-capability-map 版本标识
+    #[serde(rename = "nodeCapabilityMapVersion")]
+    pub node_capability_map_version: String,
+    /// stage-capability-map 版本标识
+    #[serde(rename = "stageCapabilityMapVersion")]
+    pub stage_capability_map_version: String,
+    /// 关联 IntentAuthorization ID
     #[serde(rename = "intentAuthorizationId")]
     pub intent_authorization_id: String,
-    /// 服务端求交后的 capability set 摘要
-    #[serde(rename = "allowedCapabilitySetDigest")]
+    /// 语义计划哈希（跨修订版本稳定，从语义字段投影派生）
+    #[serde(rename = "semanticPlanHash")]
+    pub semantic_plan_hash: String,
+    /// 完整不可变修订记录摘要（写入 PlanRevision 后填入）
+    #[serde(rename = "planRevisionDigest")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowed_capability_set_digest: Option<String>,
-    /// 自主执行预算（毫秒）
-    #[serde(rename = "budgetMs")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_ms: Option<i64>,
-    /// 授权绝对过期时间
-    #[serde(rename = "expiresAt")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
+    pub plan_revision_digest: Option<String>,
     /// RunSpec 创建时间
     #[serde(rename = "createdAt")]
-    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 由 generate.py 自动生成，禁止手动修改。
@@ -80,6 +104,24 @@ pub struct PlanRevision {
     #[serde(rename = "parentRevisionId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_revision_id: Option<String>,
+    /// 所属任务 ID（§11 plan_revisions.task_id）
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    /// 规格修订号，单调递增（§11 plan_revisions.spec_revision）
+    #[serde(rename = "specRevision")]
+    pub spec_revision: i64,
+    /// 关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id）
+    #[serde(rename = "intentAuthorizationId")]
+    pub intent_authorization_id: String,
+    /// DAG 版本号（§11 plan_revisions.dag_version）
+    #[serde(rename = "dagVersion")]
+    pub dag_version: i64,
+    /// node→capability 映射版本（§11 plan_revisions.node_capability_map_version）
+    #[serde(rename = "nodeCapabilityMapVersion")]
+    pub node_capability_map_version: String,
+    /// stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version）
+    #[serde(rename = "stageCapabilityMapVersion")]
+    pub stage_capability_map_version: String,
     /// 语义计划哈希，跨修订版本稳定
     #[serde(rename = "semanticPlanHash")]
     pub semantic_plan_hash: String,

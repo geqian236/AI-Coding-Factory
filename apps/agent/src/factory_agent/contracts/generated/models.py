@@ -38,25 +38,44 @@ class CredentialRef(TypedDict, total=False):
 
 class RunSpec(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
-    # RunSpec 唯一 ID
-    runSpecId: str
+    # RunSpec schema 版本号
+    schemaVersion: int
+    # 同一 taskId 下的规格修订序号
+    specRevision: Optional[int]
+    # 父 PlanRevision ID；genesis 修订为 null
+    parentRevisionId: Optional[str]
     # 关联任务 ID
     taskId: str
-    # 语义计划哈希（跨 revision 稳定）
-    semanticPlanHash: str
-    # 目标终点阶段（Master Spec §6.1 权威 target_stage 集合）
+    # 用户目标的结构化表达
+    goal: str
+    # 规划假设列表
+    assumptions: list[str]
+    # 范围声明（§8：include/exclude）
+    scope: dict[str, Any]
+    # 约束条件列表
+    constraints: list[str]
+    # 验收条件列表
+    acceptanceCriteria: list[str]
+    # 目标终点阶段（Master Spec §6.1 权威 6 阶段）
     targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
-    repositoryBinding: dict[str, Any]
-    # IntentAuthorization 唯一 ID
+    # 仓库绑定（§8：mode/root/baseBranch/baseCommit）
+    repository: dict[str, Any]
+    # 工作计划 DAG（§8：dagVersion/nodes/barriers）
+    workPlan: dict[str, Any]
+    # 风险画像（§8：level/reasons）
+    riskProfile: dict[str, Any]
+    # node-capability-map 版本标识
+    nodeCapabilityMapVersion: str
+    # stage-capability-map 版本标识
+    stageCapabilityMapVersion: str
+    # 关联 IntentAuthorization ID
     intentAuthorizationId: str
-    # 服务端求交后的 capability set 摘要
-    allowedCapabilitySetDigest: Optional[str]
-    # 自主执行预算（毫秒）
-    budgetMs: Optional[int]
-    # 授权绝对过期时间
-    expiresAt: Optional[str]
+    # 语义计划哈希（跨修订版本稳定，从语义字段投影派生）
+    semanticPlanHash: str
+    # 完整不可变修订记录摘要（写入 PlanRevision 后填入）
+    planRevisionDigest: Optional[str]
     # RunSpec 创建时间
-    createdAt: str
+    createdAt: Optional[str]
 
 class PlanRevision(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
@@ -64,6 +83,18 @@ class PlanRevision(TypedDict, total=False):
     planRevisionId: str
     # 父修订版本 ID（范围内重规划时设置）
     parentRevisionId: Optional[str]
+    # 所属任务 ID（§11 plan_revisions.task_id）
+    taskId: str
+    # 规格修订号，单调递增（§11 plan_revisions.spec_revision）
+    specRevision: int
+    # 关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id）
+    intentAuthorizationId: str
+    # DAG 版本号（§11 plan_revisions.dag_version）
+    dagVersion: int
+    # node→capability 映射版本（§11 plan_revisions.node_capability_map_version）
+    nodeCapabilityMapVersion: str
+    # stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version）
+    stageCapabilityMapVersion: str
     # 语义计划哈希，跨修订版本稳定
     semanticPlanHash: str
     # 本修订版本内容摘要
