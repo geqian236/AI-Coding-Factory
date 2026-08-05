@@ -2,10 +2,10 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/durable-event.v2.schema.json",
   "title": "DurableEventV2",
-  "description": "耐久化后的事件，包含 taskSeq、eventId、eventDigest 和 head（由物化器填写，不得由 Adapter 预填）。",
+  "description": "耐久化后的事件，包含 taskSeq、eventId、previousEventDigest 与 eventDigest。事件链使用 previousEventDigest 单链模型（Master Spec §10.1）：genesis 事件 previousEventDigest = sha256:<64 个 0>。eventDigest = SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的完整对象))，故 previousEventDigest 仍是计算输入的一部分，构成防篡改链。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["eventId", "taskId", "taskSeq", "batchOrdinal", "eventDigest", "head", "ingestEventId", "eventType", "sourceSeq", "payload", "durableAt"],
+  "required": ["eventId", "taskId", "taskSeq", "batchOrdinal", "previousEventDigest", "eventDigest", "ingestEventId", "eventType", "sourceSeq", "payload", "durableAt"],
   "properties": {
     "eventId": {
       "type": "string",
@@ -30,16 +30,11 @@
     "eventDigest": {
       "type": "string",
       "minLength": 1,
-      "description": "事件内容摘要（SHA-256 hex）"
+      "description": "事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。"
     },
-    "head": {
-      "type": "string",
-      "minLength": 1,
-      "description": "本批次物化后的 head 摘要（链式验证用）"
-    },
-    "previousHead": {
+    "previousEventDigest": {
       "type": ["string", "null"],
-      "description": "前驱批次 head 摘要（genesis 为 null）"
+      "description": "前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。"
     },
     "ingestEventId": {
       "type": "string",

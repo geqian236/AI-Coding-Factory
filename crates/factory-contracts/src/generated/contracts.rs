@@ -341,15 +341,12 @@ pub struct DurableEventV2 {
     /// 所属批次序号
     #[serde(rename = "batchOrdinal")]
     pub batch_ordinal: i64,
-    /// 事件内容摘要（SHA-256 hex）
+    /// 事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。
     #[serde(rename = "eventDigest")]
     pub event_digest: String,
-    /// 本批次物化后的 head 摘要（链式验证用）
-    pub head: String,
-    /// 前驱批次 head 摘要（genesis 为 null）
-    #[serde(rename = "previousHead")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_head: Option<String>,
+    /// 前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。
+    #[serde(rename = "previousEventDigest")]
+    pub previous_event_digest: Option<String>,
     /// 原始摄取 ID（来自 PreparedEventV2）
     #[serde(rename = "ingestEventId")]
     pub ingest_event_id: String,
@@ -442,7 +439,7 @@ pub struct RunnerProtocol {
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct TestReceipt {
-    /// 回执唯一 ID
+    /// 回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查）
     #[serde(rename = "receiptId")]
     pub receipt_id: String,
     /// 测试 ID（来自 required-test-catalog.v1.json）
@@ -451,11 +448,11 @@ pub struct TestReceipt {
     /// 环境 Compatibility Manifest 摘要
     #[serde(rename = "environmentManifestDigest")]
     pub environment_manifest_digest: String,
-    /// 执行动作列表
+    /// 执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS）
     pub actions: Vec<serde_json::Value>,
-    /// 期望结果描述（机器可读）
+    /// 期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
     pub expected: serde_json::Value,
-    /// 实际观察结果（机器可读）
+    /// 实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
     pub actual: serde_json::Value,
     /// 外部副作用计数
     #[serde(rename = "sideEffectCount")]
@@ -469,22 +466,21 @@ pub struct TestReceipt {
     #[serde(rename = "failureReason")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
-    /// 场景合同内容摘要（来自 required-test-catalog）
+    /// 场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS）
     #[serde(rename = "scenarioContractDigest")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scenario_contract_digest: Option<String>,
+    pub scenario_contract_digest: String,
     /// 实现贡献者列表
     #[serde(rename = "implementationContributors")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub implementation_contributors: Option<Vec<String>>,
-    /// 最终通过责任人
+    /// 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）
     #[serde(rename = "finalPassOwner")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_pass_owner: Option<String>,
-    /// 要求重放次数
+    pub final_pass_owner: String,
+    /// 执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer）
+    pub qualification: String,
+    /// 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）
     #[serde(rename = "requiredReplays")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required_replays: Option<i64>,
+    pub required_replays: i64,
     /// 回执创建时间
     #[serde(rename = "createdAt")]
     pub created_at: String,

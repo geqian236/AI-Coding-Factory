@@ -56,7 +56,7 @@ describe("materialize vectors", () => {
     });
   }
 
-  it("多 Task 交错：各自 genesis，taskSeq 与 head 相互独立", () => {
+  it("多 Task 交错：各自 genesis，taskSeq 与 eventDigest 相互独立", () => {
     const inv = eventGolden.invariants.interleavedTasksIndependent;
     const byName = (n: string) =>
       eventGolden.materialize.find((x: any) => x.name === n);
@@ -66,7 +66,15 @@ describe("materialize vectors", () => {
     const rb = materializeBatch(b.batch, b.anchor, b.durableAt);
     expect(ra[0].taskSeq).toBe(0);
     expect(rb[0].taskSeq).toBe(0);
-    expect(ra[0].head).not.toBe(rb[0].head);
+    // previousEventDigest 单链：两条独立链的 genesis eventDigest 必须不同（payload 不同）
+    expect(ra[0].eventDigest).not.toBe(rb[0].eventDigest);
+    // 两者 previousEventDigest 都是固定全零 predecessor（genesis）
+    expect(ra[0].previousEventDigest).toBe(
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    expect(rb[0].previousEventDigest).toBe(
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
   });
 });
 

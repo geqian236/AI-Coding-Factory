@@ -97,10 +97,13 @@ class TestMaterializeVectors:
         b = by_name[inv["taskB"]]
         ra = materialize_batch(a["batch"], a["anchor"], a["durableAt"])
         rb = materialize_batch(b["batch"], b["anchor"], b["durableAt"])
-        # 两条链各自 genesis（taskSeq 从 0 起），head 相互独立。
+        # 两条链各自 genesis（taskSeq 从 0 起），eventDigest 相互独立（previousEventDigest 单链模型）。
         assert ra[0]["taskSeq"] == 0
         assert rb[0]["taskSeq"] == 0
-        assert ra[0]["head"] != rb[0]["head"]
+        assert ra[0]["eventDigest"] != rb[0]["eventDigest"]
+        # previousEventDigest 都是全零 predecessor（genesis）
+        assert ra[0]["previousEventDigest"] == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        assert rb[0]["previousEventDigest"] == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 
 class TestMaterializeRejectVectors:

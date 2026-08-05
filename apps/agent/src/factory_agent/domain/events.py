@@ -16,13 +16,11 @@ SQLite 事务、writer epoch 竞争留到 Phase 1。物化器与 TypeScript
       "sha256:" + lowercaseHex(SHA-256(JCS(payload)))
 
   eventDigest
-      "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 与 head
-      两个字段后的完整对象)))；因此计算输入仍包含 previousHead、payload、
-      payloadDigest 和全部 identity，构成防篡改链。
-
-  head
-      等于本事件的 eventDigest，作为链式指针；批内下一事件的 previousHead
-      指向前一事件的 head，genesis 事件使用固定 predecessor（"sha256:" + 64 个 0）。
+      "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的
+      完整对象)))；因此计算输入仍包含 previousEventDigest、payload、payloadDigest
+      和全部 identity，构成防篡改链。previousEventDigest 单链模型（Master Spec
+      §10.1）：本事件无 head 字段，下一事件的 previousEventDigest 指向前一事件的
+      eventDigest；genesis 事件 previousEventDigest = "sha256:" + 64 个 0。
 
 物化规则（fail-closed）：
   - batch.previousHead 必须与 anchor.committedHead 相等（同为 None 或同字符串），
@@ -55,8 +53,9 @@ _SHA256_PREFIX = "sha256:"
 # genesis 事件的固定前驱：sha256: + 64 个 0（Master Spec §10.1 全零 predecessor）。
 GENESIS_PREDECESSOR = f"{_SHA256_PREFIX}{'0' * 64}"
 
-# eventDigest 计算时必须排除的字段（自身摘要值与链指针，避免自指循环）。
-_DIGEST_EXCLUDED_FIELDS: frozenset[str] = frozenset({"eventDigest", "head"})
+# eventDigest 计算时必须排除的字段（仅排除自身摘要，避免自指循环）。
+# previousEventDigest 仍参与计算（Master Spec §10.1）。
+_DIGEST_EXCLUDED_FIELDS: frozenset[str] = frozenset({"eventDigest"})
 
 # PreparedEventV2 的必需字段（缺任一即 fail closed）。
 _REQUIRED_PREPARED_EVENT_FIELDS: tuple[str, ...] = (
@@ -251,13 +250,14 @@ def materialize_batch(
 
         task_seq = base_seq + index
 
-        # 组装 DurableEventV2（不含 eventDigest 与 head，二者随后计算）。
+        # 组装 DurableEventV2（不含 eventDigest，随后计算）。
+        # previousEventDigest 单链：下条事件的 previousEventDigest 指向本条 eventDigest。
         durable: dict[str, Any] = {
             "eventId": event_id(ingest_id),
             "taskId": task_id,
             "taskSeq": task_seq,
             "batchOrdinal": batch_ordinal,
-            "previousHead": prev_head,
+            "previousEventDigest": prev_head,
             "ingestEventId": ingest_id,
             "eventType": event["eventType"],
             "sourceSeq": event["sourceSeq"],
@@ -266,15 +266,15 @@ def materialize_batch(
             "durableAt": durable_at,
         }
 
-        # eventDigest = JCS(去除 eventDigest 与 head 后的完整对象) 的 SHA-256。
+        # eventDigest = JCS(去除 eventDigest 字段后的完整对象) 的 SHA-256。
+        # previousEventDigest 仍参与计算（Master Spec §10.1）。
         digest_input = {
             k: v for k, v in durable.items() if k not in _DIGEST_EXCLUDED_FIELDS
         }
         event_digest = _sha256_prefixed(canonicalize(digest_input))
         durable["eventDigest"] = event_digest
-        durable["head"] = event_digest  # head 即本事件 eventDigest，作为链指针。
 
         durable_events.append(durable)
-        prev_head = event_digest  # 下一事件前驱指向本事件 head。
+        prev_head = event_digest  # 下一事件 previousEventDigest 指向前一事件 eventDigest。
 
     return durable_events

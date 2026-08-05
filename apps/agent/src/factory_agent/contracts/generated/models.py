@@ -226,12 +226,10 @@ class DurableEventV2(TypedDict, total=False):
     taskSeq: int
     # 所属批次序号
     batchOrdinal: int
-    # 事件内容摘要（SHA-256 hex）
+    # 事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。
     eventDigest: str
-    # 本批次物化后的 head 摘要（链式验证用）
-    head: str
-    # 前驱批次 head 摘要（genesis 为 null）
-    previousHead: Optional[str]
+    # 前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。
+    previousEventDigest: Optional[str]
     # 原始摄取 ID（来自 PreparedEventV2）
     ingestEventId: str
     # 事件类型
@@ -289,17 +287,17 @@ class RunnerProtocol(TypedDict, total=False):
 
 class TestReceipt(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
-    # 回执唯一 ID
+    # 回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查）
     receiptId: str
     # 测试 ID（来自 required-test-catalog.v1.json）
     testId: str
     # 环境 Compatibility Manifest 摘要
     environmentManifestDigest: str
-    # 执行动作列表
+    # 执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS）
     actions: list[dict[str, Any]]
-    # 期望结果描述（机器可读）
+    # 期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
     expected: dict[str, Any]
-    # 实际观察结果（机器可读）
+    # 实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
     actual: dict[str, Any]
     # 外部副作用计数
     sideEffectCount: int
@@ -309,13 +307,15 @@ class TestReceipt(TypedDict, total=False):
     result: Literal["PASS", "FAIL", "BLOCKED_UNCERTIFIED"]
     # 失败原因（result=FAIL 时必填）
     failureReason: Optional[str]
-    # 场景合同内容摘要（来自 required-test-catalog）
-    scenarioContractDigest: Optional[str]
+    # 场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS）
+    scenarioContractDigest: str
     # 实现贡献者列表
     implementationContributors: list[str]
-    # 最终通过责任人
-    finalPassOwner: Optional[str]
-    # 要求重放次数
-    requiredReplays: Optional[int]
+    # 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）
+    finalPassOwner: str
+    # 执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer）
+    qualification: str
+    # 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）
+    requiredReplays: int
     # 回执创建时间
     createdAt: str

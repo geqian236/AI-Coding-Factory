@@ -92,7 +92,7 @@
           "taskId": "task-a",
           "taskSeq": 0,
           "batchOrdinal": 0,
-          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "ingestEventId": "ingest-genesis-1",
           "eventType": "stream",
           "sourceSeq": 0,
@@ -101,15 +101,14 @@
           },
           "payloadDigest": "sha256:9d9d0fa533c79791f57d6a9cea60140c0a4ba53a50da152b77792b805b3532cf",
           "durableAt": "2026-08-04T00:00:01Z",
-          "eventDigest": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905",
-          "head": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905"
+          "eventDigest": "sha256:41f664ff5d585cab22fb071aae12af7e9b906fac2766d58d1d6da98ed612044d"
         },
         {
           "eventId": "evt_92bb4aafb835efe93cb51a4606ea9f91aa1bc705822ef9c5dd9f559da2cb03cf",
           "taskId": "task-a",
           "taskSeq": 1,
           "batchOrdinal": 0,
-          "previousHead": "sha256:cb54df5da2573834d9ea15cd501c5860e052464e0171a977c26ffe0631e8a905",
+          "previousEventDigest": "sha256:41f664ff5d585cab22fb071aae12af7e9b906fac2766d58d1d6da98ed612044d",
           "ingestEventId": "ingest-genesis-2",
           "eventType": "tool",
           "sourceSeq": 1,
@@ -118,8 +117,7 @@
           },
           "payloadDigest": "sha256:678ca9cc6ad7df7daa7f0e328419c6a60a7b54e4444ba4aaf0c01aac1ce3c73c",
           "durableAt": "2026-08-04T00:00:01Z",
-          "eventDigest": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
-          "head": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982"
+          "eventDigest": "sha256:71c59b5b775765ed4ea4984ff522c761a9a2f5db05dfd149e1d35f5dfe7857d2"
         }
       ]
     },
@@ -153,7 +151,7 @@
           "taskId": "task-a",
           "taskSeq": 2,
           "batchOrdinal": 1,
-          "previousHead": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
+          "previousEventDigest": "sha256:cda99560789a8bd24854f84f40fde3028661bcce01bc268728bfa422118c7982",
           "ingestEventId": "ingest-a-3",
           "eventType": "state",
           "sourceSeq": 2,
@@ -162,8 +160,7 @@
           },
           "payloadDigest": "sha256:349708f57264580cbe6ce3272988a4318f4f973b41634f02c6a36b3d8bcf781e",
           "durableAt": "2026-08-04T00:01:01Z",
-          "eventDigest": "sha256:274d47d4ff81b061b913023bb6064f852b9e394e0ad207b6a3a493d9f5cc263f",
-          "head": "sha256:274d47d4ff81b061b913023bb6064f852b9e394e0ad207b6a3a493d9f5cc263f"
+          "eventDigest": "sha256:4fa6bd1bda3496ed65b68754ee9fd2b6620db8b67dcc12548260ca05b5c3217e"
         }
       ]
     },
@@ -197,7 +194,7 @@
           "taskId": "task-b",
           "taskSeq": 0,
           "batchOrdinal": 0,
-          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "ingestEventId": "ingest-b-1",
           "eventType": "stream",
           "sourceSeq": 0,
@@ -206,8 +203,7 @@
           },
           "payloadDigest": "sha256:d52d890da585f19e06f3c10f4ebb629cf0931efece3f55c1e7de25fa0cb5d9b4",
           "durableAt": "2026-08-04T00:00:31Z",
-          "eventDigest": "sha256:2833bedc5cc971b220622a39560b35e885f74ef02cd01704716bacf128199cf8",
-          "head": "sha256:2833bedc5cc971b220622a39560b35e885f74ef02cd01704716bacf128199cf8"
+          "eventDigest": "sha256:e07058d0843c5a6a5035de7b72039816e6afcf0d5d0da028009055aa5223eeaa"
         }
       ]
     },
@@ -241,7 +237,7 @@
           "taskId": "task-c",
           "taskSeq": 0,
           "batchOrdinal": 0,
-          "previousHead": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "previousEventDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "ingestEventId": "ingest-c-1",
           "eventType": "gate",
           "sourceSeq": 0,
@@ -250,8 +246,7 @@
           },
           "payloadDigest": "sha256:0cd4101d3beb3cdd08a62cb8508f2a2a0942b290a02d6ba252d5fb481d3ce054",
           "durableAt": "2026-08-04T00:02:01Z",
-          "eventDigest": "sha256:75457a3fdb2be889e954ba9c49d3395e14bb11cd7bbe52815fc782e5d3623d82",
-          "head": "sha256:75457a3fdb2be889e954ba9c49d3395e14bb11cd7bbe52815fc782e5d3623d82"
+          "eventDigest": "sha256:95948232304c16ed44e1d9c5d82e74061ab44a6380cd48aa43e917e900ba428e"
         }
       ]
     }

@@ -15,13 +15,14 @@
 //!       "sha256:" + lowercaseHex(SHA-256(JCS(payload)))
 //!
 //!   eventDigest
-//!       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 与 head
-//!       两个字段后的完整对象)))；计算输入仍包含 previousHead、payload、
-//!       payloadDigest 和全部 identity，构成防篡改链。
+//!       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后
+//!       的完整对象)))；计算输入仍包含 previousEventDigest、payload、payloadDigest
+//!       和全部 identity，构成防篡改链。
 //!
-//!   head
-//!       等于本事件的 eventDigest，作为链式指针；批内下一事件的 previousHead
-//!       指向前一事件的 head，genesis 事件使用固定 predecessor（"sha256:" + 64 个 0）。
+//!   previousEventDigest
+//!       上一条事件的 eventDigest；genesis 事件使用固定 predecessor（"sha256:" + 64
+//!       个 0）。本事件无 head 字段，链式指针完全通过 previousEventDigest 单链表达
+//!       （Master Spec §10.1）。
 //!
 //! 物化规则（fail-closed）：
 //!   - batch.previousHead 必须与 anchor.committedHead 相等（同为 null 或同字符串），
@@ -263,14 +264,15 @@ pub fn materialize_batch(
 
         let task_seq = base_seq + index as i64;
 
-        // 组装 DurableEventV2（不含 eventDigest 与 head，二者随后计算）。
+        // 组装 DurableEventV2（不含 eventDigest，随后计算）。
+        // previousEventDigest 单链：下条事件的 previousEventDigest 指向本条 eventDigest。
         // 字段插入顺序仅为可读性；canonicalizer 会按 UTF-16 序重排。
         let mut durable = Map::new();
         durable.insert("eventId".to_string(), Value::String(event_id(&ingest_id)?));
         durable.insert("taskId".to_string(), Value::String(task_id.clone()));
         durable.insert("taskSeq".to_string(), Value::from(task_seq));
         durable.insert("batchOrdinal".to_string(), Value::from(batch_ordinal));
-        durable.insert("previousHead".to_string(), Value::String(prev_head.clone()));
+        durable.insert("previousEventDigest".to_string(), Value::String(prev_head.clone()));
         durable.insert("ingestEventId".to_string(), Value::String(ingest_id.clone()));
         durable.insert("eventType".to_string(), event["eventType"].clone());
         durable.insert("sourceSeq".to_string(), event["sourceSeq"].clone());
@@ -281,15 +283,15 @@ pub fn materialize_batch(
         );
         durable.insert("durableAt".to_string(), Value::String(durable_at.to_string()));
 
-        // eventDigest = JCS(去除 eventDigest 与 head 后的完整对象) 的 SHA-256。
-        // 此时 durable 尚未包含 eventDigest/head，故直接对其规范化即符合定义。
+        // eventDigest = JCS(去除 eventDigest 字段后的完整对象) 的 SHA-256。
+        // previousEventDigest 仍参与计算（Master Spec §10.1）。此时 durable 尚未
+        // 包含 eventDigest，故直接对其规范化即符合定义。
         let bytes = canonicalize_value(&Value::Object(durable.clone()))?;
         let event_digest = sha256_prefixed(&bytes);
         durable.insert("eventDigest".to_string(), Value::String(event_digest.clone()));
-        durable.insert("head".to_string(), Value::String(event_digest.clone()));
 
         durable_events.push(Value::Object(durable));
-        prev_head = event_digest; // 下一事件前驱指向本事件 head。
+        prev_head = event_digest; // 下一事件 previousEventDigest 指向前一事件 eventDigest。
     }
 
     Ok(durable_events)

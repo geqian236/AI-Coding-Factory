@@ -93,7 +93,7 @@ fn materialize_vectors() {
 
 #[test]
 fn interleaved_tasks_independent() {
-    // 不变量：多 Task 交错，taskA 与 taskB 各自从 genesis 起链，taskSeq 与 head 互不影响。
+    // 不变量：多 Task 交错，taskA 与 taskB 各自从 genesis 起链，taskSeq 与 eventDigest 互不影响。
     let golden = load_golden("event-hash.v2.json");
     let inv = &golden["invariants"]["interleavedTasksIndependent"];
     let a_name = inv["taskA"].as_str().unwrap();
@@ -106,7 +106,17 @@ fn interleaved_tasks_independent() {
     let rb = materialize_batch(&b["batch"], &b["anchor"], b["durableAt"].as_str().unwrap()).unwrap();
     assert_eq!(ra[0]["taskSeq"].as_i64(), Some(0));
     assert_eq!(rb[0]["taskSeq"].as_i64(), Some(0));
-    assert_ne!(ra[0]["head"], rb[0]["head"], "两条独立链 head 不应相同");
+    // previousEventDigest 单链：两条独立链的 genesis eventDigest 必须不同（payload 不同）
+    assert_ne!(ra[0]["eventDigest"], rb[0]["eventDigest"], "两条独立链 eventDigest 不应相同");
+    // 两者 previousEventDigest 都是固定全零 predecessor（genesis）
+    assert_eq!(
+        ra[0]["previousEventDigest"].as_str().unwrap(),
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    assert_eq!(
+        rb[0]["previousEventDigest"].as_str().unwrap(),
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
 }
 
 #[test]

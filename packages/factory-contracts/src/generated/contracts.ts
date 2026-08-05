@@ -217,12 +217,10 @@ export interface DurableEventV2 {
   taskSeq: number;
   /** 所属批次序号 */
   batchOrdinal: number;
-  /** 事件内容摘要（SHA-256 hex） */
+  /** 事件内容摘要（SHA-256 hex）。计算输入为 DurableEventV2 去除本字段后的完整对象（JCS），previousEventDigest 仍参与计算。 */
   eventDigest: string;
-  /** 本批次物化后的 head 摘要（链式验证用） */
-  head: string;
-  /** 前驱批次 head 摘要（genesis 为 null） */
-  previousHead?: string | null;
+  /** 前驱事件 eventDigest（genesis 为 sha256:<64 个 0>，固定全零 predecessor）。批内下一事件指向前一事件的 eventDigest。 */
+  previousEventDigest: string | null;
   /** 原始摄取 ID（来自 PreparedEventV2） */
   ingestEventId: string;
   /** 事件类型 */
@@ -283,17 +281,17 @@ export interface RunnerProtocol {
 
 /** TestReceipt — 由 generate.py 自动生成，禁止手动修改 */
 export interface TestReceipt {
-  /** 回执唯一 ID */
+  /** 回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查） */
   receiptId: string;
   /** 测试 ID（来自 required-test-catalog.v1.json） */
   testId: string;
   /** 环境 Compatibility Manifest 摘要 */
   environmentManifestDigest: string;
-  /** 执行动作列表 */
+  /** 执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS） */
   actions: Record<string, unknown>[];
-  /** 期望结果描述（机器可读） */
+  /** 期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS） */
   expected: Record<string, unknown>;
-  /** 实际观察结果（机器可读） */
+  /** 实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS） */
   actual: Record<string, unknown>;
   /** 外部副作用计数 */
   sideEffectCount: number;
@@ -303,14 +301,16 @@ export interface TestReceipt {
   result: "PASS" | "FAIL" | "BLOCKED_UNCERTIFIED";
   /** 失败原因（result=FAIL 时必填） */
   failureReason?: string;
-  /** 场景合同内容摘要（来自 required-test-catalog） */
-  scenarioContractDigest?: string;
+  /** 场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS） */
+  scenarioContractDigest: string;
   /** 实现贡献者列表 */
   implementationContributors?: string[];
-  /** 最终通过责任人 */
-  finalPassOwner?: string;
-  /** 要求重放次数 */
-  requiredReplays?: number;
+  /** 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单） */
+  finalPassOwner: string;
+  /** 执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer） */
+  qualification: string;
+  /** 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁） */
+  requiredReplays: number;
   /** 回执创建时间 */
   createdAt: string;
 }

@@ -15,13 +15,14 @@
  *       "sha256:" + lowercaseHex(SHA-256(JCS(payload)))
  *
  *   eventDigest
- *       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 与 head
- *       两个字段后的完整对象)))；计算输入仍包含 previousHead、payload、
- *       payloadDigest 和全部 identity，构成防篡改链。
+ *       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后
+ *       的完整对象)))；计算输入仍包含 previousEventDigest、payload、payloadDigest
+ *       和全部 identity，构成防篡改链。
  *
- *   head
- *       等于本事件的 eventDigest，作为链式指针；批内下一事件的 previousHead
- *       指向前一事件的 head，genesis 事件使用固定 predecessor（"sha256:" + 64 个 0）。
+ *   previousEventDigest
+ *       上一条事件的 eventDigest；genesis 事件使用固定 predecessor（"sha256:" + 64
+ *       个 0）。本事件无 head 字段，链式指针完全通过 previousEventDigest 单链表达
+ *       （Master Spec §10.1）。
  *
  * 物化规则（fail-closed）：
  *   - batch.previousHead 必须与 anchor.committedHead 相等（同为 null 或同字符串），
@@ -49,8 +50,9 @@ const SHA256_PREFIX = "sha256:";
 /** genesis 事件的固定前驱：sha256: + 64 个 0（Master Spec §10.1 全零 predecessor）。 */
 export const GENESIS_PREDECESSOR = `${SHA256_PREFIX}${"0".repeat(64)}`;
 
-/** eventDigest 计算时必须排除的字段（自身摘要值与链指针，避免自指循环）。 */
-const DIGEST_EXCLUDED_FIELDS = new Set(["eventDigest", "head"]);
+/** eventDigest 计算时必须排除的字段（仅排除自身摘要，避免自指循环）。
+ *  previousEventDigest 仍参与计算（Master Spec §10.1）。 */
+const DIGEST_EXCLUDED_FIELDS = new Set(["eventDigest"]);
 
 /** PreparedEventV2 的必需字段（缺任一即 fail closed）。 */
 const REQUIRED_PREPARED_EVENT_FIELDS = [
@@ -232,14 +234,15 @@ export function materializeBatch(
 
     const taskSeq = baseSeq + index;
 
-    // 组装 DurableEventV2（不含 eventDigest 与 head，二者随后计算）。
+    // 组装 DurableEventV2（不含 eventDigest，随后计算）。
+    // previousEventDigest 单链：下条事件的 previousEventDigest 指向本条 eventDigest。
     // 字段插入顺序与 Python 实现保持一致（canonicalizer 会重新排序，此处仅为可读性）。
     const durable: JsonObject = {
       eventId: eventId(ingestId),
       taskId,
       taskSeq,
       batchOrdinal,
-      previousHead: prevHead,
+      previousEventDigest: prevHead,
       ingestEventId: ingestId,
       eventType: event["eventType"],
       sourceSeq: event["sourceSeq"],
@@ -248,7 +251,8 @@ export function materializeBatch(
       durableAt,
     };
 
-    // eventDigest = JCS(去除 eventDigest 与 head 后的完整对象) 的 SHA-256。
+    // eventDigest = JCS(去除 eventDigest 字段后的完整对象) 的 SHA-256。
+    // previousEventDigest 仍参与计算（Master Spec §10.1）。
     const digestInput: JsonObject = {};
     for (const [k, v] of Object.entries(durable)) {
       if (!DIGEST_EXCLUDED_FIELDS.has(k)) {
@@ -257,10 +261,9 @@ export function materializeBatch(
     }
     const eventDigest = sha256Prefixed(canonicalize(digestInput));
     durable["eventDigest"] = eventDigest;
-    durable["head"] = eventDigest; // head 即本事件 eventDigest，作为链指针。
 
     durableEvents.push(durable);
-    prevHead = eventDigest; // 下一事件前驱指向本事件 head。
+    prevHead = eventDigest; // 下一事件 previousEventDigest 指向前一事件 eventDigest。
   }
 
   return durableEvents;
