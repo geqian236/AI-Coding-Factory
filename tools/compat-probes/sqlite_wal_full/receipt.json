@@ -96,7 +96,7 @@
     {
       "name": "age_threshold_triggered",
       "passed": true,
-      "detail": "低速+sleep 应触发 age 阈值 COMMIT（实测 elapsed=562.0ms）"
+      "detail": "低速+sleep 应触发 age 阈值 COMMIT（实测 elapsed=563.0ms）"
     },
     {
       "name": "journam_mode_is_wal",
@@ -173,7 +173,7 @@
         "events_fired": true,
         "bytes_fired": true,
         "age_fired": true,
-        "age_elapsed_ms": 562.0000000053551
+        "age_elapsed_ms": 562.9999999946449
       }
     },
     {
@@ -226,6 +226,6 @@
     "synchronous": 2
   },
   "artifact_digest": "sha256:f1274251475b788f40052e0b63d58907a5b3b1a13f56e3636534b12d1b674bfe",
-  "timestamp": "2026-08-05T17:43:52.921010+08:00",
-  "run_nonce": "0d63e1c5ae3e40ffa4d22a541a58d848"
+  "timestamp": "2026-08-05T19:20:37.744820+08:00",
+  "run_nonce": "d4d14ccc4fcd46b59c5592caf33e86e7"
 }

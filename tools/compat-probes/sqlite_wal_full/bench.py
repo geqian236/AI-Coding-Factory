@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 SPIKE = "sqlite_wal_full"
 
@@ -581,6 +582,45 @@ if __name__ == "__main__":
     # 把 wrapper 传入的本轮 nonce 写入 receipt，供 wrapper 读回做新鲜度断言。
     if args.nonce is not None:
         receipt["run_nonce"] = args.nonce
+
+    # GPT 第二轮要求（Wave E）：spike receipt 必须完整绑定证明证据，避免「陈旧或
+    # 错版本 receipt 被误判 PASS」。
+    # - schemaDigest: 探针读到的 SQLite schema 文件 SHA-256（durable-event.v2
+    #   / prepared-batch.v2 / compatibility-manifest.v1 / test-receipt.v1）
+    # - probeDigest: 当前 bench.py 文件自身 SHA-256（拒绝「替换 bench.py 但仍用
+    #   旧 receipt hash 通过」）
+    # - candidateSha: git HEAD 的 SHA（绑定到确切提交；commit 漂移即失效）
+    # - probeSourcePath: 唯一输出路径（已存在的 emit-path 概念，但标准化为绝对
+    #   路径，便于下游与 wrapper 端对端校验）
+    repo_root_marker = Path(__file__).resolve()
+    for _ in range(4):
+        if (repo_root_marker / ".git").is_dir():
+            break
+        repo_root_marker = repo_root_marker.parent
+    receipt["schemaDigest"] = {
+        "durable-event.v2": _sha256_file(
+            repo_root_marker / "contracts" / "schemas" / "durable-event.v2.schema.json"
+        ),
+        "prepared-batch.v2": _sha256_file(
+            repo_root_marker / "contracts" / "schemas" / "prepared-batch.v2.schema.json"
+        ),
+        "test-receipt.v1": _sha256_file(
+            repo_root_marker / "contracts" / "schemas" / "test-receipt.v1.schema.json"
+        ),
+        "compatibility-manifest.v1": _sha256_file(
+            repo_root_marker / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
+        ),
+    }
+    receipt["probeDigest"] = _sha256_file(Path(__file__).resolve())
+    try:
+        candidate_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo_root_marker),
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        candidate_sha = "unavailable"
+    receipt["candidateSha"] = candidate_sha
+
     out = json.dumps(receipt, indent=2, ensure_ascii=False)
     print(out)
 
