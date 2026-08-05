@@ -1,0 +1,75 @@
+{
+  "spike": "git_object_bridge",
+  "status": "PASS",
+  "environment": {
+    "os": "Windows",
+    "os_version": "10.0.26200",
+    "python_version": "3.12.10",
+    "git_version": "git version 2.52.0.windows.1",
+    "arch": "AMD64"
+  },
+  "actions": [
+    "created source repo, HEAD=5e4e05e67cb0",
+    "git bundle create: ok=True size=349B digest=sha256:66cffe1548bc1",
+    "clone bare from bundle: ok=True",
+    "worktree add native=True clone_fallback=False",
+    "sentinel verified in worktree: True",
+    "pack roundtrip: pack_ok=True verify_ok=True digest=sha256:bf46087a6e9fe",
+    "user workspace zero pollution: True"
+  ],
+  "observable_facts": {
+    "head_sha": "5e4e05e67cb03455a01e4162df9f2e645efef266",
+    "bundle_size_bytes": 349,
+    "bundle_digest": "sha256:66cffe1548bc1524ea98442a3c2f4ccda23ecd24cbcabd1da37619cbd81a5a8e",
+    "bundle_ok": true,
+    "mirror_ok": true,
+    "worktree_add_native": true,
+    "clone_fallback_used": false,
+    "sentinel_ok": true,
+    "pack_ok": true,
+    "pack_digest": "sha256:bf46087a6e9fe3457ed8d7bc9af9516e617fb80b860f5940ebee0b0e0a89fc40",
+    "pack_verify_ok": true,
+    "zero_pollution": true,
+    "polluted_keys": []
+  },
+  "assertions": [
+    {
+      "name": "bundle_created",
+      "passed": true,
+      "detail": "size=349B"
+    },
+    {
+      "name": "mirror_import_ok",
+      "passed": true,
+      "detail": "bare clone from bundle"
+    },
+    {
+      "name": "worktree_add_native",
+      "passed": true,
+      "detail": "native worktree add (clone_fallback=False)"
+    },
+    {
+      "name": "sentinel_survives_roundtrip",
+      "passed": true,
+      "detail": "probe commit content verified in worktree"
+    },
+    {
+      "name": "pack_created",
+      "passed": true,
+      "detail": "digest=sha256:bf46087a6e9fe3457"
+    },
+    {
+      "name": "pack_verify_index_pack",
+      "passed": true,
+      "detail": "git index-pack --verify 校验 pack 自洽与全对象完整性"
+    },
+    {
+      "name": "user_workspace_zero_pollution",
+      "passed": true,
+      "detail": "源仓库全流程前后指纹一致；differing=[]"
+    }
+  ],
+  "artifact_digest": "sha256:66cffe1548bc1524ea98442a3c2f4ccda23ecd24cbcabd1da37619cbd81a5a8e",
+  "env_digest": "sha256:f8a4f9bae3bf31ca79810dc9bfc9f84e889e624c02c067ae382ae9a5ccb39996",
+  "timestamp": "2026-08-05T12:52:05.668946+08:00"
+}

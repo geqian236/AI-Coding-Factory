@@ -1,0 +1,79 @@
+{
+    "spike":  "windows_durable_io",
+    "status":  "PASS",
+    "environment":  {
+                        "driver_pid":  30168,
+                        "arch":  "X64",
+                        "ps_version":  "5.1.26100.8875",
+                        "os":  "Microsoft Windows 10.0.26200 ",
+                        "probe_backend":  "rust_child_writer + powershell_parent_killer(cross_process_hard_kill)"
+                    },
+    "actions":  [
+                    "cargo build windows_durable_io (via dev.ps1, ld.lld)",
+                    "Start-Process writer \u0027child\u0027 (独立进程) 后台",
+                    "poll stdout for CHILD_READY (writer 已 write+flush+rename)",
+                    "Stop-Process -Force 定点硬杀 writer(崩溃点:未走正常退出)",
+                    "独立进程读回 final:逐字节校验 + nonce 新鲜度 + sha256"
+                ],
+    "observable_facts":  {
+                             "writer_hard_killed":  true,
+                             "writer_pid":  25592,
+                             "nonce":  "217c1fe623c2f9557d0f576a90c7bd61",
+                             "nonce_fresh":  true,
+                             "content_byte_match":  true,
+                             "writer_spawn_pid":  25592,
+                             "alive_before_kill":  true,
+                             "flush_ok":  true,
+                             "dir_sync_ok":  false,
+                             "rename_ok":  true,
+                             "writer_reported_bytes":  59,
+                             "final_file_size":  59,
+                             "driver_pid":  30168
+                         },
+    "assertions":  [
+                       {
+                           "detail":  "driver_pid=30168 spawn_pid=25592 writer_self_reported_pid=25592",
+                           "name":  "writer_is_separate_process",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "alive_before_kill=True killed=True (被杀前仍在运行,未走正常退出路径)",
+                           "name":  "writer_alive_then_hard_killed",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "writer_rename_ok=True final_exists=True tmp_gone=True",
+                           "name":  "atomic_rename_completed",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "writer 自报 sync_all(FlushFileBuffers) 实测结果=True(硬杀前已 flush)",
+                           "name":  "flush_before_crash",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "独立进程读回 byte-for-byte 匹配=True size=59 writer_bytes=59",
+                           "name":  "data_survives_cross_process_kill",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "final 文件含本 writer 自报 nonce=217c1fe623c2f9557d0f576a90c7bd61 -\u003e 非陈旧文件",
+                           "name":  "final_nonce_matches_this_writer",
+                           "passed":  true
+                       }
+                   ],
+    "uncertified_aspects":  [
+                                {
+                                    "status":  "BLOCKED_UNCERTIFIED",
+                                    "reason":  "断电/内核崩溃后数据仍在 需真实掉电或内核崩溃 纯软件杀进程无法证明(数据仍在 OS page cache)",
+                                    "aspect":  "power_loss_durability"
+                                },
+                                {
+                                    "status":  "BLOCKED_UNCERTIFIED",
+                                    "reason":  "Windows 对目录句柄 sync_all 基本 no-op writer 实测 dir_sync_ok=False 无法证明父目录条目已落盘",
+                                    "aspect":  "parent_dir_fsync_effective"
+                                }
+                            ],
+    "artifact_digest":  "sha256:a88f0c276b0b3e3a2237f381cf52f7f2b2d307537cd5846e850af9b12a9b55c2",
+    "timestamp":  "2026-08-05T15:19:15.6005300+08:00"
+}

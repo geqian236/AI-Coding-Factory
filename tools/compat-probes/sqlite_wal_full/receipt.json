@@ -1,0 +1,107 @@
+{
+  "spike": "sqlite_wal_full",
+  "status": "PASS",
+  "environment": {
+    "os": "Windows",
+    "os_version": "10.0.26200",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python_version": "3.12.10",
+    "arch": "AMD64",
+    "sqlite_version": "3.49.1"
+  },
+  "actions": [
+    "spawn child writer: 5 批 × 20 行 COMMIT + 1 未提交事务，child.kill() 硬杀",
+    "recovery: rows_total=100 (expected 100), per_batch={'0': 20, '1': 20, '2': 20, '3': 20, '4': 20}",
+    "disk-full：本 sandbox 无独立小卷，标记 BLOCKED_UNCERTIFIED，不伪造"
+  ],
+  "observable_facts": {
+    "rows_recovered": 100,
+    "committed_prefix_intact": true,
+    "uncommitted_tail_absent": true,
+    "group_commit_atomic": true
+  },
+  "eventBatchParameters": {
+    "maxBatchEvents": 200,
+    "maxBatchBytes": 262144,
+    "maxBatchAgeMs": 500,
+    "synchronous": "FULL"
+  },
+  "parameterTupleDigest": "sha256:e978d6e7ebea9b2984c043336d0171c80e9705cb51e0e66cbd1d277ed7be9888",
+  "benchmarkProfileDigest": "sha256:cc4421bc3a53e875fef0e587db409f858d73b7dc587080a003e172c87f165cee",
+  "benchmark_profile": {
+    "committed_batches": 5,
+    "batch_size": 20,
+    "rows_recovered": 100
+  },
+  "env_digest": "sha256:44ffd705614269c6ac384ae8b53909bfbb67a95b606fcba1600af22294bae4c5",
+  "param_digest": "sha256:e978d6e7ebea9b2984c043336d0171c80e9705cb51e0e66cbd1d277ed7be9888",
+  "assertions": [
+    {
+      "name": "child_committed_before_kill",
+      "passed": true,
+      "detail": "子进程在被杀前已宣告 COMMITTED"
+    },
+    {
+      "name": "committed_prefix_survives_process_kill",
+      "passed": true,
+      "detail": "已提交前缀完整：100==100"
+    },
+    {
+      "name": "uncommitted_tail_absent_after_kill",
+      "passed": true,
+      "detail": "未提交事务的批次在恢复后不出现"
+    },
+    {
+      "name": "group_commit_atomic_no_half_batch",
+      "passed": true,
+      "detail": "每个已提交批次行数恰为 batch_size（无半批）"
+    }
+  ],
+  "subResults": [
+    {
+      "aspect": "process_kill_recovery",
+      "status": "PASS",
+      "facts": {
+        "committed_seen": true,
+        "rows_total": 100,
+        "expected_rows": 100,
+        "committed_prefix_intact": true,
+        "uncommitted_absent": true,
+        "all_batches_atomic": true,
+        "per_batch_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        }
+      }
+    },
+    {
+      "aspect": "group_commit_atomicity",
+      "status": "PASS",
+      "facts": {
+        "per_batch_counts": {
+          "0": 20,
+          "1": 20,
+          "2": 20,
+          "3": 20,
+          "4": 20
+        },
+        "batch_size": 20
+      }
+    },
+    {
+      "aspect": "disk_full_enospc",
+      "status": "BLOCKED_UNCERTIFIED",
+      "reason": "本环境无独立小容量卷，无法可靠制造 ENOSPC；模拟易 flaky 或需管理员挂载 VHD",
+      "unblock_steps": [
+        "以管理员挂载固定小容量 VHD（如 16 MiB）到纯 ASCII 路径",
+        "将 crash_probe.db 置于该卷，写入直至 sqlite3.OperationalError: database or disk is full",
+        "校验 WAL 在 ENOSPC 下不暴露半提交批次，恢复后仍满足 group-commit 原子性"
+      ]
+    }
+  ],
+  "artifact_digest": "sha256:f1274251475b788f40052e0b63d58907a5b3b1a13f56e3636534b12d1b674bfe",
+  "timestamp": "2026-08-05T11:36:40.231937+08:00"
+}

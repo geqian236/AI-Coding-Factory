@@ -1,8 +1,8 @@
 # AI Coding Factory — Contracts v1 Protocol Reference
 
-> **状态**：Phase 0 基线已冻结。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
+> **状态**：Phase 0 基线已冻结，全部 spike 认证完毕（HEAD: ef9a33f）。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
 >
-> **版本**：v1（2026-08-04）
+> **版本**：v1（2026-08-05）
 
 ---
 
@@ -213,4 +213,4 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 
 ---
 
-*本文档由 Task 8 生成，属于 Phase 0 基线。如需修改合同，请通过标准 PR 流程并更新相关 golden vector。*
+*本文档由 Task 8 生成，属于 Phase 0 基线（收口于 2026-08-05，HEAD: ef9a33f）。如需修改合同，请通过标准 PR 流程并更新相关 golden vector。*

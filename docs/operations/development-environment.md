@@ -200,15 +200,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- `
 
 | Spike | 状态 | 认证文件 |
 |-------|------|---------|
-| Windows Durable IO | 已提交 | `tools/compat-probes/windows_durable_io/receipt.json` |
-| SQLite WAL FULL | 已提交 | `tools/compat-probes/sqlite_wal_full/receipt.json` |
-| Clock Source | 已提交 | `tools/compat-probes/clock_source/receipt.json` |
-| Named Pipe | 待 Phase 1 | `tools/compat-probes/named_pipe/` |
-| Runner Identity | 待 Phase 1 | `tools/compat-probes/runner_identity/` |
-| Git Object Bridge | 待 Phase 1 | `tools/compat-probes/git_object_bridge/` |
+| Windows Durable IO | 已认证 (PASS) | `tools/compat-probes/windows_durable_io/receipt.json` |
+| SQLite WAL FULL | 已认证 (PASS, disk-full BLOCKED_UNCERTIFIED) | `tools/compat-probes/sqlite_wal_full/receipt.json` |
+| Clock Source | 已认证 (PASS) | `tools/compat-probes/clock_source/receipt.json` |
+| Named Pipe | 已认证 (PASS) | `tools/compat-probes/named_pipe/receipt.json` |
+| Runner Identity | 已认证 (PASS) | `tools/compat-probes/runner_identity/receipt.json` |
+| Git Object Bridge | 已认证 (PASS) | `tools/compat-probes/git_object_bridge/receipt.json` |
 | Tauri E2E | 待 Phase 2 | `tools/compat-probes/tauri_e2e/` |
 
-未认证项以 `BLOCKED_UNCERTIFIED` 状态记录，不得伪造兼容。
+所有 Phase 0 receipt 均包含 `assertions` 数组（每条有 `name/passed/detail`）和
+`observable_facts`，status 来自真实可观测行为；disk-full 子结果诚实标记
+`BLOCKED_UNCERTIFIED` 并附解封步骤，不伪造兼容。
 
 ---
 
@@ -231,4 +233,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- `
 
 ---
 
-*本文档由 Task 8 生成，属于 Phase 0 基线文档。*
+*本文档由 Task 8 生成，Phase 0 全部 spike 认证完毕（2026-08-05，HEAD: ef9a33f）。*
