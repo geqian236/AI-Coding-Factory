@@ -24,8 +24,8 @@
     },
     "targetStage": {
       "type": "string",
-      "enum": ["DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR", "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION"],
-      "description": "目标终点阶段"
+      "enum": ["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"],
+      "description": "目标终点阶段（Master Spec §6.1 权威 target_stage 集合）"
     },
     "repositoryBinding": {
       "type": "object",

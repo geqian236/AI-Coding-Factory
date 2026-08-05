@@ -27,8 +27,8 @@ export interface RunSpec {
   taskId: string;
   /** 语义计划哈希（跨 revision 稳定） */
   semanticPlanHash: string;
-  /** 目标终点阶段 */
-  targetStage: "DESIGN_REVIEW" | "CODE_REVIEW" | "PUBLISH_PR" | "MERGE" | "ACCEPT_STAGING" | "ACCEPT_PRODUCTION";
+  /** 目标终点阶段（Master Spec §6.1 权威 target_stage 集合） */
+  targetStage: "DESIGN_APPROVED" | "CODEX_APPROVED" | "PR_READY" | "MERGED" | "STAGING_ACCEPTED" | "PRODUCTION_ACCEPTED";
   repositoryBinding: Record<string, unknown>;
   /** IntentAuthorization 唯一 ID */
   intentAuthorizationId: string;
@@ -56,7 +56,7 @@ export interface PlanRevision {
   nodes: Record<string, unknown>[];
   /** 阶段屏障列表 */
   barriers: Record<string, unknown>[];
-  /** target_stage 到节点集合的映射 */
+  /** target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类） */
   stageMaps: Record<string, unknown>;
   createdAt: string;
 }
@@ -85,8 +85,8 @@ export interface ControlCommand {
 export interface TaskIntakeRequest {
   /** 用户自然语言需求描述 */
   requirementText: string;
-  /** 用户选择的目标终点阶段 */
-  targetStage: "DESIGN_REVIEW" | "CODE_REVIEW" | "PUBLISH_PR" | "MERGE" | "ACCEPT_STAGING" | "ACCEPT_PRODUCTION";
+  /** 用户选择的目标终点阶段（Master Spec §6.1 权威 target_stage 分类） */
+  targetStage: "DESIGN_APPROVED" | "CODEX_APPROVED" | "PR_READY" | "MERGED" | "STAGING_ACCEPTED" | "PRODUCTION_ACCEPTED";
   repositorySelection: Record<string, unknown>;
   environmentSelection?: Record<string, unknown>;
   /** 用户设定的自主执行预算上限（毫秒） */

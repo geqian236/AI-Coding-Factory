@@ -43,7 +43,7 @@ pub struct RunSpec {
     /// 语义计划哈希（跨 revision 稳定）
     #[serde(rename = "semanticPlanHash")]
     pub semantic_plan_hash: String,
-    /// 目标终点阶段
+    /// 目标终点阶段（Master Spec §6.1 权威 target_stage 集合）
     #[serde(rename = "targetStage")]
     pub target_stage: String,
     #[serde(rename = "repositoryBinding")]
@@ -90,7 +90,7 @@ pub struct PlanRevision {
     pub nodes: Vec<serde_json::Value>,
     /// 阶段屏障列表
     pub barriers: Vec<serde_json::Value>,
-    /// target_stage 到节点集合的映射
+    /// target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）
     #[serde(rename = "stageMaps")]
     pub stage_maps: serde_json::Value,
     #[serde(rename = "createdAt")]
@@ -138,7 +138,7 @@ pub struct TaskIntakeRequest {
     /// 用户自然语言需求描述
     #[serde(rename = "requirementText")]
     pub requirement_text: String,
-    /// 用户选择的目标终点阶段
+    /// 用户选择的目标终点阶段（Master Spec §6.1 权威 target_stage 分类）
     #[serde(rename = "targetStage")]
     pub target_stage: String,
     #[serde(rename = "repositorySelection")]

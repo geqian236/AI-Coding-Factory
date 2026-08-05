@@ -6,6 +6,8 @@ Task 2 合同层测试：验证 schema、策略目录和测试目录的完整性
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,10 +27,10 @@ EXPECTED_NODE_TYPES = {
     "RESTORE_DRILL",
 }
 
-# 精确期望的 target_stage 集合
+# 精确期望的 target_stage 集合（Master Spec §6.1 权威 6 阶段）
 EXPECTED_TARGET_STAGES = {
-    "DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR",
-    "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION",
+    "DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY",
+    "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED",
 }
 
 # 精确期望的 47 个测试 ID（来自 Master Spec §20.2）
@@ -159,7 +161,7 @@ def test_all_schemas_have_additional_properties_false() -> None:
         elif schema.get("type") == "object":
             if schema.get("additionalProperties") is not False:
                 errors.append(f"{fname}: 顶层对象缺少 additionalProperties:false")
-    assert not errors, f"additionalProperties 违规:\n" + "\n".join(errors)
+    assert not errors, "additionalProperties 违规:\n" + "\n".join(errors)
 
 
 def test_all_schemas_are_valid_json() -> None:
@@ -252,18 +254,18 @@ def test_stage_capability_arrays_have_no_duplicates(stage_capability_map: dict) 
 def test_higher_stages_include_lower_stage_capabilities(stage_capability_map: dict) -> None:
     """高级 stage 的 capabilities 必须是低级 stage 的超集（渐进式权限）"""
     stage_caps = stage_capability_map.get("stageCapabilities", {})
-    design = set(stage_caps["DESIGN_REVIEW"]["capabilities"])
-    code_review = set(stage_caps["CODE_REVIEW"]["capabilities"])
-    publish_pr = set(stage_caps["PUBLISH_PR"]["capabilities"])
-    merge = set(stage_caps["MERGE"]["capabilities"])
-    accept_staging = set(stage_caps["ACCEPT_STAGING"]["capabilities"])
-    accept_prod = set(stage_caps["ACCEPT_PRODUCTION"]["capabilities"])
+    design = set(stage_caps["DESIGN_APPROVED"]["capabilities"])
+    codex_approved = set(stage_caps["CODEX_APPROVED"]["capabilities"])
+    pr_ready = set(stage_caps["PR_READY"]["capabilities"])
+    merged = set(stage_caps["MERGED"]["capabilities"])
+    staging_accepted = set(stage_caps["STAGING_ACCEPTED"]["capabilities"])
+    production_accepted = set(stage_caps["PRODUCTION_ACCEPTED"]["capabilities"])
 
-    assert design.issubset(code_review), "CODE_REVIEW 应包含 DESIGN_REVIEW 的全部 capabilities"
-    assert code_review.issubset(publish_pr), "PUBLISH_PR 应包含 CODE_REVIEW 的全部 capabilities"
-    assert publish_pr.issubset(merge), "MERGE 应包含 PUBLISH_PR 的全部 capabilities"
-    assert merge.issubset(accept_staging), "ACCEPT_STAGING 应包含 MERGE 的全部 capabilities"
-    assert accept_staging.issubset(accept_prod), "ACCEPT_PRODUCTION 应包含 ACCEPT_STAGING 的全部 capabilities"
+    assert design.issubset(codex_approved), "CODEX_APPROVED 应包含 DESIGN_APPROVED 的全部 capabilities"
+    assert codex_approved.issubset(pr_ready), "PR_READY 应包含 CODEX_APPROVED 的全部 capabilities"
+    assert pr_ready.issubset(merged), "MERGED 应包含 PR_READY 的全部 capabilities"
+    assert merged.issubset(staging_accepted), "STAGING_ACCEPTED 应包含 MERGED 的全部 capabilities"
+    assert staging_accepted.issubset(production_accepted), "PRODUCTION_ACCEPTED 应包含 STAGING_ACCEPTED 的全部 capabilities"
 
 
 # ─────────────────────── node pause policy tests ───────────────────────
@@ -383,13 +385,18 @@ def test_codegen_generated_files_exist() -> None:
 
 
 def test_codegen_no_drift() -> None:
-    """generate.py --check 必须通过（三语言生成树无漂移）"""
-    import subprocess
+    """generate.py --check 必须通过（三语言生成树无漂移）
 
+    使用 sys.executable 而非裸 "python"：后者经 PATH 解析，
+    可能命中与运行 pytest 不同的解释器，导致漂移检测结果不可信。
+    显式 encoding="utf-8" 避免 Windows locale（GBK）解码子进程中文输出时崩溃。
+    """
     result = subprocess.run(
-        ["python", str(CODEGEN_DIR / "generate.py"), "--check"],
+        [sys.executable, str(CODEGEN_DIR / "generate.py"), "--check"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(REPO_ROOT),
     )
     assert result.returncode == 0, (

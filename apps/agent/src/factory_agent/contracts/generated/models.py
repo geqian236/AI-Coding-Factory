@@ -44,8 +44,8 @@ class RunSpec(TypedDict, total=False):
     taskId: str
     # 语义计划哈希（跨 revision 稳定）
     semanticPlanHash: str
-    # 目标终点阶段
-    targetStage: Literal["DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR", "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION"]
+    # 目标终点阶段（Master Spec §6.1 权威 target_stage 集合）
+    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
     repositoryBinding: dict[str, Any]
     # IntentAuthorization 唯一 ID
     intentAuthorizationId: str
@@ -72,7 +72,7 @@ class PlanRevision(TypedDict, total=False):
     nodes: list[dict[str, Any]]
     # 阶段屏障列表
     barriers: list[dict[str, Any]]
-    # target_stage 到节点集合的映射
+    # target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）
     stageMaps: dict[str, Any]
     createdAt: str
 
@@ -99,8 +99,8 @@ class TaskIntakeRequest(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 用户自然语言需求描述
     requirementText: str
-    # 用户选择的目标终点阶段
-    targetStage: Literal["DESIGN_REVIEW", "CODE_REVIEW", "PUBLISH_PR", "MERGE", "ACCEPT_STAGING", "ACCEPT_PRODUCTION"]
+    # 用户选择的目标终点阶段（Master Spec §6.1 权威 target_stage 分类）
+    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
     repositorySelection: dict[str, Any]
     environmentSelection: dict[str, Any]
     # 用户设定的自主执行预算上限（毫秒）

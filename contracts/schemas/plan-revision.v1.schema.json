@@ -80,14 +80,14 @@
     "stageMaps": {
       "type": "object",
       "additionalProperties": false,
-      "description": "target_stage 到节点集合的映射",
+      "description": "target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）",
       "properties": {
-        "DESIGN_REVIEW":     {"type": "array", "items": {"type": "string"}},
-        "CODE_REVIEW":       {"type": "array", "items": {"type": "string"}},
-        "PUBLISH_PR":        {"type": "array", "items": {"type": "string"}},
-        "MERGE":             {"type": "array", "items": {"type": "string"}},
-        "ACCEPT_STAGING":    {"type": "array", "items": {"type": "string"}},
-        "ACCEPT_PRODUCTION": {"type": "array", "items": {"type": "string"}}
+        "DESIGN_APPROVED":     {"type": "array", "items": {"type": "string"}},
+        "CODEX_APPROVED":      {"type": "array", "items": {"type": "string"}},
+        "PR_READY":            {"type": "array", "items": {"type": "string"}},
+        "MERGED":              {"type": "array", "items": {"type": "string"}},
+        "STAGING_ACCEPTED":    {"type": "array", "items": {"type": "string"}},
+        "PRODUCTION_ACCEPTED": {"type": "array", "items": {"type": "string"}}
       }
     },
     "createdAt": {
