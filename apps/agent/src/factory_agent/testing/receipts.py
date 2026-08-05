@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 # ─── 常量 ────────────────────────────────────────────────────────────────────
 
 # 合法的 result 枚举值
@@ -53,7 +52,7 @@ class ReceiptAction:
     inputDigest: str | None = None
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ReceiptAction":
+    def from_dict(cls, d: dict[str, Any]) -> ReceiptAction:
         """从字典反序列化动作记录。"""
         return cls(
             actionId=d["actionId"],
@@ -232,7 +231,7 @@ class TestReceipt:
     # ── 序列化 ────────────────────────────────────────────────────────────────
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "TestReceipt":
+    def from_dict(cls, d: dict[str, Any]) -> TestReceipt:
         """从字典反序列化回执（遵循 test-receipt.v1 schema）。"""
         actions = [
             ReceiptAction.from_dict(a) if isinstance(a, dict) else a

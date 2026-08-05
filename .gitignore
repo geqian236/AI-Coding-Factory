@@ -49,3 +49,20 @@ worktrees/
 *.swp
 Thumbs.db
 Desktop.ini
+
+# Claude Code / workflow 产物（会话级，不入库）
+.claude/
+.tmp_*.py
+
+# Spike 运行时中间产物（探针每轮重新生成；只有最终 receipt.json 入库）
+tools/compat-probes/**/_*_stderr.log
+tools/compat-probes/**/_*_stdout.log
+tools/compat-probes/**/_server_*.log
+tools/compat-probes/**/_broker_*.log
+tools/compat-probes/**/_child_*.log
+tools/compat-probes/**/client_receipt.json
+tools/compat-probes/**/server_receipt.json
+tools/compat-probes/**/probe_tmp/
+# 探针脚手架生成器（本地一次性工具，非入库源码）
+tools/compat-probes/_gen_ps1.py
+tools/compat-probes/_gen_spikes.py

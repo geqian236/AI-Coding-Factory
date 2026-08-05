@@ -135,7 +135,7 @@ def load_catalog(path: Path | None = None) -> dict[str, Any]:
                 f"测试条目 [{test_id}] 缺少必需字段: {sorted(missing_fields)}"
             )
 
-    return catalog  # type: ignore[return-value]
+    return catalog  # type: ignore[no-any-return]
 
 
 def get_test_ids(catalog: dict[str, Any] | None = None) -> frozenset[str]:
@@ -159,7 +159,7 @@ def get_test_entry(test_id: str, catalog: dict[str, Any] | None = None) -> dict[
         catalog = load_catalog()
     for entry in catalog["tests"]:
         if entry["testId"] == test_id:
-            return entry  # type: ignore[return-value]
+            return entry  # type: ignore[no-any-return]
     raise KeyError(f"testId '{test_id}' 不在 required-test-catalog 中")
 
 

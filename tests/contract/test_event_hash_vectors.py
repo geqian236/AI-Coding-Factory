@@ -12,7 +12,6 @@ import json
 from typing import Any
 
 import pytest
-
 from factory_agent.domain.events import (
     EventHashError,
     event_id,
@@ -20,6 +19,7 @@ from factory_agent.domain.events import (
     payload_digest,
 )
 from factory_agent.policy.canonical_json import canonicalize_json_text
+
 from tests.conftest import REPO_ROOT
 
 # golden 向量目录

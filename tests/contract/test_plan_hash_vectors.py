@@ -9,11 +9,9 @@ canonical JSON、semanticPlanHash、planRevisionDigest、barrierId 输出与
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
-
 from factory_agent.policy.canonical_json import (
     CanonicalJsonError,
     canonicalize_json_text,
@@ -23,6 +21,7 @@ from factory_agent.policy.plan_hash import (
     plan_revision_digest,
     semantic_plan_hash,
 )
+
 from tests.conftest import REPO_ROOT
 
 # golden 向量目录

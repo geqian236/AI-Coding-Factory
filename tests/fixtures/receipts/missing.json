@@ -10,7 +10,9 @@
         "executedAt": "2026-08-04T00:00:00Z"
       }
     ],
-    "expected": {"allHashesMatch": true},
+    "expected": {
+      "allHashesMatch": true
+    },
     "actual": {},
     "sideEffectCount": 0,
     "artifactDigests": [],
