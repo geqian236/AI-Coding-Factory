@@ -6,6 +6,7 @@ members = [
     "crates/factory-contracts",
     # Task 7 compat probe crates
     "tools/compat-probes/windows_durable_io",
+    "tools/compat-probes/clock_source",
 ]
 resolver = "2"
 
