@@ -7,6 +7,7 @@ members = [
     # Task 7 compat probe crates
     "tools/compat-probes/windows_durable_io",
     "tools/compat-probes/clock_source",
+    "tools/compat-probes/named_pipe",
 ]
 resolver = "2"
 
