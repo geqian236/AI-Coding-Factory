@@ -19,7 +19,7 @@
     ],
     "result": "PASS",
     "createdAt": "2026-08-04T00:00:00Z",
-    "scenarioContractDigest": "placeholder-to-be-filled-by-implementer",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
     "implementationContributors": ["factory-contracts"],
     "finalPassOwner": "codex-reviewer",
     "requiredReplays": 3,

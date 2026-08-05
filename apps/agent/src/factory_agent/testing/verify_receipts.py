@@ -32,6 +32,7 @@ from factory_agent.testing.receipts import (
     load_receipts_from_file,
 )
 from factory_agent.testing.required_test_catalog import (
+    digest_by_test_id,
     get_test_ids,
     load_catalog,
 )
@@ -72,13 +73,18 @@ class VerificationResult:
 def verify(
     catalog_path: Path,
     receipts_path: Path,
+    require_coverage: bool = False,
 ) -> VerificationResult:
     """
     验证回执目录（或单文件）是否通过所有规则。
 
     参数：
-      catalog_path  : required-test-catalog.v1.json 路径
-      receipts_path : 包含回执 JSON 文件的目录，或单个 JSON 文件
+      catalog_path     : required-test-catalog.v1.json 路径
+      receipts_path    : 包含回执 JSON 文件的目录，或单个 JSON 文件
+      require_coverage : True 时启用覆盖门禁——required-test-catalog 中每个
+                         testId 都必须有一条 result=PASS 的回执，否则报
+                         MISSING_COVERAGE。默认 False 保持逐回执校验模式
+                         （单元测试与增量 fixture 用），Phase 0 总门禁显式传 True。
 
     返回：VerificationResult（errors 为空表示全部通过）
     """
@@ -131,6 +137,37 @@ def verify(
                 f"CONFLICTING_RESULTS [{test_id}]: 同一 testId 出现冲突结果 {sorted(unique_results)}"
             )
 
+    # ── 6. scenarioContractDigest 绑定校验 ────────────────────────────────────
+    # 回执若携带非空 scenarioContractDigest，必须与 catalog 中该 testId 的冻结值一致；
+    # 场景合同漂移（catalog 侧改动）或回执引用了旧合同都会失配，fail closed。
+    # digest 为 None/缺省表示回执未声明合同绑定，不在此处强制（覆盖门禁另行处理）。
+    catalog_digests = digest_by_test_id(catalog)
+    for receipt in receipts:
+        declared = receipt.scenarioContractDigest
+        if declared is None:
+            continue
+        expected = catalog_digests.get(receipt.testId)
+        if expected is not None and declared != expected:
+            result.add_error(
+                f"DIGEST_MISMATCH [{receipt.receiptId}]: testId='{receipt.testId}' "
+                f"的 scenarioContractDigest 与 catalog 冻结值不一致"
+                f"（回执={declared} / catalog={expected}）"
+            )
+
+    # ── 7. 覆盖门禁（仅在 require_coverage=True 时）────────────────────────────
+    # Phase 0 总门禁要求：47 个 required testId 每个都必须有一条 result=PASS 的回执。
+    # 只提供 1/47 或存在未 PASS 的必需项都会 fail closed，杜绝"部分回执即通过"。
+    if require_coverage:
+        passing_ids = {
+            r.testId for r in receipts if r.result == "PASS"
+        }
+        missing = sorted(catalog_ids - passing_ids)
+        if missing:
+            result.add_error(
+                f"MISSING_COVERAGE: {len(missing)}/{len(catalog_ids)} 个必需 testId "
+                f"缺少 result=PASS 的回执: {missing}"
+            )
+
     return result
 
 
@@ -161,6 +198,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="以 JSON 格式输出结果（方便机器解析）",
     )
+    parser.add_argument(
+        "--require-coverage",
+        action="store_true",
+        default=False,
+        help="要求 catalog 全部 47 个 testId 均有 PASS 回执；缺任一即 fail-closed（Phase 0 总门禁用）",
+    )
     return parser
 
 
@@ -176,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     result = verify(
         catalog_path=args.catalog,
         receipts_path=args.receipts,
+        require_coverage=args.require_coverage,
     )
 
     if args.json_output:

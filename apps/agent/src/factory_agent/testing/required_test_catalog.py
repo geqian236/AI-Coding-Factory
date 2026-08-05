@@ -8,11 +8,20 @@ apps/agent/src/factory_agent/testing/required_test_catalog.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
+from factory_agent.policy.canonical_json import canonicalize
+
 # ─── 常量 ────────────────────────────────────────────────────────────────────
+
+# scenarioContractDigest 摘要输出前缀。
+_SHA256_PREFIX = "sha256:"
+
+# 计算 scenarioContractDigest 时必须排除的字段（自身摘要值，避免自指循环）。
+_DIGEST_EXCLUDED_FIELDS = frozenset({"scenarioContractDigest"})
 
 # 相对于本文件向上 5 层到达 repo root
 _REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -152,3 +161,38 @@ def get_test_entry(test_id: str, catalog: dict[str, Any] | None = None) -> dict[
         if entry["testId"] == test_id:
             return entry  # type: ignore[return-value]
     raise KeyError(f"testId '{test_id}' 不在 required-test-catalog 中")
+
+
+def scenario_contract_digest(entry: dict[str, Any]) -> str:
+    """计算某测试条目的 scenarioContractDigest（冻结场景合同身份）。
+
+    对「除 scenarioContractDigest 自身外」的完整条目做与 plan/event hash 同一的
+    RFC 8785 canonicalizer（NFC + JCS）后取 SHA-256，前缀 "sha256:"。因此 testId、
+    scenario 文本、implementationContributors、finalPassOwner、requiredReplays、
+    crashPointIds 中任一漂移都会改变摘要，使旧回执的 scenarioContractDigest 失配。
+
+    Args:
+        entry: required-test-catalog 中的单个测试条目。
+
+    Returns:
+        形如 "sha256:<64 位小写十六进制>" 的场景合同摘要。
+
+    Raises:
+        CanonicalJsonError: 条目含非法数字/类型/重复键。
+    """
+    material = {k: v for k, v in entry.items() if k not in _DIGEST_EXCLUDED_FIELDS}
+    digest = hashlib.sha256(canonicalize(material)).hexdigest()
+    return f"{_SHA256_PREFIX}{digest}"
+
+
+def digest_by_test_id(catalog: dict[str, Any] | None = None) -> dict[str, str]:
+    """返回 {testId: 冻结的 scenarioContractDigest} 映射（读取 catalog 中的存储值）。
+
+    供聚合器绑定校验使用：回执携带的 scenarioContractDigest 必须与此映射一致。
+    """
+    if catalog is None:
+        catalog = load_catalog()
+    return {
+        entry["testId"]: entry["scenarioContractDigest"]
+        for entry in catalog["tests"]
+    }
