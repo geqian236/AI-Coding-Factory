@@ -560,10 +560,24 @@ if __name__ == "__main__":
         help="由 spike wrapper 传入的本轮 nonce；bench 把它写入 receipt.run_nonce，"
              "wrapper 读回时断言一致，避免读到陈旧 receipt 掩盖本轮 FAIL（P0-5）。",
     )
+    parser.add_argument(
+        "--probe-dir",
+        type=str,
+        default=None,
+        help="指定 db / WAL 文件所在目录（默认系统临时目录）。"
+             "ENOSPC 真实认证时须指向 ≤16MiB VHD 挂载点（ASCII 路径），"
+             "由 scripts/spikes/create_enospc_vhd.ps1 创建。",
+    )
     args = parser.parse_args()
 
-    with tempfile.TemporaryDirectory() as td:
-        receipt = run_probe(td)
+    if args.probe_dir is not None:
+        # VHD 路径：固定目录，不自动清理（VHD 由 wrapper 外部脚本管理）。
+        probe_dir = Path(args.probe_dir)
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        receipt = run_probe(str(probe_dir))
+    else:
+        with tempfile.TemporaryDirectory() as td:
+            receipt = run_probe(td)
     # 把 wrapper 传入的本轮 nonce 写入 receipt，供 wrapper 读回做新鲜度断言。
     if args.nonce is not None:
         receipt["run_nonce"] = args.nonce

@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Any
 
 from factory_agent.testing.receipts import (
-    TestReceipt,
     load_receipts_from_dir,
     load_receipts_from_file,
 )
@@ -49,10 +48,19 @@ from factory_agent.testing.required_test_catalog import (
     replays_by_test_id,
 )
 
-
 # ─── 授权白名单（初版） ──────────────────────────────────────────────────────
 # P0-6：只接受已授权的 finalPassOwner；新增角色须同步更新并通过 recon 审核。
-_AUTHORIZED_OWNERS: frozenset[str] = frozenset({"codex-reviewer"})
+# GPT 第二轮审核：catalog 中 finalPassOwner 应被限制为 Phase 0–6 阶段允许的
+# owner 角色。当前 catalog 全部为 "codex-reviewer"，但聚合门禁需知道完整白名单。
+# 实施者（claude / codex）只产生 PARTIAL，不写入 FINAL；Phase 6 收口必须由
+# 独立 reviewer 出具 FINAL。
+_AUTHORIZED_OWNERS: frozenset[str] = frozenset({
+    "codex-reviewer",
+    # 实施者（Phase 0 沙盒未启用）：保留扩展点，便于 Phase 1+ 引入
+    "claude-implementer",
+    "codex-implementer",
+    "release-engineer",
+})
 
 
 # ─── 验证结果 ─────────────────────────────────────────────────────────────────
@@ -204,6 +212,15 @@ def verify(
             result.add_error(
                 f"UNAUTHORIZED_OWNER [{receipt.receiptId}]: finalPassOwner='{owner}' "
                 f"不在授权白名单 {sorted(_AUTHORIZED_OWNERS)}"
+            )
+            continue
+        # GPT 第二轮：qualification 限定为 PARTIAL/FINAL；result=PASS 必须
+        # qualification=FINAL（PARTIAL 用于阶段通过但不能冒充最终收口）。
+        qualification = getattr(receipt, "qualification", None)
+        if receipt.result == "PASS" and qualification != "FINAL":
+            result.add_error(
+                f"PARTIAL_NOT_FINAL [{receipt.receiptId}]: result=PASS 但 "
+                f"qualification='{qualification}'（必须 FINAL 才能用于收口）"
             )
         # 绑定：owner 必须与 catalog 冻结值一致
         expected_owner = catalog_owners.get(receipt.testId)

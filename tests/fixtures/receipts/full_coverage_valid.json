@@ -32,7 +32,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -69,7 +69,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -106,7 +106,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -143,7 +143,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -180,7 +180,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -217,7 +217,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -255,7 +255,7 @@
       "policy-engine"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -293,7 +293,7 @@
       "policy-engine"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -331,7 +331,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -368,7 +368,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -405,7 +405,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -442,7 +442,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -479,7 +479,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -516,7 +516,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -553,7 +553,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -590,7 +590,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -628,7 +628,7 @@
       "desktop-shell"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -665,7 +665,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -702,7 +702,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -739,7 +739,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -776,7 +776,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -813,7 +813,7 @@
       "factory-contracts"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   },
@@ -850,7 +850,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -887,7 +887,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -925,7 +925,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 2,
     "runtimeId": "python-3.12"
   },
@@ -963,7 +963,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 2,
     "runtimeId": "python-3.12"
   },
@@ -1000,7 +1000,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1037,7 +1037,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1074,7 +1074,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1111,7 +1111,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1149,7 +1149,7 @@
       "verification"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1187,7 +1187,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1224,7 +1224,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1261,7 +1261,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1298,7 +1298,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1335,7 +1335,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1373,7 +1373,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1410,7 +1410,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1447,7 +1447,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1484,7 +1484,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1522,7 +1522,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1560,7 +1560,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1597,7 +1597,7 @@
       "hardening"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1634,7 +1634,7 @@
       "hardening"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1672,7 +1672,7 @@
       "ai-harness"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1709,7 +1709,7 @@
       "hardening"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1747,7 +1747,7 @@
       "verification"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1784,7 +1784,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1821,7 +1821,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1858,7 +1858,7 @@
       "deployment"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1895,7 +1895,7 @@
       "control-plane"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   },
@@ -1932,7 +1932,7 @@
       "hardening"
     ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 1,
     "runtimeId": "python-3.12"
   }

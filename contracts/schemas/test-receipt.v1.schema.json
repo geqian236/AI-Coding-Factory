@@ -93,8 +93,8 @@
     },
     "qualification": {
       "type": "string",
-      "minLength": 1,
-      "description": "执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer）"
+      "enum": ["PARTIAL", "FINAL"],
+      "description": "执行资质等级（GPT 第二轮审核限定）：PARTIAL=阶段/中间通过；FINAL=最终/收口通过。verify_receipts 强制 PARTIAL 不能冒充 FINAL 用于收口。"
     },
     "requiredReplays": {
       "type": "integer",

@@ -273,14 +273,40 @@ def test_emit_manifest_rejects_failed_spike_receipt(
     emit_manifest_module: ModuleType,
     tmp_path: Path,
 ) -> None:
-    """spike receipt status != PASS 时 emit_manifest 必须 fail closed（ValueError）。"""
+    """spike receipt status = FAIL 时 emit_manifest 必须 fail closed（ValueError）。
+
+    GPT 第二轮要求：真实 receipt（PASS 或 BLOCKED_UNCERTIFIED）必须能绑定
+    manifest；只有 FAIL（已认证失败）才拒发。
+    """
     bad = tmp_path / "bad.json"
     bad.write_text(
         json.dumps({"status": "FAIL", "env_digest": "sha256:abc", "param_digest": "sha256:def"}),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="SPIKE_NOT_PASS"):
+    with pytest.raises(ValueError, match="SPIKE_NOT_VALID"):
         emit_manifest_module.emit_manifest(spike_receipt_path=bad)
+
+
+def test_emit_manifest_accepts_blocked_spike_receipt(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """GPT 第二轮要求：BLOCKED_UNCERTIFIED receipt 必须能绑定 manifest。
+
+    真实 SQLite spike 在 Phase 0 沙盒内顶层 BLOCKED（disk-full 必选子项无独立小卷），
+    但 process-kill 恢复 / group-commit 原子 / 三阈值触发 / PRAGMA 读回均已认证；
+    emitter 不能因 BLOCKED 而拒发真实证据。manifest.sqliteSpikeReceiptStatus 透传
+    BLOCKED_UNCERTIFIED 给 Phase 6 validator。
+    """
+    real_receipt_path = Path(
+        __import__("os").path.dirname(__import__("os").path.dirname(__import__("os").path.dirname(__file__)))
+    ) / "tools" / "compat-probes" / "sqlite_wal_full" / "receipt.json"
+    if not real_receipt_path.exists():
+        pytest.skip("real sqlite receipt not present")
+    manifest = emit_manifest_module.emit_manifest(spike_receipt_path=real_receipt_path)
+    assert manifest["sqliteSpikeReceiptStatus"] == "BLOCKED_UNCERTIFIED"
+    assert manifest["benchmarkProfileDigest"].startswith("sha256:")
+    assert manifest["sqliteSpikeReceiptDigest"].startswith("sha256:")
 
 
 def test_emit_manifest_produces_valid_structure(

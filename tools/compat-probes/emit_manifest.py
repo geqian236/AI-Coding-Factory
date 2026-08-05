@@ -200,7 +200,9 @@ def emit_manifest(
 
     fail-closed 规则：
     - spike_receipt_path 必须存在
-    - spike receipt status 必须为 PASS
+    - spike receipt status 必须为 PASS 或 BLOCKED_UNCERTIFIED
+      （BLOCKED 仍可生成 manifest：manifest.status 透传，调用方据此
+      识别「未完整认证」状态，而不是被 emitter 拒发导致真实证据丢）
     - spike receipt 必须含 env_digest、param_digest
     - benchmark profile 文件必须存在
     - manifest schema 文件必须存在
@@ -217,10 +219,14 @@ def emit_manifest(
     with spike_receipt_path.open(encoding="utf-8") as f:
         spike_receipt: dict[str, Any] = json.load(f)
 
-    # 检查 spike 状态
-    if spike_receipt.get("status") != "PASS":
+    # 检查 spike 状态：允许 PASS 与 BLOCKED_UNCERTIFIED（GPT 第二轮要求
+    # 真实 receipt 必须可绑定 manifest）。FAIL 仍拒发（已认证失败不应
+    # 进入 Compatibility Manifest 发布面）。
+    spike_status = spike_receipt.get("status")
+    if spike_status not in ("PASS", "BLOCKED_UNCERTIFIED"):
         raise ValueError(
-            f"SPIKE_NOT_PASS: SQLite spike receipt status='{spike_receipt.get('status')}' 不是 PASS"
+            f"SPIKE_NOT_VALID: SQLite spike receipt status='{spike_status}' "
+            "不在 (PASS, BLOCKED_UNCERTIFIED) — FAIL receipt 不参与 manifest 绑定"
         )
 
     # 检查必需字段
@@ -320,6 +326,7 @@ def emit_manifest(
         "eventBatchParameters": event_batch_parameters,
         "benchmarkProfileDigest": benchmark_profile_digest,
         "sqliteSpikeReceiptDigest": sqlite_spike_receipt_digest,
+        "sqliteSpikeReceiptStatus": spike_status,
         "stageCapeabilityMapDigest": stage_cap_digest,
         "nodeCapabilityMapDigest": node_cap_digest,
         "environmentDigest": spike_receipt["env_digest"],

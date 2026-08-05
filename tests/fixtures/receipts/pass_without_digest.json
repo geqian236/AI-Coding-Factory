@@ -11,15 +11,23 @@
         "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
       }
     ],
-    "expected": {"allHashesMatch": true},
-    "actual": {"allHashesMatch": true},
+    "expected": {
+      "allHashesMatch": true
+    },
+    "actual": {
+      "allHashesMatch": true
+    },
     "sideEffectCount": 0,
-    "artifactDigests": ["sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"],
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
     "result": "PASS",
     "createdAt": "2026-08-05T00:00:00Z",
-    "implementationContributors": ["factory-contracts"],
+    "implementationContributors": [
+      "factory-contracts"
+    ],
     "finalPassOwner": "codex-reviewer",
-    "qualification": "codex-reviewer",
+    "qualification": "FINAL",
     "requiredReplays": 3,
     "runtimeId": "python-3.12"
   }

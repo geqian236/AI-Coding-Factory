@@ -23,6 +23,14 @@ $common     = "$PSScriptRoot\_common.ps1"
 # 本轮 nonce：传给子进程，再断言 receipt.run_nonce 一致，避免读到陈旧 PASS。
 $nonce = [guid]::NewGuid().ToString("N")
 
+# ENOSPC 真实认证路径：如果 D:\vhd_enospc 存在且是 VHD 挂载点，把 probe-dir
+# 指向它（由 create_enospc_vhd.ps1 创建）。否则默认用系统临时目录。
+$probeDir = $null
+if (Test-Path "D:\vhd_enospc") {
+    $probeDir = "D:\vhd_enospc"
+    Write-Host "[probe] using VHD mount as probe-dir: $probeDir"
+}
+
 $py = $null
 foreach ($candidate in @("python","python3","py")) {
     try { $v = & $candidate --version 2>&1; if ($LASTEXITCODE -eq 0) { $py = $candidate; break } } catch {}
@@ -36,7 +44,8 @@ Write-Host "Running SQLite WAL FULL probe with $py ..."
 # P0-5：用 try/catch 捕获子进程调用异常（如 python 找不到 bench.py 报
 # NativeCommandError），不能让异常直接抛到上层吞掉 FAIL receipt 写盘步骤。
 try {
-    $out = & $py $benchPy --nonce $nonce 2>&1
+    $probeArg = if ($probeDir) { @("--probe-dir", $probeDir) } else { @() }
+    $out = & $py $benchPy --nonce $nonce @probeArg 2>&1
     $ec  = $LASTEXITCODE
     $outStr = $out -join "`n"
     Write-Host $outStr

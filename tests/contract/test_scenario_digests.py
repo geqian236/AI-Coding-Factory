@@ -15,8 +15,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from factory_agent.testing.required_test_catalog import (
     digest_by_test_id,
     load_catalog,
@@ -142,7 +140,7 @@ def test_require_coverage_passes_with_full_47(tmp_path: Path) -> None:
                 "createdAt": "2026-08-05T00:00:00Z",
                 "scenarioContractDigest": digests[tid],
                 "finalPassOwner": owners[tid],
-                "qualification": owners[tid],
+                "qualification": "FINAL",  # GPT 第二轮：result=PASS 必须 qualification=FINAL
                 "requiredReplays": n_replays,
             })
     full = tmp_path / "full_coverage.json"

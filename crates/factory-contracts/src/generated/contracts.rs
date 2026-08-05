@@ -553,7 +553,7 @@ pub struct TestReceipt {
     /// 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）
     #[serde(rename = "finalPassOwner")]
     pub final_pass_owner: String,
-    /// 执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer）
+    /// 执行资质等级（GPT 第二轮审核限定）：PARTIAL=阶段/中间通过；FINAL=最终/收口通过。verify_receipts 强制 PARTIAL 不能冒充 FINAL 用于收口。
     pub qualification: String,
     /// 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）
     #[serde(rename = "requiredReplays")]
