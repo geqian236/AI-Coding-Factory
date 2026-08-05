@@ -1,146 +1,115 @@
-﻿//! Windows 持久 IO 探针
-//! 验证 write → flush → rename → sync-parent-dir 的耐久语义。
-//! 输出 JSON receipt，包含每步 observable fact 和 SHA-256 digest。
+//! Windows 持久 IO 探针 —— child-writer(跨进程硬杀崩溃一致性验证的"被杀方")
+//!
+//! 诚实边界:真正的掉电级 durability(断电/内核崩溃后数据仍在)在纯软件环境
+//! **无法证明** —— 进程被杀后数据仍留在 OS page cache,杀进程并不能证明
+//! FlushFileBuffers 已把字节落到稳定存储。故本 probe 只认证可真实观测的两点:
+//!   1. 原子 rename:tmp -> final 在同卷上原子完成;
+//!   2. 跨进程崩溃一致性:writer 进程在 flush + rename 后、正常退出前被父进程
+//!      **硬杀**,一个独立进程仍能读到完整且正确(含本 writer 自报 nonce)的
+//!      final 文件。
+//! 掉电级 durability 与"父目录 fsync 实际生效"由 driver 如实标 BLOCKED_UNCERTIFIED
+//! (非 gating),绝不冒充已认证。
+//!
+//! 本二进制即"被硬杀的 writer 子进程":写入 -> FlushFileBuffers(sync_all)->
+//! 原子 rename -> 打印结构化 CHILD_READY 行(含自报 PID / nonce / 实测 flush 结果)
+//! -> 挂起等待父进程硬杀;超时自保退出,避免父进程异常时子进程泄漏为常驻孤儿。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn sha256_hex(data: &[u8]) -> String {
-    // 简单 FNV-1a 替代（无 ring 依赖）——仅用于 probe receipt，非安全用途
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}{:016x}", h, h.wrapping_add(0xdeadbeef))
-}
-
-fn now_iso() -> String {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{}s{}ns", d.as_secs(), d.subsec_nanos())
-}
-
-#[derive(serde::Serialize)]
-struct Receipt {
-    spike: &'static str,
-    status: &'static str,
-    environment: Environment,
-    actions: Vec<String>,
-    observable_facts: ObservableFacts,
-    assertions: Vec<Assertion>,
-    artifact_digest: String,
-    timestamp: String,
-}
-
-#[derive(serde::Serialize)]
-struct Environment {
-    os: &'static str,
-    arch: &'static str,
-    probe_version: &'static str,
-}
-
-#[derive(serde::Serialize)]
-struct ObservableFacts {
-    write_bytes: usize,
-    flush_succeeded: bool,
-    rename_succeeded: bool,
-    content_verified_after_rename: bool,
-    file_size_bytes: u64,
-}
-
-#[derive(serde::Serialize)]
-struct Assertion {
-    name: String,
-    passed: bool,
-    detail: String,
-}
-
-fn run_probe(tmp_dir: &Path) -> io::Result<Receipt> {
-    let mut actions = Vec::new();
-    let payload = b"DURABLE_IO_PROBE_PAYLOAD_v1\n";
-    let tmp_path: PathBuf = tmp_dir.join("probe_tmp.dat");
-    let final_path: PathBuf = tmp_dir.join("probe_final.dat");
-
-    // Step 1: open + write
-    let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
-    f.write_all(payload)?;
-    actions.push(format!("write {} bytes to {:?}", payload.len(), tmp_path));
-
-    // Step 2: flush (flushes OS buffers; on Windows calls FlushFileBuffers via sync_all)
-    f.flush()?;
-    f.sync_all()?;
-    actions.push("flush + sync_all (FlushFileBuffers)".to_string());
-
-    // Step 3: rename (atomic on same volume)
-    fs::rename(&tmp_path, &final_path)?;
-    actions.push(format!("rename {:?} -> {:?}", tmp_path, final_path));
-
-    // Step 4: verify content after rename
-    let content = fs::read(&final_path)?;
-    let content_ok = content == payload;
-    actions.push(format!("read back {} bytes, match={}", content.len(), content_ok));
-
-    // Step 5: sync parent dir (on Windows: open dir and sync_all)
-    let parent_dir = tmp_dir;
-    {
-        let dir_handle = File::open(parent_dir)?;
-        // sync_all on a directory handle is a no-op on Windows but validates the handle
-        let _ = dir_handle.sync_all();
-    }
-    actions.push(format!("sync parent dir {:?}", parent_dir));
-
-    let meta = fs::metadata(&final_path)?;
-    let artifact_digest = sha256_hex(&content);
-
-    let facts = ObservableFacts {
-        write_bytes: payload.len(),
-        flush_succeeded: true,
-        rename_succeeded: true,
-        content_verified_after_rename: content_ok,
-        file_size_bytes: meta.len(),
+/// splitmix64:无外部 RNG 依赖,由「时间纳秒 ⊕ pid」播种,产生一次性 nonce。
+/// nonce 让 driver 能证明读到的 final 文件确为**本次** writer 所写(新鲜度),
+/// 而非上一轮遗留的陈旧文件。
+fn gen_nonce() -> (u64, u64) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = nanos ^ ((std::process::id() as u64) << 17);
+    let mut next = || {
+        seed = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
     };
+    (next(), next())
+}
 
-    let assertions = vec![
-        Assertion {
-            name: "content_survives_rename".to_string(),
-            passed: content_ok,
-            detail: format!("expected {} bytes, got {}", payload.len(), content.len()),
-        },
-        Assertion {
-            name: "file_size_matches_write".to_string(),
-            passed: meta.len() == payload.len() as u64,
-            detail: format!("expected={} actual={}", payload.len(), meta.len()),
-        },
-    ];
+/// child-writer 主体:写 -> flush -> 原子 rename -> 打印 READY -> 挂起等被杀。
+/// 返回 Err 时由 main 打印 CHILD_ERROR 并以非 0 退出(driver 据此判 ERROR)。
+fn run_child(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let tmp_path = dir.join("probe_tmp.dat");
+    let final_path = dir.join("probe_final.dat");
 
-    let all_pass = assertions.iter().all(|a| a.passed);
-    Ok(Receipt {
-        spike: "windows_durable_io",
-        status: if all_pass { "PASS" } else { "FAIL" },
-        environment: Environment { os: std::env::consts::OS, arch: std::env::consts::ARCH, probe_version: "0.1.0" },
-        actions,
-        observable_facts: facts,
-        assertions,
-        artifact_digest: format!("fnv1a:{}", artifact_digest),
-        timestamp: now_iso(),
-    })
+    // spawn 前 driver 已删旧 final;child 再删一次,保证新鲜度断言严格成立。
+    let _ = fs::remove_file(&final_path);
+    let _ = fs::remove_file(&tmp_path);
+
+    let (n1, n2) = gen_nonce();
+    let nonce_hex = format!("{:016x}{:016x}", n1, n2);
+    // 固定前缀 + nonce:driver 逐字节比对整体,并用 nonce 判新鲜度。
+    let payload = format!("DURABLE_IO_PROBE_v2\nnonce={}\n", nonce_hex).into_bytes();
+
+    // Step 1:写入 tmp。
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    f.write_all(&payload)?;
+
+    // Step 2:flush + sync_all(Windows 上即 FlushFileBuffers)。实测结果,非硬编码。
+    f.flush()?;
+    let flush_ok = f.sync_all().is_ok();
+    drop(f);
+
+    // Step 3:原子 rename(同卷 MoveFileEx 语义)。
+    fs::rename(&tmp_path, &final_path)?;
+    let rename_ok = final_path.exists() && !tmp_path.exists();
+
+    // Step 4:尝试 sync 父目录。Windows 上对目录句柄 sync_all 基本是 no-op,
+    // 如实上报实测调用结果,不冒充"父目录已持久化"。
+    let dir_sync_ok = File::open(dir).and_then(|d| d.sync_all()).is_ok();
+
+    // Step 5:打印结构化 READY 行并**立即 flush stdout**,让 driver 精确拿到
+    // writer 自身 PID,据此做定点硬杀与新鲜度校验。
+    println!(
+        "CHILD_READY pid={} nonce={} bytes={} flush_ok={} rename_ok={} dir_sync_ok={}",
+        std::process::id(),
+        nonce_hex,
+        payload.len(),
+        flush_ok,
+        rename_ok,
+        dir_sync_ok
+    );
+    io::stdout().flush()?;
+
+    // Step 6:挂起等待父进程硬杀。设 60s 自保上限:父进程异常未杀时子进程自行
+    // 退出,绝不泄漏为常驻孤儿进程。
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Ok(())
 }
 
 fn main() {
-    let tmp_dir = std::env::temp_dir().join("windows_durable_io_probe");
-    std::fs::create_dir_all(&tmp_dir).ok();
-    match run_probe(&tmp_dir) {
-        Ok(receipt) => {
-            let json = serde_json::to_string_pretty(&receipt).unwrap();
-            println!("{}", json);
-            std::fs::remove_dir_all(&tmp_dir).ok();
-            if receipt.status != "PASS" { std::process::exit(1); }
+    let args: Vec<String> = std::env::args().collect();
+    // 调用协议:windows_durable_io child <tmp_dir>
+    if args.len() >= 3 && args[1] == "child" {
+        match run_child(Path::new(&args[2])) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("CHILD_ERROR {}", e);
+                std::process::exit(2);
+            }
         }
-        Err(e) => {
-            eprintln!("PROBE ERROR: {}", e);
-            std::process::exit(2);
-        }
+        return;
     }
+    eprintln!("usage: windows_durable_io child <tmp_dir>");
+    std::process::exit(64);
 }

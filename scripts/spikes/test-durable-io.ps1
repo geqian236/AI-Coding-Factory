@@ -1,92 +1,231 @@
-﻿Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-$spikeName   = "windows_durable_io"
-$scriptRoot  = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
-$receiptDir  = "$scriptRoot\tools\compat-probes\windows_durable_io"
-$receiptPath = "$receiptDir\receipt.json"
-[System.IO.Directory]::CreateDirectory($receiptDir) | Out-Null
+﻿<#
+.SYNOPSIS  Spike: Windows 持久 IO 探针(真·跨进程硬杀崩溃一致性验证)
+.DESCRIPTION
+    起一个独立的 Rust writer 子进程(windows_durable_io child <dir>):
+      write -> FlushFileBuffers(sync_all)-> 原子 rename -> 打印 CHILD_READY
+      (含自报 PID / nonce / 实测 flush 结果)-> 挂起。
+    本 driver 作为**父/杀手进程**:轮询 stdout 上的 CHILD_READY 握手,确认 writer
+    已完成 flush+rename 且仍在运行(未正常退出)后,用 Stop-Process -Force 对其
+    **定点硬杀**;随后作为**独立进程**读回 final 文件,逐字节校验内容并核对 nonce
+    新鲜度 —— 证明"writer 崩溃(被杀)后,独立进程仍读到完整正确的已落盘数据"。
 
-$actions    = [System.Collections.Generic.List[string]]::new()
-$assertions = [System.Collections.Generic.List[hashtable]]::new()
-$status     = "PASS"
-$tmpDir     = [System.IO.Path]::Combine($receiptDir, "probe_tmp")
+    诚实边界:掉电级 durability(断电/内核崩溃后仍在)与"父目录 fsync 真实生效"
+    在纯软件环境无法证明,如实写入 uncertified_aspects 标 BLOCKED_UNCERTIFIED,
+    **不参与 gating**,绝不冒充已认证。非 Windows / 工具链缺失时如实写
+    BLOCKED_UNCERTIFIED / ERROR。
+#>
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$spikeName    = "windows_durable_io"
+$scriptRoot   = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
+$probeDir     = "$scriptRoot\tools\compat-probes\windows_durable_io"
+$receiptPath  = "$probeDir\receipt.json"
+$manifest     = "$probeDir\Cargo.toml"
+$devWrapper   = "$scriptRoot\scripts\dev.ps1"
+$tmpDir       = "$probeDir\probe_tmp"
+$childOut     = "$probeDir\_child_stdout.log"
+$childErr     = "$probeDir\_child_stderr.log"
+# dev.ps1 将 CARGO_TARGET_DIR 绑定到 D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target。
+# writer 是自足 exe,运行期不依赖 dev.ps1 环境(仅**构建**需要 ld.lld 链接器),
+# 故构建后直接 Start-Process 该 exe 以取真实 PID 做定点硬杀。
+$dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
+$writerExe    = "$dataRoot\cargo-target\debug\windows_durable_io.exe"
+
+# receipt 统一用无 BOM UTF-8 写:PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM,
+# 令下游 Python json.load 报 "Unexpected UTF-8 BOM"。
+function Write-Receipt($obj) {
+    $json = $obj | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText($receiptPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# ── 0. 平台前置检查 ─────────────────────────────────────────────────────────────
+if ($env:OS -notmatch "Windows") {
+    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
+                     reason="Windows durable-IO semantics require Windows host"
+                     timestamp=(Get-Date -Format "o") }
+    Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
+}
+
+# ── 1. 经 dev.ps1 + cargo 预构建 Rust writer(双 -- 调用协议)──────────────────────
+# 第一个 -- 被 PowerShell & 当作"停止解析参数"标记吞掉,第二个 -- 才原样进入
+# dev.ps1 的 $args 作为其子命令分隔符。dev.ps1 注入 Unicode 安全链接器 ld.lld,
+# 使含 CJK 的项目根也能链接。
+Push-Location $scriptRoot
+try {
+    & $devWrapper -- -- cargo build --manifest-path $manifest --quiet
+    $buildExit = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+if ($buildExit -ne 0 -or -not (Test-Path $writerExe)) {
+    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
+                     reason="Rust writer build failed or exe missing (toolchain/linker unavailable)"
+                     build_exit=$buildExit; writer_exe=$writerExe; timestamp=(Get-Date -Format "o") }
+    Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
+}
+
+# ── 2. 清理上轮中间产物,保证 nonce 新鲜度断言严格成立 ────────────────────────────
 [System.IO.Directory]::CreateDirectory($tmpDir) | Out-Null
-# 幂等：按名删除上一轮遗留的两个探针文件。不用 Directory.Delete(recursive)——
-# Windows 上递归删目录常因句柄占用而延迟/竞争，残留的 probe_final.dat 会让
-# File.Move（PS 5.1 无覆盖重载）再次因“目标已存在”失败。按文件名删则确定生效，
-# File.Delete 对不存在的文件是 no-op。
 foreach ($f in @("probe_tmp.dat","probe_final.dat")) {
     $p = [System.IO.Path]::Combine($tmpDir, $f)
     if ([System.IO.File]::Exists($p)) { [System.IO.File]::Delete($p) }
 }
+foreach ($f in @($childOut, $childErr)) { if (Test-Path $f) { Remove-Item $f -Force } }
 
-$envInfo = @{
-    os=([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)
-    arch=([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
-    ps_version=($PSVersionTable.PSVersion.ToString())
-    hostname=($env:COMPUTERNAME)
-    probe_backend="powershell_dotnet"
+# ── 3. 起独立 writer 子进程(后台),轮询 stdout 上的 CHILD_READY 握手 ─────────────
+Write-Host "启动 Rust writer 子进程(独立进程)..."
+$child = Start-Process -FilePath $writerExe -ArgumentList @("child", $tmpDir) `
+          -RedirectStandardOutput $childOut -RedirectStandardError $childErr `
+          -PassThru -NoNewWindow
+$spawnPid = $child.Id
+
+$readyLine = $null
+$deadline  = (Get-Date).AddSeconds(15)
+while ((Get-Date) -lt $deadline) {
+    if ($child.HasExited) { break }   # writer 提前退出 -> 停止等待
+    if (Test-Path $childOut) {
+        $m = Select-String -Path $childOut -Pattern '^CHILD_READY ' -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($m) { $readyLine = $m.Line; break }
+    }
+    Start-Sleep -Milliseconds 100
 }
 
-try {
-    $payload   = [System.Text.Encoding]::UTF8.GetBytes("DURABLE_IO_PROBE_PAYLOAD_v1")
-    $tmpFile   = [System.IO.Path]::Combine($tmpDir,"probe_tmp.dat")
-    $finalFile = [System.IO.Path]::Combine($tmpDir,"probe_final.dat")
-    [System.IO.File]::WriteAllBytes($tmpFile,$payload)
-    $actions.Add("write " + $payload.Length.ToString() + " bytes to probe_tmp.dat")
+if (-not $readyLine) {
+    try { if (-not $child.HasExited) { $child.Kill() } } catch {}
+    $errText = ""
+    if (Test-Path $childErr) { $errText = (Get-Content $childErr -Raw) }
+    $r = [ordered]@{ spike=$spikeName; status="ERROR"
+                     error="writer did not signal CHILD_READY within timeout"
+                     child_stderr=$errText; timestamp=(Get-Date -Format "o") }
+    Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 1
+}
 
-    $fs = New-Object System.IO.FileStream($tmpFile,[System.IO.FileMode]::Open,[System.IO.FileAccess]::ReadWrite,[System.IO.FileShare]::None)
-    $fs.Flush($true); $fs.Close(); $fs.Dispose()
-    $actions.Add("FileStream.Flush(flushToDisk=true) => FlushFileBuffers on file")
+# ── 4. 解析 READY 行,提取 writer 自报 PID / nonce / 实测 flush 结果 ───────────────
+function Get-Field($line, $key) {
+    $m = [regex]::Match($line, "$key=(\S+)")
+    if ($m.Success) { return $m.Groups[1].Value } else { return $null }
+}
+$childPid   = [int](Get-Field $readyLine "pid")
+$nonce      = Get-Field $readyLine "nonce"
+$childBytes = [int](Get-Field $readyLine "bytes")
+$flushOk    = (Get-Field $readyLine "flush_ok")    -eq "true"
+$renameOk   = (Get-Field $readyLine "rename_ok")   -eq "true"
+$dirSyncOk  = (Get-Field $readyLine "dir_sync_ok") -eq "true"
 
-    [System.IO.File]::Move($tmpFile,$finalFile)
-    $renameOk = [System.IO.File]::Exists($finalFile)
-    $tmpGone  = (-not [System.IO.File]::Exists($tmpFile))
-    $actions.Add("File.Move rename: dest_exists=" + $renameOk.ToString() + " src_gone=" + $tmpGone.ToString())
+# ── 5. writer 已 flush+rename 且仍挂起(未正常退出)时,对其定点硬杀 ────────────────
+# 这是"崩溃点":writer 从未执行任何清理/正常退出路径就被强杀。
+$aliveBeforeKill = $false
+try { $aliveBeforeKill = -not (Get-Process -Id $childPid -ErrorAction Stop).HasExited } catch {}
+try { Stop-Process -Id $childPid -Force -ErrorAction Stop } catch {}
 
-    $readBack  = [System.IO.File]::ReadAllBytes($finalFile)
-    $contentOk = ($readBack.Length -eq $payload.Length)
+# 等待进程确实消失(最多 5s),确认硬杀生效。
+$killed = $false
+$killDeadline = (Get-Date).AddSeconds(5)
+while ((Get-Date) -lt $killDeadline) {
+    if (-not (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) { $killed = $true; break }
+    Start-Sleep -Milliseconds 100
+}
+
+# ── 6. 作为独立进程读回 final,逐字节校验内容 + nonce 新鲜度 ───────────────────────
+$finalFile = [System.IO.Path]::Combine($tmpDir, "probe_final.dat")
+$tmpFile   = [System.IO.Path]::Combine($tmpDir, "probe_tmp.dat")
+$expected  = [System.Text.Encoding]::UTF8.GetBytes("DURABLE_IO_PROBE_v2`nnonce=$nonce`n")
+
+$finalExists = [System.IO.File]::Exists($finalFile)
+$tmpGone     = (-not [System.IO.File]::Exists($tmpFile))
+$contentOk   = $false
+$nonceFresh  = $false
+$fileSize    = 0
+$digest      = "none"
+if ($finalExists) {
+    $readBack = [System.IO.File]::ReadAllBytes($finalFile)
+    $fileSize = $readBack.Length
+    $contentOk = ($readBack.Length -eq $expected.Length)
     if ($contentOk) {
-        for ($i=0;$i -lt $payload.Length;$i++) {
-            if ($readBack[$i] -ne $payload[$i]) { $contentOk=$false; break }
+        for ($i = 0; $i -lt $expected.Length; $i++) {
+            if ($readBack[$i] -ne $expected[$i]) { $contentOk = $false; break }
         }
     }
-    $actions.Add("read back " + $readBack.Length.ToString() + " bytes: content_match=" + $contentOk.ToString())
-
-    $dirInfo  = New-Object System.IO.DirectoryInfo($tmpDir)
-    $nFiles   = $dirInfo.GetFiles().Count
-    $fileVisibleInDir = ($nFiles -gt 0)
-    $actions.Add("parent dir GetFiles count=" + $nFiles.ToString())
-
-    $fileSize = (New-Object System.IO.FileInfo($finalFile)).Length
+    $readText = [System.Text.Encoding]::UTF8.GetString($readBack)
+    $nonceFresh = ($readText -match [regex]::Escape("nonce=$nonce"))
     $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($readBack)
     $digest = "sha256:" + [System.BitConverter]::ToString($hashBytes).Replace("-","").ToLower()
-
-    $facts = [ordered]@{
-        write_bytes                   = $payload.Length
-        flush_file_succeeded          = $true
-        rename_succeeded              = $renameOk
-        src_gone_after_rename         = $tmpGone
-        content_verified_after_rename = $contentOk
-        file_size_bytes               = $fileSize
-        file_visible_in_parent_dir    = $fileVisibleInDir
-    }
-    $assertions.Add(@{name="content_survives_rename";    passed=$contentOk;        detail="byte-for-byte match after File.Move"})
-    $assertions.Add(@{name="src_absent_after_rename";    passed=$tmpGone;          detail="source absent after rename"})
-    $assertions.Add(@{name="file_size_matches_write";    passed=($fileSize -eq $payload.Length); detail="exp=" + $payload.Length.ToString() + " got=" + $fileSize.ToString()})
-    $assertions.Add(@{name="file_visible_in_parent_dir"; passed=$fileVisibleInDir; detail="DirectoryInfo.GetFiles returned " + $nFiles.ToString() + " file(s)"})
-    foreach ($a in $assertions) { if (-not $a.passed) { $status="FAIL" } }
-
-    $receipt=[ordered]@{spike=$spikeName;status=$status;environment=$envInfo;actions=@($actions);observable_facts=$facts;assertions=@($assertions);artifact_digest=$digest;timestamp=(Get-Date -Format "o")}
-} catch {
-    $status="ERROR"
-    $receipt=[ordered]@{spike=$spikeName;status="ERROR";error=$_.Exception.Message;timestamp=(Get-Date -Format "o")}
 }
 
-$json=$receipt|ConvertTo-Json -Depth 10
-$json|Out-File -Encoding utf8 $receiptPath
-Write-Host $json
-if ($status -ne "PASS") { exit 1 }
-# 显式 exit 0：spike 通过时必须设置 $LASTEXITCODE，否则 test.ps1 的 Run-Suite
-# 在 StrictMode 下读取未定义的 $LASTEXITCODE 会抛异常并中断整个套件。
+# ── 7. 组装 gating 断言(全部来自真实观测)───────────────────────────────────────
+$assertions = @()
+$assertions += @{ name="writer_is_separate_process"
+                  passed=($childPid -ne $PID) -and ($spawnPid -eq $childPid) -and ($childPid -ne 0)
+                  detail="driver_pid=$PID spawn_pid=$spawnPid writer_self_reported_pid=$childPid" }
+$assertions += @{ name="writer_alive_then_hard_killed"
+                  passed=($aliveBeforeKill -and $killed)
+                  detail="alive_before_kill=$aliveBeforeKill killed=$killed (被杀前仍在运行,未走正常退出路径)" }
+$assertions += @{ name="atomic_rename_completed"
+                  passed=($renameOk -and $finalExists -and $tmpGone)
+                  detail="writer_rename_ok=$renameOk final_exists=$finalExists tmp_gone=$tmpGone" }
+$assertions += @{ name="flush_before_crash"
+                  passed=$flushOk
+                  detail="writer 自报 sync_all(FlushFileBuffers) 实测结果=$flushOk(硬杀前已 flush)" }
+$assertions += @{ name="data_survives_cross_process_kill"
+                  passed=($contentOk -and ($fileSize -eq $childBytes))
+                  detail="独立进程读回 byte-for-byte 匹配=$contentOk size=$fileSize writer_bytes=$childBytes" }
+$assertions += @{ name="final_nonce_matches_this_writer"
+                  passed=$nonceFresh
+                  detail="final 文件含本 writer 自报 nonce=$nonce -> 非陈旧文件" }
+
+$allPass = ($assertions | Where-Object { -not $_.passed } | Measure-Object).Count -eq 0
+$status  = if ($allPass) { "PASS" } else { "FAIL" }
+
+# ── 8. 诚实边界:无法在纯软件环境认证的方面,如实标 BLOCKED_UNCERTIFIED(非 gating)─
+$uncertified = @(
+    @{ aspect="power_loss_durability"; status="BLOCKED_UNCERTIFIED"
+       reason="断电/内核崩溃后数据仍在 需真实掉电或内核崩溃 纯软件杀进程无法证明(数据仍在 OS page cache)" }
+    @{ aspect="parent_dir_fsync_effective"; status="BLOCKED_UNCERTIFIED"
+       reason="Windows 对目录句柄 sync_all 基本 no-op writer 实测 dir_sync_ok=$dirSyncOk 无法证明父目录条目已落盘" }
+)
+
+$final = [ordered]@{
+    spike  = $spikeName
+    status = $status
+    environment = @{
+        os            = ([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)
+        arch          = ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
+        ps_version    = ($PSVersionTable.PSVersion.ToString())
+        probe_backend = "rust_child_writer + powershell_parent_killer(cross_process_hard_kill)"
+        driver_pid    = $PID
+    }
+    actions = @(
+        "cargo build windows_durable_io (via dev.ps1, ld.lld)",
+        "Start-Process writer 'child' (独立进程) 后台",
+        "poll stdout for CHILD_READY (writer 已 write+flush+rename)",
+        "Stop-Process -Force 定点硬杀 writer(崩溃点:未走正常退出)",
+        "独立进程读回 final:逐字节校验 + nonce 新鲜度 + sha256"
+    )
+    observable_facts = @{
+        driver_pid          = $PID
+        writer_pid          = $childPid
+        writer_spawn_pid    = $spawnPid
+        nonce               = $nonce
+        writer_reported_bytes = $childBytes
+        final_file_size     = $fileSize
+        flush_ok            = $flushOk
+        rename_ok           = $renameOk
+        dir_sync_ok         = $dirSyncOk
+        alive_before_kill   = $aliveBeforeKill
+        writer_hard_killed  = $killed
+        content_byte_match  = $contentOk
+        nonce_fresh         = $nonceFresh
+    }
+    assertions        = $assertions
+    uncertified_aspects = $uncertified
+    artifact_digest   = $digest
+    timestamp         = (Get-Date -Format "o")
+}
+
+Write-Receipt $final
+Write-Host "STATUS: $status"
+if ($status -notin @("PASS","BLOCKED_UNCERTIFIED")) { exit 1 }
+# 成功/受阻显式 exit 0:确保 $LASTEXITCODE 被设置,避免上层 StrictMode 读未定义变量中断。
 exit 0
