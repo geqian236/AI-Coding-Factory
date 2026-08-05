@@ -1,117 +1,99 @@
-﻿//! WSL Runner Identity 探针
-//! 若 Docker/WSL 不可用则输出 BLOCKED_UNCERTIFIED，不伪造结果。
+//! WSL Runner Identity 探针 —— broker(非破坏性"孤儿存活"验证的"被杀方")
+//!
+//! 声称能力:CI runner(broker)进程被杀后,它启动的容器不随之死亡 —— 即容器
+//! 生命周期独立于启动它的进程(在 Windows + Docker Desktop/WSL2 上,容器由 daemon
+//! 拥有,运行在 WSL2 VM 内,不在 broker 的进程树/Job 内)。
+//!
+//! 诚实边界:真正的 broker-kill(杀 LxssManager 服务或 dockerd daemon)需要管理员
+//! 且会**破坏共享系统**,故不做;改为非破坏性等价验证 —— 真实硬杀"启动容器的
+//! broker 进程本身",再由独立进程确认容器仍在运行。daemon/LxssManager 级 kill 由
+//! driver 如实标 BLOCKED_UNCERTIFIED(非 gating),绝不冒充已认证。
+//!
+//! 本二进制即"被硬杀的 broker 子进程":用 driver 传入的容器名(含 nonce)起一个
+//! detached 容器 -> 从 `docker run -d` 拿到真实 container_id -> 打印结构化
+//! BROKER_READY 行(含自报 PID / name / container_id)-> 挂起等父进程硬杀;
+//! 超时自保退出,避免 broker 异常时子进程泄漏为常驻孤儿。
+//!
+//! 注意:容器清理(docker rm -f)由 driver 负责 —— broker 会被硬杀,无法自行清理,
+//! 且"清理不依赖 broker 存活"恰恰印证了容器与 broker 解耦。
 
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn now_ts() -> String {
-    SystemTime::now().duration_since(UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| format!("unix_s:{}", d.as_secs()))
         .unwrap_or_else(|_| "unknown".into())
 }
 
-fn docker_available() -> bool {
-    Command::new("docker").args(["version", "--format", "{{.Client.Version}}"])
-        .output().map(|o| o.status.success()).unwrap_or(false)
-}
-
-fn run_container_probe() -> serde_json::Value {
-    // Start a detached container
+/// broker 主体:起 detached 容器 -> 打印 READY -> 挂起等被杀。
+/// 返回 Err(msg) 时由 main 打印 BROKER_ERROR 并非 0 退出(driver 据此判 FAIL/ERROR)。
+fn run_broker(container_name: &str) -> Result<(), String> {
+    // 起 detached 容器:由 daemon 拥有,不在本进程树内。python:3.12-slim 镜像已由
+    // driver 预检确认本地缓存,故此处 `docker run` 不应因拉镜像超时;若仍失败则如实返回错误。
     let run = Command::new("docker")
-        .args(["run", "-d", "--rm", "alpine", "sleep", "30"])
-        .output();
-    let container_id = match run {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        Ok(o) => return serde_json::json!({
-            "status": "FAIL",
-            "detail": format!("docker run failed: {}", String::from_utf8_lossy(&o.stderr))
-        }),
-        Err(e) => return serde_json::json!({"status":"FAIL","detail":format!("docker run error: {}",e)}),
-    };
+        .args([
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "python:3.12-slim",
+            "python3",
+            "-c",
+            "import time; time.sleep(60)",
+        ])
+        .output()
+        .map_err(|e| format!("docker run spawn error: {}", e))?;
 
-    if container_id.len() < 12 {
-        return serde_json::json!({"status":"FAIL","detail":"container ID too short"});
+    if !run.status.success() {
+        return Err(format!(
+            "docker run failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
     }
-    let short_id = &container_id[..12];
 
-    // Verify running
-    let inspect_before = Command::new("docker")
-        .args(["inspect", "--format", "{{.State.Running}}", short_id])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    // `docker run -d` 的 stdout 即容器完整 ID —— 这是"本 broker 确实启动了该容器"的
+    // 因果铁证(driver 据此核对存活的容器 ID 与本 broker 自报值一致)。
+    let container_id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    if container_id.len() < 12 {
+        return Err(format!("container id too short: '{}'", container_id));
+    }
 
-    // Kill (stop) the container to simulate broker kill — use SIGKILL equivalent
-    // Note: true broker-kill simulation would require killing LxssManager service,
-    // which requires admin and is destructive; instead we verify container persists
-    // across a brief pause (demonstrating process-group independence).
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // 打印结构化 READY 行并**立即 flush stdout**,让 driver 精确拿到 broker 自身 PID
+    // 与容器 ID,据此做定点硬杀与因果核对。
+    println!(
+        "BROKER_READY pid={} name={} container_id={} ts={}",
+        std::process::id(),
+        container_name,
+        container_id,
+        now_ts()
+    );
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 
-    let inspect_after = Command::new("docker")
-        .args(["inspect", "--format", "{{.State.Running}}", short_id])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    // Cleanup
-    let _ = Command::new("docker").args(["stop", short_id]).output();
-
-    serde_json::json!({
-        "status": if inspect_before == "true" && inspect_after == "true" { "PASS" } else { "FAIL" },
-        "container_id": short_id,
-        "running_before": inspect_before,
-        "running_after_pause": inspect_after,
-    })
+    // 挂起等待父进程硬杀。设 60s 自保上限(与容器 sleep 60 对齐):父进程异常未杀时
+    // broker 自行退出,容器也会随 sleep 结束而停止,driver 的 rm -f 仍能兜底清理。
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Ok(())
 }
 
 fn main() {
-    if !docker_available() {
-        let receipt = serde_json::json!({
-            "spike": "runner_identity",
-            "status": "BLOCKED_UNCERTIFIED",
-            "reason": "Docker CLI not found — install Docker Desktop with WSL2 backend to certify",
-            "environment": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
-            "actions": ["checked docker availability — not found"],
-            "observable_facts": { "docker_available": false },
-            "assertions": [],
-            "artifact_digest": "none",
-            "timestamp": now_ts()
-        });
-        println!("{}", serde_json::to_string_pretty(&receipt).unwrap());
+    let args: Vec<String> = std::env::args().collect();
+    // 调用协议:runner_identity broker <container_name>
+    if args.len() >= 3 && args[1] == "broker" {
+        match run_broker(&args[2]) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("BROKER_ERROR {}", e);
+                std::process::exit(2);
+            }
+        }
         return;
     }
-
-    let probe = run_container_probe();
-    let pass = probe["status"].as_str().unwrap_or("FAIL") == "PASS";
-
-    let receipt = serde_json::json!({
-        "spike": "runner_identity",
-        "status": probe["status"],
-        "environment": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
-        "actions": [
-            "docker run -d alpine sleep 30",
-            "docker inspect State.Running (before)",
-            "sleep 500ms (broker-kill simulation)",
-            "docker inspect State.Running (after)",
-            "docker stop container"
-        ],
-        "observable_facts": {
-            "docker_available": true,
-            "container_id": probe["container_id"],
-            "running_before": probe["running_before"],
-            "running_after_pause": probe["running_after_pause"],
-        },
-        "assertions": [{
-            "name": "container_survives_broker_pause",
-            "passed": pass,
-            "detail": format!("running_before={} running_after={}", probe["running_before"], probe["running_after_pause"])
-        }],
-        "artifact_digest": format!("container_id:{}", probe["container_id"].as_str().unwrap_or("none")),
-        "timestamp": now_ts()
-    });
-
-    println!("{}", serde_json::to_string_pretty(&receipt).unwrap());
-    if !pass { std::process::exit(1); }
+    eprintln!("usage: runner_identity broker <container_name>");
+    std::process::exit(64);
 }
