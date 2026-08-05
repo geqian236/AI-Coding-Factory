@@ -8,6 +8,7 @@ members = [
     "tools/compat-probes/windows_durable_io",
     "tools/compat-probes/clock_source",
     "tools/compat-probes/named_pipe",
+    "tools/compat-probes/runner_identity",
 ]
 resolver = "2"
 
