@@ -2,19 +2,21 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/test-receipt.v1.schema.json",
   "title": "TestReceipt",
-  "description": "机器可读测试回执，至少包含测试 ID、环境 manifest 摘要、动作、期望、实际状态、外部副作用计数、Artifact 摘要和最终 receipt。禁止手工文字改为成功。",
+  "description": "机器可读测试回执，至少包含测试 ID、环境 manifest 摘要、动作、期望、实际状态、外部副作用计数、Artifact 摘要和最终 receipt。禁止手工文字改为成功。P0-6 fail-closed 强化：expected/actual 必须非空、actions 至少 1 条、finalPassOwner/requiredReplays/scenarioContractDigest/qualification 为必填以防伪造 FINAL PASS。",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "receiptId", "testId", "environmentManifestDigest",
     "actions", "expected", "actual", "sideEffectCount",
-    "artifactDigests", "result", "createdAt"
+    "artifactDigests", "result", "createdAt",
+    "finalPassOwner", "requiredReplays", "scenarioContractDigest",
+    "qualification"
   ],
   "properties": {
     "receiptId": {
       "type": "string",
       "minLength": 1,
-      "description": "回执唯一 ID"
+      "description": "回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查）"
     },
     "testId": {
       "type": "string",
@@ -28,7 +30,8 @@
     },
     "actions": {
       "type": "array",
-      "description": "执行动作列表",
+      "minItems": 1,
+      "description": "执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS）",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -43,11 +46,13 @@
     },
     "expected": {
       "type": "object",
-      "description": "期望结果描述（机器可读）"
+      "minProperties": 1,
+      "description": "期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS）"
     },
     "actual": {
       "type": "object",
-      "description": "实际观察结果（机器可读）"
+      "minProperties": 1,
+      "description": "实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS）"
     },
     "sideEffectCount": {
       "type": "integer",
@@ -74,7 +79,7 @@
     "scenarioContractDigest": {
       "type": "string",
       "minLength": 1,
-      "description": "场景合同内容摘要（来自 required-test-catalog）"
+      "description": "场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS）"
     },
     "implementationContributors": {
       "type": "array",
@@ -84,12 +89,17 @@
     "finalPassOwner": {
       "type": "string",
       "minLength": 1,
-      "description": "最终通过责任人"
+      "description": "最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）"
+    },
+    "qualification": {
+      "type": "string",
+      "minLength": 1,
+      "description": "执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格，如 codex-reviewer / claude-implementer）"
     },
     "requiredReplays": {
       "type": "integer",
-      "minimum": 0,
-      "description": "要求重放次数"
+      "minimum": 1,
+      "description": "要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）"
     },
     "createdAt": {
       "type": "string",

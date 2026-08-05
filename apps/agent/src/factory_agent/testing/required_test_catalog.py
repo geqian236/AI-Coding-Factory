@@ -196,3 +196,33 @@ def digest_by_test_id(catalog: dict[str, Any] | None = None) -> dict[str, str]:
         entry["testId"]: entry["scenarioContractDigest"]
         for entry in catalog["tests"]
     }
+
+
+def owner_by_test_id(catalog: dict[str, Any] | None = None) -> dict[str, str]:
+    """返回 {testId: catalog 冻结的 finalPassOwner} 映射。
+
+    P0-6 fail-closed：聚合器检查 receipt.finalPassOwner 必须等于本映射值
+    （OWNER_MISMATCH），并且 owner 必须在白名单 UNAUTHORIZED_OWNER。
+    不新增 catalog 字段，只读取已存在的 finalPassOwner，避免 digest 漂移。
+    """
+    if catalog is None:
+        catalog = load_catalog()
+    return {
+        entry["testId"]: entry["finalPassOwner"]
+        for entry in catalog["tests"]
+    }
+
+
+def replays_by_test_id(catalog: dict[str, Any] | None = None) -> dict[str, int]:
+    """返回 {testId: catalog 冻结的 requiredReplays} 映射。
+
+    P0-6 fail-closed：聚合器对每个 testId 计数 result=PASS 且校验通过的去重
+    receiptId 数，< requiredReplays 报 INSUFFICIENT_REPLAYS。
+    不新增 catalog 字段，只读取已存在的 requiredReplays，避免 digest 漂移。
+    """
+    if catalog is None:
+        catalog = load_catalog()
+    return {
+        entry["testId"]: entry["requiredReplays"]
+        for entry in catalog["tests"]
+    }

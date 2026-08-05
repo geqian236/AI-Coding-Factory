@@ -103,29 +103,48 @@ def test_default_mode_does_not_require_coverage() -> None:
 
 
 def test_require_coverage_passes_with_full_47(tmp_path: Path) -> None:
-    """require_coverage=True 时，为全部 47 个 testId 各造一条真实 PASS 回执必须通过。"""
+    """require_coverage=True 时，为全部 47 个 testId 各造一条真实 PASS 回执必须通过。
+
+    P0-6：每条回执必须满足 schema 必填项（finalPassOwner/qualification/
+    requiredReplays/scenarioContractDigest/非空 expected/actual/至少 1 个 actions）。
+    对 requiredReplays>1 的条目生成多条独立 receiptId 通过 INSUFFICIENT_REPLAYS。
+    """
+    from factory_agent.testing.required_test_catalog import (
+        owner_by_test_id,
+        replays_by_test_id,
+    )
+
     catalog = load_catalog(CATALOG_PATH)
     digests = digest_by_test_id(catalog)
+    owners = owner_by_test_id(catalog)
+    replays = replays_by_test_id(catalog)
+
     receipts = []
     for entry in catalog["tests"]:
         tid = entry["testId"]
-        receipts.append({
-            "receiptId": f"rcpt-{tid}",
-            "testId": tid,
-            "environmentManifestDigest": "sha256:" + "a" * 64,
-            "actions": [{
-                "actionId": f"act-{tid}",
-                "description": f"执行 {tid} 场景并观察结果",
-                "executedAt": "2026-08-05T00:00:00Z",
-            }],
-            "expected": {},
-            "actual": {},
-            "sideEffectCount": 0,
-            "artifactDigests": ["sha256:" + "b" * 64],
-            "result": "PASS",
-            "createdAt": "2026-08-05T00:00:00Z",
-            "scenarioContractDigest": digests[tid],
-        })
+        n_replays = replays[tid]
+        for i in range(n_replays):
+            ordinal = i + 1
+            receipts.append({
+                "receiptId": f"rcpt-{tid}-{ordinal:02d}",
+                "testId": tid,
+                "environmentManifestDigest": "sha256:" + "a" * 64,
+                "actions": [{
+                    "actionId": f"act-{tid}-{ordinal:02d}",
+                    "description": f"执行 {tid} 场景重放 #{ordinal} 并观察结果",
+                    "executedAt": "2026-08-05T00:00:00Z",
+                }],
+                "expected": {"observed": True, "testId": tid, "replayOrdinal": ordinal},
+                "actual": {"observed": True, "testId": tid, "replayOrdinal": ordinal},
+                "sideEffectCount": 0,
+                "artifactDigests": ["sha256:" + "b" * 64],
+                "result": "PASS",
+                "createdAt": "2026-08-05T00:00:00Z",
+                "scenarioContractDigest": digests[tid],
+                "finalPassOwner": owners[tid],
+                "qualification": owners[tid],
+                "requiredReplays": n_replays,
+            })
     full = tmp_path / "full_coverage.json"
     full.write_text(json.dumps(receipts), encoding="utf-8")
     result = verify(CATALOG_PATH, full, require_coverage=True)

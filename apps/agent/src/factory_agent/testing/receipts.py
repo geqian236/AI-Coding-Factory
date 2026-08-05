@@ -5,6 +5,10 @@ apps/agent/src/factory_agent/testing/receipts.py
 遵循 contracts/schemas/test-receipt.v1.schema.json；
 禁止通过手工文字将 result 改为 PASS。
 
+P0-6 强化（Phase 0）：expected/actual 必须非空、actions 至少 1 条、
+finalPassOwner/requiredReplays/scenarioContractDigest/qualification 必填，
+杜绝伪造 FINAL PASS。
+
 算法版本: v1（Phase 0）
 """
 from __future__ import annotations
@@ -111,9 +115,11 @@ class TestReceipt:
     scenarioContractDigest: str | None = None
     # 实现贡献者列表
     implementationContributors: list[str] = field(default_factory=list)
-    # 最终通过责任人
+    # 最终通过责任人（P0-6：必填）
     finalPassOwner: str | None = None
-    # 要求重放次数
+    # 执行资质标签（P0-6：必填，标识评审/实施/审计等角色资格）
+    qualification: str | None = None
+    # 要求重放次数（P0-6：必填且 >=1）
     requiredReplays: int | None = None
     # 运行时标识（可选；若存在则必须是已知 runtimeId）
     runtimeId: str | None = None
@@ -130,6 +136,12 @@ class TestReceipt:
           - UNKNOWN_RUNTIME       : runtimeId 不在已知列表
           - INVALID_RESULT        : result 不是合法枚举值
           - MANUAL_PASS           : result=PASS 但无动作（疑似手工文字 PASS）
+          - EMPTY_EXPECTED        : result=PASS 但 expected 为空（P0-6）
+          - EMPTY_ACTUAL          : result=PASS 但 actual 为空（P0-6）
+          - MISSING_OWNER         : finalPassOwner 缺失（P0-6）
+          - MISSING_QUALIFICATION : qualification 缺失（P0-6）
+          - MISSING_DIGEST        : scenarioContractDigest 缺失（P0-6）
+          - MISSING_REPLAYS       : requiredReplays 缺失或 <1（P0-6）
           - MISSING_FIELD         : 必需字段缺失或类型错误
         """
         errors: list[str] = []
@@ -152,6 +164,54 @@ class TestReceipt:
             errors.append(
                 f"MANUAL_PASS [{self.receiptId}]: result=PASS 但 actions 为空，"
                 "疑似手工文字 PASS；机器回执必须记录至少一条执行动作"
+            )
+
+        # P0-6：result=PASS 时 expected 必须非空（防伪造 FINAL PASS）
+        if self.result == "PASS" and not self.expected:
+            errors.append(
+                f"EMPTY_EXPECTED [{self.receiptId}]: result=PASS 但 expected 为空，"
+                "无法证明期望被验证"
+            )
+
+        # P0-6：result=PASS 时 actual 必须非空（防伪造 FINAL PASS）
+        if self.result == "PASS" and not self.actual:
+            errors.append(
+                f"EMPTY_ACTUAL [{self.receiptId}]: result=PASS 但 actual 为空，"
+                "无法证明真实观察被记录"
+            )
+
+        # P0-6：finalPassOwner 必填（result=PASS 时强制，FAIL/BLOCKED 时允许 None，
+        # 但仍然报错以便聚合时识别伪造 FAIL）。我们保持对全部 result 强制以避免任何字段缺失。
+        if not self.finalPassOwner or not self.finalPassOwner.strip():
+            errors.append(
+                f"MISSING_OWNER [{self.receiptId}]: finalPassOwner 缺失，"
+                "无法确认最终通过责任人"
+            )
+
+        # P0-6：qualification 必填
+        if not self.qualification or not self.qualification.strip():
+            errors.append(
+                f"MISSING_QUALIFICATION [{self.receiptId}]: qualification 缺失，"
+                "无法确认执行资质标签"
+            )
+
+        # P0-6：scenarioContractDigest 必填（对所有 result 强制，聚合端 PASS 单独再校验）
+        if not self.scenarioContractDigest or not self.scenarioContractDigest.strip():
+            errors.append(
+                f"MISSING_DIGEST [{self.receiptId}]: scenarioContractDigest 缺失，"
+                "无法绑定场景合同身份"
+            )
+
+        # P0-6：requiredReplays 必填且 >=1
+        if self.requiredReplays is None:
+            errors.append(
+                f"MISSING_REPLAYS [{self.receiptId}]: requiredReplays 缺失，"
+                "无法计算覆盖门禁"
+            )
+        elif self.requiredReplays < 1:
+            errors.append(
+                f"MISSING_REPLAYS [{self.receiptId}]: requiredReplays={self.requiredReplays} "
+                "必须 >=1"
             )
 
         # 检查 runtimeId（若存在则必须已知）
@@ -193,6 +253,7 @@ class TestReceipt:
             scenarioContractDigest=d.get("scenarioContractDigest"),
             implementationContributors=d.get("implementationContributors", []),
             finalPassOwner=d.get("finalPassOwner"),
+            qualification=d.get("qualification"),
             requiredReplays=d.get("requiredReplays"),
             runtimeId=d.get("runtimeId"),
         )
@@ -219,6 +280,8 @@ class TestReceipt:
             result["implementationContributors"] = self.implementationContributors
         if self.finalPassOwner is not None:
             result["finalPassOwner"] = self.finalPassOwner
+        if self.qualification is not None:
+            result["qualification"] = self.qualification
         if self.requiredReplays is not None:
             result["requiredReplays"] = self.requiredReplays
         if self.runtimeId is not None:

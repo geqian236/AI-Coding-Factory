@@ -11,6 +11,11 @@ Task 6 合同层测试：测试回执覆盖率验证与 fail-closed 规则。
   - 未映射 testId 被拒绝
   - 手工文字 PASS（空 actions + result=PASS）被拒绝
   - 未知 runtimeId 被拒绝
+  - P0-6：6 个负例 fixture 全 fail closed：
+    forged_empty_pass / missing_owner / owner_mismatch /
+    insufficient_replays / pass_without_digest / duplicate_receipt_id
+  - P0-6：full_coverage_valid.json 正例通过（满足 47 ID + 各 requiredReplays +
+    owner 白名单 + 非空 expected/actual + 正确 digest）
 """
 from __future__ import annotations
 
@@ -28,6 +33,17 @@ FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "receipts"
 VALID_FIXTURE = FIXTURES_DIR / "valid.json"
 MISSING_FIXTURE = FIXTURES_DIR / "missing.json"
 CONFLICT_FIXTURE = FIXTURES_DIR / "conflict.json"
+FULL_COVERAGE_FIXTURE = FIXTURES_DIR / "full_coverage_valid.json"
+
+# P0-6 负例 fixture：每条都应在 verify() 中以非零退出 / passed=False 失败
+P06_NEGATIVE_FIXTURES = {
+    "forged_empty_pass.json": "EMPTY_EXPECTED/EMPTY_ACTUAL",
+    "missing_owner.json": "MISSING_OWNER",
+    "owner_mismatch.json": "UNAUTHORIZED_OWNER",
+    "insufficient_replays.json": "INSUFFICIENT_REPLAYS",
+    "pass_without_digest.json": "MISSING_DIGEST",
+    "duplicate_receipt_id.json": "DUPLICATE_RECEIPT_ID",
+}
 
 # 精确期望的 47 个测试 ID（同 test_schema_catalog.py 以保持一致性）
 EXPECTED_TEST_IDS = {
@@ -316,3 +332,224 @@ def test_cli_conflict_fixture_exits_nonzero() -> None:
         f"CLI 对 conflict.json 应退出码非零，实际 {proc.returncode}\n"
         f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
     )
+
+
+# ─────────────────────── P0-6 负例 fixture fail-closed 测试 ──────────────────
+
+
+def test_p06_negative_fixtures_exist() -> None:
+    """6 个 P0-6 负例 fixture 必须全部存在。"""
+    for name in P06_NEGATIVE_FIXTURES:
+        fixture = FIXTURES_DIR / name
+        assert fixture.exists(), f"P0-6 负例 fixture 缺失: {fixture}"
+
+
+def test_p06_positive_fixture_exists() -> None:
+    """P0-6 正例 fixture full_coverage_valid.json 必须存在。"""
+    assert FULL_COVERAGE_FIXTURE.exists(), f"P0-6 正例 fixture 缺失: {FULL_COVERAGE_FIXTURE}"
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_error_token"),
+    list(P06_NEGATIVE_FIXTURES.items()),
+)
+def test_p06_negative_fixture_fails_closed(
+    fixture_name: str, expected_error_token: str
+) -> None:
+    """每个 P0-6 负例 fixture 在 verify() 中必须 fail closed 且触发预期错误码。"""
+    from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
+
+    fixture_path = FIXTURES_DIR / fixture_name
+    # insufficient_replays.json 需要 require_coverage=True 才能触发 INSUFFICIENT_REPLAYS
+    require_coverage = fixture_name == "insufficient_replays.json"
+    result = verify(CATALOG_PATH, fixture_path, require_coverage=require_coverage)
+    assert not result.passed, (
+        f"{fixture_name} 应验证失败（fail closed），但实际通过"
+    )
+    matched = [e for e in result.errors if expected_error_token.split("/")[0] in e]
+    assert matched, (
+        f"{fixture_name} 应触发 {expected_error_token} 错误，但未发现。"
+        f"所有错误: {result.errors}"
+    )
+
+
+def test_p06_positive_fixture_passes_full_coverage() -> None:
+    """full_coverage_valid.json 在 require_coverage=True 下必须通过——满足全部 47 ID +
+    各 requiredReplays + owner 白名单 + 非空 expected/actual + 正确 digest。"""
+    from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
+
+    result = verify(CATALOG_PATH, FULL_COVERAGE_FIXTURE, require_coverage=True)
+    assert result.passed, f"full_coverage_valid.json 应通过，错误: {result.errors}"
+
+
+def test_p06_positive_fixture_passes_default_mode() -> None:
+    """full_coverage_valid.json 在默认（无 require_coverage）下也必须通过——逐回执校验。"""
+    from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
+
+    result = verify(CATALOG_PATH, FULL_COVERAGE_FIXTURE)
+    assert result.passed, f"full_coverage_valid.json 应通过，错误: {result.errors}"
+
+
+def test_p06_full_coverage_has_47_unique_ids() -> None:
+    """full_coverage_valid.json 必须覆盖全部 47 个唯一 testId。"""
+    with FULL_COVERAGE_FIXTURE.open(encoding="utf-8") as f:
+        data = json.load(f)
+    ids = {r["testId"] for r in data}
+    assert ids == EXPECTED_TEST_IDS, (
+        f"full_coverage_valid.json ID 集合不完整。\n"
+        f"  多出: {ids - EXPECTED_TEST_IDS}\n"
+        f"  缺少: {EXPECTED_TEST_IDS - ids}"
+    )
+
+
+def test_p06_full_coverage_has_unique_receipt_ids() -> None:
+    """full_coverage_valid.json 内所有 receiptId 必须唯一（与 DUPLICATE_RECEIPT_ID 规则一致）。"""
+    with FULL_COVERAGE_FIXTURE.open(encoding="utf-8") as f:
+        data = json.load(f)
+    rids = [r["receiptId"] for r in data]
+    assert len(rids) == len(set(rids)), (
+        f"full_coverage_valid.json 内存在重复 receiptId: "
+        f"{[r for r in rids if rids.count(r) > 1]}"
+    )
+
+
+def test_p06_full_coverage_replay_counts_meet_catalog() -> None:
+    """full_coverage_valid.json 每个 testId 的去重 receiptId 数必须 >= catalog.requiredReplays。"""
+    from factory_agent.testing.required_test_catalog import (  # type: ignore[import]
+        load_catalog,
+        replays_by_test_id,
+    )
+
+    catalog = load_catalog(CATALOG_PATH)
+    replays = replays_by_test_id(catalog)
+    with FULL_COVERAGE_FIXTURE.open(encoding="utf-8") as f:
+        data = json.load(f)
+    counts: dict[str, set[str]] = {}
+    for r in data:
+        counts.setdefault(r["testId"], set()).add(r["receiptId"])
+    for tid, required in replays.items():
+        actual = len(counts.get(tid, set()))
+        assert actual >= required, (
+            f"{tid}: actual={actual} < required={required}"
+        )
+
+
+# ─────────────────────── P0-6 单元校验：catalog helper ──────────────────────
+
+
+def test_p06_catalog_helpers_match_entries() -> None:
+    """owner_by_test_id / replays_by_test_id 必须与 catalog 条目内容一致。"""
+    from factory_agent.testing.required_test_catalog import (  # type: ignore[import]
+        load_catalog,
+        owner_by_test_id,
+        replays_by_test_id,
+    )
+
+    catalog = load_catalog(CATALOG_PATH)
+    owners = owner_by_test_id(catalog)
+    replays = replays_by_test_id(catalog)
+    assert len(owners) == 47
+    assert len(replays) == 47
+    for entry in catalog["tests"]:
+        tid = entry["testId"]
+        assert owners[tid] == entry["finalPassOwner"], f"{tid}: owner 映射不一致"
+        assert replays[tid] == entry["requiredReplays"], f"{tid}: replays 映射不一致"
+
+
+# ─────────────────────── P0-6 TestReceipt 字段级校验 ─────────────────────────
+
+
+def test_p06_receipt_validate_flags_empty_expected() -> None:
+    """result=PASS + 空 expected 必须触发 EMPTY_EXPECTED。"""
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    rcpt = TestReceipt(
+        receiptId="x",
+        testId="PLAN-HASH-001",
+        environmentManifestDigest="sha256:" + "a" * 64,
+        actions=[],
+        expected={},
+        actual={"ok": True},
+        sideEffectCount=0,
+        artifactDigests=[],
+        result="PASS",
+        createdAt="2026-08-05T00:00:00Z",
+        scenarioContractDigest="sha256:" + "0" * 64,
+        finalPassOwner="codex-reviewer",
+        qualification="codex-reviewer",
+        requiredReplays=1,
+    )
+    errors = rcpt.validate()
+    assert any("EMPTY_EXPECTED" in e for e in errors), f"缺 EMPTY_EXPECTED: {errors}"
+
+
+def test_p06_receipt_validate_flags_empty_actual() -> None:
+    """result=PASS + 空 actual 必须触发 EMPTY_ACTUAL。"""
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    rcpt = TestReceipt(
+        receiptId="x",
+        testId="PLAN-HASH-001",
+        environmentManifestDigest="sha256:" + "a" * 64,
+        actions=[],
+        expected={"ok": True},
+        actual={},
+        sideEffectCount=0,
+        artifactDigests=[],
+        result="PASS",
+        createdAt="2026-08-05T00:00:00Z",
+        scenarioContractDigest="sha256:" + "0" * 64,
+        finalPassOwner="codex-reviewer",
+        qualification="codex-reviewer",
+        requiredReplays=1,
+    )
+    errors = rcpt.validate()
+    assert any("EMPTY_ACTUAL" in e for e in errors), f"缺 EMPTY_ACTUAL: {errors}"
+
+
+def test_p06_receipt_validate_flags_missing_owner() -> None:
+    """finalPassOwner 缺失必须触发 MISSING_OWNER。"""
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    rcpt = TestReceipt(
+        receiptId="x",
+        testId="PLAN-HASH-001",
+        environmentManifestDigest="sha256:" + "a" * 64,
+        actions=[],
+        expected={"ok": True},
+        actual={"ok": True},
+        sideEffectCount=0,
+        artifactDigests=[],
+        result="PASS",
+        createdAt="2026-08-05T00:00:00Z",
+        scenarioContractDigest="sha256:" + "0" * 64,
+        finalPassOwner=None,
+        qualification="codex-reviewer",
+        requiredReplays=1,
+    )
+    errors = rcpt.validate()
+    assert any("MISSING_OWNER" in e for e in errors), f"缺 MISSING_OWNER: {errors}"
+
+
+def test_p06_receipt_validate_flags_missing_replays() -> None:
+    """requiredReplays None 必须触发 MISSING_REPLAYS。"""
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    rcpt = TestReceipt(
+        receiptId="x",
+        testId="PLAN-HASH-001",
+        environmentManifestDigest="sha256:" + "a" * 64,
+        actions=[],
+        expected={"ok": True},
+        actual={"ok": True},
+        sideEffectCount=0,
+        artifactDigests=[],
+        result="PASS",
+        createdAt="2026-08-05T00:00:00Z",
+        scenarioContractDigest="sha256:" + "0" * 64,
+        finalPassOwner="codex-reviewer",
+        qualification="codex-reviewer",
+        requiredReplays=None,
+    )
+    errors = rcpt.validate()
+    assert any("MISSING_REPLAYS" in e for e in errors), f"缺 MISSING_REPLAYS: {errors}"

@@ -1,0 +1,52 @@
+[
+  {
+    "receiptId": "rcpt-duplicate-id-001",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-duplicate-id-001a",
+        "description": "第一条 receipt，与第二条共享 receiptId 触发 DUPLICATE_RECEIPT_ID",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {"allHashesMatch": true},
+    "actual": {"allHashesMatch": true},
+    "sideEffectCount": 0,
+    "artifactDigests": ["sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": ["factory-contracts"],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-duplicate-id-001",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-duplicate-id-001b",
+        "description": "第二条 receipt 与第一条共享 receiptId — 触发 DUPLICATE_RECEIPT_ID",
+        "executedAt": "2026-08-05T00:01:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {"allHashesMatch": true},
+    "actual": {"allHashesMatch": true},
+    "sideEffectCount": 0,
+    "artifactDigests": ["sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:01:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": ["factory-contracts"],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  }
+]

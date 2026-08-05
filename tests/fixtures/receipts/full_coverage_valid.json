@@ -1,0 +1,1939 @@
+[
+  {
+    "receiptId": "rcpt-full-cov-STAGE-001-01",
+    "testId": "STAGE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-001-01",
+        "description": "执行 STAGE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:ddd06396e6051fa4b64313e3343cd17e9a6f9fa3cc15469c5b11a30790df3ce8",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STAGE-002-01",
+    "testId": "STAGE-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-002-01",
+        "description": "执行 STAGE-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:b89422c80fdf03e4954046e4a8bc19192212026ac3bf95bcf346101fcc5dec7b",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STAGE-003-01",
+    "testId": "STAGE-003",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-003-01",
+        "description": "执行 STAGE-003 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-003",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-003",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:ebf2a2883990e10a9859430b8675921baf4164884c70d570ddd154d9a57dbb99",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STAGE-004-01",
+    "testId": "STAGE-004",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-004-01",
+        "description": "执行 STAGE-004 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-004",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-004",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:34c59a9ba612545c8a59229c8f17c15cb6e6ec326f1986a0c117e1ad97a19a6e",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STAGE-005-01",
+    "testId": "STAGE-005",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-005-01",
+        "description": "执行 STAGE-005 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-005",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-005",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:5a5754cf91e02448e7a201e4a2825180e7edcd7b102fed23e725b587e2a4f15e",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STAGE-006-01",
+    "testId": "STAGE-006",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STAGE-006-01",
+        "description": "执行 STAGE-006 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STAGE-006",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STAGE-006",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:cc9452a014ddcccbed100016b288f4edd865afcf97da68fdfe983e92e623dbca",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-AUTH-001-01",
+    "testId": "AUTH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-AUTH-001-01",
+        "description": "执行 AUTH-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "AUTH-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "AUTH-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:10431e742e8536c9736dbf1789ede03762e23e03d0052d1a813f5ac6c32c7796",
+    "implementationContributors": [
+      "control-plane",
+      "policy-engine"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-AUTH-002-01",
+    "testId": "AUTH-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-AUTH-002-01",
+        "description": "执行 AUTH-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "AUTH-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "AUTH-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:4d033f97b7bb7450b6ba45e92cd439f2a4adf16c2da79b850c2e5240b59bf22d",
+    "implementationContributors": [
+      "control-plane",
+      "policy-engine"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PLAN-001-01",
+    "testId": "PLAN-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PLAN-001-01",
+        "description": "执行 PLAN-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PLAN-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PLAN-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:d1fdd1d16792adaa709d8671a91375f1c6b6ce5076baabe38007c6f284466c34",
+    "implementationContributors": [
+      "control-plane",
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PLAN-HASH-001-01",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PLAN-HASH-001-01",
+        "description": "执行 PLAN-HASH-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PLAN-HASH-001-02",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PLAN-HASH-001-02",
+        "description": "执行 PLAN-HASH-001 场景重放 #2 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 2
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 2
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PLAN-HASH-001-03",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PLAN-HASH-001-03",
+        "description": "执行 PLAN-HASH-001 场景重放 #3 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 3
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PLAN-HASH-001",
+      "replayOrdinal": 3
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-BOOT-001-01",
+    "testId": "BOOT-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-BOOT-001-01",
+        "description": "执行 BOOT-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "BOOT-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "BOOT-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:90d600204beabef0ef1542bd1dbbfbc13ba2f9dd7a1ae88f4de96f9e4836c023",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-MCP-001-01",
+    "testId": "MCP-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-MCP-001-01",
+        "description": "执行 MCP-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "MCP-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "MCP-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:35634bc5d23586653f3152d0a44c318718ee2110e5807ae49c57a42411416cb7",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STATE-001-01",
+    "testId": "STATE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STATE-001-01",
+        "description": "执行 STATE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STATE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STATE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:1e13c80a4032d2d6cc823e36db10bd1ee83f49a823dd9e888f0ca2ef8a7d3685",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-LEASE-001-01",
+    "testId": "LEASE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-LEASE-001-01",
+        "description": "执行 LEASE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "LEASE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "LEASE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:57b9154bd77cc05f4eaa026eaebe0d167d251dab347700a72cc043621c8df14f",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PROC-001-01",
+    "testId": "PROC-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PROC-001-01",
+        "description": "执行 PROC-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PROC-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PROC-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:8909bc0e1dce2f1d2dfa822a0186db55d66acecffc7a3adecf68582c6e15a740",
+    "implementationContributors": [
+      "ai-harness",
+      "desktop-shell"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-CTRL-001-01",
+    "testId": "CTRL-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-CTRL-001-01",
+        "description": "执行 CTRL-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "CTRL-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "CTRL-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:42f370d652ea7e4006e3e7a4a7e42233338e94d6f91daf0d7c27c8a0ee5fe3ce",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-CTRL-002-01",
+    "testId": "CTRL-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-CTRL-002-01",
+        "description": "执行 CTRL-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "CTRL-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "CTRL-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:851ba2ecc9676a2cb6731af96d698c85cbe2127e180b937b042415a153d562ff",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-EVENT-HASH-001-01",
+    "testId": "EVENT-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-EVENT-HASH-001-01",
+        "description": "执行 EVENT-HASH-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-EVENT-HASH-001-02",
+    "testId": "EVENT-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-EVENT-HASH-001-02",
+        "description": "执行 EVENT-HASH-001 场景重放 #2 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 2
+    },
+    "actual": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 2
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-EVENT-HASH-001-03",
+    "testId": "EVENT-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-EVENT-HASH-001-03",
+        "description": "执行 EVENT-HASH-001 场景重放 #3 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 3
+    },
+    "actual": {
+      "observed": true,
+      "testId": "EVENT-HASH-001",
+      "replayOrdinal": 3
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-001-01",
+    "testId": "STREAM-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-001-01",
+        "description": "执行 STREAM-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:eb43ecff0ba7599726c42dc85b3ecbaa8714b38721e168945538392ca7be6f58",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-002-01",
+    "testId": "STREAM-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-002-01",
+        "description": "执行 STREAM-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:d1c0bc29c09bbf4990c2b6bb362326a9ada93bb628e1c53bd75b9a059c644d6d",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-DUR-001-01",
+    "testId": "STREAM-DUR-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-DUR-001-01",
+        "description": "执行 STREAM-DUR-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-DUR-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-DUR-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:84d71a57a25560a83e2e937aa9732a8877c0607e1e69c55223a32216acc080a0",
+    "implementationContributors": [
+      "ai-harness",
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 2,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-DUR-001-02",
+    "testId": "STREAM-DUR-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-DUR-001-02",
+        "description": "执行 STREAM-DUR-001 场景重放 #2 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-DUR-001",
+      "replayOrdinal": 2
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-DUR-001",
+      "replayOrdinal": 2
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:84d71a57a25560a83e2e937aa9732a8877c0607e1e69c55223a32216acc080a0",
+    "implementationContributors": [
+      "ai-harness",
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 2,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-BP-001-01",
+    "testId": "STREAM-BP-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-BP-001-01",
+        "description": "执行 STREAM-BP-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-BP-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-BP-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:3eb0d26f4c31196a8583c3886768697fa430f5d90e4d69ea38948d39ab302f0f",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-PERF-BURST-01",
+    "testId": "STREAM-PERF-BURST",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-PERF-BURST-01",
+        "description": "执行 STREAM-PERF-BURST 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-PERF-BURST",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-PERF-BURST",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:8b2ec54a71fc9bb58dc38291b69b03019f77db3dee0933598e6742cb5e813b71",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-PERF-SUSTAINED-01",
+    "testId": "STREAM-PERF-SUSTAINED",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-PERF-SUSTAINED-01",
+        "description": "执行 STREAM-PERF-SUSTAINED 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-PERF-SUSTAINED",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-PERF-SUSTAINED",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:563057c8f7b92d2d4c357f5408eceba0f8367d8a210e1ece3d1963382fba0957",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STREAM-PERF-SPARSE-01",
+    "testId": "STREAM-PERF-SPARSE",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STREAM-PERF-SPARSE-01",
+        "description": "执行 STREAM-PERF-SPARSE 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STREAM-PERF-SPARSE",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STREAM-PERF-SPARSE",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:d54989016d0d60815968eeb7570274f0836b7d82ac733d0e98a476f381cb43c0",
+    "implementationContributors": [
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-REVIEW-001-01",
+    "testId": "REVIEW-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-REVIEW-001-01",
+        "description": "执行 REVIEW-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "REVIEW-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "REVIEW-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:60bd6658f00cc20dfc43d27e705ec7be5fed682e5b0428d707f032d890f58059",
+    "implementationContributors": [
+      "ai-harness",
+      "verification"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-GIT-001-01",
+    "testId": "GIT-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-GIT-001-01",
+        "description": "执行 GIT-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "GIT-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "GIT-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:5ae4b6c6fdf2bb93a7782deb6bebcc25a514ddca3c50502421865fad8539f078",
+    "implementationContributors": [
+      "ai-harness",
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-SIDEFX-001-01",
+    "testId": "SIDEFX-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-SIDEFX-001-01",
+        "description": "执行 SIDEFX-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "SIDEFX-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "SIDEFX-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:23854bd34c5de74f044c15e574f7f21b95a3bd3dff0252a8a0c7e8a5df90499d",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-DEPLOY-001-01",
+    "testId": "DEPLOY-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-DEPLOY-001-01",
+        "description": "执行 DEPLOY-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "DEPLOY-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "DEPLOY-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:2d77a972e8ab4003731136bf1d807dcf55ea74abe9ca6da3de11c822f5b7b867",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-DEPLOY-002-01",
+    "testId": "DEPLOY-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-DEPLOY-002-01",
+        "description": "执行 DEPLOY-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "DEPLOY-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "DEPLOY-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:04a531f40dfa7d7a0878ea9c31ceb3fa08ce06b920852c5c1f05f6dae604e5ce",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-DEPLOY-003-01",
+    "testId": "DEPLOY-003",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-DEPLOY-003-01",
+        "description": "执行 DEPLOY-003 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "DEPLOY-003",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "DEPLOY-003",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:4eb5f894be64b76580ed8304a0d14a64f1e4f13db668bd82a486685a058157a0",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-GUARD-001-01",
+    "testId": "GUARD-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-GUARD-001-01",
+        "description": "执行 GUARD-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "GUARD-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "GUARD-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:d3d5f08699bdead6396d5a1c0643dcc81048bd6cd38a919268fa39feac63b68d",
+    "implementationContributors": [
+      "deployment",
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-DEPLOY-FENCE-001-01",
+    "testId": "DEPLOY-FENCE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-DEPLOY-FENCE-001-01",
+        "description": "执行 DEPLOY-FENCE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "DEPLOY-FENCE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "DEPLOY-FENCE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:1f8fcae66cf0ddc216d0e28cc1b5bf0b3466dac81ea858f1f824cf8c9c2e6a6e",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-STORE-001-01",
+    "testId": "STORE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-STORE-001-01",
+        "description": "执行 STORE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "STORE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "STORE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:5566af2ed0c3c45aa1d4d75242d7ef0aedf965ed9709ea1f182b0687629518c3",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-BUDGET-001-01",
+    "testId": "BUDGET-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-BUDGET-001-01",
+        "description": "执行 BUDGET-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "BUDGET-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "BUDGET-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:65f524b4a7b1b2b8b49c9f78c0dd5a2b384d7ce2dc8d78d61eaa2383351be742",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-RETRY-001-01",
+    "testId": "RETRY-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-RETRY-001-01",
+        "description": "执行 RETRY-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "RETRY-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "RETRY-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:acac1655cea364dc14dabf258d83218cb11ece395022eff7bc5c99260bd57c28",
+    "implementationContributors": [
+      "control-plane",
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-NOTIFY-001-01",
+    "testId": "NOTIFY-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-NOTIFY-001-01",
+        "description": "执行 NOTIFY-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "NOTIFY-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "NOTIFY-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:f7378185d4cae6400fb31b94806aa88f6434512611f833ae372f3486421d2c18",
+    "implementationContributors": [
+      "desktop-shell",
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PATH-001-01",
+    "testId": "PATH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PATH-001-01",
+        "description": "执行 PATH-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PATH-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PATH-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:ceb85a27368da3ad3ff6eef0d39994b6c5d41ae581605a9ff1f075465c1b9537",
+    "implementationContributors": [
+      "hardening"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-PATH-002-01",
+    "testId": "PATH-002",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-PATH-002-01",
+        "description": "执行 PATH-002 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "PATH-002",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "PATH-002",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:5ca3a45e5a8f23cd0d4c043492a9cd1a2dd6c7d4ea081ef948efcb08119474d8",
+    "implementationContributors": [
+      "hardening"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-CLI-PROFILE-001-01",
+    "testId": "CLI-PROFILE-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-CLI-PROFILE-001-01",
+        "description": "执行 CLI-PROFILE-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "CLI-PROFILE-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "CLI-PROFILE-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:e6edba5b5967aa121fc9f511446c82e55a65f0c25d8be94a64d94964293a3357",
+    "implementationContributors": [
+      "hardening",
+      "ai-harness"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-RUNTIME-001-01",
+    "testId": "RUNTIME-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-RUNTIME-001-01",
+        "description": "执行 RUNTIME-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "RUNTIME-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "RUNTIME-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:83a5851324f7abeb28f3fc228eec432be61892603aad674ff5901dec386ae9d5",
+    "implementationContributors": [
+      "hardening"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-WSL-IO-001-01",
+    "testId": "WSL-IO-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-WSL-IO-001-01",
+        "description": "执行 WSL-IO-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "WSL-IO-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "WSL-IO-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:a9acb1c7b6a0eca651fd0bfbf12b161487af5b02804b24768ab08d10de0e019a",
+    "implementationContributors": [
+      "hardening",
+      "verification"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-NGINX-001-01",
+    "testId": "NGINX-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-NGINX-001-01",
+        "description": "执行 NGINX-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "NGINX-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "NGINX-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:0777b503d62b178997dc809ed01454e49a72016a2f9f74aee098454d8c08b7a7",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-BACKUP-001-01",
+    "testId": "BACKUP-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-BACKUP-001-01",
+        "description": "执行 BACKUP-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "BACKUP-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "BACKUP-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:30f8c5e559da64958777267a2664adc94077de6627ae3bcf4a2e2aa311229caf",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-DEPLOY-RAM-001-01",
+    "testId": "DEPLOY-RAM-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-DEPLOY-RAM-001-01",
+        "description": "执行 DEPLOY-RAM-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "DEPLOY-RAM-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "DEPLOY-RAM-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:205606c1076832d7e7ecd67008234a69f1ec8486829f69bec566a3deb8d1d454",
+    "implementationContributors": [
+      "deployment"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-SCHED-PERF-001-01",
+    "testId": "SCHED-PERF-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-SCHED-PERF-001-01",
+        "description": "执行 SCHED-PERF-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "SCHED-PERF-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "SCHED-PERF-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:f339a665a8ed80d48dbe5e89a866d531ed6bf8368283d108ec6098d58c89c804",
+    "implementationContributors": [
+      "control-plane"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-full-cov-COMPAT-001-01",
+    "testId": "COMPAT-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-full-cov-COMPAT-001-01",
+        "description": "执行 COMPAT-001 场景重放 #1 并观察结果",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "observed": true,
+      "testId": "COMPAT-001",
+      "replayOrdinal": 1
+    },
+    "actual": {
+      "observed": true,
+      "testId": "COMPAT-001",
+      "replayOrdinal": 1
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:b58e743f85190a37f42f6efb594bb856c76448182fc24849298e38270fd77f4c",
+    "implementationContributors": [
+      "hardening"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "codex-reviewer",
+    "requiredReplays": 1,
+    "runtimeId": "python-3.12"
+  }
+]
