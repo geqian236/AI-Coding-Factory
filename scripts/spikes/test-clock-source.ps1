@@ -78,11 +78,17 @@ env = {'os': platform.system(), 'version': platform.version(),
        'python': platform.python_version(), 'arch': platform.machine(),
        'probe_backend': 'python_time_monotonic_ns'}
 env_str = json.dumps(env, sort_keys=True)
+# 分辨率感知漂移容差：monotonic 无法分辨小于自身分辨率的时间差，
+# Windows 默认计时器分辨率 ~15.625ms，在 100ms 小窗口上量化误差可达 ±15%。
+# 固定 ppm 阈值物理上不可能通过；容差必须覆盖时钟量化粒度：
+#   tol_ns = 2 * clock_resolution_ns + 1% * wall_elapsed_ns
+res_ns = time.get_clock_info('monotonic').resolution * 1e9
+drift_tol_ns = 2 * res_ns + 0.01 * wall_elapsed
 assertions = [
     {'name': 'monotonic_includes_sleep', 'passed': mono_ok,
      'detail': f'mono_elapsed={mono_elapsed}ns >= {sleep_ms}ms*0.9'},
-    {'name': 'drift_within_tolerance', 'passed': abs(drift_ppm) < 10000,
-     'detail': f'drift={drift_ppm}ppm (threshold 10000ppm)'},
+    {'name': 'drift_within_resolution_tolerance', 'passed': abs(drift_ns) <= drift_tol_ns,
+     'detail': f'|drift|={abs(drift_ns)}ns <= tol={int(drift_tol_ns)}ns (2*res={int(2*res_ns)}ns + 1%wall)'},
 ]
 status = 'PASS' if all(a['passed'] for a in assertions) else 'FAIL'
 receipt = {

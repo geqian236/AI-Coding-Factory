@@ -66,3 +66,7 @@ tools/compat-probes/**/probe_tmp/
 # 探针脚手架生成器（本地一次性工具，非入库源码）
 tools/compat-probes/_gen_ps1.py
 tools/compat-probes/_gen_spikes.py
+
+# Phase 0 验收总回执（phase0-acceptance.ps1 每轮从干净树重新生成，绑定候选 SHA；
+# 是可再生运行时 artifact，不入库——提交它会造成 cleanTree 声明与实际树状态循环失配）
+.phase0-acceptance-receipt.json

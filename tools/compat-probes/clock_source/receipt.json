@@ -1,0 +1,40 @@
+{
+  "spike": "clock_source",
+  "status": "PASS",
+  "environment": {
+    "os": "Windows",
+    "version": "10.0.26200",
+    "python": "3.11.3",
+    "arch": "AMD64",
+    "probe_backend": "python_time_monotonic_ns"
+  },
+  "actions": [
+    "record wall_ns=1785946457311291800 mono_start",
+    "sleep 100ms",
+    "record mono_elapsed_ns=93000000 wall_elapsed_ns=100566700"
+  ],
+  "observable_facts": {
+    "sleep_requested_ms": 100,
+    "mono_elapsed_ns": 93000000,
+    "wall_elapsed_ns": 100566700,
+    "drift_ns": -7566700,
+    "drift_ppm": -75240,
+    "mono_includes_sleep": true,
+    "boot_id": "boot_time_ns:1785946457318858500",
+    "clock_resolution_ns": 15625000.0
+  },
+  "assertions": [
+    {
+      "name": "monotonic_includes_sleep",
+      "passed": true,
+      "detail": "mono_elapsed=93000000ns >= 100ms*0.9"
+    },
+    {
+      "name": "drift_within_resolution_tolerance",
+      "passed": true,
+      "detail": "|drift|=7566700ns <= tol=32255667ns (2*res=31250000ns + 1%wall)"
+    }
+  ],
+  "artifact_digest": "mono_ns:93000000",
+  "timestamp": "2026-08-06T00:14:17.504684+08:00"
+}

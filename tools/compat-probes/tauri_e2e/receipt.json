@@ -1,0 +1,49 @@
+﻿{
+    "spike":  "tauri_e2e",
+    "status":  "BLOCKED_UNCERTIFIED",
+    "reason":  "Tauri CLI + WebView2 runtime not available in this environment",
+    "unblock_steps":  [
+                          "cargo install tauri-cli --version 2",
+                          "Install WebView2 runtime from Microsoft",
+                          "cd tools/compat-probes/tauri_e2e \u0026\u0026 npm install",
+                          "npx tauri dev — verify native window opens",
+                          "npx vitest run specs/ inside Tauri context"
+                      ],
+    "environment":  {
+                        "ps_version":  "5.1.26100.8875",
+                        "os":  "Windows_NT",
+                        "hostname":  "搁浅"
+                    },
+    "actions":  [
+                    "verified framework files exist",
+                    "checked Tauri CLI availability — not found",
+                    "emitting BLOCKED_UNCERTIFIED"
+                ],
+    "observable_facts":  {
+                             "missing_files":  [
+
+                                               ],
+                             "tauri_cli_available":  false,
+                             "framework_files_present":  true,
+                             "webview2_available":  false
+                         },
+    "assertions":  [
+                       {
+                           "detail":  "package.json presence",
+                           "name":  "framework_package_json_exists",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "shell.spec.ts presence",
+                           "name":  "framework_spec_exists",
+                           "passed":  true
+                       },
+                       {
+                           "detail":  "BLOCKED: Tauri runtime not installed — run: cargo install tauri-cli@2; install WebView2",
+                           "name":  "tauri_runtime_available",
+                           "passed":  false
+                       }
+                   ],
+    "artifact_digest":  "none",
+    "timestamp":  "2026-08-06T00:10:44.2816647+08:00"
+}

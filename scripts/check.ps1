@@ -168,17 +168,22 @@ Invoke-GateCheck "13-vitest" {
     corepack pnpm --filter "@factory/contracts" test
 }
 
-# Rust cargo check（链接策略已在 .cargo/config.toml 与 dev.ps1 中冻结）
-Invoke-GateCheck "14-rust-check" {
+# Rust cargo test（GPT 第三轮 item 3：cargo check 不能替代运行时断言，必须真跑 test）。
+# 根因修复：rust-toolchain.toml 的 channel="stable" 在 msvc 默认 host 上被解析成
+# stable-x86_64-pc-windows-msvc，build-script 为 msvc host 编译 → 找不到 link.exe。
+# 用 +stable-x86_64-pc-windows-gnu 显式覆盖，使 host 也是 gnu，build-script 走 gnu host
+# + rust-lld（config.toml linker-flavor=ld），全程不碰 msvc link.exe。
+Invoke-GateCheck "14-rust-test" {
     $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "D:\acf-dev\cargo-home" }
     $env:RUSTUP_HOME = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "D:\acf-dev\rustup-home" }
+    # 只前置 CARGO_HOME\bin（rustup shim 所在），不前置 gnu 工具链 bin：
+    # 否则 cargo/rustc 解析成 gnu 工具链里的真实 exe，不认 +toolchain 语法
+    # （报 "no such command: +stable-..."）。shim 才能分发 +toolchain。
     $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
     $env:CARGO_TARGET_DIR = "D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target"
-    $gnuBin = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu\bin"
-    $env:PATH = "$gnuBin;$env:PATH"
-    $sysroot = (& rustc --print sysroot 2>$null | Select-Object -First 1)
-    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-gnu\bin\rust-lld.exe"
-    cargo check --target x86_64-pc-windows-gnu -p factory-contracts --tests
+    $sysroot = (& rustc +stable-x86_64-pc-windows-gnu --print sysroot 2>$null | Select-Object -First 1)
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
+    cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked
 }
 
 # Bootstrap-dev 必须能跑 -VerifyOnly（plan-validation 引用已删除）
