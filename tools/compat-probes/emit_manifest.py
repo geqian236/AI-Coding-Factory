@@ -50,10 +50,12 @@ DEFAULT_NODE_CAP_MAP_PATH = (
     _REPO_ROOT / "contracts" / "policies" / "node-capability-map.v1.json"
 )
 
-# 固定 eventBatchParameters 值（由 SQLite spike 认证后确定）
-DEFAULT_MAX_BATCH_EVENTS = 1000
-DEFAULT_MAX_BATCH_BYTES = 1_048_576   # 1 MiB
-DEFAULT_MAX_BATCH_AGE_MS = 100
+# eventBatchParameters 默认值（Master Spec §11 首版参考值：200 events / 256 KiB / 500 ms）。
+# 仅在 spike receipt 未携带 eventBatchParameters 时作为回退（合成回执单元测试用）；
+# 真实 SQLite spike receipt 会携带实测 tuple，emitter 优先读取并重算 digest 绑定校验。
+DEFAULT_MAX_BATCH_EVENTS = 200
+DEFAULT_MAX_BATCH_BYTES = 262144      # 256 KiB
+DEFAULT_MAX_BATCH_AGE_MS = 500
 SYNCHRONOUS_MODE = "FULL"
 
 
@@ -154,13 +156,47 @@ def emit_manifest(
         )
     benchmark_profile_digest = _sha256_file(benchmark_profile_path)
 
-    # ── 3. 计算 parameterTupleDigest ─────────────────────────────────────────
-    parameter_tuple_digest = compute_parameter_tuple_digest(
-        max_batch_events=DEFAULT_MAX_BATCH_EVENTS,
-        max_batch_bytes=DEFAULT_MAX_BATCH_BYTES,
-        max_batch_age_ms=DEFAULT_MAX_BATCH_AGE_MS,
-        synchronous=SYNCHRONOUS_MODE,
-    )
+    # ── 3. 绑定 eventBatchParameters：优先读 spike 实测 tuple，重算 digest 核对 ──
+    # 真实 SQLite spike receipt 携带 eventBatchParameters（实际施加并认证的参数）与
+    # parameterTupleDigest；emitter 必须读取实测值、重算 digest 并核对，任一不符即
+    # fail closed（PARAM_TUPLE_MISMATCH）——这才是「manifest 绑定 SQLite 实测参数」。
+    # 仅当 receipt 未携带该 tuple 时（合成回执）才回退到 §11 默认值。
+    spike_params = spike_receipt.get("eventBatchParameters")
+    if spike_params is not None:
+        for key in ("maxBatchEvents", "maxBatchBytes", "maxBatchAgeMs", "synchronous"):
+            if key not in spike_params:
+                raise ValueError(
+                    f"SPIKE_PARAM_MISSING: spike receipt eventBatchParameters 缺少 '{key}'"
+                )
+        max_batch_events = spike_params["maxBatchEvents"]
+        max_batch_bytes = spike_params["maxBatchBytes"]
+        max_batch_age_ms = spike_params["maxBatchAgeMs"]
+        synchronous = spike_params["synchronous"]
+        parameter_tuple_digest = compute_parameter_tuple_digest(
+            max_batch_events=max_batch_events,
+            max_batch_bytes=max_batch_bytes,
+            max_batch_age_ms=max_batch_age_ms,
+            synchronous=synchronous,
+        )
+        # 绑定核对：spike 自报的 parameterTupleDigest 必须与 emitter 重算值一致。
+        declared_tuple_digest = spike_receipt.get("parameterTupleDigest")
+        if declared_tuple_digest is not None and declared_tuple_digest != parameter_tuple_digest:
+            raise ValueError(
+                "PARAM_TUPLE_MISMATCH: spike receipt 自报 parameterTupleDigest 与 emitter "
+                f"重算值不一致（receipt={declared_tuple_digest} / recomputed={parameter_tuple_digest}）"
+            )
+    else:
+        # 回退：合成回执无实测 tuple，用 §11 默认值（单元测试路径）。
+        max_batch_events = DEFAULT_MAX_BATCH_EVENTS
+        max_batch_bytes = DEFAULT_MAX_BATCH_BYTES
+        max_batch_age_ms = DEFAULT_MAX_BATCH_AGE_MS
+        synchronous = SYNCHRONOUS_MODE
+        parameter_tuple_digest = compute_parameter_tuple_digest(
+            max_batch_events=max_batch_events,
+            max_batch_bytes=max_batch_bytes,
+            max_batch_age_ms=max_batch_age_ms,
+            synchronous=synchronous,
+        )
 
     # ── 4. 计算 spike receipt 摘要 ────────────────────────────────────────────
     sqlite_spike_receipt_digest = _sha256_dict(spike_receipt)
@@ -184,11 +220,13 @@ def emit_manifest(
     )
 
     # ── 6. 组装 manifest ──────────────────────────────────────────────────────
+    # 使用步骤 3 解析出的实测（或回退默认）参数，而非硬编码常量——确保 manifest
+    # 绑定的正是 SQLite spike 实际认证的 eventBatchParameters。
     event_batch_parameters: dict[str, Any] = {
-        "maxBatchEvents": DEFAULT_MAX_BATCH_EVENTS,
-        "maxBatchBytes": DEFAULT_MAX_BATCH_BYTES,
-        "maxBatchAgeMs": DEFAULT_MAX_BATCH_AGE_MS,
-        "synchronous": SYNCHRONOUS_MODE,
+        "maxBatchEvents": max_batch_events,
+        "maxBatchBytes": max_batch_bytes,
+        "maxBatchAgeMs": max_batch_age_ms,
+        "synchronous": synchronous,
         "parameterTupleDigest": parameter_tuple_digest,
         "sqliteSpikeReceiptDigest": sqlite_spike_receipt_digest,
     }
