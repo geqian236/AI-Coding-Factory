@@ -63,14 +63,20 @@ Invoke-GateCheck "2-schema-validity" {
 }
 
 # 3. Golden vectors
+# fail-closed：plan_hash / event_hash 向量测试文件必须存在并通过；缺任一即整体红
+# （GPT 审核指出此分支原为 SKIP-即-PASS 的 fail-open 漏洞）。
 Invoke-GateCheck "3-golden-vectors" {
     $ph = "tests\contract\test_plan_hash_vectors.py"
     $ev = "tests\contract\test_event_hash_vectors.py"
-    if ((Test-Path $ph) -and (Test-Path $ev)) {
+    $missing = @()
+    if (-not (Test-Path $ph)) { $missing += $ph }
+    if (-not (Test-Path $ev)) { $missing += $ev }
+    if ($missing.Count -gt 0) {
+        Write-Host "  [FAIL] Golden vectors 测试文件缺失：$($missing -join ', ')"
+        # 必须让 pytest 真跑（即便 no collection）以触发非零退出
         python -m pytest $ph $ev -q --tb=short --no-header
     } else {
-        Write-Host "  [SKIP] plan_hash/event_hash tests not yet implemented (Task 3/4)"
-        $global:LASTEXITCODE = 0
+        python -m pytest $ph $ev -q --tb=short --no-header
     }
 }
 

@@ -30,11 +30,12 @@ def check_chinese_coverage() -> int:
     """
     扫描 apps/agent/src 下的非生成、非测试 Python 文件，
     确保每个含 def/class 的文件至少包含一个中文字符。
+    fail-closed：apps/agent/src 不存在或为空即视为缺失，return 1。
     """
     src_dir = REPO_ROOT / "apps" / "agent" / "src"
     if not src_dir.exists():
-        print(f"OK: src 目录不存在，跳过检查: {src_dir}")
-        return 0
+        print(f"FAIL: 中文覆盖门禁要求 apps/agent/src 存在: {src_dir}", file=sys.stderr)
+        return 1
 
     missing = []
     for py_file in sorted(src_dir.rglob("*.py")):
@@ -98,7 +99,12 @@ def check_no_bare_print() -> int:
     # Python
     py_src = REPO_ROOT / "apps" / "agent" / "src"
     if py_src.exists():
-        for py_file in sorted(py_src.rglob("*.py")):
+        # fail-closed：目录存在但无 .py 文件同样视为违规（避免空目录伪装 PASS）
+        py_files = sorted(py_src.rglob("*.py"))
+        if not py_files:
+            print(f"FAIL: apps/agent/src 存在但无 .py 源码", file=sys.stderr)
+            return 1
+        for py_file in py_files:
             parts = py_file.parts
             if any(p in parts for p in ("__pycache__", "generated")):
                 continue
@@ -123,7 +129,19 @@ def check_no_bare_print() -> int:
     # TypeScript
     ts_src = REPO_ROOT / "packages"
     if ts_src.exists():
-        for ts_file in sorted(ts_src.rglob("*.ts")):
+        ts_files_all = sorted(ts_src.rglob("*.ts"))
+        # 排除 node_modules 与测试
+        ts_files = [
+            f for f in ts_files_all
+            if "node_modules" not in f.parts
+            and ".test." not in f.name
+            and ".spec." not in f.name
+        ]
+        if not ts_files:
+            # 没有受管 TS 源码（仅 node_modules）也算 fail-closed（防止空仓库伪装）
+            print(f"FAIL: packages/ 下无受管 .ts 源码（仅 node_modules 不算）", file=sys.stderr)
+            return 1
+        for ts_file in ts_files:
             # node_modules 是第三方依赖,不属于本项目源码,跳过
             if "node_modules" in ts_file.parts:
                 continue
@@ -176,9 +194,16 @@ def check_secret_scan() -> int:
         REPO_ROOT / "crates" / "factory-contracts" / "src",
     ]
 
+    # fail-closed：所有 search_dir 必须存在；缺任一即视为扫描不全，整体红。
+    missing_dirs = [str(d.relative_to(REPO_ROOT)) for d in search_dirs if not d.exists()]
+    if missing_dirs:
+        print(
+            f"FAIL: 秘密扫描范围目录缺失: {', '.join(missing_dirs)}",
+            file=sys.stderr,
+        )
+        return 1
+    scanned_any = False
     for search_dir in search_dirs:
-        if not search_dir.exists():
-            continue
         for src_file in sorted(search_dir.rglob("*")):
             if not src_file.is_file():
                 continue
@@ -194,6 +219,7 @@ def check_secret_scan() -> int:
                 source = src_file.read_text(encoding="utf-8")
             except Exception:  # noqa: BLE001
                 continue
+            scanned_any = True
             for i, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if stripped.startswith(("#", "//", "/*", "*", "//!")):
@@ -202,6 +228,9 @@ def check_secret_scan() -> int:
                     rel = str(src_file.relative_to(REPO_ROOT)).replace("\\", "/")
                     violations.append(f"{rel}:{i}: {stripped[:100]}")
 
+    if not scanned_any:
+        print("FAIL: 秘密扫描未覆盖任何源码文件（目录存在但为空）", file=sys.stderr)
+        return 1
     if violations:
         print(
             f"FAIL: 发现 {len(violations)} 处疑似秘密泄露:",
@@ -232,9 +261,16 @@ def check_c_drive_paths() -> int:
         REPO_ROOT / "crates" / "factory-contracts" / "src",
     ]
 
+    # fail-closed：所有 search_dir 必须存在
+    missing_dirs = [str(d.relative_to(REPO_ROOT)) for d in search_dirs if not d.exists()]
+    if missing_dirs:
+        print(
+            f"FAIL: C 盘路径扫描范围目录缺失: {', '.join(missing_dirs)}",
+            file=sys.stderr,
+        )
+        return 1
+    scanned_any = False
     for search_dir in search_dirs:
-        if not search_dir.exists():
-            continue
         for src_file in sorted(search_dir.rglob("*")):
             if not src_file.is_file():
                 continue
@@ -250,6 +286,7 @@ def check_c_drive_paths() -> int:
                 source = src_file.read_text(encoding="utf-8")
             except Exception:  # noqa: BLE001
                 continue
+            scanned_any = True
             for i, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if stripped.startswith(("#", "//", "/*", "*", "//!")):
@@ -258,6 +295,9 @@ def check_c_drive_paths() -> int:
                     rel = str(src_file.relative_to(REPO_ROOT)).replace("\\", "/")
                     violations.append(f"{rel}:{i}: {stripped[:100]}")
 
+    if not scanned_any:
+        print("FAIL: C 盘路径扫描未覆盖任何源码文件（目录存在但为空）", file=sys.stderr)
+        return 1
     if violations:
         print(
             f"FAIL: 发现 {len(violations)} 处 C 盘路径引用:",

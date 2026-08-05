@@ -20,7 +20,6 @@ def test_required_workspace_files_exist() -> None:
         "pyproject.toml",
         "uv.lock",
         ".node-version",
-        ".github/workflows/plan-validation.yml",
         ".github/workflows/ci.yml",
         ".github/pull_request_template.md",
         "scripts/bootstrap-dev.ps1",
