@@ -124,6 +124,9 @@ def check_no_bare_print() -> int:
     ts_src = REPO_ROOT / "packages"
     if ts_src.exists():
         for ts_file in sorted(ts_src.rglob("*.ts")):
+            # node_modules 是第三方依赖,不属于本项目源码,跳过
+            if "node_modules" in ts_file.parts:
+                continue
             name = ts_file.name
             if ".test." in name or ".spec." in name:
                 continue

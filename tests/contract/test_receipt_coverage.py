@@ -15,6 +15,7 @@ Task 6 合同层测试：测试回执覆盖率验证与 fail-closed 规则。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -270,7 +271,10 @@ def test_verify_rejects_unknown_runtime(tmp_path: Path) -> None:
 def _run_verify_cli(catalog: Path, receipts: Path) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
     """调用 verify_receipts CLI 并返回 CompletedProcess。"""
     agent_src = str(REPO_ROOT / "apps" / "agent" / "src")
-    env_with_path = {**__import__("os").environ, "PYTHONPATH": agent_src}
+    env_with_path = {**os.environ, "PYTHONPATH": agent_src}
+    # 必须显式指定 encoding：Windows 上 text=True 默认走 locale 编码（GBK），
+    # 子进程输出的 UTF-8 中文会让读取线程抛 UnicodeDecodeError，
+    # 导致断言失败时 stdout/stderr 全部丢失、无法排查。
     return subprocess.run(
         [
             sys.executable, "-m", "factory_agent.testing.verify_receipts",
@@ -279,8 +283,11 @@ def _run_verify_cli(catalog: Path, receipts: Path) -> subprocess.CompletedProces
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=str(REPO_ROOT),
         env=env_with_path,
+        check=False,
     )
 
 
