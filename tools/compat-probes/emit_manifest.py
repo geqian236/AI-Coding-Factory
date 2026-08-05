@@ -78,6 +78,87 @@ def _sha256_dict(d: dict[str, Any]) -> str:
     return _sha256_bytes(json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8"))
 
 
+def _verify_receipt_digests(
+    spike_receipt: dict[str, Any],
+    benchmark_profile_path: Path,
+) -> None:
+    """强制绑定 spike receipt 的三组 digest（P0-3 修复：消除命名冲突 + fail closed）。
+
+    1. `benchmarkProfileDigest`：receipt 必须携带，且必须等于冻结
+       `benchmark_profile_path` 文件的真实 SHA-256。原 emitter 用的是后者，故旧版
+       receipt 自报值（如 cc4421bc…，实际是 bench 内部小结字典摘要）与 emitter
+       重算值（03df1bc4…）**永不相等**——这是命名冲突而非真不同步。
+       现在 bench 已修正，receipt 自报的就是冻结文件摘要，本校验强制 binding。
+    2. `env_digest`：必须等于 `sha256_dict(spike_receipt['environment'])`。
+    3. `parameterTupleDigest`：必须等于 emitter 自重算值（去掉软守卫）。
+       兼容旧 receipt 把 digest 放到顶层 `param_digest`，二者择一存在即可。
+
+    任一缺失或不匹配都 `raise ValueError`，错误码前缀便于测试 `match`：
+      BENCHMARK_PROFILE_DIGEST_MISMATCH / ENV_DIGEST_MISMATCH / PARAM_TUPLE_MISMATCH
+    """
+    # ── (1) benchmarkProfileDigest ────────────────────────────────────────────
+    if "benchmarkProfileDigest" not in spike_receipt:
+        raise ValueError(
+            "BENCHMARK_PROFILE_DIGEST_MISMATCH: spike receipt 缺少 'benchmarkProfileDigest' 字段，"
+            "无法证明 receipt 绑定的是真实冻结 benchmark profile 文件摘要（P0-3 fail closed）"
+        )
+    expected_bp = _sha256_file(benchmark_profile_path)
+    actual_bp = spike_receipt["benchmarkProfileDigest"]
+    if actual_bp != expected_bp:
+        raise ValueError(
+            f"BENCHMARK_PROFILE_DIGEST_MISMATCH: spike receipt['benchmarkProfileDigest']={actual_bp} "
+            f"与冻结文件 {benchmark_profile_path} 实际摘要 {expected_bp} 不一致 "
+            "—— bench 端必须用 _sha256_file 写入真实冻结 profile 摘要，不再用内部小结字典摘要"
+        )
+
+    # ── (2) env_digest ────────────────────────────────────────────────────────
+    if "env_digest" not in spike_receipt:
+        raise ValueError(
+            "ENV_DIGEST_MISMATCH: spike receipt 缺少 'env_digest' 字段（P0-3 fail closed）"
+        )
+    if "environment" not in spike_receipt:
+        raise ValueError(
+            "ENV_DIGEST_MISMATCH: spike receipt 缺少 'environment' 字段，无法重算 env_digest"
+        )
+    expected_env = _sha256_dict(spike_receipt["environment"])
+    actual_env = spike_receipt["env_digest"]
+    if actual_env != expected_env:
+        raise ValueError(
+            f"ENV_DIGEST_MISMATCH: spike receipt['env_digest']={actual_env} "
+            f"与 sha256_dict(receipt['environment']) 重算值 {expected_env} 不一致"
+        )
+
+    # ── (3) parameterTupleDigest（兼容旧字段名 param_digest）──────────────────
+    declared = spike_receipt.get("parameterTupleDigest") or spike_receipt.get("param_digest")
+    if not declared:
+        raise ValueError(
+            "PARAM_TUPLE_MISMATCH: spike receipt 既无 'parameterTupleDigest' 也无 "
+            "'param_digest' 字段（P0-3 fail closed）"
+        )
+    spike_params = spike_receipt.get("eventBatchParameters")
+    if spike_params is None:
+        raise ValueError(
+            "PARAM_TUPLE_MISMATCH: spike receipt 缺少 'eventBatchParameters'，无法重算 parameterTupleDigest"
+        )
+    try:
+        recomputed = compute_parameter_tuple_digest(
+            max_batch_events=spike_params["maxBatchEvents"],
+            max_batch_bytes=spike_params["maxBatchBytes"],
+            max_batch_age_ms=spike_params["maxBatchAgeMs"],
+            synchronous=spike_params["synchronous"],
+        )
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"PARAM_TUPLE_MISMATCH: spike receipt eventBatchParameters 不合法或缺键: {exc}"
+        ) from exc
+    # P0-3 修复：去掉 `declared is not None` 软守卫，PASS 必须等于。
+    if declared != recomputed:
+        raise ValueError(
+            f"PARAM_TUPLE_MISMATCH: spike receipt 自报 parameterTupleDigest/param_digest={declared} "
+            f"与 emitter 重算值 {recomputed} 不一致"
+        )
+
+
 def compute_parameter_tuple_digest(
     max_batch_events: int,
     max_batch_bytes: int,
@@ -178,13 +259,8 @@ def emit_manifest(
             max_batch_age_ms=max_batch_age_ms,
             synchronous=synchronous,
         )
-        # 绑定核对：spike 自报的 parameterTupleDigest 必须与 emitter 重算值一致。
-        declared_tuple_digest = spike_receipt.get("parameterTupleDigest")
-        if declared_tuple_digest is not None and declared_tuple_digest != parameter_tuple_digest:
-            raise ValueError(
-                "PARAM_TUPLE_MISMATCH: spike receipt 自报 parameterTupleDigest 与 emitter "
-                f"重算值不一致（receipt={declared_tuple_digest} / recomputed={parameter_tuple_digest}）"
-            )
+        # 注意：详细的参数 digest 绑定校验（含 PASS 必须等于）已下沉到
+        # `_verify_receipt_digests`，确保合成回执走的是一致错误码前缀。
     else:
         # 回退：合成回执无实测 tuple，用 §11 默认值（单元测试路径）。
         max_batch_events = DEFAULT_MAX_BATCH_EVENTS
@@ -197,6 +273,13 @@ def emit_manifest(
             max_batch_age_ms=max_batch_age_ms,
             synchronous=synchronous,
         )
+
+    # ── 3.5 P0-3 强制绑定：在 §11 与 §5 之间收紧 receipt digest 与冻结契约的同步 ──
+    # - benchmarkProfileDigest 必须等于冻结 profile 文件 SHA-256
+    # - env_digest 必须等于 sha256_dict(receipt.environment)
+    # - parameterTupleDigest 必须等于 emitter 自重算值（去掉软守卫）
+    # 任一缺失或不匹配均 fail closed，错误码前缀便于测试 `match`。
+    _verify_receipt_digests(spike_receipt, benchmark_profile_path)
 
     # ── 4. 计算 spike receipt 摘要 ────────────────────────────────────────────
     sqlite_spike_receipt_digest = _sha256_dict(spike_receipt)

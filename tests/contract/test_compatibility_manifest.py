@@ -9,9 +9,12 @@ Task 6 合同层测试：Compatibility Manifest 结构与 benchmark profile 合�
   - compatibility-manifest schema 强制 synchronous=FULL
   - emit_manifest 模块正确计算 parameterTupleDigest
   - 缺少 SQLite spike receipt 时 fail closed
+  - P0-3 修复：emit_manifest 强制绑定 receipt 三组 digest（benchmark/env/param）
+    —— 3 负例 fail closed + 1 合成正例 passed
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import ModuleType
@@ -21,6 +24,69 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_PROFILE_PATH = REPO_ROOT / "contracts" / "benchmarks" / "benchmark-profile.v1.json"
 MANIFEST_SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
+
+
+def _sha256_file(p: Path) -> str:
+    return "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _sha256_dict(d: dict) -> str:  # type: ignore[type-arg]
+    return "sha256:" + hashlib.sha256(
+        json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_synthetic_pass_receipt() -> dict:
+    """构造一个自洽的 PASS receipt fixture（不走真实 SQLite spike 路径）。
+
+    Phase 0 沙盒内无独立小卷 → 真实 SQLite spike 顶层 BLOCKED → manifest 测试
+    必须改用合成 fixture 复用 emit_manifest.py 的回退默认参数路径（无
+    eventBatchParameters 时走 §11 默认值）。此 fixture 必须满足 P0-3 三组
+    digest 绑定校验（benchmarkProfileDigest / env_digest / parameterTupleDigest），
+    否则新绑定校验会误伤合成正例。
+    """
+    environment = {
+        "os": "synthetic-test",
+        "synthesized_by": "test_compatibility_manifest",
+    }
+    # 合成路径默认参数（emit_manifest §11 默认）
+    params = {
+        "maxBatchEvents": 200,
+        "maxBatchBytes": 262144,
+        "maxBatchAgeMs": 500,
+        "synchronous": "FULL",
+    }
+    # 用 emitter 同一算法预计算 parameterTupleDigest，避免手工算错
+    import importlib
+    spec = importlib.util.spec_from_file_location(
+        "_em",
+        REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py",
+    )
+    em = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(em)
+    tuple_digest = em.compute_parameter_tuple_digest(
+        max_batch_events=params["maxBatchEvents"],
+        max_batch_bytes=params["maxBatchBytes"],
+        max_batch_age_ms=params["maxBatchAgeMs"],
+        synchronous=params["synchronous"],
+    )
+    return {
+        "status": "PASS",
+        # P0-3 修复：合成 receipt 也必须自报这三组 digest 真实值
+        "environment": environment,
+        "env_digest": _sha256_dict(environment),
+        "benchmarkProfileDigest": _sha256_file(BENCHMARK_PROFILE_PATH),
+        "parameterTupleDigest": tuple_digest,
+        # 携带 eventBatchParameters（用合成默认参数）以满足 emitter 校验：
+        # _verify_receipt_digests 重算 parameterTupleDigest 依赖该字段。无
+        # eventBatchParameters 的回退路径仅在 receipt 不带 digest 时使用。
+        "eventBatchParameters": params,
+        # 旧兼容字段
+        "param_digest": tuple_digest,
+        # 旧合成用例残留的兜底
+        "assertions": [{"name": "synthetic_ok", "passed": True}],
+    }
 
 
 # ─────────────────────── session fixtures ───────────────────────
@@ -221,15 +287,14 @@ def test_emit_manifest_produces_valid_structure(
     emit_manifest_module: ModuleType,
     tmp_path: Path,
 ) -> None:
-    """有效 spike receipt 应产生包含全部必需顶级字段的 manifest。"""
+    """有效 spike receipt 应产生包含全部必需顶级字段的 manifest。
+
+    Phase 0 沙盒无独立小卷 → 真实 SQLite spike 顶层 BLOCKED → 改用合成 PASS
+    fixture 复用 emit_manifest.py:188-199 默认值路径。
+    """
     receipt = tmp_path / "receipt.json"
     receipt.write_text(
-        json.dumps({
-            "status": "PASS",
-            "env_digest": "sha256:" + "a" * 64,
-            "param_digest": "sha256:" + "b" * 64,
-            "assertions": [{"name": "wal_ok", "passed": True}],
-        }),
+        json.dumps(_build_synthetic_pass_receipt()),
         encoding="utf-8",
     )
     manifest = emit_manifest_module.emit_manifest(spike_receipt_path=receipt)
@@ -248,10 +313,13 @@ def test_emit_manifest_parameter_tuple_digest_consistent(
     emit_manifest_module: ModuleType,
     tmp_path: Path,
 ) -> None:
-    """emit_manifest 计算的 parameterTupleDigest 必须与独立调用 compute_parameter_tuple_digest 一致。"""
+    """emit_manifest 计算的 parameterTupleDigest 必须与独立调用 compute_parameter_tuple_digest 一致。
+
+    Phase 0 沙盒无独立小卷 → 真实 SQLite spike 顶层 BLOCKED → 改用合成 PASS fixture。
+    """
     receipt = tmp_path / "receipt.json"
     receipt.write_text(
-        json.dumps({"status": "PASS", "env_digest": "sha256:env", "param_digest": "sha256:param"}),
+        json.dumps(_build_synthetic_pass_receipt()),
         encoding="utf-8",
     )
     manifest = emit_manifest_module.emit_manifest(spike_receipt_path=receipt)
@@ -263,3 +331,84 @@ def test_emit_manifest_parameter_tuple_digest_consistent(
         emit_manifest_module.SYNCHRONOUS_MODE,
     )
     assert manifest["eventBatchParameters"]["parameterTupleDigest"] == expected
+
+
+# ─────────────────────── P0-3 修复：digest 强制绑定 ────────────────────────────
+# Phase 0 沙盒内无独立小卷 → 真实 SQLite spike 顶层 BLOCKED → manifest 测试走合成
+# fixture（见 _build_synthetic_pass_receipt）。下述 4 个用例验证 §2.3 不变量：
+#   3 个负例 fail closed（benchmark/env/param digest mismatch）
+#   1 个合成正例 passed（test_emit_manifest_binds_real_receipt）
+
+
+def test_emit_manifest_rejects_benchmark_profile_digest_mismatch(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """benchmarkProfileDigest 不等于冻结 profile 文件摘要 → fail closed。"""
+    receipt = _build_synthetic_pass_receipt()
+    receipt["benchmarkProfileDigest"] = "sha256:" + "f" * 64  # 错值
+    r_path = tmp_path / "r.json"
+    r_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="BENCHMARK_PROFILE_DIGEST_MISMATCH"):
+        emit_manifest_module.emit_manifest(spike_receipt_path=r_path)
+
+
+def test_emit_manifest_rejects_missing_benchmark_profile_digest(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """benchmarkProfileDigest 字段缺失 → fail closed（缺字段也算 mismatch）。"""
+    receipt = _build_synthetic_pass_receipt()
+    del receipt["benchmarkProfileDigest"]
+    r_path = tmp_path / "r.json"
+    r_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="BENCHMARK_PROFILE_DIGEST_MISMATCH"):
+        emit_manifest_module.emit_manifest(spike_receipt_path=r_path)
+
+
+def test_emit_manifest_rejects_env_digest_mismatch(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """env_digest 与 sha256_dict(environment) 重算值不一致 → fail closed。"""
+    receipt = _build_synthetic_pass_receipt()
+    receipt["env_digest"] = "sha256:" + "1" * 64  # 与真实 environment 不一致
+    r_path = tmp_path / "r.json"
+    r_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="ENV_DIGEST_MISMATCH"):
+        emit_manifest_module.emit_manifest(spike_receipt_path=r_path)
+
+
+def test_emit_manifest_rejects_param_tuple_digest_mismatch(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """parameterTupleDigest 与 emitter 重算值不一致 → fail closed（去掉软守卫）。"""
+    receipt = _build_synthetic_pass_receipt()
+    receipt["parameterTupleDigest"] = "sha256:" + "0" * 64  # 与真实参数重算值不一致
+    r_path = tmp_path / "r.json"
+    r_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="PARAM_TUPLE_MISMATCH"):
+        emit_manifest_module.emit_manifest(spike_receipt_path=r_path)
+
+
+def test_emit_manifest_binds_real_receipt(
+    emit_manifest_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """合成 PASS fixture 自报三组 digest 真实值 → emitter 应当成功 binding 不抛错。
+
+    Phase 0 沙盒无独立小卷 → 真实 SQLite spike 顶层 BLOCKED → manifest 测试走合成
+    fixture 并显式标注「真实 SQLite spike 顶层 BLOCKED → manifest 测试走合成 fixture」。
+    """
+    receipt = _build_synthetic_pass_receipt()
+    r_path = tmp_path / "r.json"
+    r_path.write_text(json.dumps(receipt), encoding="utf-8")
+    manifest = emit_manifest_module.emit_manifest(spike_receipt_path=r_path)
+
+    # emitter 写出的 manifest 的 benchmarkProfileDigest 应等于冻结文件摘要
+    assert manifest["benchmarkProfileDigest"] == _sha256_file(BENCHMARK_PROFILE_PATH)
+    # environmentDigest 应等于 receipt.env_digest
+    assert manifest["environmentDigest"] == receipt["env_digest"]
+    # parameterTupleDigest 应等于 receipt 自报值（合成 fixture 已用 emitter 同算法预算）
+    assert manifest["eventBatchParameters"]["parameterTupleDigest"] == receipt["parameterTupleDigest"]
