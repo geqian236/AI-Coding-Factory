@@ -270,3 +270,139 @@ class TestReadOnlyGuarantee:
         sc.validate_storage_path(target)
         assert not Path(target).exists()
         assert not Path("D:\\codex项目\\__probe_no_create__").exists()
+
+
+class TestProjectRootPrefix:
+    """规则 3.5（新增）：路径必须严格位于项目根 ``_REQUIRED_ROOT`` 内部。
+
+    关键不变量：必须按 ``Path.parts`` 各段 + ``os.path.normcase`` 配对比较，
+    不能用裸 ``str.startswith``；后者会被 ``D:\\codex项目-evil`` 这类
+    *字符串前缀延伸* 路径绕过。
+    """
+
+    @pytest.mark.parametrize("bad_path", [
+        # 字符串前缀延伸攻击：第二段不是 "codex项目"
+        "D:\\codex项目-evil",
+        "D:\\codex项目-evil\\nested",
+        # Windows 大小写变体：第二段是 "codex项目" 但盘符段不在常量前缀
+        # 这里覆盖大小写不敏感正确性——CODEX项目 应当通过 normcase 后通过校验
+        # 反例：根目录本身之外的非法路径
+        "D:\\OtherProject",
+        "D:\\OtherProject\\child",
+        # 同名目录但父层多塞一段
+        "D:\\foo\\codex项目",
+    ])
+    def test_path_outside_root_rejected(
+        self, allow_all: None, bad_path: str
+    ) -> None:
+        """路径不在 ``D:\\codex项目`` 严格内部时必须拒绝。"""
+        with pytest.raises(StorageViolationError) as exc_info:
+            sc.validate_storage_path(bad_path)
+        assert "项目根" in str(exc_info.value) or "前缀" in str(exc_info.value)
+
+    def test_root_itself_is_accepted(self, allow_all: None) -> None:
+        """项目根本身（路径等于 ``_REQUIRED_ROOT``）应通过校验。"""
+        receipt = sc.validate_storage_path("D:\\codex项目")
+        assert receipt.drive == "D"
+        assert str(receipt.path).lower().endswith("codex项目")
+
+    def test_root_descendant_accepted(self, allow_all: None) -> None:
+        """项目根的严格后代路径应通过校验。"""
+        receipt = sc.validate_storage_path(
+            "D:\\codex项目\\AI-Coding-Factory-Data\\dev"
+        )
+        assert receipt.drive == "D"
+
+    def test_root_with_trailing_separator_accepted(self, allow_all: None) -> None:
+        """项目根带尾分隔符 ``D:\\codex项目\\`` 也算合规（与常量等价）。"""
+        receipt = sc.validate_storage_path("D:\\codex项目\\")
+        assert receipt.drive == "D"
+
+    def test_prefix_confusion_sibling_rejected(self, allow_all: None) -> None:
+        """``D:\\codex项目evil``（无连字符）也必须拒绝——按段 normcase 校验。"""
+        with pytest.raises(StorageViolationError):
+            sc.validate_storage_path("D:\\codex项目evil")
+
+    def test_normcase_insensitive_drive(self, allow_all: None) -> None:
+        """盘符大小写差异不应影响校验（normcase 不敏感）。"""
+        receipt = sc.validate_storage_path("d:\\codex项目")
+        assert receipt.drive == "D"
+
+
+class TestProjectRootPrefixOnRealpath:
+    """规则 7 扩展：reparse 解析结果也必须落在项目根之内。
+
+    防止 ``D:\\codex项目\\link`` 解析到 ``D:\\other\\elsewhere`` 的
+    跨根重定向攻击；即便解析后仍在 D 盘，也不能脱离项目根。
+    """
+
+    def test_realpath_escape_to_sibling_rejected(
+        self, allow_all: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """解析后落到 ``D:\\codex项目-evil``（盘符合规但根外）必须拒绝。"""
+        monkeypatch.setattr(
+            os.path,
+            "realpath",
+            lambda p, **_kwargs: "D:\\codex项目-evil\\target",
+        )
+        with pytest.raises(StorageViolationError) as exc_info:
+            sc.validate_storage_path(_GOOD_PATH)
+        assert "项目根" in str(exc_info.value) or "根" in str(exc_info.value)
+
+    def test_realpath_escape_to_unrelated_d_rejected(
+        self, allow_all: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """解析后落到 ``D:\\other`` 也必须拒绝（盘符对但根外）。"""
+        monkeypatch.setattr(
+            os.path,
+            "realpath",
+            lambda p, **_kwargs: "D:\\OtherProject\\subdir",
+        )
+        with pytest.raises(StorageViolationError):
+            sc.validate_storage_path(_GOOD_PATH)
+
+    def test_realpath_inside_root_accepted(
+        self, allow_all: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """解析后仍位于项目根内部（如经过合规软链接）应通过。"""
+        monkeypatch.setattr(
+            os.path,
+            "realpath",
+            lambda p, **_kwargs: "D:\\codex项目\\real_target\\nested",
+        )
+        receipt = sc.validate_storage_path(_GOOD_PATH)
+        assert receipt.drive == "D"
+
+
+class TestHelperSegmentAwarePrefix:
+    """_is_within_required_root 单元测试：分段 normcase 比较正确性。"""
+
+    @pytest.mark.parametrize("good_path", [
+        "D:\\codex项目",
+        "D:\\codex项目\\AI-Coding-Factory-Data",
+        "D:\\codex项目\\AI-Coding-Factory-Data\\dev",
+    ])
+    def test_within_root_returns_true(self, allow_all: None, good_path: str) -> None:
+        """合规根路径或严格后代应返回 True。"""
+        target = Path(os.path.abspath(good_path))
+        assert sc._is_within_required_root(target) is True
+
+    @pytest.mark.parametrize("bad_path", [
+        "D:\\other",
+        "D:\\codex项目-evil",
+        "D:\\codex项目evil",
+        "D:\\OtherProject",
+        "D:\\foo\\codex项目",
+        "C:\\codex项目",  # 盘符外
+    ])
+    def test_outside_root_returns_false(
+        self, allow_all: None, bad_path: str
+    ) -> None:
+        """字符串前缀延伸或盘符外的路径应返回 False。"""
+        target = Path(os.path.abspath(bad_path))
+        assert sc._is_within_required_root(target) is False
+
+    def test_normcase_insensitive_segments(self, allow_all: None) -> None:
+        """segments 大小写差异不应影响判定（Windows normcase）。"""
+        target = Path(os.path.abspath("D:\\CODEX项目"))
+        assert sc._is_within_required_root(target) is True

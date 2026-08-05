@@ -2,17 +2,24 @@
 
 Phase 0 职责（只读验证，不创建目录、不写入文件）：
   - 验证路径必须位于 D 盘固定卷
+  - 验证路径必须位于 D 盘项目根 (``D:\\codex项目``) 严格内部，
+    拒绝 ``D:\\codex项目-evil`` 等前缀混淆（按 path segments normcase 分段比较）
   - 拒绝 C/E/F 及其他非 D 盘 fallback 路径
   - 拒绝 junction / symlink 伪装（检查路径自身与全部祖先）
   - 拒绝 SUBST 虚拟盘（QueryDosDeviceW 返回 \\??\\ 前缀）
   - 拒绝网络卷 (DRIVE_REMOTE) 与可移动卷 (DRIVE_REMOVABLE)
   - 拒绝未知卷类型 (DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR / CDROM / RAMDISK)
-  - 拒绝 reparse 链跨卷逃逸（解析后落到非 D 盘）
+  - 拒绝 reparse 链跨卷逃逸（解析后落到非 D 盘、或落到 D 盘项目根之外）
+  - 拒绝 reparse 解析后落到 D 盘项目根前缀之外的路径（重定向逃逸）
 
 设计要点：绝不能对入参先做 ``Path.resolve()`` 再检测 reparse point。
 Windows 上 ``resolve()`` 会跟随 junction/symlink，检测目标而非链接本身，
 使伪装路径全部误判为合规。因此本模块先用 ``os.path.abspath``
 做纯词法归一化（不触碰文件系统），再逐级检查 reparse 属性。
+
+存储根前缀校验同样必须按 segments + normcase 比较，单靠 ``startswith``
+会被 ``D:\\codex项目-evil`` 绕过。规则 7 的 realpath 结果也必须经同一
+根前缀校验（防止 reparse 链把项目根内的链接解析到项目根外）。
 
 Phase 1+ 才添加实际写入、卷 identity 持久化与 WSL/Docker 迁移逻辑。
 """
@@ -52,6 +59,13 @@ _ALLOWED_DRIVE_TYPES: frozenset[int] = frozenset({_DRIVE_FIXED})
 
 # 必须驻留在 D 盘
 _REQUIRED_DRIVE = "D"
+
+# 项目工作根（Phase 0 强约束）：所有写入路径必须严格位于此目录或其一
+# 级后代之内。该目录位于 D 盘固定卷上；将根校验下沉到模块常量是为了让
+# ``config.get_d_root()`` 与 ``validate_storage_path`` 共用同一基线，
+# 避免环境变量或参数覆盖把工作根挪到 ``D:\\other`` 这类合规但不在项目内
+# 的位置（合规盘符 ≠ 合规工作根）。
+_REQUIRED_ROOT: Path = Path("D:/codex项目")
 
 # Windows FILE_ATTRIBUTE_REPARSE_POINT（junction / symlink 均置此位）
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -157,6 +171,32 @@ def _iter_self_and_ancestors(path: Path) -> list[Path]:
     return [path, *path.parents]
 
 
+def _is_within_required_root(path: Path) -> bool:
+    """判定路径是否严格位于项目根 ``_REQUIRED_ROOT`` 内部。
+
+    关键不变量：必须按 ``Path.parts`` 各段配对 + ``os.path.normcase`` 做
+    Windows 大小写不敏感比较，不得使用 ``str.startswith`` 或裸 ``os.path.commonpath``。
+    原因：``D:\\codex项目-evil`` 是 ``D:\\codex项目`` 的字符串前缀的延伸，
+    但它的 *第二段* 是 ``codex项目-evil`` 而不是 ``codex项目``，按段比较
+    会被正确拒绝；startswith 会被错误放行。
+
+    路径自身可等于根（合规根本身），或者其 segments 序列以根 segments
+    序列作为前缀（合规后代）。注意：本函数只负责结构层校验，不负责
+    路径是否存在；存在性校验由 ``require_exists`` 规则处理。
+
+    Args:
+        path: 已词法归一化的绝对路径（必须包含完整盘符部分）。
+
+    Returns:
+        True 表示路径等于根或严格祖先后代；False 表示其它路径。
+    """
+    root_parts = tuple(os.path.normcase(part) for part in _REQUIRED_ROOT.parts)
+    target_parts = tuple(os.path.normcase(part) for part in path.parts)
+    if len(target_parts) < len(root_parts):
+        return False
+    return target_parts[: len(root_parts)] == root_parts
+
+
 def validate_storage_path(
     path: os.PathLike[str] | str,
     *,
@@ -171,10 +211,11 @@ def validate_storage_path(
       1. 平台必须为 Windows
       2. 路径必须能解析出有效盘符
       3. 盘符必须为 D（拒绝 C/E/F 及其他 fallback）
+      3.5. 路径必须严格位于项目根 ``_REQUIRED_ROOT`` 内（按 segments normcase）
       4. 卷类型必须为 FIXED（拒绝网络/可移动/CDROM/RAMDISK/未知）
       5. NT 设备路径不得为 SUBST 虚拟盘
       6. 路径自身与全部祖先均不得为 reparse point
-      7. reparse 解析结果不得跨卷逃逸到非 D 盘
+      7. reparse 解析结果不得跨卷逃逸到非 D 盘，且必须仍位于项目根内
       8. require_exists=True 时路径必须存在
 
     Args:
@@ -212,6 +253,17 @@ def validate_storage_path(
             f"'{drive_letter}:'（已拒绝 C/E/F 及其他盘 fallback）"
         )
 
+    # 规则 3.5（新增）：必须严格位于项目根 ``_REQUIRED_ROOT`` 内部。
+    # 不允许 ``D:\codex项目-evil`` 之类字符串前缀混淆；按 path segments
+    # normcase 逐段比较，避免裸 startswith 绕过。
+    if not _is_within_required_root(absolute):
+        raise StorageViolationError(
+            f"存储路径必须位于项目根 '{_REQUIRED_ROOT}' 严格内部，"
+            f"实际路径 '{absolute}' 不在该前缀之内"
+            "（已按 path segments normcase 校验，"
+            "防 D:\\codex项目-evil 等前缀混淆）"
+        )
+
     # 规则 4：卷类型必须为固定磁盘
     drive_type = _get_drive_type(f"{drive_part}\\")
     if drive_type not in _ALLOWED_DRIVE_TYPES:
@@ -242,7 +294,10 @@ def validate_storage_path(
                 "（junction 或 symlink），已拒绝伪装路径"
             )
 
-    # 规则 7：reparse 解析结果不得跨卷逃逸（防御 lstat 漏检的边界情形）
+    # 规则 7：reparse 解析结果不得跨卷逃逸（防御 lstat 漏检的边界情形）。
+    # 同时 resolved 路径也必须通过项目根前缀校验——若链接位于
+    # ``D:\codex项目\link`` 但指向 ``D:\other\elsewhere``，仅靠盘符检测
+    # 会放行跨根重定向；这里使用与规则 3.5 同一套按段 normcase 比较。
     try:
         resolved = Path(os.path.realpath(absolute))
     except OSError as exc:
@@ -252,6 +307,11 @@ def validate_storage_path(
         raise StorageViolationError(
             f"路径 reparse 链跨卷逃逸：归一化路径在 {drive_part}，"
             f"实际解析到 '{resolved_drive}'，已拒绝"
+        )
+    if not _is_within_required_root(resolved):
+        raise StorageViolationError(
+            f"reparse 解析结果不在项目根 '{_REQUIRED_ROOT}' 之内："
+            f"resolved='{resolved}'（已按 segments normcase 校验）"
         )
 
     # 规则 8：按需检查存在性
