@@ -102,7 +102,7 @@ def check_no_bare_print() -> int:
         # fail-closed：目录存在但无 .py 文件同样视为违规（避免空目录伪装 PASS）
         py_files = sorted(py_src.rglob("*.py"))
         if not py_files:
-            print(f"FAIL: apps/agent/src 存在但无 .py 源码", file=sys.stderr)
+            print("FAIL: apps/agent/src 存在但无 .py 源码", file=sys.stderr)
             return 1
         for py_file in py_files:
             parts = py_file.parts
@@ -113,7 +113,7 @@ def check_no_bare_print() -> int:
                 continue
             try:
                 source = py_file.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112
                 continue
             # CLI 入口点文件中的 print() 用于用户输出，允许使用
             if _is_cli_entrypoint(source):
@@ -139,7 +139,7 @@ def check_no_bare_print() -> int:
         ]
         if not ts_files:
             # 没有受管 TS 源码（仅 node_modules）也算 fail-closed（防止空仓库伪装）
-            print(f"FAIL: packages/ 下无受管 .ts 源码（仅 node_modules 不算）", file=sys.stderr)
+            print("FAIL: packages/ 下无受管 .ts 源码（仅 node_modules 不算）", file=sys.stderr)
             return 1
         for ts_file in ts_files:
             # node_modules 是第三方依赖,不属于本项目源码,跳过
@@ -150,7 +150,7 @@ def check_no_bare_print() -> int:
                 continue
             try:
                 source = ts_file.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112
                 continue
             for i, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
@@ -217,7 +217,7 @@ def check_secret_scan() -> int:
                 continue
             try:
                 source = src_file.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112
                 continue
             scanned_any = True
             for i, line in enumerate(source.splitlines(), 1):
@@ -284,7 +284,7 @@ def check_c_drive_paths() -> int:
                 continue
             try:
                 source = src_file.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S112
                 continue
             scanned_any = True
             for i, line in enumerate(source.splitlines(), 1):

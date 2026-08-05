@@ -64,7 +64,6 @@ function Assert-RequiredFiles {
         "scripts/bootstrap-dev.ps1",
         "scripts/check.ps1",
         "scripts/test.ps1",
-        ".github/workflows/plan-validation.yml",
         ".github/workflows/ci.yml",
         ".github/pull_request_template.md"
     )

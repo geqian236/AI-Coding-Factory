@@ -66,10 +66,16 @@ def get_d_root(override: str | os.PathLike[str] | None = None) -> Path:
       2. 环境变量 FACTORY_D_ROOT
       3. 内置常量 D_ROOT（"D:\\codex项目"）
 
-    不变量：第 1 / 第 2 优先级拿到的覆盖值必须通过 ``validate_storage_path``
-    的完整 8 条规则（盘符 / 项目根前缀 / 卷类型 / SUBST / reparse / 跨根
-    逃逸），否则视为不可信输入并抛 ``ConfigurationError``（fail closed）。
-    仅内置 ``D_ROOT`` 常量路径允许跳过校验，作为唯一可信基线。
+    不变量：所有候选值（含内置 ``D_ROOT`` 常量、``FACTORY_D_ROOT``
+    环境变量和 ``override`` 参数）一律通过 ``validate_storage_path``
+    的完整 8 条规则（盘符 / 项目根前缀 / 卷类型 / SUBST / reparse /
+    跨根逃逸），否则视为不可信输入并抛 ``ConfigurationError``（fail closed）。
+
+    早期实现对内置常量 ``D_ROOT`` 跳过校验（理由：常量路径是唯一可信基线）。
+    但若该常量本身被替换为 junction/SUBST 目标，攻击者可把项目路径
+    重定向到 D:\other 之外，绕过项目根前缀。GPT 审核指明此漏洞。
+    本修订一律校验；常量路径 ``D:/codex项目`` 是项目自己创建的目录，
+    校验对启动性能无显著影响。
 
     Args:
         override: 可选路径字符串，覆盖环境变量和内置常量。
@@ -81,25 +87,19 @@ def get_d_root(override: str | os.PathLike[str] | None = None) -> Path:
         ConfigurationError: 覆盖值无法解析或未通过存储位置合同时。
     """
     raw_value: str | os.PathLike[str] | None = override
-    is_constant_fallback = False
     if raw_value is None:
         env_value = os.environ.get("FACTORY_D_ROOT")
-        if env_value:
-            raw_value = env_value
-        else:
-            raw_value = D_ROOT
-            is_constant_fallback = True
+        raw_value = env_value if env_value else D_ROOT
 
     candidate = _coerce_d_root(raw_value)
-    if not is_constant_fallback:
-        # 覆盖值（含 override 参数 / 环境变量）必须经存储合同校验。
-        # 把 ``StorageViolationError`` 翻译为 ``ConfigurationError``，
-        # 因为对调用方而言这是「配置被拒」而非「存储子系统内部错误」。
-        try:
-            validate_storage_path(candidate)
-        except StorageViolationError as exc:
-            raise ConfigurationError(
-                f"FACTORY_D_ROOT 覆盖值 '{raw_value}' 不满足 D 盘存储位置合同：{exc}"
+    # 所有候选值（含内置常量）一律经存储合同校验（fail closed）。
+    # 把 ``StorageViolationError`` 翻译为 ``ConfigurationError``，
+    # 因为对调用方而言这是「配置被拒」而非「存储子系统内部错误」。
+    try:
+        validate_storage_path(candidate)
+    except StorageViolationError as exc:
+        raise ConfigurationError(
+            f"FACTORY_D_ROOT 候选值 '{raw_value}' 不满足 D 盘存储位置合同：{exc}"
             ) from exc
     return candidate
 

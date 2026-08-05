@@ -265,7 +265,9 @@ def test_higher_stages_include_lower_stage_capabilities(stage_capability_map: di
     assert codex_approved.issubset(pr_ready), "PR_READY 应包含 CODEX_APPROVED 的全部 capabilities"
     assert pr_ready.issubset(merged), "MERGED 应包含 PR_READY 的全部 capabilities"
     assert merged.issubset(staging_accepted), "STAGING_ACCEPTED 应包含 MERGED 的全部 capabilities"
-    assert staging_accepted.issubset(production_accepted), "PRODUCTION_ACCEPTED 应包含 STAGING_ACCEPTED 的全部 capabilities"
+    assert (
+        staging_accepted.issubset(production_accepted)
+    ), "PRODUCTION_ACCEPTED 应包含 STAGING_ACCEPTED 的全部 capabilities"
 
 
 # ─────────────────────── node pause policy tests ───────────────────────

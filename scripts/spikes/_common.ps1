@@ -64,3 +64,25 @@ function Get-FreshReceipt {
     }
     return $obj
 }
+
+<#
+.SYNOPSIS  根据 spike receipt status 决定 wrapper 退出码（fail-closed 三态）。
+.DESCRIPTION
+    GPT 第二轮审核指出 wrapper 把 BLOCKED_UNCERTIFIED 当 exit 0 等于把「未认证」
+    伪装成「已认证」，掩盖 ENOSPC 等必选子项的验证缺失。正确语义：
+      - PASS               -> exit 0（已认证）
+      - BLOCKED_UNCERTIFIED -> exit 2（未认证，需解封步骤；聚合层据此显式报告）
+      - FAIL / 其它        -> exit 1（已认证失败）
+    返回的整数直接交给 ``exit $code``，避免调用方再写分支。
+
+    必须在 StrictMode 下读取 $LASTEXITCODE 前显式设值（PS 5.1 StrictMode 不允许
+    未定义 $LASTEXITCODE），否则 test.ps1 的 Run-Suite 会抛异常并中断整个套件。
+#>
+function Exit-ByReceiptStatus {
+    param([Parameter(Mandatory=$true)] [string] $Status)
+    switch ($Status) {
+        'PASS'               { return 0 }
+        'BLOCKED_UNCERTIFIED' { return 2 }
+        default              { return 1 }
+    }
+}

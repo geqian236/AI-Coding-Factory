@@ -36,6 +36,9 @@ select = ["E", "F", "I", "UP", "ANN", "S"]
 "tools/compat-probes/**" = ["S101", "S603", "S607", "S108"]
 # 代码生成脚本需要写入生成物路径，允许 subprocess 与断言自检。
 "contracts/codegen/**" = ["S101", "S603"]
+# 三语言 codegen 产物（Python/TS/Rust 同源生成）：行长度与 ruff 规则不应约束
+# 生成器输出，否则每改一次 schema 就破坏门禁。E501/ANN401 由 generate.py 端保证。
+"apps/agent/src/factory_agent/contracts/generated/**" = ["E501", "ANN401", "F401", "F811", "I001", "UP007", "UP045", "UP035"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -227,7 +227,8 @@ export function materializeBatch(
     seenIngest.add(ingestId);
 
     // 批内事件 taskId 必须与 batch.taskId 一致（若显式给出）。
-    const eventTask = "taskId" in event ? event["taskId"] : taskId;
+    // 显式类型注解：避免 TS7022（隐式 any 因为三元表达式一侧是 unknown）。
+    const eventTask: string = "taskId" in event ? (event["taskId"] as string) : taskId;
     if (eventTask !== taskId) {
       throw new EventHashError(`events[${index}].taskId 与 batch.taskId 不一致，拒绝物化`);
     }

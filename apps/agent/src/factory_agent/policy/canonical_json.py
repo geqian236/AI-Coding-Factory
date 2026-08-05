@@ -164,17 +164,17 @@ def _encode_number(value: int | float) -> str:
     # 去尾随零（令有效数字串最短），同步调整指数。
     while len(digits) > 1 and digits[-1] == 0:
         digits.pop()
-        exp += 1
+        exp += 1  # type: ignore[operator]
     # 去前导零。
     while len(digits) > 1 and digits[0] == 0:
         digits.pop(0)
     digit_str = "".join(str(d) for d in digits)
     # value = int(digit_str) × 10^exp，故 n = exp + k。
-    n = exp + len(digit_str)
+    n = exp + len(digit_str)  # type: ignore[operator]
     return sign + _es6_format(digit_str, n)
 
 
-def _encode(value: Any) -> str:
+def _encode(value: object) -> str:  # noqa: ANN401
     """递归将已解析的 Python 值编码为规范 JSON 字符串片段。
 
     Args:
@@ -236,7 +236,7 @@ def _encode_object(obj: dict[Any, Any]) -> str:
     return "{" + ",".join(parts) + "}"
 
 
-def canonicalize(value: Any) -> bytes:
+def canonicalize(value: object) -> bytes:  # noqa: ANN401
     """将已解析的 Python 值规范化为 RFC 8785 UTF-8 字节序列。
 
     Args:
@@ -286,7 +286,7 @@ def canonicalize_json_text(text: str) -> bytes:
     return canonicalize(parsed)
 
 
-def _reject_constant(name: str) -> Any:
+def _reject_constant(name: str) -> object:  # noqa: ANN401
     """parse_constant 回调：拒绝 NaN / Infinity / -Infinity 字面量。
 
     Args:

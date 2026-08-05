@@ -78,7 +78,8 @@ if (-not (Test-Path $receiptOut)) {
 # 读 receipt：-Encoding utf8 修 GBK；断言 nonce 与本轮一致。
 $receipt = Get-FreshReceipt -Path $receiptOut -Nonce $nonce
 Write-Host "STATUS: $($receipt.status)"
-if ($receipt.status -notin @("PASS","BLOCKED_UNCERTIFIED")) { exit 1 }
-# 显式 exit 0：spike 通过时必须设置 $LASTEXITCODE，否则 test.ps1 的 Run-Suite
-# 在 StrictMode 下读取未定义的 $LASTEXITCODE 会抛异常并中断整个套件。
-exit 0
+# FAIL-closed (GPT 第二轮审核指出)：spike 只有在 PASS 时才允许 wrapper exit 0。
+# BLOCKED_UNCERTIFIED 在 Phase 0 sandbox 是因为缺独立小卷（disk-full 必选子项），
+# 但 wrapper 把 BLOCKED 当 exit 0 等于把"未认证"伪装成"已认证"，掩盖真实的
+# ENOSPC 验证缺失。统一三态退出码由 _common.ps1 的 Exit-ByReceiptStatus 提供。
+exit (Exit-ByReceiptStatus -Status $receipt.status)

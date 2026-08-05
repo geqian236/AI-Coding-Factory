@@ -220,13 +220,18 @@ def _redact_value_in_container(item: object) -> object:
 def _redact_dict(data: dict[str, object]) -> dict[str, object]:
     """递归脱敏字典中所有层级的敏感字段。
 
-    行为：
-      - 字典：递归到子字典（必须显式递归，因为 ``_redact_value`` 仅
-        处理扁平原子值，不负责解构 dict）；
-      - list/tuple：保留容器类型，逐元素递归（元素若是 dict 走本函数，
-        若是 str 走 ``_scan_str``，若 list/tuple 走自身递归）；
-      - str：经 ``_scan_str`` 做值扫描；
-      - 其它原始类型：原样保留。
+    行为（顺序关键，GPT 审核指明）：
+      1. **外层 key 命中敏感模式时整值替换 ``[REDACTED]``**，不分 value 类型
+         （即使 value 是 dict）。这关闭了
+         ``{"authorization": {"credential": "plain-secret"}}`` 这种「外层
+         key 敏感但 value 是 dict」被先递归进 dict 再按子 key 透传 secret
+         的绕过路径。
+      2. value 是 dict 且外层 key 不敏感：递归到子字典。
+      3. value 是 list/tuple：保留容器类型，逐元素递归（元素若是 dict 走
+         本函数，若是 str 走 ``_scan_str``，若 list/tuple 走自身递归）。
+      4. value 是 str 且外层 key 不敏感：经 ``_redact_value`` 做 key+value
+         双扫。
+      5. 其它原始类型：原样保留。
 
     Args:
         data: 原始字典（不修改）。
@@ -236,11 +241,32 @@ def _redact_dict(data: dict[str, object]) -> dict[str, object]:
     """
     result: dict[str, object] = {}
     for k, v in data.items():
+        # 关键：先按外层 key 整值替换，关闭嵌套敏感 key 绕过。
+        if _SENSITIVE_KEY_PATTERN.search(k):
+            result[k] = _REDACTED
+            continue
+        # 外层 key 不敏感：按 value 类型分支
         if isinstance(v, dict):
             result[k] = _redact_dict(v)
+        elif isinstance(v, list):
+            result[k] = [_redact_value_list_element(x) for x in v]
+        elif isinstance(v, tuple):
+            result[k] = tuple(_redact_value_list_element(x) for x in v)
         else:
             result[k] = _redact_value(k, v)
     return result
+
+
+def _redact_value_list_element(elem: object) -> object:
+    """递归脱敏 list/tuple 元素。dict 走 ``_redact_dict``，str 走 ``_scan_str``，
+    嵌套 list/tuple 递归。"""
+    if isinstance(elem, dict):
+        return _redact_dict(elem)
+    if isinstance(elem, list):
+        return [_redact_value_list_element(x) for x in elem]
+    if isinstance(elem, tuple):
+        return tuple(_redact_value_list_element(x) for x in elem)
+    return _redact_value("", elem)
 
 
 class _JsonFormatter(logging.Formatter):

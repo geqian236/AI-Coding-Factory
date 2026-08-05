@@ -81,7 +81,6 @@ Write-ReceiptNoBom -Path $receiptPath -Object $obj
 # 读 receipt（带 nonce 断言）
 $r = Get-FreshReceipt -Path $receiptPath -Nonce $nonce
 Write-Host "STATUS: $($r.status)"
-if ($r.status -ne "PASS") { exit 1 }
-# 显式 exit 0：spike 通过时必须设置 $LASTEXITCODE，否则 test.ps1 的 Run-Suite
-# 在 StrictMode 下读取未定义的 $LASTEXITCODE 会抛异常并中断整个套件。
-exit 0
+# FAIL-closed (GPT 第二轮审核指出)：三态退出码由 _common.ps1 的 Exit-ByReceiptStatus 提供。
+# git-bridge 无必选 BLOCKED 子项，正常路径仅 PASS 或 FAIL。
+exit (Exit-ByReceiptStatus -Status $r.status)

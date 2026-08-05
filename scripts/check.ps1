@@ -52,6 +52,40 @@ function Invoke-GateCheck {
 
 Set-Location $REPO_ROOT
 
+# ── Python 3.12 锁定（GPT 第二轮审核指出）─────────────────────────────────
+# 仓库 .python-version 声明 3.12，但 PATH 中的 python 可能被 anaconda 等
+# 覆写为 3.11，导致 CI 与本机结果漂移。本段按以下优先级解析 Python 3.12：
+#   1. .python-version 指定 3.12（pyenv / GitHub Actions standard）
+#   2. Windows 标准安装路径 %LOCALAPPDATA%\Programs\Python\Python312\python.exe
+#   3. uv python find 3.12（跨平台回退）
+# 锁定失败直接 fail closed（exit 1），不再回退到 PATH 中任意 python。
+$pythonVersionFile = Join-Path $REPO_ROOT ".python-version"
+$requiredPython = if (Test-Path $pythonVersionFile) {
+    (Get-Content $pythonVersionFile -Raw -Encoding utf8).Trim()
+} else { "3.12" }
+Write-Host "[check.ps1] 要求 Python $requiredPython"
+
+# 候选解析路径：env PYTHON_BIN 覆盖 > 用户本地安装 > uv 解析
+$candidatePy = $env:PYTHON_BIN
+if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
+    $localPy = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($requiredPython.Replace('.',''))\python.exe"
+    if (Test-Path $localPy) { $candidatePy = $localPy }
+}
+if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
+    try {
+        $uvPy = (& uv python find $requiredPython 2>$null | Select-Object -First 1)
+        if ($uvPy -and (Test-Path $uvPy)) { $candidatePy = $uvPy }
+    } catch {}
+}
+if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
+    Write-Error "[check.ps1] fail-closed: 未找到 Python $requiredPython。设置 `$env:PYTHON_BIN 指向 python.exe 或安装 Python $requiredPython。"
+    exit 1
+}
+$actualVer = (& $candidatePy --version 2>$null | Select-Object -First 1)
+Write-Host "[check.ps1] 使用 $candidatePy ($actualVer)"
+# 用别名 python 指向锁定的 3.12，覆盖 PATH 中的旧版
+function python { & $candidatePy @args }
+
 # 1. Codegen drift
 Invoke-GateCheck "1-codegen-drift" {
     python contracts/codegen/generate.py --check
@@ -80,24 +114,24 @@ Invoke-GateCheck "3-golden-vectors" {
     }
 }
 
-# 4. Chinese coverage (via helper script)
+# 4. Chinese coverage (via helper script, locked Python 3.12)
 Invoke-GateCheck "4-chinese-coverage" {
-    python scripts/_gate_checks.py chinese-coverage
+    & $candidatePy scripts/_gate_checks.py chinese-coverage
 }
 
 # 5. No bare print/console.log (via helper script)
 Invoke-GateCheck "5-no-bare-print" {
-    python scripts/_gate_checks.py no-bare-print
+    & $candidatePy scripts/_gate_checks.py no-bare-print
 }
 
 # 6. Secret scan (via helper script)
 Invoke-GateCheck "6-secret-scan" {
-    python scripts/_gate_checks.py secret-scan
+    & $candidatePy scripts/_gate_checks.py secret-scan
 }
 
 # 7. C-drive paths (via helper script)
 Invoke-GateCheck "7-c-drive-paths" {
-    python scripts/_gate_checks.py c-drive-paths
+    & $candidatePy scripts/_gate_checks.py c-drive-paths
 }
 
 # 8. Catalog 47 IDs
@@ -110,6 +144,48 @@ Invoke-GateCheck "9-no-doc-placeholders" {
     python -m pytest tests/contract/test_no_placeholders.py -q --tb=short --no-header
 }
 
+# ── GPT 第二轮审核要求：check.ps1 真调用全栈（不能再 9 项假绿）──────────────
+# ruff
+Invoke-GateCheck "10-ruff-lint" {
+    uv run ruff check apps/agent/src scripts tests/contract tests/security
+}
+
+# mypy
+Invoke-GateCheck "11-mypy-strict" {
+    uv run mypy apps/agent/src --config-file pyproject.toml
+}
+
+# TypeScript tsc + vitest
+Invoke-GateCheck "12-tsc-noemit" {
+    Push-Location packages/factory-contracts
+    try {
+        corepack pnpm exec tsc --noEmit
+    } finally {
+        Pop-Location
+    }
+}
+Invoke-GateCheck "13-vitest" {
+    corepack pnpm --filter "@factory/contracts" test
+}
+
+# Rust cargo check（链接策略已在 .cargo/config.toml 与 dev.ps1 中冻结）
+Invoke-GateCheck "14-rust-check" {
+    $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "D:\acf-dev\cargo-home" }
+    $env:RUSTUP_HOME = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "D:\acf-dev\rustup-home" }
+    $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
+    $env:CARGO_TARGET_DIR = "D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target"
+    $gnuBin = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu\bin"
+    $env:PATH = "$gnuBin;$env:PATH"
+    $sysroot = (& rustc --print sysroot 2>$null | Select-Object -First 1)
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-gnu\bin\rust-lld.exe"
+    cargo check --target x86_64-pc-windows-gnu -p factory-contracts --tests
+}
+
+# Bootstrap-dev 必须能跑 -VerifyOnly（plan-validation 引用已删除）
+Invoke-GateCheck "15-bootstrap-verify" {
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bootstrap-dev.ps1 -VerifyOnly
+}
+
 # Summary
 Write-Host ""
 Write-Host "========================================"
@@ -120,8 +196,8 @@ foreach ($r in $gate_results) {
 }
 Write-Host "========================================"
 if ($failures.Count -gt 0) {
-    Write-Host "[check.ps1] FAIL - $($failures.Count)/9 check(s) failed" -ForegroundColor Red
+    Write-Host "[check.ps1] FAIL - $($failures.Count)/$($gate_results.Count) check(s) failed" -ForegroundColor Red
     exit 1
 }
-Write-Host "[check.ps1] PASS - all 9 gate checks passed!" -ForegroundColor Green
+Write-Host "[check.ps1] PASS - all $($gate_results.Count) gate checks passed!" -ForegroundColor Green
 exit 0

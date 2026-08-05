@@ -74,7 +74,7 @@ class PlanHashError(FactoryError):
     error_code = "plan-hash-error"
 
 
-def _require_mapping(value: Any, label: str) -> dict[str, Any]:
+def _require_mapping(value: object, label: str) -> dict[str, object]:  # noqa: ANN401
     """校验 value 为字典，否则 fail closed。
 
     Args:
