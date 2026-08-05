@@ -4,6 +4,8 @@
 members = [
     # 合同层（Task 3 启用 canonical/plan 模块）
     "crates/factory-contracts",
+    # Task 7 compat probe crates
+    "tools/compat-probes/windows_durable_io",
 ]
 resolver = "2"
 
