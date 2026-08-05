@@ -5,7 +5,15 @@
 //! (packages/factory-contracts/src/event.ts) 字节级一致，共用同一
 //! canonical.rs 底座（NFC + RFC 8785 JCS）。
 //!
-//! 算法（严格来自 Master Spec §10.1，映射到冻结的 v2 schema 字段名）：
+//! GPT 第二轮审核指出早期实现只放了 §10.1 子集字段；本修订补齐：
+//! 执行身份（runId/runSeq/stepId/attemptId/source/processIdentity）、
+//! 双 span（sourceTransportSpan/sanitizedStreamSpan）、
+//! 脱敏证据（redactions/redactionManifestDigest/sanitizedProviderFrameDigest/
+//! mappingPrecision）、schemaVersion、durabilityClass、providerEventId、
+//! streamId、preparedBatchId、wallTime、monotonicTimeNs、ingestedAt、
+//! providerVersion、adapterVersion、eventType 改为 §10.1 具体枚举。
+//!
+//! 算法（严格来自 Master Spec §10.1）：
 //!
 //!   eventId
 //!       "evt_" + lowercaseHex(SHA-256(JCS(["factory-event-id-v2", ingestEventId])))
@@ -14,25 +22,27 @@
 //!   payloadDigest
 //!       "sha256:" + lowercaseHex(SHA-256(JCS(payload)))
 //!
-//!   eventDigest
-//!       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后
-//!       的完整对象)))；计算输入仍包含 previousEventDigest、payload、payloadDigest
-//!       和全部 identity，构成防篡改链。
+//!   redactionManifestDigest
+//!       "sha256:" + lowercaseHex(SHA-256(JCS(redactions 列表)))
 //!
-//!   previousEventDigest
-//!       上一条事件的 eventDigest；genesis 事件使用固定 predecessor（"sha256:" + 64
-//!       个 0）。本事件无 head 字段，链式指针完全通过 previousEventDigest 单链表达
-//!       （Master Spec §10.1）。
+//!   eventDigest
+//!       "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的
+//!       完整对象)))；previousEventDigest 仍参与计算。previousEventDigest 单链模型：
+//!       本事件无 head 字段，下一事件的 previousEventDigest 指向前一事件的 eventDigest；
+//!       genesis 事件 previousEventDigest = "sha256:" + 64 个 0。
 //!
 //! 物化规则（fail-closed）：
-//!   - batch.previousHead 必须与 anchor.committedHead 相等（同为 null 或同字符串），
-//!     否则视为前驱漂移 / 竞争批次抢占同一旧 head，拒绝。
-//!   - batch 内所有事件的 taskId 必须等于 batch.taskId。
-//!   - batch 至少含一个事件；ingestEventId 批内不得重复。
+//!   - batch.previousHead 必须与 anchor.committedHead 相等（同为 null 或同字符串）。
+//!   - 批内所有事件的 taskId 必须等于 batch.taskId。
+//!   - 批至少含一个事件；ingestEventId 批内不得重复。
+//!   - 每个事件必须含 §10.1 完整字段集（required by durable-event.v2 schema）。
+//!   - processIdentity 必填子字段不能缺失。
+//!   - 双 span 必填子字段不能缺失。
 //!   - taskSeq 由 anchor 单调延续：genesis 从 0 开始，否则从 committedTaskSeq+1 开始。
-//!   - batchOrdinal 为批次级序号，原样复制到每个 DurableEventV2。
+//!   - batchOrdinal 为事件在批内序号，原样从 event 拷贝。
+//!   - redactions 列表空表示本事件未脱敏。
 //!
-//! 失败错误码：event-hash-error（不记录完整事件正文）。
+//! 失败错误码：event-hash-error。
 
 use crate::canonical::{canonicalize, canonicalize_value, CanonValue, CanonicalJsonError};
 use serde_json::{Map, Value};
@@ -53,22 +63,34 @@ const SHA256_PREFIX: &str = "sha256:";
 pub const GENESIS_PREDECESSOR: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-/// PreparedEventV2 的必需字段（缺任一即 fail closed）。
-const REQUIRED_PREPARED_EVENT_FIELDS: [&str; 4] =
-    ["ingestEventId", "eventType", "sourceSeq", "payload"];
+/// PreparedEventV2 必需字段（每个 batch.events[i] 必须含）。
+/// 全字段集按 §10.1：执行身份、双 span、脱敏、时间、版本。
+const REQUIRED_PREPARED_EVENT_FIELDS: [&str; 22] = [
+    // 身份
+    "ingestEventId", "taskId", "runId", "stepId", "attemptId", "source",
+    // 类型与 Provider 引用
+    "eventType", "providerEventId", "sourceSeq", "streamId",
+    // Prepared 关联（preparedBatchId 在 batch 顶层；events 每项含 batchOrdinal）
+    "batchOrdinal",
+    // 双 span
+    "sourceTransportSpan", "sanitizedStreamSpan",
+    // 时间 / 版本
+    "wallTime", "monotonicTimeNs", "ingestedAt", "providerVersion", "adapterVersion",
+    // 受管进程身份
+    "processIdentity",
+    // Payload / 脱敏
+    "payload", "sanitizedProviderFrameDigest", "redactions",
+];
 
-/// PreparedEventV2 允许出现的字段（对齐冻结 schema 的 additionalProperties:false）。
-/// 出现集合外字段即 fail closed，兑现 §10.1「schema 未声明的扩展字段不得混入 v2 hash」。
-/// taskId 允许出现以便批内逐事件校验一致性。
-const ALLOWED_PREPARED_EVENT_FIELDS: [&str; 8] = [
-    "ingestEventId",
-    "taskId",
-    "eventType",
-    "sourceSeq",
-    "transportSpanDigest",
-    "payload",
+/// PreparedEventV2 允许出现的字段集（对齐 schema 的 additionalProperties:false）。
+/// 出现集合外字段即 fail closed。
+const ALLOWED_EXTRA_PREPARED_EVENT_FIELDS: [&str; 6] = [
     "payloadDigest",
-    "preparedAt",
+    "redactionManifestDigest",
+    "previousEventDigest",
+    "eventDigest",
+    "runSeq",
+    "durabilityClass",
 ];
 
 /// 事件物化输入非法（缺字段、类型错误、前驱漂移、重复摄取 ID 等）时抛出。
@@ -115,7 +137,6 @@ pub fn event_id(ingest_event_id: &str) -> Result<String, EventHashError> {
     if ingest_event_id.is_empty() {
         return Err(EventHashError::new("ingestEventId 必须为非空字符串"));
     }
-    // 域分离数组：["factory-event-id-v2", ingestEventId]。
     let domain_array = CanonValue::Array(vec![
         CanonValue::Str(EVENT_ID_DOMAIN.to_string()),
         CanonValue::Str(ingest_event_id.to_string()),
@@ -129,6 +150,12 @@ pub fn event_id(ingest_event_id: &str) -> Result<String, EventHashError> {
 /// 计算 payloadDigest（脱敏后 payload 的 JCS 摘要）。
 pub fn payload_digest(payload: &Value) -> Result<String, EventHashError> {
     let bytes = canonicalize_value(payload)?;
+    Ok(sha256_prefixed(&bytes))
+}
+
+/// 计算 redactionManifestDigest（redactions 列表的 JCS 摘要）。
+pub fn redaction_manifest_digest(redactions: &Value) -> Result<String, EventHashError> {
+    let bytes = canonicalize_value(redactions)?;
     Ok(sha256_prefixed(&bytes))
 }
 
@@ -160,14 +187,19 @@ fn require_object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, V
 
 /// 把一个 PreparedBatchV2 物化为按序连接的 DurableEventV2 列表（纯函数）。
 ///
+/// 每个 PreparedEventV2 必须含 §10.1 全字段集；物化器直通到 DurableEventV2。
+///
 /// # 参数
-/// - `batch`：PreparedBatchV2 对象（同一 Task，含 events / previousHead / batchOrdinal / taskId）。
-/// - `anchor`：该 Task 当前已提交锚点，含 committedTaskSeq（null 表示 genesis）与
-///   committedHead（null 表示 genesis）。
-/// - `durable_at`：本批次耐久化完成时间（RFC3339 字符串），写入每个 DurableEventV2。
+/// - `batch`：PreparedBatchV2 简化输入：{taskId, preparedBatchId, events[],
+///   batchOrdinal, previousHead}。events[] 每项含 §10.1 全字段集
+///   （不含 schemaVersion/durabilityClass/eventId/taskSeq/payloadDigest/
+///   previousEventDigest/eventDigest/redactionManifestDigest —— 这些由物化器派生）。
+/// - `anchor`：该 Task 当前已提交锚点 {committedTaskSeq, committedHead}。
+/// - `durable_at`：本批次耐久化完成时间（RFC3339）。
 ///
 /// # 错误
-/// - `EventHashError`：结构非法、前驱漂移、taskId 不一致、批次为空或 ingestEventId 重复。
+/// - `EventHashError`：缺字段 / 未知字段 / 前驱漂移 / taskId 不一致 /
+///   ingestEventId 重复 / processIdentity 不合规。
 /// - 规范化失败（经 `From<CanonicalJsonError>` 上抛）。
 pub fn materialize_batch(
     batch: &Value,
@@ -181,20 +213,17 @@ pub fn materialize_batch(
         _ => return Err(EventHashError::new("batch.taskId 必须为非空字符串")),
     };
 
+    let prepared_batch_id = match batch_obj.get("preparedBatchId") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => return Err(EventHashError::new("batch.preparedBatchId 必须为非空字符串")),
+    };
+
     let events = match batch_obj.get("events") {
         Some(Value::Array(a)) if !a.is_empty() => a,
         _ => return Err(EventHashError::new("batch.events 必须为非空数组")),
     };
 
-    let batch_ordinal: i64 = match batch_obj.get("batchOrdinal") {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .ok_or_else(|| EventHashError::new("batch.batchOrdinal 必须为整数"))?,
-        _ => return Err(EventHashError::new("batch.batchOrdinal 必须为整数")),
-    };
-
     // 前驱校验：batch.previousHead 必须与 anchor.committedHead 完全一致。
-    // 二者同为 null（genesis）或同一字符串；不一致即前驱漂移 / 竞争抢占旧 head。
     let null = Value::Null;
     let batch_prev = batch_obj.get("previousHead").unwrap_or(&null);
     let committed_head = anchor.get("committedHead").unwrap_or(&null);
@@ -207,7 +236,7 @@ pub fn materialize_batch(
     let base_seq = base_task_seq(anchor)?;
 
     // genesis（无已提交 head）首事件前驱为全零 predecessor，否则接已提交 head。
-    let mut prev_head: String = if committed_head.is_null() {
+    let mut prev_event_digest: String = if committed_head.is_null() {
         GENESIS_PREDECESSOR.to_string()
     } else {
         committed_head
@@ -224,7 +253,10 @@ pub fn materialize_batch(
 
         // 未知字段拒绝（对齐 schema additionalProperties:false）。
         for key in event.keys() {
-            if !ALLOWED_PREPARED_EVENT_FIELDS.contains(&key.as_str()) {
+            let k = key.as_str();
+            if !REQUIRED_PREPARED_EVENT_FIELDS.contains(&k)
+                && !ALLOWED_EXTRA_PREPARED_EVENT_FIELDS.contains(&k)
+            {
                 return Err(EventHashError::new(format!(
                     "events[{index}] 含未声明字段 '{key}'（{EVENT_HASH_VERSION}）"
                 )));
@@ -253,45 +285,157 @@ pub fn materialize_batch(
             )));
         }
 
-        // 批内事件 taskId 必须与 batch.taskId 一致（若显式给出）。
-        if let Some(event_task) = event.get("taskId") {
-            if event_task.as_str() != Some(task_id.as_str()) {
+        let event_task = match event.get("taskId") {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
                 return Err(EventHashError::new(format!(
-                    "events[{index}].taskId 与 batch.taskId 不一致，拒绝物化"
+                    "events[{index}].taskId 缺失或非字符串"
+                )))
+            }
+        };
+        if event_task != task_id {
+            return Err(EventHashError::new(format!(
+                "events[{index}].taskId 与 batch.taskId 不一致，拒绝物化"
+            )));
+        }
+
+        // processIdentity 必填子字段校验（schema required 重复保险）
+        let pi = match event.get("processIdentity") {
+            Some(Value::Object(m)) => m,
+            _ => {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].processIdentity 必须为对象"
+                )))
+            }
+        };
+        for sub in [
+            "executorId", "hostId", "runtime", "executableDigest",
+            "pid", "processStartTime", "jobObjectId",
+        ] {
+            if !pi.contains_key(sub) {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].processIdentity 缺子字段 '{sub}'"
+                )));
+            }
+        }
+
+        // 双 span 必填子字段校验
+        let sts = match event.get("sourceTransportSpan") {
+            Some(Value::Object(m)) => m,
+            _ => {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].sourceTransportSpan 必须为对象"
+                )))
+            }
+        };
+        for sub in ["coordinate", "start", "endExclusive", "mappingPrecision"] {
+            if !sts.contains_key(sub) {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].sourceTransportSpan 缺子字段 '{sub}'"
+                )));
+            }
+        }
+        let sss = match event.get("sanitizedStreamSpan") {
+            Some(Value::Object(m)) => m,
+            _ => {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].sanitizedStreamSpan 必须为对象"
+                )))
+            }
+        };
+        for sub in ["segmentId", "start", "endExclusive"] {
+            if !sss.contains_key(sub) {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].sanitizedStreamSpan 缺子字段 '{sub}'"
                 )));
             }
         }
 
         let task_seq = base_seq + index as i64;
 
+        // 派生字段
+        let redactions = match event.get("redactions") {
+            Some(Value::Array(a)) => a,
+            _ => {
+                return Err(EventHashError::new(format!(
+                    "events[{index}].redactions 必须为数组"
+                )))
+            }
+        };
+
+        let durability_class = event
+            .get("durabilityClass")
+            .cloned()
+            .unwrap_or(Value::String("derived".to_string()));
+
+        let run_seq = event
+            .get("runSeq")
+            .cloned()
+            .unwrap_or(Value::from(0));
+
+        let ingested_at = event
+            .get("ingestedAt")
+            .cloned()
+            .unwrap_or(Value::String(durable_at.to_string()));
+
         // 组装 DurableEventV2（不含 eventDigest，随后计算）。
-        // previousEventDigest 单链：下条事件的 previousEventDigest 指向本条 eventDigest。
-        // 字段插入顺序仅为可读性；canonicalizer 会按 UTF-16 序重排。
         let mut durable = Map::new();
+        durable.insert("schemaVersion".to_string(), Value::from(2));
+        durable.insert("durabilityClass".to_string(), durability_class);
         durable.insert("eventId".to_string(), Value::String(event_id(&ingest_id)?));
         durable.insert("taskId".to_string(), Value::String(task_id.clone()));
         durable.insert("taskSeq".to_string(), Value::from(task_seq));
-        durable.insert("batchOrdinal".to_string(), Value::from(batch_ordinal));
-        durable.insert("previousEventDigest".to_string(), Value::String(prev_head.clone()));
+        durable.insert("runId".to_string(), event["runId"].clone());
+        durable.insert("runSeq".to_string(), run_seq);
+        durable.insert("stepId".to_string(), event["stepId"].clone());
+        durable.insert("attemptId".to_string(), event["attemptId"].clone());
+        durable.insert("source".to_string(), event["source"].clone());
         durable.insert("ingestEventId".to_string(), Value::String(ingest_id.clone()));
         durable.insert("eventType".to_string(), event["eventType"].clone());
+        durable.insert("providerEventId".to_string(), event["providerEventId"].clone());
         durable.insert("sourceSeq".to_string(), event["sourceSeq"].clone());
+        durable.insert("streamId".to_string(), event["streamId"].clone());
+        durable.insert("preparedBatchId".to_string(), Value::String(prepared_batch_id.clone()));
+        // batchOrdinal 是事件在批内序号（per-event；schema 一致语义）
+        durable.insert("batchOrdinal".to_string(), event["batchOrdinal"].clone());
+        durable.insert("sourceTransportSpan".to_string(), Value::Object(sts.clone()));
+        durable.insert("sanitizedStreamSpan".to_string(), Value::Object(sss.clone()));
+        durable.insert("wallTime".to_string(), event["wallTime"].clone());
+        durable.insert("monotonicTimeNs".to_string(), event["monotonicTimeNs"].clone());
+        durable.insert("ingestedAt".to_string(), ingested_at);
+        durable.insert("providerVersion".to_string(), event["providerVersion"].clone());
+        durable.insert("adapterVersion".to_string(), event["adapterVersion"].clone());
+        durable.insert("processIdentity".to_string(), Value::Object(pi.clone()));
         durable.insert("payload".to_string(), event["payload"].clone());
+        durable.insert(
+            "sanitizedProviderFrameDigest".to_string(),
+            event["sanitizedProviderFrameDigest"].clone(),
+        );
         durable.insert(
             "payloadDigest".to_string(),
             Value::String(payload_digest(&event["payload"])?),
         );
-        durable.insert("durableAt".to_string(), Value::String(durable_at.to_string()));
+        durable.insert(
+            "previousEventDigest".to_string(),
+            Value::String(prev_event_digest.clone()),
+        );
+        durable.insert(
+            "redactions".to_string(),
+            Value::Array(redactions.clone()),
+        );
+        durable.insert(
+            "redactionManifestDigest".to_string(),
+            Value::String(redaction_manifest_digest(&Value::Array(redactions.clone()))?),
+        );
 
-        // eventDigest = JCS(去除 eventDigest 字段后的完整对象) 的 SHA-256。
-        // previousEventDigest 仍参与计算（Master Spec §10.1）。此时 durable 尚未
-        // 包含 eventDigest，故直接对其规范化即符合定义。
+        // eventDigest = JCS(去除 eventDigest 字段后完整对象) 的 SHA-256。
+        // 此时 durable 尚未包含 eventDigest，故直接对其规范化即符合定义。
         let bytes = canonicalize_value(&Value::Object(durable.clone()))?;
         let event_digest = sha256_prefixed(&bytes);
         durable.insert("eventDigest".to_string(), Value::String(event_digest.clone()));
 
         durable_events.push(Value::Object(durable));
-        prev_head = event_digest; // 下一事件 previousEventDigest 指向前一事件 eventDigest。
+        prev_event_digest = event_digest; // 下一事件 previousEventDigest 指向前一事件 eventDigest。
     }
 
     Ok(durable_events)
