@@ -77,6 +77,35 @@ if (-not $PROJECT_ROOT) {
 # Project-root data dir (mirrors dev.ps1); Rust toolchain/target all under it.
 $DATA_ROOT = Join-Path $PROJECT_ROOT "AI-Coding-Factory-Data\dev"
 
+# --- W3 storage contract: every cache/temp path must live under the project ---
+# root. GPT round-5 item 3: the runner set only Rust paths, leaving TEMP/TMP/
+# COREPACK_HOME/PNPM_STORE_DIR on C:. Mirror dev.ps1: bind all of them under
+# DATA_ROOT and fail-closed assert each resolves under the project root, so the
+# single documented command never writes outside D:\codex项目.
+$_cacheDirs = @{
+    TEMP                     = (Join-Path $DATA_ROOT "tmp")
+    TMP                      = (Join-Path $DATA_ROOT "tmp")
+    COREPACK_HOME            = (Join-Path $DATA_ROOT "corepack")
+    PNPM_STORE_DIR           = (Join-Path $DATA_ROOT "pnpm-store")
+    PNPM_HOME                = (Join-Path $DATA_ROOT "pnpm-home")
+    NPM_CONFIG_CACHE         = (Join-Path $DATA_ROOT "npm-cache")
+    UV_CACHE_DIR             = (Join-Path $DATA_ROOT "uv-cache")
+    PIP_CACHE_DIR            = (Join-Path $DATA_ROOT "pip-cache")
+    PLAYWRIGHT_BROWSERS_PATH = (Join-Path $DATA_ROOT "playwright")
+}
+foreach ($k in $_cacheDirs.Keys) {
+    $dir = $_cacheDirs[$k]
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    # Fail-closed: the physical target must resolve under the project root.
+    $full = [System.IO.Path]::GetFullPath($dir)
+    $rootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
+    if ($full.TrimEnd('\') -ne $rootFull -and -not $full.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Error "[acceptance] fail-closed: cache path $k '$full' is not under project root '$PROJECT_ROOT'."
+        exit 1
+    }
+    Set-Item -Path "Env:$k" -Value $dir
+}
+
 # Python 3.12 lock (mirrors check.ps1): PATH python may be anaconda 3.11 and
 # drift results. Resolve 3.12 by: .python-version -> local install -> uv find.
 # Fail-closed if 3.12 not found; A-1/B-2 must run under the locked interpreter.
@@ -135,6 +164,19 @@ function Get-FileSha256 {
     return "sha256:$hash"
 }
 
+# Strip ANSI/VT escape sequences (W1: vitest/pytest embed color codes between
+# tokens like "Tests <ESC>[32m70 passed", which breaks count regexes and makes
+# a PASS depend on the terminal's color environment). We also set NO_COLOR /
+# FORCE_COLOR=0 to suppress codes at the source; this is the defensive second
+# layer so count parsing is deterministic regardless of tool/term behavior.
+function Remove-Ansi {
+    param([string]$Text)
+    if ($null -eq $Text) { return "" }
+    # CSI sequences: ESC [ ... final-byte ; also lone ESC and OSC sequences.
+    $esc = [char]27
+    return ($Text -replace "$esc\[[0-9;?]*[ -/]*[@-~]", "" -replace "$esc\][^$esc]*$esc\\", "" -replace "$esc[@-Z\\-_]", "")
+}
+
 # Run one acceptance command, capture exit code + full stdout, record result.
 # Returns the full stdout string so callers can parse frozen counts.
 function Invoke-AcceptanceCheck {
@@ -157,14 +199,16 @@ function Invoke-AcceptanceCheck {
     $passed = ($code -eq 0)
     Write-Host $stdout
     Write-Host "  [$Id] exit=$code passed=$passed"
+    # W1: strip ANSI so tail + returned string are deterministic for count regexes.
+    $clean = Remove-Ansi $stdout
     $results.Add([ordered]@{
         id       = $Id
         desc     = $Desc
         exitCode = $code
         passed   = $passed
-        tail     = ($stdout -split "`n" | Select-Object -Last 3) -join " | "
+        tail     = ($clean -split "`n" | Select-Object -Last 3) -join " | "
     })
-    return $stdout
+    return $clean
 }
 
 # Record a synthetic (non-command) check result into $results.
@@ -203,7 +247,8 @@ function Test-SpikeReceipt {
     param(
         [string]$Name,
         [string]$Path,
-        [bool]$EnvCompat  # true => BLOCKED_UNCERTIFIED allowed if subcheckId in allowlist
+        [bool]$EnvCompat,  # true => BLOCKED_UNCERTIFIED allowed if subcheckId in allowlist
+        [datetime]$RunStart = [datetime]::MinValue  # W2: receipt must be regenerated this round
     )
     if (-not (Test-Path $Path)) {
         return @{ ok = $false; status = "MISSING"; detail = "receipt file absent" }
@@ -217,6 +262,21 @@ function Test-SpikeReceipt {
     foreach ($f in @("spike", "status", "assertions")) {
         if (-not ($obj.PSObject.Properties.Name -contains $f)) {
             return @{ ok = $false; status = "INVALID"; detail = "missing required field '$f'" }
+        }
+    }
+    # W2 (GPT round-5 item 2): the receipt's own spike name MUST match the expected
+    # node. Closes the hole where a minimal {"spike":"not-clock-source"} self-report
+    # was accepted for clock_source.
+    if ([string]$obj.spike -ne $Name) {
+        return @{ ok = $false; status = "NAME_MISMATCH"; detail = "receipt spike='$($obj.spike)' != expected '$Name' (self-report / wrong probe)" }
+    }
+    # W2 freshness: the receipt file must have been regenerated during THIS run
+    # (mtime >= runStart). A stale receipt from a prior round is rejected, so the
+    # runner cannot pass on historical evidence - it must re-execute the wrapper.
+    if ($RunStart -ne [datetime]::MinValue) {
+        $mtime = (Get-Item -LiteralPath $Path).LastWriteTime
+        if ($mtime -lt $RunStart) {
+            return @{ ok = $false; status = "STALE"; detail = "receipt mtime $($mtime.ToString('o')) < runStart $($RunStart.ToString('o')) (not re-executed this round)" }
         }
     }
     $status = [string]$obj.status
@@ -337,9 +397,26 @@ if ($a2out -match "Tests\s+(\d+)\s+passed") {
 }
 
 # --- A-3b Rust runtime assertions (V7: project-root env; cwd already REPO_ROOT)
+# --no-fail-fast: run BOTH test binaries (event_vectors + plan_vectors) and
+# report each result, so a first-binary hiccup cannot hide the second's count.
+# Bounded single retry: a freshly-linked test.exe can fail to LAUNCH on its
+# first execution on Windows (Defender real-time scan locks the image / libgcc
+# DLL not yet flushed) -> cargo exits 101 before any assertion runs. The image
+# is byte-identical across runs, so a genuine assertion defect fails BOTH
+# attempts; only a transient first-launch failure clears on retry. This keeps
+# A-3b deterministic on a cold detached worktree (the reviewer's exact case).
 Set-RustGnuEnv
 $a3out = Invoke-AcceptanceCheck "A-3b" "Rust contract runtime assertions (cargo test, gnu)" {
-    cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked
+    # Capture each attempt's output into $out (not the pipeline) so a retry
+    # REPLACES rather than appends - otherwise the count regex below would sum
+    # both attempts (e.g. 7 + 7+7 = 21) and break A-3b-count. Only the final
+    # attempt is emitted, so the count reflects one clean run (14).
+    $out = (cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked --no-fail-fast 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[A-3b] first attempt exit=$LASTEXITCODE; retrying once (Windows first-launch transient guard)"
+        $out = (cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked --no-fail-fast 2>&1 | Out-String)
+    }
+    Write-Output $out
 }
 # Sum "N passed" across the test binaries (event_vectors + plan_vectors).
 $cargoPassed = 0
@@ -388,7 +465,13 @@ Invoke-AcceptanceCheck "GATES" "check.ps1 15 gates" {
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 } | Out-Null
 
-# --- spike evidence validation (V3: not bare top-level status) -------------
+# --- spike execution + evidence validation (W2: real replay this round) ----
+# GPT round-5 item 2: the runner MUST execute each wrapper this round (not read
+# historical receipts). We stamp a per-run context (runId/nonce/candidateSha),
+# record runStart, execute every wrapper as a CHILD process (so a wrapper's
+# `exit N` cannot kill this runner), then deep-validate each freshly-written
+# receipt: name match + freshness (mtime >= runStart) + evidence shape +
+# allowlist. Each spike receipt is digest-bound into the total receipt.
 $spikeReceipts = [ordered]@{
     "clock_source"       = "tools/compat-probes/clock_source/receipt.json"
     "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
@@ -398,14 +481,49 @@ $spikeReceipts = [ordered]@{
     "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
     "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
 }
+# Wrapper script per spike (executed fresh this round).
+$spikeWrappers = [ordered]@{
+    "clock_source"       = "scripts/spikes/test-clock-source.ps1"
+    "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
+    "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
+    "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
+    "runner_identity"    = "scripts/spikes/test-runner-identity.ps1"
+    "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
+    "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
+}
 $envCompatSpikes = @("sqlite_wal_full", "tauri_e2e")
 
+# Per-run identity, bound into the total receipt (this-round unified replay).
+$runId    = [guid]::NewGuid().ToString()
+$runNonce = -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+$runStart = Get-Date
+
+# Rust env for wrappers that cargo-build (named_pipe/git_bridge via dev.ps1
+# inherit it; A-3b already called Set-RustGnuEnv above).
+Set-RustGnuEnv
+
 $spikeStatuses = [ordered]@{}
+$spikeBindings = [ordered]@{}
 foreach ($name in ($spikeReceipts.Keys)) {
-    $isEnv = ($envCompatSpikes -contains $name)
-    $v = Test-SpikeReceipt -Name $name -Path $spikeReceipts[$name] -EnvCompat $isEnv
+    $isEnv   = ($envCompatSpikes -contains $name)
+    $wrapper = Join-Path $REPO_ROOT $spikeWrappers[$name]
+    # Execute the wrapper as a child process (its `exit` cannot kill this runner).
+    Write-Host "-- [spike:$name] executing $($spikeWrappers[$name]) --" -ForegroundColor Cyan
+    if (Test-Path -LiteralPath $wrapper) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper 2>&1 | Out-String | Write-Host
+        Write-Host "  [spike:$name] wrapper exit=$LASTEXITCODE"
+    } else {
+        Write-Host "  [spike:$name] wrapper MISSING: $wrapper"
+    }
+    # Deep-validate the freshly-written receipt (name/freshness/evidence/allowlist).
+    $v = Test-SpikeReceipt -Name $name -Path $spikeReceipts[$name] -EnvCompat $isEnv -RunStart $runStart
     $spikeStatuses[$name] = $v.status
-    Add-CheckResult "spike:$name" "spike receipt evidence" $v.ok "status=$($v.status); $($v.detail)"
+    $spikeBindings[$name] = [ordered]@{
+        status        = $v.status
+        ok            = $v.ok
+        receiptDigest = (Get-FileSha256 $spikeReceipts[$name])
+    }
+    Add-CheckResult "spike:$name" "spike executed + receipt evidence" $v.ok "status=$($v.status); $($v.detail)"
 }
 
 # --- clean-tree re-check (V5: only the gitignored receipt may be dirty) -----
@@ -449,7 +567,11 @@ $receipt = [ordered]@{
         cargoPassed   = $FROZEN_CARGO_PASSED
     }
     checks               = $results
+    runId                = $runId
+    runNonce             = $runNonce
+    runStartedAt         = ($runStart.ToString("o"))
     spikeStatuses        = $spikeStatuses
+    spikeBindings        = $spikeBindings
     blockedAllowlist     = $BLOCKED_ALLOWLIST
     scriptDigests        = $scriptDigests
     schemaDigests        = $schemaDigests

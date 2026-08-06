@@ -54,7 +54,11 @@ Desktop.ini
 .claude/
 .tmp_*.py
 
-# Spike 运行时中间产物（探针每轮重新生成；只有最终 receipt.json 入库）
+# Spike 运行时产物（GPT 第五轮 item 2：phase0-acceptance.ps1 每轮真实执行 wrapper
+# 重新生成 receipt.json 并按 runStart 校验新鲜度；receipt 因此是可再生运行时
+# artifact，不入库——提交它会使"每轮统一重放"退化成读陈旧回执，且弄脏树破坏
+# cleanTree 通过条件。spike 源码（*.rs/*.py/package.json/*.spec.ts）仍入库。）
+tools/compat-probes/**/receipt.json
 tools/compat-probes/**/_*_stderr.log
 tools/compat-probes/**/_*_stdout.log
 tools/compat-probes/**/_server_*.log

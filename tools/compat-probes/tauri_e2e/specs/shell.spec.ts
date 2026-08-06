@@ -75,10 +75,17 @@ describe("Tauri E2E spike (shell.spec.ts)", () => {
       expect(IS_TAURI).toBe(false);
       return;
     }
-    // Placeholder: actual shell command execution test
-    // import { Command } from "@tauri-apps/plugin-shell";
-    // const output = await new Command("echo", ["hello"]).execute();
-    // expect(output.stdout.trim()).toBe("hello");
-    expect(true).toBe(true); // placeholder assertion
+    // GPT round-5 item 5: a bare `expect(true).toBe(true)` here would let this
+    // test masquerade as a passing E2E assertion whenever it runs inside a real
+    // Tauri WebView. Real shell-command E2E is NOT implemented yet, so even in a
+    // Tauri context this must NOT falsely certify — fail loudly instead.
+    // Unblock: implement the real command execution below and delete this throw.
+    //   import { Command } from "@tauri-apps/plugin-shell";
+    //   const output = await new Command("echo", ["hello"]).execute();
+    //   expect(output.stdout.trim()).toBe("hello");
+    throw new Error(
+      "shell-command E2E not implemented — cannot certify PASS; " +
+      "spike remains BLOCKED_UNCERTIFIED until a real in-Tauri run is added"
+    );
   });
 });

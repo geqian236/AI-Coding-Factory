@@ -128,9 +128,14 @@ jobs:
 
   windows-probes:
     # Windows-only compat-probes 必须在 windows-latest 上真实执行 spike wrapper，
-    # 不能只跑 pytest 冒充（GPT 第四轮 REVISE item 6：此 job 原先只跑合同测试
-    # 属假绿）。每个 wrapper 按真实退出码处理：0=PASS，2=BLOCKED_UNCERTIFIED
-    # （allowlist 内 sqlite disk-full / tauri 无头，不失败），其余非零=FAIL 整体红。
+    # 判定按 receipt 的 status + subcheckId，绝不只看退出码（GPT 第五轮 REVISE
+    # item 4：核心 wrapper 如 named_pipe/runner_identity 在 BLOCKED 时也 exit 0，
+    # 只看退出码会让核心能力受阻仍绿）。规则：
+    #   - 核心 spike（clock/durable-io/named-pipe/git-bridge/runner-identity）：
+    #     receipt.status 必须 == PASS，任何 BLOCKED/FAIL 即整体红。
+    #   - env-compat spike（sqlite_wal_full/tauri_e2e）：只有 receipt 的
+    #     subcheckId（或 required 阻断 subResult 的 id）在冻结 allowlist 内时
+    #     才允许 BLOCKED_UNCERTIFIED；否则整体红。
     name: windows-probes
     runs-on: windows-latest
     steps:
@@ -142,27 +147,62 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: 安装 pytest
         run: pip install pytest
-      - name: 真实执行 compatibility spikes（按退出码 fail-closed）
+      - name: 真实执行 compatibility spikes（按 receipt subcheckId fail-closed）
         shell: pwsh
         run: |
-          $spikes = @(
-            "test-clock-source", "test-durable-io", "test-named-pipe",
-            "test-git-bridge", "test-runner-identity", "test-sqlite-wal",
-            "test-tauri-e2e"
+          # spike 名 -> wrapper；core = 必须 PASS，env-compat = 允许 allowlist BLOCKED。
+          $spikes = [ordered]@{
+            "clock_source"       = "test-clock-source"
+            "windows_durable_io" = "test-durable-io"
+            "named_pipe"         = "test-named-pipe"
+            "git_object_bridge"  = "test-git-bridge"
+            "runner_identity"    = "test-runner-identity"
+            "sqlite_wal_full"    = "test-sqlite-wal"
+            "tauri_e2e"          = "test-tauri-e2e"
+          }
+          $envCompat = @("sqlite_wal_full", "tauri_e2e")
+          # 冻结 BLOCKED allowlist（与 PHASE_0_ACCEPTANCE.md §1 + phase0-acceptance.ps1 一致）。
+          $allowlist = @(
+            "spike:sqlite_wal_full/disk_full_enospc",
+            "spike:tauri_e2e/webview_runtime"
           )
           $hardFail = $false
-          foreach ($s in $spikes) {
-            $script = Join-Path "scripts/spikes" "$s.ps1"
+          foreach ($name in $spikes.Keys) {
+            $script  = Join-Path "scripts/spikes" "$($spikes[$name]).ps1"
+            $receipt = Join-Path "tools/compat-probes/$name" "receipt.json"
             if (-not (Test-Path $script)) {
-              Write-Error "[$s] wrapper 缺失，fail-closed"; $hardFail = $true; continue
+              Write-Error "[$name] wrapper 缺失，fail-closed"; $hardFail = $true; continue
             }
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script
-            $code = $LASTEXITCODE
-            # 0=PASS, 2=BLOCKED_UNCERTIFIED（allowlist 内，不算失败）；其余=FAIL
-            if ($code -ne 0 -and $code -ne 2) {
-              Write-Error "[$s] 退出码 $code，判 FAIL"; $hardFail = $true
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script | Out-Null
+            if (-not (Test-Path $receipt)) {
+              Write-Error "[$name] 未产出 receipt.json，fail-closed"; $hardFail = $true; continue
+            }
+            $obj = Get-Content $receipt -Raw -Encoding utf8 | ConvertFrom-Json
+            $status = [string]$obj.status
+            # 收集阻断 subcheckId：顶层 subcheckId + required 阻断的 subResult。
+            $blockingIds = @()
+            if ($obj.PSObject.Properties.Name -contains "subcheckId") { $blockingIds += [string]$obj.subcheckId }
+            if ($obj.PSObject.Properties.Name -contains "subResults") {
+              foreach ($sr in @($obj.subResults)) {
+                $req = ($sr.PSObject.Properties.Name -contains "required") -and [bool]$sr.required
+                if ($req -and ($sr.status -eq "BLOCKED_UNCERTIFIED" -or $sr.status -eq "FAIL")) {
+                  $blockingIds += "spike:$name/$($sr.aspect)"
+                }
+              }
+            }
+            if ($status -eq "PASS") {
+              Write-Host "[$name] status=PASS"
+            } elseif ($status -eq "BLOCKED_UNCERTIFIED" -and ($envCompat -contains $name)) {
+              $hit = @($blockingIds | Where-Object { $allowlist -contains $_ })
+              if ($hit.Count -ge 1) {
+                Write-Host "[$name] status=BLOCKED_UNCERTIFIED allowlisted ($($hit -join ','))"
+              } else {
+                Write-Error "[$name] BLOCKED 但 subcheckId 不在 allowlist（$($blockingIds -join ',')），fail-closed"
+                $hardFail = $true
+              }
             } else {
-              Write-Host "[$s] 退出码 $code（PASS 或 allowlist BLOCKED）"
+              Write-Error "[$name] status=$status（核心 spike 必须 PASS，或非 allowlist BLOCKED），fail-closed"
+              $hardFail = $true
             }
           }
           if ($hardFail) { exit 1 }

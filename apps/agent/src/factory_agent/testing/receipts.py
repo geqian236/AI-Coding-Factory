@@ -23,6 +23,26 @@ from typing import Any
 # 合法的 result 枚举值
 VALID_RESULTS = frozenset({"PASS", "FAIL", "BLOCKED_UNCERTIFIED"})
 
+# test-receipt schema 是回执结构的单一真源；validate() 运行时读取其
+# required / minItems / minProperties 并无条件强制，杜绝手写 validate 与
+# schema 漂移（GPT 第五轮 item 6：schema 无条件要求 actions/expected/actual
+# 非空，旧 validate 仅在 result==PASS 时检查，可复现漂移）。
+# receipts.py 位于 apps/agent/src/factory_agent/testing/，向上 5 层到 REPO_ROOT。
+_SCHEMA_PATH = (
+    Path(__file__).resolve().parents[5]
+    / "contracts" / "schemas" / "test-receipt.v1.schema.json"
+)
+_schema_cache: dict[str, Any] | None = None
+
+
+def _load_receipt_schema() -> dict[str, Any]:
+    """加载 test-receipt schema（模块级缓存）；schema 是结构约束的单一真源。"""
+    global _schema_cache
+    if _schema_cache is None:
+        with _SCHEMA_PATH.open(encoding="utf-8") as f:
+            _schema_cache = json.load(f)
+    return _schema_cache
+
 # 已知合法的 runtimeId 标识（未来可扩展）
 KNOWN_RUNTIME_IDS = frozenset({
     "python-3.12",
@@ -158,25 +178,36 @@ class TestReceipt:
                 f"必须是 {sorted(VALID_RESULTS)}"
             )
 
-        # 检查手工文字 PASS：result=PASS 但 actions 为空（机器生成必须记录动作）
-        if self.result == "PASS" and not self.actions:
+        # GPT 第五轮 item 6：actions/expected/actual 的非空约束由 schema 单一真源
+        # 无条件强制（不再仅在 result==PASS 时查）。schema 声明 actions.minItems=1、
+        # expected.minProperties=1、actual.minProperties=1；validate() 运行时读取
+        # 这些约束并对所有 result 强制，消除手写 validate 与 schema 的可复现漂移
+        # （旧代码对 result=FAIL 且三项为空返回 []，而 schema 会拒绝）。
+        _schema = _load_receipt_schema()
+        _props = _schema.get("properties", {})
+        _actions_min = _props.get("actions", {}).get("minItems", 1)
+        _expected_min = _props.get("expected", {}).get("minProperties", 1)
+        _actual_min = _props.get("actual", {}).get("minProperties", 1)
+
+        # 无条件：actions 至少 minItems 条（保留 MANUAL_PASS 前缀，兼容既有测试）
+        if len(self.actions) < _actions_min:
             errors.append(
-                f"MANUAL_PASS [{self.receiptId}]: result=PASS 但 actions 为空，"
-                "疑似手工文字 PASS；机器回执必须记录至少一条执行动作"
+                f"MANUAL_PASS [{self.receiptId}]: actions 数量 {len(self.actions)} < "
+                f"schema minItems={_actions_min}；机器回执必须记录至少一条执行动作"
             )
 
-        # P0-6：result=PASS 时 expected 必须非空（防伪造 FINAL PASS）
-        if self.result == "PASS" and not self.expected:
+        # 无条件：expected 至少 minProperties 个属性
+        if len(self.expected) < _expected_min:
             errors.append(
-                f"EMPTY_EXPECTED [{self.receiptId}]: result=PASS 但 expected 为空，"
-                "无法证明期望被验证"
+                f"EMPTY_EXPECTED [{self.receiptId}]: expected 属性数 {len(self.expected)} < "
+                f"schema minProperties={_expected_min}；无法证明期望被验证"
             )
 
-        # P0-6：result=PASS 时 actual 必须非空（防伪造 FINAL PASS）
-        if self.result == "PASS" and not self.actual:
+        # 无条件：actual 至少 minProperties 个属性
+        if len(self.actual) < _actual_min:
             errors.append(
-                f"EMPTY_ACTUAL [{self.receiptId}]: result=PASS 但 actual 为空，"
-                "无法证明真实观察被记录"
+                f"EMPTY_ACTUAL [{self.receiptId}]: actual 属性数 {len(self.actual)} < "
+                f"schema minProperties={_actual_min}；无法证明真实观察被记录"
             )
 
         # P0-6：finalPassOwner 必填（result=PASS 时强制，FAIL/BLOCKED 时允许 None，

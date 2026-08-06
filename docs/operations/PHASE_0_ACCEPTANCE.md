@@ -33,8 +33,10 @@
      - `spike:sqlite_wal_full/disk_full_enospc` —— 真实 ENOSPC 需 admin 挂载 VHD，
        解封脚本 `scripts/spikes/create_enospc_vhd.ps1`。该子项 BLOCKED 使 sqlite spike
        **顶层判 BLOCKED_UNCERTIFIED**（按 §3 优先级 `FAIL > BLOCKED > PASS`）。
-     - `spike:tauri_e2e` —— WebView2 E2E 需 Tauri 运行时 + 显示环境，本 sandbox 无头。
-       保留 Phase 0 spike ownership，正式记为 `BLOCKED_UNCERTIFIED`（非"待 Phase 2"）。
+     - `spike:tauri_e2e/webview_runtime` —— WebView2 E2E 需 Tauri 运行时 + 显示环境，
+       本 sandbox 无头。保留 Phase 0 spike ownership，正式记为 `BLOCKED_UNCERTIFIED`
+       （非"待 Phase 2"）。该 subcheckId 与 tauri wrapper 发出的 receipt `subcheckId`
+       及 §3 allowlist key 三处统一。
    - 顶层状态优先级冻结为 `FAIL > BLOCKED_UNCERTIFIED > PASS`：任一必选子项 FAIL
      顶层即 FAIL；无 FAIL 但有 allowlist 内 BLOCKED 顶层即 BLOCKED_UNCERTIFIED。
    - **不伪造 PASS**：allowlist 内项在解封环境（admin CI Windows runner）跑通后转 PASS。
@@ -52,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 327 passed, 1 skipped（contract 196 + agent 78 + security 53）；唯一 skip = `tests/agent/unit/test_config.py::D 盘固定卷检测`（环境受限，非失败） |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 327 passed, 1 skipped（contract 196 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL） |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -71,7 +73,7 @@
 > - event_vectors.rs：7 passed（event_id/payload_digest/materialize/reject/interleaved）
 > - plan_vectors.rs：7 passed（canonical/barrier_id/plan_revision_digest/semantic_plan_hash）
 >
-> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：Python(322) + TS(70) +
+> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：Python(327) + TS(70) +
 > Rust(14) 均对同一份 golden 做 RFC 8785 字节相等断言，三侧一致即跨语言认证。
 
 ### 2.2 门禁（scripts/check.ps1，15 项全 PASS）
@@ -149,7 +151,9 @@
 
 ## 4. 明确移交 Phase 1 的项（不阻断 Phase 0）
 
-以下属 Master Spec 定义但按 §11「Phase 0 只冻结纯输入/输出」移交 Phase 1：
+以下属 Master Spec 定义、但本 Phase 0 不实现的项，逐项给出独立移交理由（不援引
+「纯输入/输出」作全局规则——该措辞在 Phase 0 计划中仅约束 Task 4 事件物化器，
+不泛化到并发/授权/Verifier 等其它子系统）：
 
 1. **并发实现**：SQLite 单写者 coordinator、writer epoch CAS、多 Task 原子 claim 事务
    （Phase 0 只冻结 PreparedBatchV2/DurableEventV2 的**纯函数物化算法**与 schema）。
@@ -161,8 +165,11 @@
 3. **PASS 从确定性断言派生**：receipt 聚合当前强制 owner/qualification/replay/digest 门禁；
    "PASS 完全由确定性断言自动派生、不接受任何 self-report" 属 Phase 1 Verifier 实现。
 4. **真实 ENOSPC 认证**：需 admin 挂载 VHD，在 CI Windows runner 执行。
-5. **TestReceipt schema/dataclass/loader 完全统一为单一生成源**：Phase 0 三者语义一致且
-   互相校验，codegen 单一真源统一属 Phase 1。
+5. ~~TestReceipt 单一生成源~~ —— **已在 Phase 0 消除**（本轮 W6）：test-receipt 已从
+   codegen catalog 移除（`codegen=false`），schema 是唯一结构真源，手写 dataclass 为唯一
+   Python 表示；`validate()` 运行时读取 schema 的 `required`/`minItems`/`minProperties`
+   并**无条件强制**（不再仅 `result==PASS` 时查），机械一致性测试绑定 dataclass 字段集
+   ↔ schema 属性集。不再属 Phase 1。
 
 > 这些项若在 Phase 0 审核中被提出，按第 1.3 条记入 `PHASE_1_BACKLOG.md`，不阻断收口。
 

@@ -71,21 +71,39 @@ foreach ($k in $wvKeys) {
 }
 
 # --- derive status from observed evidence (never hardcoded) -----------------
+# GPT round-5 item 5: this wrapper is a READINESS probe only - it never launches
+# a real Tauri window nor executes the E2E suite. Therefore it MUST NOT emit PASS
+# on readiness alone; readiness is necessary but not sufficient for E2E
+# certification. PASS is only legitimate when a real E2E run (native window +
+# in-Tauri vitest) actually executes and passes, which this wrapper does not do.
+# Consequently the only outcomes here are:
+#   - framework files missing            -> FAIL (hard)
+#   - framework present, E2E NOT executed -> BLOCKED_UNCERTIFIED (allowlisted)
+# The reason distinguishes whether runtime deps are present, but either way the
+# absence of an actual E2E run keeps this BLOCKED, never PASS.
 $frameworkOk = $frameworkPkgOk -and $frameworkSpecOk
+# Whether a real E2E run happened. This wrapper never runs one; wired as a
+# constant so the PASS path is provably unreachable until real E2E is added.
+$e2eExecuted = $false
 if (-not $frameworkOk) {
     $status = "FAIL"
     $reason = "framework files missing: $($missing -join ', ')"
-} elseif ($tauriCliOk -and $webview2Ok) {
-    # Runtime deps present; headless E2E launch still not attempted here, so this
-    # spike certifies "environment ready" as PASS; actual window E2E is Phase 2.
+} elseif ($e2eExecuted -and $tauriCliOk -and $webview2Ok) {
+    # Unreachable today ($e2eExecuted is always false): only a genuine E2E run
+    # (native window opened + in-Tauri vitest passed) may certify PASS.
     $status = "PASS"
-    $reason = "Tauri CLI $tauriCliVersion + WebView2 $webview2Version present; framework files present"
+    $reason = "real Tauri E2E executed and passed (CLI $tauriCliVersion + WebView2 $webview2Version)"
 } else {
     $status = "BLOCKED_UNCERTIFIED"
     $missingDeps = @()
     if (-not $tauriCliOk) { $missingDeps += "tauri-cli" }
     if (-not $webview2Ok) { $missingDeps += "webview2-runtime" }
-    $reason = "framework files present; missing runtime dependency: $($missingDeps -join ', ')"
+    if ($tauriCliOk -and $webview2Ok) {
+        # Runtime ready, but E2E was still not executed -> honestly BLOCKED.
+        $reason = "runtime ready (Tauri CLI $tauriCliVersion + WebView2 $webview2Version) but E2E NOT executed by this readiness probe; real window+in-Tauri vitest run required to certify"
+    } else {
+        $reason = "framework files present; E2E not executed; missing runtime dependency: $($missingDeps -join ', ')"
+    }
 }
 
 $assertions = @(
@@ -93,6 +111,9 @@ $assertions = @(
     @{ name = "framework_spec_exists";         passed = $frameworkSpecOk; detail = "Test-Path specs\shell.spec.ts = $frameworkSpecOk" }
     @{ name = "tauri_cli_available";           passed = $tauriCliOk;      detail = "probed tauri/cargo-tauri --version -> $(if ($tauriCliOk) { $tauriCliVersion } else { 'not found' })" }
     @{ name = "webview2_runtime_available";    passed = $webview2Ok;      detail = "EdgeUpdate client pv -> $(if ($webview2Ok) { $webview2Version } else { 'not found' })" }
+    # E2E execution is the assertion that would gate PASS; this readiness probe
+    # never runs it, so it is honestly false and PASS stays unreachable.
+    @{ name = "e2e_actually_executed";         passed = $e2eExecuted;     detail = "readiness probe does not launch a Tauri window or run in-Tauri vitest; real E2E not executed" }
 )
 
 $receipt = [ordered]@{
