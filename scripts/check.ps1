@@ -181,8 +181,15 @@ Invoke-GateCheck "14-rust-test" {
     # （报 "no such command: +stable-..."）。shim 才能分发 +toolchain。
     $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
     $env:CARGO_TARGET_DIR = "D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target"
-    $sysroot = (& rustc +stable-x86_64-pc-windows-gnu --print sysroot 2>$null | Select-Object -First 1)
-    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
+    # 根因修复（第五轮 REVISE 后诊断）：ld.lld 路径必须从字面 $env:RUSTUP_HOME 拼接，
+    # 绝不从 `rustc --print sysroot` 的 stdout 捕获。前置门禁（node/pnpm/vitest）会把
+    # [Console]::OutputEncoding 改成 GBK；随后 rustc stdout 捕获到的含 CJK 的 sysroot
+    # 被 GBK 破坏（D:\codex项目 -> D:\codex椤圭洰）→ linker 路径 exists=False →
+    # "linker not found (os error 3)" → build-script link 失败 exit 101。此故障只在
+    # 完整 check.ps1 序列冷跑时出现（隔离跑编码未被污染故通过），是 heisenbug 的根因。
+    # $env:RUSTUP_HOME 是进程环境变量、字节正确，与 dev.ps1 / Set-RustGnuEnv 同源做法。
+    $gnuToolchain = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu"
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $gnuToolchain "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
     cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked
 }
 
