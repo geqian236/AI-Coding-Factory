@@ -41,7 +41,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: 安装测试依赖
-        run: pip install pytest
+        # jsonschema：test_receipt_schema_conformance 用真库对 stdlib 回退校验器做
+        # 逐例等价证明（GPT 第六轮 item 3）；装了它该测试才真跑而非 importorskip 假绿，
+        # 且 receipts.validate() 在 CI 走权威 jsonschema 而非回退实现。
+        run: pip install pytest jsonschema
       - name: Codegen drift 检测
         # 三语言生成树必须无漂移；漂移即整体红（fail-closed）。
         run: python contracts/codegen/generate.py --check
@@ -146,19 +149,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 安装 pytest
-        run: pip install pytest
-      - name: 真实执行 compatibility spikes（按 receipt subcheckId fail-closed）
+        run: pip install pytest jsonschema
+      - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
         shell: pwsh
         run: |
-          # spike 名 -> wrapper；core = 必须 PASS，env-compat = 允许 allowlist BLOCKED。
+          # GPT 第六轮 item 4：CI 曾自带一份 receipt 判定逻辑，与 runner 各自演化出
+          # 不同的 fail-open 洞（不查 wrapper 退出码、PASS 不核 assertions、BLOCKED 只
+          # 要求命中一个 allowlist、无 candidate/run/probe 绑定）。现改为 dot-source
+          # scripts/spikes/_receipt-validator.ps1——与 phase0-acceptance.ps1 同一个
+          # Test-SpikeReceiptEvidence，一处修补处处生效：strict-bool（拒 "false" 字符串）、
+          # 全 blocker 必须 allowlisted、wrapper 退出码参与判定、runBinding/run_nonce 绑定。
+          . "$PWD/scripts/spikes/_receipt-validator.ps1"
+
           $spikes = [ordered]@{
-            "clock_source"       = "test-clock-source"
-            "windows_durable_io" = "test-durable-io"
-            "named_pipe"         = "test-named-pipe"
-            "git_object_bridge"  = "test-git-bridge"
-            "runner_identity"    = "test-runner-identity"
-            "sqlite_wal_full"    = "test-sqlite-wal"
-            "tauri_e2e"          = "test-tauri-e2e"
+            "clock_source"       = "scripts/spikes/test-clock-source.ps1"
+            "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
+            "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
+            "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
+            "runner_identity"    = "scripts/spikes/test-runner-identity.ps1"
+            "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
+            "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
+          }
+          $receipts = [ordered]@{
+            "clock_source"       = "tools/compat-probes/clock_source/receipt.json"
+            "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
+            "named_pipe"         = "tools/compat-probes/named_pipe/receipt.json"
+            "git_object_bridge"  = "tools/compat-probes/git_object_bridge/receipt.json"
+            "runner_identity"    = "tools/compat-probes/runner_identity/receipt.json"
+            "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
+            "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
           }
           $envCompat = @("sqlite_wal_full", "tauri_e2e")
           # 冻结 BLOCKED allowlist（与 PHASE_0_ACCEPTANCE.md §1 + phase0-acceptance.ps1 一致）。
@@ -166,42 +185,51 @@ jobs:
             "spike:sqlite_wal_full/disk_full_enospc",
             "spike:tauri_e2e/webview_runtime"
           )
+
+          # 本轮运行身份：绑定 candidate/run/probe（item 4 缺失项）。
+          $env:SPIKE_RUN_ID        = [guid]::NewGuid().ToString()
+          $env:SPIKE_RUN_NONCE     = -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+          $env:SPIKE_CANDIDATE_SHA = "$env:GITHUB_SHA"
+          $runStart = Get-Date
+
+          # Purge 全部 receipt：CI checkout 无 receipt（已 gitignore），但显式 purge 保
+          # 证「本轮产出」语义与 runner 一致（freshness mtime >= runStart 才通过）。
+          foreach ($name in $receipts.Keys) {
+            if (Test-Path $receipts[$name]) { Remove-Item $receipts[$name] -Force }
+          }
+
           $hardFail = $false
           foreach ($name in $spikes.Keys) {
-            $script  = Join-Path "scripts/spikes" "$($spikes[$name]).ps1"
-            $receipt = Join-Path "tools/compat-probes/$name" "receipt.json"
+            $script  = $spikes[$name]
+            $receipt = $receipts[$name]
             if (-not (Test-Path $script)) {
               Write-Error "[$name] wrapper 缺失，fail-closed"; $hardFail = $true; continue
             }
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script | Out-Null
-            if (-not (Test-Path $receipt)) {
-              Write-Error "[$name] 未产出 receipt.json，fail-closed"; $hardFail = $true; continue
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String | Write-Host
+            $wrapperExit = $LASTEXITCODE
+            if ($null -eq $wrapperExit) { $wrapperExit = 0 }
+            # 六份非 sqlite receipt 盖 runBinding（sqlite 走 run_nonce，避免扰动
+            # emit_manifest 对 eventBatchParameters 的 digest 重算）。
+            if ($name -ne "sqlite_wal_full" -and (Test-Path $receipt)) {
+              python scripts/spikes/stamp_run_binding.py $receipt $name
+              if ($LASTEXITCODE -ne 0) { Write-Error "[$name] 盖章失败 exit=$LASTEXITCODE，fail-closed"; $hardFail = $true }
             }
-            $obj = Get-Content $receipt -Raw -Encoding utf8 | ConvertFrom-Json
-            $status = [string]$obj.status
-            # 收集阻断 subcheckId：顶层 subcheckId + required 阻断的 subResult。
-            $blockingIds = @()
-            if ($obj.PSObject.Properties.Name -contains "subcheckId") { $blockingIds += [string]$obj.subcheckId }
-            if ($obj.PSObject.Properties.Name -contains "subResults") {
-              foreach ($sr in @($obj.subResults)) {
-                $req = ($sr.PSObject.Properties.Name -contains "required") -and [bool]$sr.required
-                if ($req -and ($sr.status -eq "BLOCKED_UNCERTIFIED" -or $sr.status -eq "FAIL")) {
-                  $blockingIds += "spike:$name/$($sr.aspect)"
-                }
-              }
+            $vArgs = @{
+              Name               = $name
+              Path               = $receipt
+              EnvCompat          = ($envCompat -contains $name)
+              Allowlist          = $allowlist
+              RunStart           = $runStart
+              WrapperExitCode    = $wrapperExit
+              ExpectRunId        = $env:SPIKE_RUN_ID
+              ExpectRunNonce     = $env:SPIKE_RUN_NONCE
+              ExpectCandidateSha = $env:SPIKE_CANDIDATE_SHA
             }
-            if ($status -eq "PASS") {
-              Write-Host "[$name] status=PASS"
-            } elseif ($status -eq "BLOCKED_UNCERTIFIED" -and ($envCompat -contains $name)) {
-              $hit = @($blockingIds | Where-Object { $allowlist -contains $_ })
-              if ($hit.Count -ge 1) {
-                Write-Host "[$name] status=BLOCKED_UNCERTIFIED allowlisted ($($hit -join ','))"
-              } else {
-                Write-Error "[$name] BLOCKED 但 subcheckId 不在 allowlist（$($blockingIds -join ',')），fail-closed"
-                $hardFail = $true
-              }
+            $v = Test-SpikeReceiptEvidence @vArgs
+            if ($v.ok) {
+              Write-Host "[$name] OK status=$($v.status); $($v.detail)"
             } else {
-              Write-Error "[$name] status=$status（核心 spike 必须 PASS，或非 allowlist BLOCKED），fail-closed"
+              Write-Error "[$name] fail-closed status=$($v.status); $($v.detail)"
               $hardFail = $true
             }
           }

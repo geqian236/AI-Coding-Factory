@@ -174,13 +174,30 @@ Invoke-GateCheck "13-vitest" {
 # 用 +stable-x86_64-pc-windows-gnu 显式覆盖，使 host 也是 gnu，build-script 走 gnu host
 # + rust-lld（config.toml linker-flavor=ld），全程不碰 msvc link.exe。
 Invoke-GateCheck "14-rust-test" {
-    $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "D:\acf-dev\cargo-home" }
-    $env:RUSTUP_HOME = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "D:\acf-dev\rustup-home" }
+    # 存储合同（GPT 第六轮 item 5）：standalone fallback 过去用 D:\acf-dev，超出允许根
+    # D:\codex项目，被判违约。改为从 $REPO_ROOT 向上派生 AI-Coding-Factory-Data 项目根
+    # （与 scripts/phase0-acceptance.ps1 / dev.ps1 同源做法，跨 worktree 稳健），三件套
+    # 缓存/工具链/产物全部落项目根下的 AI-Coding-Factory-Data\dev。找不到项目根即 throw，
+    # 被 Invoke-GateCheck 的 try/catch 记为 FAIL（fail-closed，绝不静默回退到 C: 或 acf-dev）。
+    $_projRoot = $null
+    $_probe = $REPO_ROOT
+    while ($_probe) {
+        if (Test-Path (Join-Path $_probe "AI-Coding-Factory-Data")) { $_projRoot = $_probe; break }
+        $_parent = Split-Path $_probe -Parent
+        if (-not $_parent -or $_parent -eq $_probe) { break }
+        $_probe = $_parent
+    }
+    if (-not $_projRoot) {
+        throw "gate-14 fail-closed: 找不到 AI-Coding-Factory-Data 项目根（$REPO_ROOT 的任何祖先），拒绝回退到 D:\acf-dev 等允许根外路径"
+    }
+    $_dataRoot = Join-Path $_projRoot "AI-Coding-Factory-Data\dev"
+    $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $_dataRoot "cargo-home" }
+    $env:RUSTUP_HOME = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $_dataRoot "rustup-home" }
     # 只前置 CARGO_HOME\bin（rustup shim 所在），不前置 gnu 工具链 bin：
     # 否则 cargo/rustc 解析成 gnu 工具链里的真实 exe，不认 +toolchain 语法
     # （报 "no such command: +stable-..."）。shim 才能分发 +toolchain。
     $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
-    $env:CARGO_TARGET_DIR = "D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target"
+    $env:CARGO_TARGET_DIR = Join-Path $_dataRoot "cargo-target"
     # 根因修复（第五轮 REVISE 后诊断）：ld.lld 路径必须从字面 $env:RUSTUP_HOME 拼接，
     # 绝不从 `rustc --print sysroot` 的 stdout 捕获。前置门禁（node/pnpm/vitest）会把
     # [Console]::OutputEncoding 改成 GBK；随后 rustc stdout 捕获到的含 CJK 的 sysroot

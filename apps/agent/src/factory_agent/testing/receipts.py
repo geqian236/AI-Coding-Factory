@@ -43,6 +43,113 @@ def _load_receipt_schema() -> dict[str, Any]:
             _schema_cache = json.load(f)
     return _schema_cache
 
+
+def schema_validation_errors(instance: dict[str, Any]) -> list[str]:
+    """对 instance 执行**全量** JSON Schema 校验，返回错误消息列表（GPT 第六轮 item 3）。
+
+    第六轮 REVISE item 3 指出：旧 validate() 只读 schema 的三个数量约束
+    （actions.minItems / expected.minProperties / actual.minProperties），
+    并未执行完整 JSON Schema 校验——反例（空 receiptId/testId/actionId/description）
+    在 validate() 得 0 错误，但真 JSON Schema 得 4 错误。此函数补上完整校验：
+
+    - **优先**用 importlib 动态加载真 `jsonschema` 库（Draft7Validator），这是权威
+      参考实现，零语义漂移。锁定 py312 验收环境与 CI 均安装该库，故 A-1 走真库。
+    - 动态 import（非顶层 `import jsonschema`）：避免 `uv run mypy` 在未装该库的
+      `.venv` 里因缺 stub 报错而打爆 gate-11，也不需要改 pyproject/uv.lock 联网重锁。
+    - 库不可用时**回退**到由 schema 驱动的 stdlib 校验器 `_stdlib_schema_errors`，
+      其行为由 test_receipt_schema_conformance 用真 jsonschema 对系统性变异电池
+      逐例证明等价（回应「运行时语义一致」要求）。
+
+    返回的错误消息带 SCHEMA 前缀 + JSON 路径，便于聚合层定位。
+    """
+    schema = _load_receipt_schema()
+    try:
+        # 动态加载：mypy 不静态解析，缺库环境不报错；装了则走权威实现。
+        import importlib
+
+        jsonschema = importlib.import_module("jsonschema")
+        validator_cls = jsonschema.Draft7Validator  # type: ignore[attr-defined]
+        validator = validator_cls(schema)
+        errors: list[str] = []
+        for err in sorted(validator.iter_errors(instance), key=lambda e: list(e.path)):
+            loc = "/".join(str(p) for p in err.path) or "<root>"
+            errors.append(f"SCHEMA [{loc}]: {err.message}")
+        return errors
+    except ModuleNotFoundError:
+        # 回退：schema 驱动的 stdlib 校验器（与真库逐例等价，见 conformance 测试）。
+        errors = []
+        _stdlib_schema_errors(instance, schema, "", errors)
+        return errors
+
+
+def _stdlib_schema_errors(
+    instance: Any, schema: dict[str, Any], path: str, errors: list[str]
+) -> None:
+    """schema 驱动的 stdlib JSON Schema 校验器（Draft-07 子集，覆盖本 schema 全部关键字）。
+
+    仅在真 `jsonschema` 库不可用时作为回退。实现的关键字与 test-receipt.v1.schema
+    实际使用的一致：type / enum / minLength / minimum / minItems / minProperties /
+    required / additionalProperties / properties / items。递归下降，错误带路径前缀。
+    保持与 Draft7Validator 相同语义：不校验 `format`（除非显式传 format_checker），
+    可选属性仅在存在时校验。
+    """
+    def _loc(p: str) -> str:
+        return p or "<root>"
+
+    stype = schema.get("type")
+    # type 校验（JSON 类型 -> Python 类型；bool 不是 int，与 JSON Schema 一致）。
+    if stype is not None:
+        type_ok = {
+            "object": isinstance(instance, dict),
+            "array": isinstance(instance, list),
+            "string": isinstance(instance, str),
+            "integer": isinstance(instance, int) and not isinstance(instance, bool),
+            "number": isinstance(instance, (int, float)) and not isinstance(instance, bool),
+            "boolean": isinstance(instance, bool),
+            "null": instance is None,
+        }.get(stype, True)
+        if not type_ok:
+            errors.append(f"SCHEMA [{_loc(path)}]: 类型应为 {stype}，实际 {type(instance).__name__}")
+            return  # 类型不符时后续关键字无意义
+
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"SCHEMA [{_loc(path)}]: 值 {instance!r} 不在 enum {schema['enum']}")
+
+    if isinstance(instance, str):
+        min_len = schema.get("minLength")
+        if min_len is not None and len(instance) < min_len:
+            errors.append(f"SCHEMA [{_loc(path)}]: 字符串长度 {len(instance)} < minLength={min_len}（不得为空）")
+
+    if isinstance(instance, (int, float)) and not isinstance(instance, bool):
+        minimum = schema.get("minimum")
+        if minimum is not None and instance < minimum:
+            errors.append(f"SCHEMA [{_loc(path)}]: 数值 {instance} < minimum={minimum}")
+
+    if isinstance(instance, list):
+        min_items = schema.get("minItems")
+        if min_items is not None and len(instance) < min_items:
+            errors.append(f"SCHEMA [{_loc(path)}]: 数组长度 {len(instance)} < minItems={min_items}")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for i, item in enumerate(instance):
+                _stdlib_schema_errors(item, item_schema, f"{path}/{i}" if path else str(i), errors)
+
+    if isinstance(instance, dict):
+        min_props = schema.get("minProperties")
+        if min_props is not None and len(instance) < min_props:
+            errors.append(f"SCHEMA [{_loc(path)}]: 属性数 {len(instance)} < minProperties={min_props}")
+        for req in schema.get("required", []):
+            if req not in instance:
+                errors.append(f"SCHEMA [{_loc(path)}]: 缺少必需属性 '{req}'")
+        props: dict[str, Any] = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for key in instance:
+                if key not in props:
+                    errors.append(f"SCHEMA [{_loc(path)}]: 不允许的额外属性 '{key}'（additionalProperties:false）")
+        for key, sub_schema in props.items():
+            if key in instance and isinstance(sub_schema, dict):
+                _stdlib_schema_errors(instance[key], sub_schema, f"{path}/{key}" if path else key, errors)
+
 # 已知合法的 runtimeId 标识（未来可扩展）
 KNOWN_RUNTIME_IDS = frozenset({
     "python-3.12",
@@ -256,6 +363,13 @@ class TestReceipt:
             errors.append(
                 f"MISSING_FIELD [{self.receiptId}]: sideEffectCount={self.sideEffectCount} 不能为负数"
             )
+
+        # GPT 第六轮 item 3：在上述带前缀的语义检查之外，追加**完整** JSON Schema
+        # 校验（真 jsonschema 优先，缺库回退 stdlib 校验器）。这补上旧 validate 漏掉的
+        # minLength / enum / additionalProperties / 嵌套 items 等全部约束，使运行时
+        # 校验与 schema 单一真源真正一致（反例：空 receiptId/testId/actionId/description
+        # 现在会返回 SCHEMA 前缀错误，而非旧代码的 0 错误）。校验落盘表示 to_dict()。
+        errors.extend(schema_validation_errors(self.to_dict()))
 
         return errors
 

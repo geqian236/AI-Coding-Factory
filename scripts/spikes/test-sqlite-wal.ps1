@@ -21,7 +21,10 @@ $common     = "$PSScriptRoot\_common.ps1"
 . $common
 
 # 本轮 nonce：传给子进程，再断言 receipt.run_nonce 一致，避免读到陈旧 PASS。
-$nonce = [guid]::NewGuid().ToString("N")
+# GPT 第六轮 item 2d：若 acceptance runner 已通过 $env:SPIKE_RUN_NONCE 传入本轮
+# 运行身份，则复用它（让 receipt.run_nonce 绑定到本轮总回执的 runNonce，供
+# Test-SpikeReceiptEvidence 的 sqlite 分支校验）；独立运行时回退到自生成 GUID。
+$nonce = if ($env:SPIKE_RUN_NONCE) { $env:SPIKE_RUN_NONCE } else { [guid]::NewGuid().ToString("N") }
 
 # ENOSPC 真实认证路径：如果 D:\vhd_enospc 存在且是 VHD 挂载点，把 probe-dir
 # 指向它（由 create_enospc_vhd.ps1 创建）。否则默认用系统临时目录。

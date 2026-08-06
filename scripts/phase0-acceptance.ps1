@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (327/1,
+        (only the gitignored receipt may appear dirty); frozen counts (330/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -93,14 +93,44 @@ $_cacheDirs = @{
     PIP_CACHE_DIR            = (Join-Path $DATA_ROOT "pip-cache")
     PLAYWRIGHT_BROWSERS_PATH = (Join-Path $DATA_ROOT "playwright")
 }
+# Reparse-point guard (round-6 item 5b): a purely lexical GetFullPath check cannot
+# detect a junction/symlink anywhere in the chain that redirects the PHYSICAL target
+# outside the project root (e.g. $DATA_ROOT\tmp junctioned to C:\tmp - the lexical
+# path still looks in-bounds while writes land on C:). After creating each cache dir
+# we walk the chain from the dir up to the project root and reject if ANY component
+# carries the ReparsePoint attribute, so no junction escape can slip a write onto C:.
+# Returns the offending path (or $null). Must be defined before the loop below (PS
+# executes top-to-bottom; the loop runs at parse-forward time, before later helpers).
+function Test-ReparsePointInChain {
+    param([string]$Leaf, [string]$Root)
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $cur = [System.IO.Path]::GetFullPath($Leaf).TrimEnd('\')
+    while ($cur) {
+        if (Test-Path -LiteralPath $cur) {
+            $attr = (Get-Item -LiteralPath $cur -Force).Attributes
+            if ($attr -band [System.IO.FileAttributes]::ReparsePoint) { return $cur }
+        }
+        if ($cur -eq $rootFull) { break }
+        $parent = Split-Path $cur -Parent
+        if (-not $parent -or $parent -eq $cur) { break }
+        $cur = $parent.TrimEnd('\')
+    }
+    return $null
+}
 foreach ($k in $_cacheDirs.Keys) {
     $dir = $_cacheDirs[$k]
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-    # Fail-closed: the physical target must resolve under the project root.
+    # Fail-closed: the physical target must resolve under the project root (lexical).
     $full = [System.IO.Path]::GetFullPath($dir)
     $rootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
     if ($full.TrimEnd('\') -ne $rootFull -and -not $full.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Error "[acceptance] fail-closed: cache path $k '$full' is not under project root '$PROJECT_ROOT'."
+        exit 1
+    }
+    # Fail-closed: no junction/symlink in the chain may redirect the physical target out.
+    $rp = Test-ReparsePointInChain -Leaf $dir -Root $PROJECT_ROOT
+    if ($rp) {
+        Write-Error "[acceptance] fail-closed: cache path $k chain contains reparse point '$rp' (possible junction escape out of project root)."
         exit 1
     }
     Set-Item -Path "Env:$k" -Value $dir
@@ -138,7 +168,7 @@ $ACCEPTANCE_SET_VERSION = "phase0-acceptance-v1"
 $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.md"
 
 # Frozen baseline counts (V5: parsed from output and enforced, not eyeballed).
-$FROZEN_PYTEST_PASSED  = 327
+$FROZEN_PYTEST_PASSED  = 330
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -241,112 +271,12 @@ function Set-RustGnuEnv {
     }
 }
 
-# Deep-validate one spike receipt (V3: evidence, not bare top-level status).
-# Returns @{ ok = <bool>; status = <string>; detail = <string> }.
-function Test-SpikeReceipt {
-    param(
-        [string]$Name,
-        [string]$Path,
-        [bool]$EnvCompat,  # true => BLOCKED_UNCERTIFIED allowed if subcheckId in allowlist
-        [datetime]$RunStart = [datetime]::MinValue  # W2: receipt must be regenerated this round
-    )
-    if (-not (Test-Path $Path)) {
-        return @{ ok = $false; status = "MISSING"; detail = "receipt file absent" }
-    }
-    try {
-        $obj = Get-Content $Path -Raw -Encoding utf8 | ConvertFrom-Json
-    } catch {
-        return @{ ok = $false; status = "UNPARSEABLE"; detail = "JSON parse failed" }
-    }
-    # Required fields (V3: a minimal {"status":"PASS"} lacks these).
-    foreach ($f in @("spike", "status", "assertions")) {
-        if (-not ($obj.PSObject.Properties.Name -contains $f)) {
-            return @{ ok = $false; status = "INVALID"; detail = "missing required field '$f'" }
-        }
-    }
-    # W2 (GPT round-5 item 2): the receipt's own spike name MUST match the expected
-    # node. Closes the hole where a minimal {"spike":"not-clock-source"} self-report
-    # was accepted for clock_source.
-    if ([string]$obj.spike -ne $Name) {
-        return @{ ok = $false; status = "NAME_MISMATCH"; detail = "receipt spike='$($obj.spike)' != expected '$Name' (self-report / wrong probe)" }
-    }
-    # W2 freshness: the receipt file must have been regenerated during THIS run
-    # (mtime >= runStart). A stale receipt from a prior round is rejected, so the
-    # runner cannot pass on historical evidence - it must re-execute the wrapper.
-    if ($RunStart -ne [datetime]::MinValue) {
-        $mtime = (Get-Item -LiteralPath $Path).LastWriteTime
-        if ($mtime -lt $RunStart) {
-            return @{ ok = $false; status = "STALE"; detail = "receipt mtime $($mtime.ToString('o')) < runStart $($RunStart.ToString('o')) (not re-executed this round)" }
-        }
-    }
-    $status = [string]$obj.status
-    $assertions = @($obj.assertions)
-    if ($assertions.Count -lt 1) {
-        return @{ ok = $false; status = $status; detail = "assertions empty (no observable evidence)" }
-    }
-    # Each assertion must carry passed (bool).
-    foreach ($a in $assertions) {
-        if (-not ($a.PSObject.Properties.Name -contains "passed")) {
-            return @{ ok = $false; status = $status; detail = "an assertion lacks 'passed'" }
-        }
-    }
-    $failedAsserts = @($assertions | Where-Object { -not $_.passed })
-    $allPassed = ($failedAsserts.Count -eq 0)
-
-    # Blocking subchecks come in two real shapes (verified against committed receipts):
-    #   Shape A (tauri_e2e): a top-level "subcheckId" string + a failed assertion.
-    #   Shape B (sqlite_wal_full): a "subResults" entry with required==true and
-    #     status BLOCKED_UNCERTIFIED/FAIL; its id is spike:<name>/<aspect>.
-    # Note: some core spikes carry "uncertified_aspects" (informational, no
-    # "required" field) - those are NOT blocking and must not fail a PASS spike.
-    $blockingSubIds = @()
-    if ($obj.PSObject.Properties.Name -contains "subResults") {
-        foreach ($sr in @($obj.subResults)) {
-            $srStatus = [string]$sr.status
-            $srRequired = $false
-            if ($sr.PSObject.Properties.Name -contains "required") { $srRequired = [bool]$sr.required }
-            if ($srRequired -and ($srStatus -eq "BLOCKED_UNCERTIFIED" -or $srStatus -eq "FAIL")) {
-                $blockingSubIds += "spike:$Name/$($sr.aspect)"
-            }
-        }
-    }
-    $topSubId = if ($obj.PSObject.Properties.Name -contains "subcheckId") { [string]$obj.subcheckId } else { $null }
-
-    if ($status -eq "PASS") {
-        # V3 consistency: PASS requires every top-level assertion passed AND no
-        # required subResult in a blocking state.
-        if (-not $allPassed) {
-            return @{ ok = $false; status = $status; detail = "status=PASS but $($failedAsserts.Count) assertion(s) failed" }
-        }
-        if ($blockingSubIds.Count -gt 0) {
-            return @{ ok = $false; status = $status; detail = "status=PASS but required subResult blocked: $($blockingSubIds -join ',')" }
-        }
-        return @{ ok = $true; status = $status; detail = "PASS: $($assertions.Count) assertions all passed" }
-    }
-    elseif ($status -eq "BLOCKED_UNCERTIFIED") {
-        if (-not $EnvCompat) {
-            return @{ ok = $false; status = $status; detail = "core spike may not be BLOCKED_UNCERTIFIED" }
-        }
-        # V3 consistency: a BLOCKED must carry real blocking evidence - either a
-        # failed top-level assertion (shape A) or a required blocked subResult
-        # (shape B). A bare self-reported BLOCKED with all-passed evidence is rejected.
-        if ($failedAsserts.Count -eq 0 -and $blockingSubIds.Count -eq 0) {
-            return @{ ok = $false; status = $status; detail = "BLOCKED but no failed assertion and no required blocked subResult (self-reported)" }
-        }
-        # The blocking subcheck id (from either shape) must be in the frozen allowlist.
-        $candidateIds = @()
-        if ($topSubId) { $candidateIds += $topSubId }
-        $candidateIds += $blockingSubIds
-        $allowedHit = @($candidateIds | Where-Object { $BLOCKED_ALLOWLIST.Keys -contains $_ })
-        if ($allowedHit.Count -lt 1) {
-            return @{ ok = $false; status = $status; detail = "no allowlisted subcheckId (candidates: $($candidateIds -join ','))" }
-        }
-        return @{ ok = $true; status = $status; detail = "BLOCKED_UNCERTIFIED allowlisted: $($allowedHit -join ',')" }
-    }
-    else {
-        return @{ ok = $false; status = $status; detail = "status '$status' not PASS/BLOCKED_UNCERTIFIED" }
-    }
-}
+# Spike-receipt evidence validation now lives in the shared module dot-sourced
+# below (GPT round-6 item 4: single source of truth). The runner and CI both call
+# Test-SpikeReceiptEvidence from scripts/spikes/_receipt-validator.ps1, so a
+# fail-open hole can only be closed in one place. The old in-file Test-SpikeReceipt
+# was removed to eliminate the second, drifting copy.
+. (Join-Path $PSScriptRoot "spikes\_receipt-validator.ps1")
 
 Write-Host "========================================"
 Write-Host "Phase 0 Acceptance - $ACCEPTANCE_SET_VERSION"
@@ -359,6 +289,120 @@ $dirtyLinesStart = @(& git status --porcelain 2>$null)
 $cleanTreeStart = ($dirtyLinesStart.Count -eq 0)
 Write-Host "candidateSha  = $candidateSha"
 Write-Host "cleanTreeStart= $cleanTreeStart"
+
+# --- spikes FIRST (round-6 item 1): execute every wrapper and validate evidence
+# BEFORE A-1. Root cause of the fresh-worktree failure: A-1's
+# test_emit_manifest_accepts_blocked_spike_receipt SKIPS when the sqlite receipt
+# is absent, so a truly fresh detached worktree (no gitignored receipt) counted
+# 326/2 (the reviewer's exact observation), NOT the leftover-receipt 327/1 that
+# a prior dry-run receipt `git status` cannot see had leaned on. Running spikes
+# first makes the single command self-contained: purge all 7 receipts, regenerate
+# them THIS round, then A-1 deterministically reads the fresh sqlite receipt so
+# that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
+# tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
+# py312), the frozen A-1 baseline is now 330 passed / 1 skipped.
+#
+# Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
+# scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
+# cannot drift (round-6 item 4). Each wrapper runs as a CHILD process (its
+# `exit N` cannot kill this runner); we capture its exit code (item 2c), stamp a
+# runBinding into the six non-sqlite receipts (item 2d; sqlite binds via run_nonce
+# to avoid disturbing emit_manifest's digest recompute over eventBatchParameters),
+# then validate: name match + freshness (mtime >= runStart) + strict-boolean
+# assertions + all-blockers-allowlisted + exit-code + run binding. Each receipt is
+# digest-bound into the total receipt.
+$spikeReceipts = [ordered]@{
+    "clock_source"       = "tools/compat-probes/clock_source/receipt.json"
+    "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
+    "named_pipe"         = "tools/compat-probes/named_pipe/receipt.json"
+    "git_object_bridge"  = "tools/compat-probes/git_object_bridge/receipt.json"
+    "runner_identity"    = "tools/compat-probes/runner_identity/receipt.json"
+    "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
+    "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
+}
+$spikeWrappers = [ordered]@{
+    "clock_source"       = "scripts/spikes/test-clock-source.ps1"
+    "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
+    "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
+    "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
+    "runner_identity"    = "scripts/spikes/test-runner-identity.ps1"
+    "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
+    "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
+}
+$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e")
+$stampScript = Join-Path $PSScriptRoot "spikes\stamp_run_binding.py"
+
+# Per-run identity: bound into the total receipt and stamped into each receipt.
+$runId    = [guid]::NewGuid().ToString()
+$runNonce = -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+$runStart = Get-Date
+
+# Purge ALL receipts BEFORE running (round-6 item 1): a hermetic run must not lean
+# on a gitignored receipt from a prior round. With the freshness check
+# (mtime >= runStart) this proves every receipt A-1 later reads was produced by
+# THIS run, closing the historical-pollution hole `git status` cannot detect.
+foreach ($name in $spikeReceipts.Keys) {
+    $rp = Join-Path $REPO_ROOT $spikeReceipts[$name]
+    if (Test-Path -LiteralPath $rp) { Remove-Item -LiteralPath $rp -Force }
+}
+
+# Rust env for cargo-building wrappers (clock/durable-io/named-pipe/runner-
+# identity). Idempotent; A-3b calls Set-RustGnuEnv again later.
+Set-RustGnuEnv
+
+# Run identity to each wrapper via env (item 2d): a wrapper inherits it as a child
+# process. sqlite reuses SPIKE_RUN_NONCE as its --nonce so its receipt.run_nonce
+# binds to this run; the runner stamps runBinding into the other six.
+$env:SPIKE_RUN_ID        = $runId
+$env:SPIKE_RUN_NONCE     = $runNonce
+$env:SPIKE_CANDIDATE_SHA = $candidateSha
+
+$spikeStatuses = [ordered]@{}
+$spikeBindings = [ordered]@{}
+foreach ($name in ($spikeReceipts.Keys)) {
+    $isEnv   = ($envCompatSpikes -contains $name)
+    $wrapper = Join-Path $REPO_ROOT $spikeWrappers[$name]
+    $receiptPath = $spikeReceipts[$name]
+    Write-Host "-- [spike:$name] executing $($spikeWrappers[$name]) --" -ForegroundColor Cyan
+    $wrapperExit = 1
+    if (Test-Path -LiteralPath $wrapper) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper 2>&1 | Out-String | Write-Host
+        $wrapperExit = $LASTEXITCODE
+        if ($null -eq $wrapperExit) { $wrapperExit = 0 }
+        Write-Host "  [spike:$name] wrapper exit=$wrapperExit"
+    } else {
+        Write-Host "  [spike:$name] wrapper MISSING: $wrapper"
+    }
+    # Stamp runBinding into the six non-sqlite receipts (item 2d). sqlite binds via
+    # run_nonce; stamping it would round-trip a receipt whose digests emit_manifest
+    # recomputes, risking a false digest mismatch.
+    if ($name -ne "sqlite_wal_full" -and (Test-Path -LiteralPath $receiptPath)) {
+        python $stampScript $receiptPath $name | Write-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  [spike:$name] WARNING stamp_run_binding exit=$LASTEXITCODE (binding check fails closed)"
+        }
+    }
+    # Shared evidence validation (single source of truth with CI; item 4).
+    $vArgs = @{
+        Name               = $name
+        Path               = $receiptPath
+        EnvCompat          = $isEnv
+        Allowlist          = [string[]]$BLOCKED_ALLOWLIST.Keys
+        RunStart           = $runStart
+        WrapperExitCode    = $wrapperExit
+        ExpectRunId        = $runId
+        ExpectRunNonce     = $runNonce
+        ExpectCandidateSha = $candidateSha
+    }
+    $v = Test-SpikeReceiptEvidence @vArgs
+    $spikeStatuses[$name] = $v.status
+    $spikeBindings[$name] = [ordered]@{
+        status        = $v.status
+        ok            = $v.ok
+        receiptDigest = (Get-FileSha256 $receiptPath)
+    }
+    Add-CheckResult "spike:$name" "spike executed + receipt evidence" $v.ok "status=$($v.status); $($v.detail)"
+}
 
 # --- A-1 + B-1 + A-2 (V1: install before vitest) ---------------------------
 
@@ -465,66 +509,7 @@ Invoke-AcceptanceCheck "GATES" "check.ps1 15 gates" {
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1
 } | Out-Null
 
-# --- spike execution + evidence validation (W2: real replay this round) ----
-# GPT round-5 item 2: the runner MUST execute each wrapper this round (not read
-# historical receipts). We stamp a per-run context (runId/nonce/candidateSha),
-# record runStart, execute every wrapper as a CHILD process (so a wrapper's
-# `exit N` cannot kill this runner), then deep-validate each freshly-written
-# receipt: name match + freshness (mtime >= runStart) + evidence shape +
-# allowlist. Each spike receipt is digest-bound into the total receipt.
-$spikeReceipts = [ordered]@{
-    "clock_source"       = "tools/compat-probes/clock_source/receipt.json"
-    "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
-    "named_pipe"         = "tools/compat-probes/named_pipe/receipt.json"
-    "git_object_bridge"  = "tools/compat-probes/git_object_bridge/receipt.json"
-    "runner_identity"    = "tools/compat-probes/runner_identity/receipt.json"
-    "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
-    "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
-}
-# Wrapper script per spike (executed fresh this round).
-$spikeWrappers = [ordered]@{
-    "clock_source"       = "scripts/spikes/test-clock-source.ps1"
-    "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
-    "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
-    "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
-    "runner_identity"    = "scripts/spikes/test-runner-identity.ps1"
-    "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
-    "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
-}
-$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e")
-
-# Per-run identity, bound into the total receipt (this-round unified replay).
-$runId    = [guid]::NewGuid().ToString()
-$runNonce = -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
-$runStart = Get-Date
-
-# Rust env for wrappers that cargo-build (named_pipe/git_bridge via dev.ps1
-# inherit it; A-3b already called Set-RustGnuEnv above).
-Set-RustGnuEnv
-
-$spikeStatuses = [ordered]@{}
-$spikeBindings = [ordered]@{}
-foreach ($name in ($spikeReceipts.Keys)) {
-    $isEnv   = ($envCompatSpikes -contains $name)
-    $wrapper = Join-Path $REPO_ROOT $spikeWrappers[$name]
-    # Execute the wrapper as a child process (its `exit` cannot kill this runner).
-    Write-Host "-- [spike:$name] executing $($spikeWrappers[$name]) --" -ForegroundColor Cyan
-    if (Test-Path -LiteralPath $wrapper) {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper 2>&1 | Out-String | Write-Host
-        Write-Host "  [spike:$name] wrapper exit=$LASTEXITCODE"
-    } else {
-        Write-Host "  [spike:$name] wrapper MISSING: $wrapper"
-    }
-    # Deep-validate the freshly-written receipt (name/freshness/evidence/allowlist).
-    $v = Test-SpikeReceipt -Name $name -Path $spikeReceipts[$name] -EnvCompat $isEnv -RunStart $runStart
-    $spikeStatuses[$name] = $v.status
-    $spikeBindings[$name] = [ordered]@{
-        status        = $v.status
-        ok            = $v.ok
-        receiptDigest = (Get-FileSha256 $spikeReceipts[$name])
-    }
-    Add-CheckResult "spike:$name" "spike executed + receipt evidence" $v.ok "status=$($v.status); $($v.detail)"
-}
+# (spikes ran FIRST, before A-1 - see the spike block above; round-6 item 1.)
 
 # --- clean-tree re-check (V5: only the gitignored receipt may be dirty) -----
 $dirtyLinesEnd = @(& git status --porcelain 2>$null)

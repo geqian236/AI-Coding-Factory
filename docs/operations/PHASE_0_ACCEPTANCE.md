@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 327 passed, 1 skipped（contract 196 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL） |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 330 passed, 1 skipped（contract 199 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 199 含第六轮 item 3 新增 `test_receipt_schema_conformance.py`（3 项：反例锁定 + stdlib 回退校验器与真 jsonschema 逐例等价 + 基准），证明运行时校验语义与 schema 单一真源一致 |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -73,7 +73,7 @@
 > - event_vectors.rs：7 passed（event_id/payload_digest/materialize/reject/interleaved）
 > - plan_vectors.rs：7 passed（canonical/barrier_id/plan_revision_digest/semantic_plan_hash）
 >
-> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：Python(327) + TS(70) +
+> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：Python(330) + TS(70) +
 > Rust(14) 均对同一份 golden 做 RFC 8785 字节相等断言，三侧一致即跨语言认证。
 
 ### 2.2 门禁（scripts/check.ps1，15 项全 PASS）
