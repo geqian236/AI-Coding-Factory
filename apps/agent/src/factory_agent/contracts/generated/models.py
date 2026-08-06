@@ -20,7 +20,6 @@ __all__ = [
     "DurableEventV2",
     "IpcEnvelope",
     "RunnerProtocol",
-    "TestReceipt",
 ]
 
 class CredentialRef(TypedDict, total=False):
@@ -338,38 +337,3 @@ class RunnerProtocol(TypedDict, total=False):
     payload: dict[str, Any]
     # 消息时间戳
     timestamp: str
-
-class TestReceipt(TypedDict, total=False):
-    """由 generate.py 自动生成，禁止手动修改。"""
-    # 回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查）
-    receiptId: str
-    # 测试 ID（来自 required-test-catalog.v1.json）
-    testId: str
-    # 环境 Compatibility Manifest 摘要
-    environmentManifestDigest: str
-    # 执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS）
-    actions: list[dict[str, Any]]
-    # 期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
-    expected: dict[str, Any]
-    # 实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS）
-    actual: dict[str, Any]
-    # 外部副作用计数
-    sideEffectCount: int
-    # 相关 Artifact 摘要列表
-    artifactDigests: list[str]
-    # 测试结论（不能通过手工文字改为 PASS）
-    result: Literal["PASS", "FAIL", "BLOCKED_UNCERTIFIED"]
-    # 失败原因（result=FAIL 时必填）
-    failureReason: Optional[str]
-    # 场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS）
-    scenarioContractDigest: str
-    # 实现贡献者列表
-    implementationContributors: list[str]
-    # 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）
-    finalPassOwner: str
-    # 执行资质等级（GPT 第二轮审核限定）：PARTIAL=阶段/中间通过；FINAL=最终/收口通过。verify_receipts 强制 PARTIAL 不能冒充 FINAL 用于收口。
-    qualification: Literal["PARTIAL", "FINAL"]
-    # 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）
-    requiredReplays: int
-    # 回执创建时间
-    createdAt: str

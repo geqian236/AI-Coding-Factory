@@ -110,23 +110,30 @@ Assert-UnderProjectRoot "PLAYWRIGHT_BROWSERS_PATH" $env:PLAYWRIGHT_BROWSERS_PATH
 $cargoBin = Join-Path $env:CARGO_HOME "bin"
 $env:PATH = "$cargoBin;$env:PATH"
 
+# Rust 工具链强制为 gnu：仓库根 rust-toolchain.toml 写 `channel = "stable"`（无 host
+# 后缀），rustup 在本机（Default host = x86_64-pc-windows-msvc）会解析成
+# stable-x86_64-pc-windows-msvc，使 build-script（proc-macro2/serde 等）为 msvc host
+# 编译并要求 link.exe（本机未装 MSVC C++ build tools）而失败。设 RUSTUP_TOOLCHAIN 让
+# 所有经本 wrapper 的 cargo/rustc（含子 wrapper 里的 cargo build/run/test）都强制走
+# gnu 工具链，host 也是 gnu，build-script 用 ld.lld，全程不碰 msvc link.exe。
+$env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-gnu"
+
 # Rust 链接器 lld 支持：直接把工具链自带、Unicode 安全的 rust-lld（ld flavor）设为链接器。
 # 实测 `-fuse-ld=lld` 经 gcc 驱动仍回退到 GNU ld、在 CJK 路径失败；故绕过 gcc，
 # 用 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER 直接指向 ld.lld.exe，与 committed
-# .cargo/config.toml 的 `linker-flavor=ld` 配合。ld.lld 位于
-# <sysroot>\lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld，由 rustc --print sysroot 定位。
-try {
-    $sysroot = (& rustc --print sysroot 2>$null | Select-Object -First 1)
-    if ($sysroot) {
-        $ldLld = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
-        if (Test-Path $ldLld) {
-            $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $ldLld
-        } else {
-            Write-Warning "[dev.ps1] 未找到 ld.lld '$ldLld'，Rust 链接会回退到 GNU ld 并在 CJK 路径失败。"
-        }
-    }
-} catch {
-    Write-Warning "[dev.ps1] 无法定位 rustc sysroot（$($_.Exception.Message)）；若非 Rust 任务可忽略。"
+# .cargo/config.toml 的 `linker-flavor=ld` 配合。
+#
+# ld.lld 路径**不经 `rustc --print sysroot` 捕获**：PowerShell 5.1 在 GBK 代码页下
+# 捕获 native 命令 stdout 时会破坏 CJK 字节（$env:RUSTUP_HOME 含 "codex项目"），
+# 使 Test-Path 在损坏路径上失败、linker 不被设置、cargo 回退 GNU ld 并在 CJK 路径挂。
+# 改为从**字面量 $env:RUSTUP_HOME**（本脚本第 3 节已 Join-Path 设定，未经任何管道捕获）
+# 直接拼接工具链内的 gcc-ld\ld.lld.exe，CJK 字节全程不经 native stdout，保持完整。
+$gnuToolchain = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu"
+$ldLld = Join-Path $gnuToolchain "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
+if (Test-Path -LiteralPath $ldLld) {
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $ldLld
+} else {
+    Write-Warning "[dev.ps1] 未找到 ld.lld '$ldLld'，Rust 链接会回退到 GNU ld 并在 CJK 路径失败。"
 }
 
 # ── 5. 解析 -- 分隔符，提取子命令 ─────────────────────────────────────────────

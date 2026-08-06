@@ -553,3 +553,95 @@ def test_p06_receipt_validate_flags_missing_replays() -> None:
     )
     errors = rcpt.validate()
     assert any("MISSING_REPLAYS" in e for e in errors), f"缺 MISSING_REPLAYS: {errors}"
+
+
+# ─────────────── TestReceipt schema ↔ dataclass 单一真源一致性 ───────────────
+# V2（第四轮 REVISE item 2）：test-receipt.v1 从 codegen 移除（codegen=false），
+# 消除「生成 TypedDict + 手写 dataclass」双源。schema 为字段与运行时白名单的
+# 单一真源；dataclass 是唯一 Python 表示。以下测试机械绑定二者，杜绝漂移。
+
+TEST_RECEIPT_SCHEMA_PATH = (
+    REPO_ROOT / "contracts" / "schemas" / "test-receipt.v1.schema.json"
+)
+
+
+def _load_test_receipt_schema() -> dict:
+    """加载 test-receipt.v1 schema。"""
+    with TEST_RECEIPT_SCHEMA_PATH.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_test_receipt_not_in_codegen_catalog() -> None:
+    """test-receipt.v1 必须 codegen=false（单一真源：dataclass，非生成 TypedDict）。"""
+    catalog_path = REPO_ROOT / "contracts" / "codegen" / "catalog.v1.json"
+    with catalog_path.open(encoding="utf-8") as f:
+        catalog = json.load(f)
+    entry = next(
+        (s for s in catalog["schemas"] if s.get("schemaId") == "test-receipt.v1"),
+        None,
+    )
+    assert entry is not None, "catalog 缺 test-receipt.v1 条目"
+    assert entry["codegen"] is False, (
+        "test-receipt.v1 必须 codegen=false，否则生成 TypedDict 与手写 dataclass 双源"
+    )
+    assert entry["category"] == "runtime-only"
+
+
+def test_test_receipt_not_in_generated_models() -> None:
+    """生成的 models.py 不得再含 TestReceipt（已移出 codegen，避免双源）。"""
+    models_path = (
+        REPO_ROOT / "apps" / "agent" / "src" / "factory_agent"
+        / "contracts" / "generated" / "models.py"
+    )
+    text = models_path.read_text(encoding="utf-8")
+    assert "class TestReceipt" not in text, (
+        "生成物仍含 TestReceipt TypedDict，与手写 dataclass 构成双源；"
+        "应重新运行 generate.py"
+    )
+
+
+def test_dataclass_fields_match_schema_properties() -> None:
+    """dataclass 字段集必须与 schema properties 完全一致（双向，无漂移）。"""
+    from dataclasses import fields
+
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    schema = _load_test_receipt_schema()
+    schema_props = set(schema["properties"].keys())
+    dataclass_fields = {f.name for f in fields(TestReceipt)}
+
+    missing_in_dataclass = schema_props - dataclass_fields
+    extra_in_dataclass = dataclass_fields - schema_props
+    assert not missing_in_dataclass, (
+        f"schema 有但 dataclass 缺的字段: {sorted(missing_in_dataclass)}"
+    )
+    assert not extra_in_dataclass, (
+        f"dataclass 有但 schema 缺的字段（additionalProperties:false 会拒绝）: "
+        f"{sorted(extra_in_dataclass)}"
+    )
+
+
+def test_schema_required_subset_of_dataclass() -> None:
+    """schema required 字段必须都是 dataclass 字段（否则反序列化必失败）。"""
+    from dataclasses import fields
+
+    from factory_agent.testing.receipts import TestReceipt  # type: ignore[import]
+
+    schema = _load_test_receipt_schema()
+    required = set(schema["required"])
+    dataclass_fields = {f.name for f in fields(TestReceipt)}
+    missing = required - dataclass_fields
+    assert not missing, f"schema required 但 dataclass 缺: {sorted(missing)}"
+
+
+def test_known_runtime_ids_match_schema_enum() -> None:
+    """KNOWN_RUNTIME_IDS 必须与 schema runtimeId enum 完全一致（运行时白名单单一真源）。"""
+    from factory_agent.testing.receipts import KNOWN_RUNTIME_IDS  # type: ignore[import]
+
+    schema = _load_test_receipt_schema()
+    schema_enum = set(schema["properties"]["runtimeId"]["enum"])
+    assert set(KNOWN_RUNTIME_IDS) == schema_enum, (
+        f"KNOWN_RUNTIME_IDS 与 schema runtimeId enum 漂移："
+        f"仅代码有 {set(KNOWN_RUNTIME_IDS) - schema_enum}，"
+        f"仅 schema 有 {schema_enum - set(KNOWN_RUNTIME_IDS)}"
+    )

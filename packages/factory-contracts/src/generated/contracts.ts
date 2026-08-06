@@ -332,39 +332,3 @@ export interface RunnerProtocol {
   /** 消息时间戳 */
   timestamp: string;
 }
-
-/** TestReceipt — 由 generate.py 自动生成，禁止手动修改 */
-export interface TestReceipt {
-  /** 回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查） */
-  receiptId: string;
-  /** 测试 ID（来自 required-test-catalog.v1.json） */
-  testId: string;
-  /** 环境 Compatibility Manifest 摘要 */
-  environmentManifestDigest: string;
-  /** 执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS） */
-  actions: Record<string, unknown>[];
-  /** 期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS） */
-  expected: Record<string, unknown>;
-  /** 实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS） */
-  actual: Record<string, unknown>;
-  /** 外部副作用计数 */
-  sideEffectCount: number;
-  /** 相关 Artifact 摘要列表 */
-  artifactDigests: string[];
-  /** 测试结论（不能通过手工文字改为 PASS） */
-  result: "PASS" | "FAIL" | "BLOCKED_UNCERTIFIED";
-  /** 失败原因（result=FAIL 时必填） */
-  failureReason?: string;
-  /** 场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS） */
-  scenarioContractDigest: string;
-  /** 实现贡献者列表 */
-  implementationContributors?: string[];
-  /** 最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单） */
-  finalPassOwner: string;
-  /** 执行资质等级（GPT 第二轮审核限定）：PARTIAL=阶段/中间通过；FINAL=最终/收口通过。verify_receipts 强制 PARTIAL 不能冒充 FINAL 用于收口。 */
-  qualification: "PARTIAL" | "FINAL";
-  /** 要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁） */
-  requiredReplays: number;
-  /** 回执创建时间 */
-  createdAt: string;
-}

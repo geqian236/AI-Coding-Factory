@@ -66,9 +66,10 @@ jobs:
         # pyproject.toml 已配 ruff；未跑过即视为 fail-closed 漏检。
         run: ruff check apps/agent/src scripts tests/contract tests/security
       - name: MyPy 类型检查
-        # apps/agent 是受代码，必须 mypy 严格通过；其余目录可选。
-        run: |
-          mypy --config-file pyproject.toml apps/agent/src || mypy apps/agent/src --ignore-missing-imports --no-strict-optional --follow-imports=silent
+        # apps/agent 是受代码，必须 mypy 严格通过（fail-closed）。
+        # 历史版本曾用 `strict || lax` 短路：严格失败仍走宽松分支通过，属 fail-open
+        # 假绿（GPT 第四轮审核 item 6 指出）。现只跑严格模式，失败即整体红。
+        run: mypy --config-file pyproject.toml apps/agent/src
 
   rust:
     name: rust
@@ -126,10 +127,10 @@ jobs:
         run: python scripts/_gate_checks.py c-drive-paths
 
   windows-probes:
-    # Windows-only compat-probes 在 ubuntu runner 上无法执行；此 job 在
-    # windows-latest 上跑 pytest（契约不依赖 probe，契约测试由 contracts job
-    # 覆盖）。probe 实物 spike 在本机与 Wave 1 测试套件中已认证（见 docs/
-    # operations/development-environment.md §8 spike 状态表）。
+    # Windows-only compat-probes 必须在 windows-latest 上真实执行 spike wrapper，
+    # 不能只跑 pytest 冒充（GPT 第四轮 REVISE item 6：此 job 原先只跑合同测试
+    # 属假绿）。每个 wrapper 按真实退出码处理：0=PASS，2=BLOCKED_UNCERTIFIED
+    # （allowlist 内 sqlite disk-full / tauri 无头，不失败），其余非零=FAIL 整体红。
     name: windows-probes
     runs-on: windows-latest
     steps:
@@ -137,7 +138,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: 安装 pytest
         run: pip install pytest
+      - name: 真实执行 compatibility spikes（按退出码 fail-closed）
+        shell: pwsh
+        run: |
+          $spikes = @(
+            "test-clock-source", "test-durable-io", "test-named-pipe",
+            "test-git-bridge", "test-runner-identity", "test-sqlite-wal",
+            "test-tauri-e2e"
+          )
+          $hardFail = $false
+          foreach ($s in $spikes) {
+            $script = Join-Path "scripts/spikes" "$s.ps1"
+            if (-not (Test-Path $script)) {
+              Write-Error "[$s] wrapper 缺失，fail-closed"; $hardFail = $true; continue
+            }
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script
+            $code = $LASTEXITCODE
+            # 0=PASS, 2=BLOCKED_UNCERTIFIED（allowlist 内，不算失败）；其余=FAIL
+            if ($code -ne 0 -and $code -ne 2) {
+              Write-Error "[$s] 退出码 $code，判 FAIL"; $hardFail = $true
+            } else {
+              Write-Host "[$s] 退出码 $code（PASS 或 allowlist BLOCKED）"
+            }
+          }
+          if ($hardFail) { exit 1 }
       - name: 合同测试（Windows runner）
         run: python -m pytest tests/contract/ -q

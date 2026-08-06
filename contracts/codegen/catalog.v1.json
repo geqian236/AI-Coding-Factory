@@ -112,9 +112,9 @@
       "name": "TestReceipt",
       "schemaPath": "contracts/schemas/test-receipt.v1.schema.json",
       "schemaId": "test-receipt.v1",
-      "codegen": true,
-      "category": "generated",
-      "description": "机器可读测试回执"
+      "codegen": false,
+      "category": "runtime-only",
+      "description": "机器可读测试回执。单一真源 = schema + 手写 dataclass（含 validate()/from_dict() 行为，codegen 无法生成）；由 test_receipt_schema_conformance 机械绑定 dataclass 字段↔schema，杜绝双源漂移。"
     },
     {
       "name": "CompatibilityManifest",

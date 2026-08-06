@@ -16,8 +16,11 @@
 1. **本文件列出的检查项 = Phase 0 完成的完整定义**。全部通过即 Phase 0 达成，
    可进入 Phase 1；不得以"spec 里还有更多字段/功能"为由追加新的 Phase 0 阻断项。
 2. **Phase 0 的定位是"合同地基 + 平台兼容性认证"，不是完整平台实现**。
-   Master Spec §11 明确："Phase 0 只冻结纯输入/输出与拒绝规则；并发 CAS、
-   SQLite 事务、writer epoch 竞争留到 Phase 1"。功能实现属于 Phase 1+。
+   "纯输入/输出与拒绝规则"这一措辞在 Master Spec 中**仅约束 Phase 0 Task 4 的事件
+   物化器**（PreparedBatchV2 → DurableEventV2 纯函数），不是 §11 的全局规则。
+   本文件对每个移交 Phase 1 的项**各自给出独立理由**（见 §4 / PHASE_1_BACKLOG），
+   不再以"§11 只冻结纯输入/输出"作为笼统依据。有状态运行时（并发 CAS、SQLite
+   事务、writer epoch、授权消费状态机）按各自定位属于 Phase 1+。
 3. **新发现的缺陷分级**：
    - 若命中本文件某检查项 → 属 Phase 0，必须修。
    - 若不命中任何检查项 → 记入 `docs/operations/PHASE_1_BACKLOG.md`，不阻断 Phase 0。
@@ -49,7 +52,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 322 passed, 1 skipped（contract 191 + agent 78 + security 53） |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 327 passed, 1 skipped（contract 196 + agent 78 + security 53）；唯一 skip = `tests/agent/unit/test_config.py::D 盘固定卷检测`（环境受限，非失败） |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -119,8 +122,19 @@
 | sqlite_wal_full | **BLOCKED_UNCERTIFIED** | 核心（process-kill 恢复 / group-commit 原子 / events/bytes/age 三阈值 / PRAGMA 读回）全 PASS；必选 disk-full ENOSPC 子项无 admin VHD 无法认证 → 按优先级顶层 = BLOCKED_UNCERTIFIED（allowlist ID `spike:sqlite_wal_full/disk_full_enospc`） |
 | tauri_e2e | **BLOCKED_UNCERTIFIED**（Phase 0 spike ownership 保留） | Phase 0 拥有该 spike；本机无 WebView2/Tauri 运行时 → 正式 BLOCKED（allowlist ID `spike:tauri_e2e/webview_runtime`），非"待 Phase 2"移交 |
 
-**顶层状态优先级**：`FAIL > BLOCKED_UNCERTIFIED > PASS`。任一必选子项 FAIL 顶层即 FAIL；
-无 FAIL 但有必选子项 BLOCKED 顶层即 BLOCKED_UNCERTIFIED；全部子项 PASS 顶层才 PASS。
+**两级"顶层"区分（消除 §3 与 §5 的表面矛盾）**：
+
+1. **单个 spike 的顶层状态**（由该 spike 的子检查派生，优先级 `FAIL > BLOCKED_UNCERTIFIED > PASS`）：
+   任一子检查 FAIL → 该 spike = FAIL；无 FAIL 但有子检查 BLOCKED → 该 spike =
+   BLOCKED_UNCERTIFIED；全部子检查 PASS → 该 spike = PASS。据此 sqlite_wal_full 与
+   tauri_e2e 两个 spike 的**自身顶层** = BLOCKED_UNCERTIFIED。
+2. **验收运行的 topStatus**（`phase0-acceptance.ps1` 的总判定）：把每个 spike 的自身顶层
+   **按 §1.4 allowlist 归约成一个通过/不通过的 check**——核心 spike 必须自身 PASS 才算
+   check 通过；allowlist 内 spike（sqlite disk_full_enospc、tauri webview_runtime）自身
+   为 BLOCKED_UNCERTIFIED **即算该 check 通过**。所有 check 通过 → 验收运行 topStatus = PASS。
+
+> 因此"sqlite/tauri spike 自身顶层 = BLOCKED_UNCERTIFIED"与"验收运行 topStatus = PASS"
+> **不矛盾**——前者是 spike 级事实标注，后者是 allowlist 归约后的运行级判定。
 
 **冻结 BLOCKED allowlist（只有以下环境兼容 ID 允许 BLOCKED_UNCERTIFIED，其余必须 PASS）**：
 

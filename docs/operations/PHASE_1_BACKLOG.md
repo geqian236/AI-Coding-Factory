@@ -1,8 +1,12 @@
-# Phase 1 Backlog（Phase 0 审核中提出、按 Master Spec §11 正确分级到 Phase 1）
+# Phase 1 Backlog（Phase 0 审核中提出、按各项独立理由分级到 Phase 1）
 
 > **用途**：记录审核过程中提出的、**不命中 [PHASE_0_ACCEPTANCE.md](PHASE_0_ACCEPTANCE.md) 冻结验收集**
-> 的项。这些项真实存在、有价值，但按 Master Spec §11「Phase 0 只冻结纯输入/输出与
-> 拒绝规则；并发 CAS、SQLite 事务、writer epoch 竞争留到 Phase 1」应在 Phase 1+ 实现。
+> 的项。这些项真实存在、有价值，但属于**有状态运行时**（并发 CAS、SQLite 事务、
+> writer epoch、授权消费状态机等），应在 Phase 1+ 实现。
+>
+> **分级依据（更正）**：Master Spec 中"纯输入/输出与拒绝规则"仅约束 Phase 0 Task 4
+> 的事件物化器，**不是 §11 全局规则**。因此下方每一项**各自给出独立的 Phase 1 归属
+> 理由**，不以"§11 只冻结纯输入/输出"作笼统依据。
 >
 > 记录在此 = 不丢弃、可追踪、不阻断 Phase 0 收口。
 
@@ -22,11 +26,19 @@
   后写入并交叉核验，调用方无法自报 `observed:true`。属 §9.2 容器化执行实现。
 - **审核出处**：第二/三轮 P0-6 深层点。
 
-### B2. TestReceipt schema / dataclass / loader 单一生成真源
-- **现状（Phase 0）**：三者语义一致且互相校验（schema 是 required 权威、dataclass `validate()`
-  逐字段查、loader 反序列化）。测试覆盖三者一致性。
-- **Phase 1 目标**：dataclass 由 `contracts/codegen/generate.py` 从 schema 单一生成，
-  消除手写 dataclass 与 schema 漂移的可能。属 codegen 扩展。
+### B2. TestReceipt 单一真源 — ✅ 已在 Phase 0 消除（第四轮 REVISE item 2）
+- **已解决**：消除"生成 TypedDict + 手写 dataclass"双源。做法：
+  1. `contracts/codegen/catalog.v1.json` 的 test-receipt 改 `codegen=false` +
+     `category=runtime-only`——三语言生成树不再产出 `TestReceipt` TypedDict/interface/struct
+     （已重生成 + codegen `--check` 零漂移验证）。**schema 为字段/枚举单一真源**，
+     `factory_agent.testing.receipts.TestReceipt` dataclass 为唯一 Python 表示（承载 `validate()`
+     行为，codegen 无法生成）。
+  2. 新增机械一致性测试 `test_receipt_dataclass_matches_schema_*`：断言 dataclass 字段集 ==
+     schema properties 集、schema required ⊆ dataclass 字段、`KNOWN_RUNTIME_IDS` == schema
+     `runtimeId` enum。任一漂移即 fail-closed。
+  3. 修正真实漂移：dataclass 的 `runtimeId` 原不在 schema（schema `additionalProperties:false`
+     会拒绝），现作为可选属性 + enum 加入 schema。
+- **不再属 Phase 1**：双源已消除、漂移由测试机械防护，从 backlog 移除。
 
 ### B3. 真实 ENOSPC 认证
 - **现状（Phase 0）**：sqlite spike disk-full 子项诚实标 `BLOCKED_UNCERTIFIED`；

@@ -105,6 +105,14 @@
       "type": "string",
       "format": "date-time",
       "description": "回执创建时间"
+    },
+    "runtimeId": {
+      "type": "string",
+      "enum": [
+        "python-3.12", "python-3.11", "rust-1.80", "rust-stable",
+        "typescript-node-20", "typescript-node-22", "factory-agent-v0"
+      ],
+      "description": "运行时标识（可选；若存在则必须是已知 runtimeId。此 enum 是 receipts.py KNOWN_RUNTIME_IDS 的单一真源，由 test_receipt_schema_conformance 机械绑定）"
     }
   }
 }
