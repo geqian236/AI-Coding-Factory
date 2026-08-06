@@ -68,7 +68,9 @@ def schema_validation_errors(instance: dict[str, Any]) -> list[str]:
         import importlib
 
         jsonschema = importlib.import_module("jsonschema")
-        validator_cls = jsonschema.Draft7Validator  # type: ignore[attr-defined]
+        # import_module 返回 ModuleType，属性访问求值为 Any，故无需静态忽略注解
+        # （早先加的 attr-defined 忽略注解反被 mypy 判 unused-ignore）。
+        validator_cls = jsonschema.Draft7Validator
         validator = validator_cls(schema)
         errors: list[str] = []
         for err in sorted(validator.iter_errors(instance), key=lambda e: list(e.path)):
@@ -83,7 +85,7 @@ def schema_validation_errors(instance: dict[str, Any]) -> list[str]:
 
 
 def _stdlib_schema_errors(
-    instance: Any, schema: dict[str, Any], path: str, errors: list[str]
+    instance: object, schema: dict[str, Any], path: str, errors: list[str]
 ) -> None:
     """schema 驱动的 stdlib JSON Schema 校验器（Draft-07 子集，覆盖本 schema 全部关键字）。
 
