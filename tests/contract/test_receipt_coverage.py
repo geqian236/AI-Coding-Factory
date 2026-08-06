@@ -35,14 +35,26 @@ MISSING_FIXTURE = FIXTURES_DIR / "missing.json"
 CONFLICT_FIXTURE = FIXTURES_DIR / "conflict.json"
 FULL_COVERAGE_FIXTURE = FIXTURES_DIR / "full_coverage_valid.json"
 
-# P0-6 负例 fixture：每条都应在 verify() 中以非零退出 / passed=False 失败
+# P0-6 负例 fixture：每条都必须 fail-closed（verify passed=False）。
+# GPT 第七轮 item 3：load_receipts_from_file 现在对原始 JSON 先做全量 schema 校验，
+# 再构造 dataclass。故 schema-invalid 的负例在 **load 门** 就被拒（RECEIPTS_LOAD +
+# schema 点名字段），比旧的语义层拒绝更早、更强；schema-valid 但语义违规的负例仍在
+# verify 语义层被拒。每条标注捕获层与期望 token，断言据此精确匹配（不放宽）：
+#   layer="load"   -> 期望 result.errors 含 RECEIPTS_LOAD 且点名 <token>（schema 字段名）
+#   layer="verify" -> 期望 result.errors 含 <token>（语义错误码）
 P06_NEGATIVE_FIXTURES = {
-    "forged_empty_pass.json": "EMPTY_EXPECTED/EMPTY_ACTUAL",
-    "missing_owner.json": "MISSING_OWNER",
-    "owner_mismatch.json": "UNAUTHORIZED_OWNER",
-    "insufficient_replays.json": "INSUFFICIENT_REPLAYS",
-    "pass_without_digest.json": "MISSING_DIGEST",
-    "duplicate_receipt_id.json": "DUPLICATE_RECEIPT_ID",
+    # schema-invalid：expected/actual 空对象违反 minProperties -> load 门拒绝。
+    "forged_empty_pass.json": ("load", "expected"),
+    # schema-invalid：缺 required finalPassOwner -> load 门拒绝。
+    "missing_owner.json": ("load", "finalPassOwner"),
+    # schema-invalid：缺 required scenarioContractDigest -> load 门拒绝。
+    "pass_without_digest.json": ("load", "scenarioContractDigest"),
+    # schema-valid，语义违规：owner 不在白名单 -> verify 语义层拒绝。
+    "owner_mismatch.json": ("verify", "UNAUTHORIZED_OWNER"),
+    # schema-valid，语义违规：PASS 去重数 < requiredReplays -> verify 覆盖门禁拒绝。
+    "insufficient_replays.json": ("verify", "INSUFFICIENT_REPLAYS"),
+    # schema-valid，语义违规：receiptId 全局重复 -> verify 语义层拒绝。
+    "duplicate_receipt_id.json": ("verify", "DUPLICATE_RECEIPT_ID"),
 }
 
 # 精确期望的 47 个测试 ID（同 test_schema_catalog.py 以保持一致性）
@@ -141,19 +153,18 @@ def test_valid_receipt_passes_model_validation() -> None:
         assert not errors, f"valid.json 回执 [{receipt.receiptId}] 验证失败: {errors}"
 
 
-def test_missing_env_digest_fails_model_validation() -> None:
-    """missing.json 中的回执必须因 MISSING_ENV_DIGEST 而失败。"""
+def test_missing_env_digest_fails_at_load() -> None:
+    """missing.json 空 environmentManifestDigest（minLength）+ 空 actual（minProperties）
+    是 schema-invalid（GPT 第七轮 item 3）：load_receipts_from_file 必须在构造 dataclass
+    前对原始 JSON 做全量 schema 校验并抛 ValueError，而非等到 dataclass 归一化后。
+
+    旧行为：from_dict 归一化后 validate() 才报 MISSING_ENV_DIGEST（有损归一化可掩盖
+    缺字段/未知字段）。新行为：raw schema 校验在 load 层 fail-closed，错误消息点名字段。
+    """
     from factory_agent.testing.receipts import load_receipts_from_file  # type: ignore[import]
 
-    receipts = load_receipts_from_file(MISSING_FIXTURE)
-    assert len(receipts) >= 1, "missing.json 应至少包含一个回执"
-    all_errors: list[str] = []
-    for receipt in receipts:
-        all_errors.extend(receipt.validate())
-    env_errors = [e for e in all_errors if "MISSING_ENV_DIGEST" in e]
-    assert env_errors, (
-        f"missing.json 应产生 MISSING_ENV_DIGEST 错误，但未发现。所有错误: {all_errors}"
-    )
+    with pytest.raises(ValueError, match="environmentManifestDigest"):
+        load_receipts_from_file(MISSING_FIXTURE)
 
 
 def test_conflict_fixture_has_two_receipts_for_same_id() -> None:
@@ -183,13 +194,20 @@ def test_verify_valid_fixture_passes() -> None:
 
 
 def test_verify_missing_env_digest_fixture_fails() -> None:
-    """verify(catalog, missing.json) 必须因 MISSING_ENV_DIGEST 返回 passed=False。"""
+    """verify(catalog, missing.json) 必须 fail-closed。
+
+    GPT 第七轮 item 3：load 层现对原始 JSON 做全量 schema 校验，missing.json 的空
+    environmentManifestDigest（minLength）+ 空 actual（minProperties）在 load 层即被
+    拒（RECEIPTS_LOAD，点名 environmentManifestDigest），verify() 据此 fail-closed。
+    这比旧的「归一化后 validate 报 MISSING_ENV_DIGEST」更强——原始违规不再被有损归一化掩盖。
+    """
     from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
 
     result = verify(CATALOG_PATH, MISSING_FIXTURE)
     assert not result.passed, "missing.json 应验证失败"
-    env_errors = [e for e in result.errors if "MISSING_ENV_DIGEST" in e]
-    assert env_errors, f"缺少 MISSING_ENV_DIGEST 错误。所有错误: {result.errors}"
+    # load 层 schema 报错点名 environmentManifestDigest（RECEIPTS_LOAD 包裹）。
+    named = [e for e in result.errors if "environmentManifestDigest" in e]
+    assert named, f"错误应点名 environmentManifestDigest。所有错误: {result.errors}"
 
 
 def test_verify_conflict_fixture_fails() -> None:
@@ -206,6 +224,10 @@ def test_verify_rejects_unmapped_test_id(tmp_path: Path) -> None:
     """testId 不在 catalog 中时 verify 必须报告 UNMAPPED_ID 错误。"""
     from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
 
+    # UNMAPPED_ID 是 catalog 语义（testId 不在 catalog），非 schema 约束——回执本身
+    # 必须 schema-valid（第七轮 item 3：load 层已对原始 JSON 做全量 schema 校验，
+    # 空 expected/actual、缺 owner 等会在 load 层被拒，测不到语义规则）。故内联回执
+    # 补全所有 required 字段 + 非空 expected/actual，只让 testId 越界以隔离 UNMAPPED_ID。
     receipt_file = tmp_path / "unknown_id.json"
     receipt_file.write_text(
         json.dumps([{
@@ -213,12 +235,16 @@ def test_verify_rejects_unmapped_test_id(tmp_path: Path) -> None:
             "testId": "NONEXISTENT-TEST-001",
             "environmentManifestDigest": "sha256:" + "a" * 64,
             "actions": [{"actionId": "act-001", "description": "test action", "executedAt": "2026-08-04T00:00:00Z"}],
-            "expected": {},
-            "actual": {},
+            "expected": {"ok": True},
+            "actual": {"ok": True},
             "sideEffectCount": 0,
             "artifactDigests": ["sha256:" + "b" * 64],
             "result": "PASS",
             "createdAt": "2026-08-04T00:00:00Z",
+            "finalPassOwner": "codex-reviewer",
+            "qualification": "FINAL",
+            "requiredReplays": 1,
+            "scenarioContractDigest": "sha256:" + "0" * 64,
         }]),
         encoding="utf-8",
     )
@@ -229,7 +255,14 @@ def test_verify_rejects_unmapped_test_id(tmp_path: Path) -> None:
 
 
 def test_verify_rejects_manual_pass(tmp_path: Path) -> None:
-    """result=PASS 但 actions 为空时必须报告 MANUAL_PASS 错误。"""
+    """空 actions（疑似手工文字 PASS）现在在 load 层就被拒（第七轮 item 3 强化）。
+
+    schema 声明 actions.minItems=1；旧代码靠归一化后 validate() 的 MANUAL_PASS 语义
+    检查，而第七轮要求 load_receipts_from_file 先对原始 JSON 做全量 schema 校验——
+    空 actions 在构造 dataclass 之前就被 fail-closed，比语义层更早。verify() 捕获
+    load 异常并以 RECEIPTS_LOAD 报告，错误必须点名 actions。
+    """
+    from factory_agent.testing.receipts import load_receipts_from_file  # type: ignore[import]
     from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
 
     receipt_file = tmp_path / "manual_pass.json"
@@ -238,24 +271,40 @@ def test_verify_rejects_manual_pass(tmp_path: Path) -> None:
             "receiptId": "rcpt-manual-pass-001",
             "testId": "PLAN-HASH-001",
             "environmentManifestDigest": "sha256:" + "a" * 64,
-            "actions": [],          # 空 actions → 疑似手工文字 PASS
-            "expected": {},
-            "actual": {},
+            "actions": [],          # 空 actions → schema minItems=1 违规
+            "expected": {"ok": True},
+            "actual": {"ok": True},
             "sideEffectCount": 0,
             "artifactDigests": [],
             "result": "PASS",
             "createdAt": "2026-08-04T00:00:00Z",
+            "finalPassOwner": "codex-reviewer",
+            "qualification": "FINAL",
+            "requiredReplays": 1,
+            "scenarioContractDigest": "sha256:" + "0" * 64,
         }]),
         encoding="utf-8",
     )
+    # load 层 fail-closed：空 actions 违反 schema，抛 ValueError 点名 actions。
+    with pytest.raises(ValueError, match="actions"):
+        load_receipts_from_file(receipt_file)
+    # verify() 捕获为 RECEIPTS_LOAD 并 fail-closed。
     result = verify(CATALOG_PATH, receipt_file)
     assert not result.passed
-    manual_errors = [e for e in result.errors if "MANUAL_PASS" in e]
-    assert manual_errors, f"缺少 MANUAL_PASS 错误。所有错误: {result.errors}"
+    assert any("RECEIPTS_LOAD" in e and "actions" in e for e in result.errors), (
+        f"应因 actions 违反 schema 在 load 层 fail-closed。所有错误: {result.errors}"
+    )
 
 
 def test_verify_rejects_unknown_runtime(tmp_path: Path) -> None:
-    """runtimeId 不在已知列表时必须报告 UNKNOWN_RUNTIME 错误。"""
+    """未知 runtimeId 现在在 load 层就被拒（第七轮 item 3 强化）。
+
+    runtimeId enum 是 schema 单一真源（KNOWN_RUNTIME_IDS 由 test 机械绑定）；第七轮
+    要求 load 先对原始 JSON 做全量 schema 校验，故越界 runtimeId 在构造 dataclass 前
+    即 fail-closed，比 validate() 的 UNKNOWN_RUNTIME 语义检查更早。其余字段全部合规，
+    使唯一违规为 runtimeId。
+    """
+    from factory_agent.testing.receipts import load_receipts_from_file  # type: ignore[import]
     from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
 
     receipt_file = tmp_path / "unknown_runtime.json"
@@ -265,20 +314,29 @@ def test_verify_rejects_unknown_runtime(tmp_path: Path) -> None:
             "testId": "PLAN-HASH-001",
             "environmentManifestDigest": "sha256:" + "a" * 64,
             "actions": [{"actionId": "act-001", "description": "run test", "executedAt": "2026-08-04T00:00:00Z"}],
-            "expected": {},
-            "actual": {},
+            "expected": {"ok": True},
+            "actual": {"ok": True},
             "sideEffectCount": 0,
             "artifactDigests": ["sha256:" + "b" * 64],
             "result": "PASS",
             "createdAt": "2026-08-04T00:00:00Z",
-            "runtimeId": "unknown-runtime-x99",   # 未知运行时
+            "finalPassOwner": "codex-reviewer",
+            "qualification": "FINAL",
+            "requiredReplays": 1,
+            "scenarioContractDigest": "sha256:" + "0" * 64,
+            "runtimeId": "unknown-runtime-x99",   # enum 越界 → schema 违规
         }]),
         encoding="utf-8",
     )
+    # load 层 fail-closed：runtimeId 不在 enum，抛 ValueError 点名 runtimeId。
+    with pytest.raises(ValueError, match="runtimeId"):
+        load_receipts_from_file(receipt_file)
+    # verify() 捕获为 RECEIPTS_LOAD 并 fail-closed。
     result = verify(CATALOG_PATH, receipt_file)
     assert not result.passed
-    rt_errors = [e for e in result.errors if "UNKNOWN_RUNTIME" in e]
-    assert rt_errors, f"缺少 UNKNOWN_RUNTIME 错误。所有错误: {result.errors}"
+    assert any("RECEIPTS_LOAD" in e and "runtimeId" in e for e in result.errors), (
+        f"应因 runtimeId 违反 schema enum 在 load 层 fail-closed。所有错误: {result.errors}"
+    )
 
 
 # ─────────────────────── CLI 集成测试（subprocess）────────────────────────────
@@ -350,15 +408,21 @@ def test_p06_positive_fixture_exists() -> None:
 
 
 @pytest.mark.parametrize(
-    ("fixture_name", "expected_error_token"),
+    ("fixture_name", "expected"),
     list(P06_NEGATIVE_FIXTURES.items()),
 )
 def test_p06_negative_fixture_fails_closed(
-    fixture_name: str, expected_error_token: str
+    fixture_name: str, expected: tuple[str, str]
 ) -> None:
-    """每个 P0-6 负例 fixture 在 verify() 中必须 fail closed 且触发预期错误码。"""
+    """每个 P0-6 负例 fixture 必须 fail closed，且在预期层触发预期错误。
+
+    GPT 第七轮 item 3：schema-invalid 负例在 load 门被拒（RECEIPTS_LOAD + schema
+    点名字段）；schema-valid 但语义违规的负例在 verify 语义层被拒。断言精确匹配层
+    与 token，不放宽（load 门是比语义层更早、更强的 fail-closed，不是绕过）。
+    """
     from factory_agent.testing.verify_receipts import verify  # type: ignore[import]
 
+    layer, token = expected
     fixture_path = FIXTURES_DIR / fixture_name
     # insufficient_replays.json 需要 require_coverage=True 才能触发 INSUFFICIENT_REPLAYS
     require_coverage = fixture_name == "insufficient_replays.json"
@@ -366,11 +430,23 @@ def test_p06_negative_fixture_fails_closed(
     assert not result.passed, (
         f"{fixture_name} 应验证失败（fail closed），但实际通过"
     )
-    matched = [e for e in result.errors if expected_error_token.split("/")[0] in e]
-    assert matched, (
-        f"{fixture_name} 应触发 {expected_error_token} 错误，但未发现。"
-        f"所有错误: {result.errors}"
-    )
+    if layer == "load":
+        # schema-invalid：verify 的 load 步骤捕获 ValueError 记为 RECEIPTS_LOAD，
+        # 且 schema 错误必须点名该缺失/空字段。
+        matched = [
+            e for e in result.errors
+            if "RECEIPTS_LOAD" in e and token in e
+        ]
+        assert matched, (
+            f"{fixture_name} 应在 load 门以 RECEIPTS_LOAD 拒绝且点名 '{token}'，"
+            f"但未发现。所有错误: {result.errors}"
+        )
+    else:
+        matched = [e for e in result.errors if token in e]
+        assert matched, (
+            f"{fixture_name} 应在 verify 语义层触发 {token} 错误，但未发现。"
+            f"所有错误: {result.errors}"
+        )
 
 
 def test_p06_positive_fixture_passes_full_coverage() -> None:

@@ -44,7 +44,8 @@ jobs:
         # jsonschema：test_receipt_schema_conformance 用真库对 stdlib 回退校验器做
         # 逐例等价证明（GPT 第六轮 item 3）；装了它该测试才真跑而非 importorskip 假绿，
         # 且 receipts.validate() 在 CI 走权威 jsonschema 而非回退实现。
-        run: pip install pytest jsonschema
+        # 版本 pin 到 uv.lock 冻结值（GPT 第七轮 repro：不用无约束安装依赖本机偶然环境）。
+        run: pip install pytest "jsonschema==4.26.0"
       - name: Codegen drift 检测
         # 三语言生成树必须无漂移；漂移即整体红（fail-closed）。
         run: python contracts/codegen/generate.py --check
@@ -149,7 +150,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 安装 pytest
-        run: pip install pytest jsonschema
+        # jsonschema pin 到 uv.lock 冻结值（GPT 第七轮 repro：frozen 安装）。
+        run: pip install pytest "jsonschema==4.26.0"
       - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
         shell: pwsh
         run: |
@@ -192,10 +194,16 @@ jobs:
           $env:SPIKE_CANDIDATE_SHA = "$env:GITHUB_SHA"
           $runStart = Get-Date
 
-          # Purge 全部 receipt：CI checkout 无 receipt（已 gitignore），但显式 purge 保
-          # 证「本轮产出」语义与 runner 一致（freshness mtime >= runStart 才通过）。
+          # Purge 全部 receipt，fail-closed（GPT 第七轮 item 1，与 runner 一致）：删除用
+          # -ErrorAction Stop 并断言文件已消失。锁定文件删除失败后若被后续 stamp/wrapper
+          # 写入刷新 mtime，freshness 会假通过——故残留即整体红。
           foreach ($name in $receipts.Keys) {
-            if (Test-Path $receipts[$name]) { Remove-Item $receipts[$name] -Force }
+            $rp = $receipts[$name]
+            if (Test-Path $rp) {
+              try { Remove-Item $rp -Force -ErrorAction Stop }
+              catch { Write-Error "[$name] 无法 purge 陈旧 receipt '$rp': $_，fail-closed"; exit 1 }
+            }
+            if (Test-Path $rp) { Write-Error "[$name] purge 后 receipt '$rp' 仍在（锁定?），fail-closed"; exit 1 }
           }
 
           $hardFail = $false
@@ -208,6 +216,16 @@ jobs:
             & pwsh -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String | Write-Host
             $wrapperExit = $LASTEXITCODE
             if ($null -eq $wrapperExit) { $wrapperExit = 0 }
+            # GPT 第七轮 item 1：盖章前捕获 mtime（stamp 会刷新它），freshness 用盖章前值。
+            $preStampMtime = [datetime]::MinValue
+            if (Test-Path $receipt) { $preStampMtime = (Get-Item $receipt).LastWriteTime }
+            # GPT 第七轮 item 2：sqlite 的 probe 是 bench.py（自报 probeDigest+candidateSha）。
+            # 计算期望 bench.py digest，validator 的 run_nonce 分支据此绑定真实探针+候选。
+            $expectProbeDigest = ""
+            if ($name -eq "sqlite_wal_full") {
+              $benchPy = "tools/compat-probes/sqlite_wal_full/bench.py"
+              $expectProbeDigest = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $benchPy).Hash.ToLower()
+            }
             # 六份非 sqlite receipt 盖 runBinding（sqlite 走 run_nonce，避免扰动
             # emit_manifest 对 eventBatchParameters 的 digest 重算）。
             if ($name -ne "sqlite_wal_full" -and (Test-Path $receipt)) {
@@ -220,10 +238,12 @@ jobs:
               EnvCompat          = ($envCompat -contains $name)
               Allowlist          = $allowlist
               RunStart           = $runStart
+              ReceiptMtime       = $preStampMtime
               WrapperExitCode    = $wrapperExit
               ExpectRunId        = $env:SPIKE_RUN_ID
               ExpectRunNonce     = $env:SPIKE_RUN_NONCE
               ExpectCandidateSha = $env:SPIKE_CANDIDATE_SHA
+              ExpectProbeDigest  = $expectProbeDigest
             }
             $v = Test-SpikeReceiptEvidence @vArgs
             if ($v.ok) {

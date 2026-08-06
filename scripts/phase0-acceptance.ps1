@@ -117,20 +117,37 @@ function Test-ReparsePointInChain {
     }
     return $null
 }
+$rootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
 foreach ($k in $_cacheDirs.Keys) {
     $dir = $_cacheDirs[$k]
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
-    # Fail-closed: the physical target must resolve under the project root (lexical).
+    # GPT round-7 item 4: validate BEFORE the first write. The old order ran New-Item
+    # first and only then checked lexical root + reparse chain - so a junctioned target
+    # dir was already created (a write) before the guard tripped, violating "fail-closed
+    # before any write". Now: (1) lexical check, (2) reparse-check the nearest EXISTING
+    # ancestor chain (Test-ReparsePointInChain skips not-yet-existing leaves and walks up
+    # to the first real ancestor), both BEFORE New-Item; (3) create; (4) re-check the FULL
+    # chain including the newly created dir.
+    # (1) lexical: the physical target must resolve under the project root.
     $full = [System.IO.Path]::GetFullPath($dir)
-    $rootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
     if ($full.TrimEnd('\') -ne $rootFull -and -not $full.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Error "[acceptance] fail-closed: cache path $k '$full' is not under project root '$PROJECT_ROOT'."
         exit 1
     }
-    # Fail-closed: no junction/symlink in the chain may redirect the physical target out.
-    $rp = Test-ReparsePointInChain -Leaf $dir -Root $PROJECT_ROOT
-    if ($rp) {
-        Write-Error "[acceptance] fail-closed: cache path $k chain contains reparse point '$rp' (possible junction escape out of project root)."
+    # (2) reparse-check the nearest existing ancestor chain BEFORE creating anything:
+    # if a parent is already a junction/symlink pointing off the project root, creating
+    # under it would land the write on C: - reject before the write happens.
+    $rpPre = Test-ReparsePointInChain -Leaf $dir -Root $PROJECT_ROOT
+    if ($rpPre) {
+        Write-Error "[acceptance] fail-closed: cache path $k ancestor '$rpPre' is a reparse point (junction escape) - refusing to write under it."
+        exit 1
+    }
+    # (3) now safe to create.
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    # (4) re-check the FULL chain (incl. the newly created dir) - defends against a TOCTOU
+    # swap between the pre-check and creation.
+    $rpPost = Test-ReparsePointInChain -Leaf $dir -Root $PROJECT_ROOT
+    if ($rpPost) {
+        Write-Error "[acceptance] fail-closed: cache path $k chain contains reparse point '$rpPost' after creation (possible junction escape out of project root)."
         exit 1
     }
     Set-Item -Path "Env:$k" -Value $dir
@@ -341,9 +358,26 @@ $runStart = Get-Date
 # on a gitignored receipt from a prior round. With the freshness check
 # (mtime >= runStart) this proves every receipt A-1 later reads was produced by
 # THIS run, closing the historical-pollution hole `git status` cannot detect.
+#
+# GPT round-7 item 1: delete MUST be fail-closed. Under the global
+# $ErrorActionPreference='Continue', a locked/undeletable receipt let Remove-Item
+# fail silently; the stale file survived, and a later stamp/wrapper write merely
+# refreshed its mtime so the freshness check still accepted it. We now delete with
+# -ErrorAction Stop and ASSERT the file is gone; any residual receipt aborts the run.
 foreach ($name in $spikeReceipts.Keys) {
     $rp = Join-Path $REPO_ROOT $spikeReceipts[$name]
-    if (Test-Path -LiteralPath $rp) { Remove-Item -LiteralPath $rp -Force }
+    if (Test-Path -LiteralPath $rp) {
+        try {
+            Remove-Item -LiteralPath $rp -Force -ErrorAction Stop
+        } catch {
+            Write-Error "[acceptance] fail-closed: could not purge stale receipt '$rp': $_"
+            exit 1
+        }
+    }
+    if (Test-Path -LiteralPath $rp) {
+        Write-Error "[acceptance] fail-closed: stale receipt '$rp' still present after purge (locked?); a refreshed mtime would defeat freshness."
+        exit 1
+    }
 }
 
 # Rust env for cargo-building wrappers (clock/durable-io/named-pipe/runner-
@@ -373,26 +407,47 @@ foreach ($name in ($spikeReceipts.Keys)) {
     } else {
         Write-Host "  [spike:$name] wrapper MISSING: $wrapper"
     }
+    # GPT round-7 item 1: capture the receipt mtime BEFORE stamping. Stamping (below)
+    # rewrites the file and refreshes mtime, so freshness MUST be judged on this
+    # pre-stamp timestamp - otherwise a wrapper that failed to regenerate its receipt
+    # (stale file surviving a failed purge) would be laundered fresh by the stamp write.
+    $preStampMtime = [datetime]::MinValue
+    if (Test-Path -LiteralPath $receiptPath) {
+        $preStampMtime = (Get-Item -LiteralPath $receiptPath).LastWriteTime
+    }
+    # GPT round-7 item 2: sqlite's probe is bench.py, which self-reports
+    # probeDigest = sha256(bench.py) + candidateSha = git HEAD. The old validator's
+    # run_nonce branch checked ONLY the nonce, so a receipt with the right nonce but
+    # zeroed candidateSha/probeDigest passed. Compute the expected bench.py digest here
+    # so the validator can bind sqlite to the real on-disk probe + this candidate.
+    $expectProbeDigest = ""
+    if ($name -eq "sqlite_wal_full") {
+        $benchPy = Join-Path $REPO_ROOT "tools/compat-probes/sqlite_wal_full/bench.py"
+        $expectProbeDigest = Get-FileSha256 $benchPy
+    }
     # Stamp runBinding into the six non-sqlite receipts (item 2d). sqlite binds via
-    # run_nonce; stamping it would round-trip a receipt whose digests emit_manifest
-    # recomputes, risking a false digest mismatch.
+    # run_nonce + candidateSha + probeDigest (all written by bench.py); stamping sqlite
+    # would round-trip a receipt whose digests emit_manifest recomputes.
     if ($name -ne "sqlite_wal_full" -and (Test-Path -LiteralPath $receiptPath)) {
         python $stampScript $receiptPath $name | Write-Host
         if ($LASTEXITCODE -ne 0) {
             Write-Host "  [spike:$name] WARNING stamp_run_binding exit=$LASTEXITCODE (binding check fails closed)"
         }
     }
-    # Shared evidence validation (single source of truth with CI; item 4).
+    # Shared evidence validation (single source of truth with CI; item 4). ReceiptMtime
+    # is the PRE-stamp mtime so freshness is judged before stamping refreshed it.
     $vArgs = @{
         Name               = $name
         Path               = $receiptPath
         EnvCompat          = $isEnv
         Allowlist          = [string[]]$BLOCKED_ALLOWLIST.Keys
         RunStart           = $runStart
+        ReceiptMtime       = $preStampMtime
         WrapperExitCode    = $wrapperExit
         ExpectRunId        = $runId
         ExpectRunNonce     = $runNonce
         ExpectCandidateSha = $candidateSha
+        ExpectProbeDigest  = $expectProbeDigest
     }
     $v = Test-SpikeReceiptEvidence @vArgs
     $spikeStatuses[$name] = $v.status

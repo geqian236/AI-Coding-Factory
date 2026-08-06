@@ -443,7 +443,16 @@ def load_receipts_from_file(path: Path) -> list[TestReceipt]:
     从单个 JSON 文件加载回执列表。
 
     文件格式：JSON 数组，每个元素为一个 TestReceipt 对象。
-    加载失败时抛出 ValueError（包含文件路径和原因）。
+
+    GPT 第七轮 blocker 3：构造 dataclass 前必须先对**原始 JSON 对象**做完整
+    schema 校验并 fail-closed。根因——TestReceipt.from_dict() 会丢弃未知字段、
+    为缺失字段补默认值（有损归一化），使得原始 JSON 违反 schema（多未知字段 /
+    缺 required 字段）的对象在加载后 validate() 反而返回 0 错误（validate 校验的
+    是已归一化的 to_dict()）。此处在 from_dict 之前逐条对 raw item 跑
+    schema_validation_errors（真 jsonschema 优先 / stdlib 回退），任一违规即抛
+    ValueError，把结构性拒绝提前到加载边界，杜绝有损归一化掩盖伪造。
+
+    加载失败时抛出 ValueError（包含文件路径、条目下标和 schema 错误）。
     """
     try:
         with path.open(encoding="utf-8") as f:
@@ -458,6 +467,13 @@ def load_receipts_from_file(path: Path) -> list[TestReceipt]:
     for i, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"回执条目 [{i}] 不是对象 [{path}]")
+        # blocker 3：先对原始对象做完整 schema 校验（未经 from_dict 归一化），
+        # 任一违规即 fail-closed，避免归一化掩盖「未知字段 / 缺 required 字段」。
+        schema_errors = schema_validation_errors(item)
+        if schema_errors:
+            raise ValueError(
+                f"回执条目 [{i}] 未通过 schema 校验 [{path}]: {'; '.join(schema_errors)}"
+            )
         try:
             receipts.append(TestReceipt.from_dict(item))
         except KeyError as exc:

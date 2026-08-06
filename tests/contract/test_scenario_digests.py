@@ -165,13 +165,16 @@ def test_digest_mismatch_is_rejected(tmp_path: Path) -> None:
                 "description": "run",
                 "executedAt": "2026-08-05T00:00:00Z",
             }],
-            "expected": {},
-            "actual": {},
+            "expected": {"ok": True},    # schema-valid: minProperties=1
+            "actual": {"ok": True},      # schema-valid: minProperties=1
             "sideEffectCount": 0,
             "artifactDigests": [],
             "result": "PASS",
             "createdAt": "2026-08-05T00:00:00Z",
             "scenarioContractDigest": "sha256:" + "0" * 64,  # 故意与 catalog 冻结值不符
+            "finalPassOwner": "codex-reviewer",   # required by schema (P0-6)
+            "qualification": "FINAL",             # required by schema
+            "requiredReplays": 1,                 # required by schema
         }]),
         encoding="utf-8",
     )

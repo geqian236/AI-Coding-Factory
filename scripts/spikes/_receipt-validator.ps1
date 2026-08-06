@@ -44,7 +44,9 @@ function Test-SpikeReceiptEvidence {
         [int]      $WrapperExitCode = 0,                          # observed wrapper exit code (item 2c)
         [string]   $ExpectRunId = "",                             # item 2d run binding expectations (empty => skip binding check)
         [string]   $ExpectRunNonce = "",
-        [string]   $ExpectCandidateSha = ""
+        [string]   $ExpectCandidateSha = "",
+        [string]   $ExpectProbeDigest = "",                       # round-7 item 2: sqlite run_nonce branch must ALSO bind probeDigest
+        [datetime] $ReceiptMtime = [datetime]::MinValue           # round-7 item 1: pre-stamp mtime (stamping refreshes mtime; freshness must use the wrapper's own write time, not the post-stamp one)
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -70,10 +72,16 @@ function Test-SpikeReceiptEvidence {
 
     # Freshness: regenerated during THIS run. A stale receipt from a prior round is
     # rejected, so the caller cannot pass on historical evidence.
+    # Round-7 item 1: the runner stamps runBinding AFTER the wrapper writes, which
+    # refreshes the file mtime - so the on-disk mtime can no longer prove the WRAPPER
+    # regenerated it this round (a purge that silently failed + a stamp would refresh a
+    # stale receipt's mtime and slip through). The caller therefore captures the
+    # PRE-STAMP mtime (the wrapper's own write time) and passes it as $ReceiptMtime; we
+    # use that when supplied, falling back to the on-disk mtime only when it is absent.
     if ($RunStart -ne [datetime]::MinValue) {
-        $mtime = (Get-Item -LiteralPath $Path).LastWriteTime
+        $mtime = if ($ReceiptMtime -ne [datetime]::MinValue) { $ReceiptMtime } else { (Get-Item -LiteralPath $Path).LastWriteTime }
         if ($mtime -lt $RunStart) {
-            return @{ ok = $false; status = "STALE"; detail = "receipt mtime $($mtime.ToString('o')) < runStart $($RunStart.ToString('o'))" }
+            return @{ ok = $false; status = "STALE"; detail = "receipt (pre-stamp) mtime $($mtime.ToString('o')) < runStart $($RunStart.ToString('o')) (wrapper did not regenerate this round)" }
         }
     }
 
@@ -99,8 +107,25 @@ function Test-SpikeReceiptEvidence {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.spike='$($rb.spike)' != '$Name'" }
             }
         } elseif ($hasNonce) {
+            # sqlite path: bench.py writes run_nonce + candidateSha + probeDigest natively.
+            # Round-6 item 2 (GPT round-7): the old run_nonce branch checked ONLY the
+            # nonce and ignored candidateSha/probeDigest, so a forged receipt with the
+            # right nonce but candidateSha/probeDigest all-zero was accepted. We now bind
+            # ALL THREE: nonce + candidate (exact commit) + probe (sha256 of bench.py).
             if ([string]$obj.run_nonce -ne $ExpectRunNonce) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "run_nonce='$($obj.run_nonce)' != '$ExpectRunNonce'" }
+            }
+            if ($ExpectCandidateSha -ne "") {
+                $rcptSha = if ($obj.PSObject.Properties.Name -contains "candidateSha") { [string]$obj.candidateSha } else { "" }
+                if ($rcptSha -ne $ExpectCandidateSha) {
+                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt candidateSha='$rcptSha' != '$ExpectCandidateSha' (nonce alone is insufficient)" }
+                }
+            }
+            if ($ExpectProbeDigest -ne "") {
+                $rcptProbe = if ($obj.PSObject.Properties.Name -contains "probeDigest") { [string]$obj.probeDigest } else { "" }
+                if ($rcptProbe -ne $ExpectProbeDigest) {
+                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt probeDigest='$rcptProbe' != expected '$ExpectProbeDigest' (probe source mismatch/forgery)" }
+                }
             }
         } else {
             return @{ ok = $false; status = "BINDING_MISSING"; detail = "no runBinding and no run_nonce; receipt not bound to this run" }

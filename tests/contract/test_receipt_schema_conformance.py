@@ -29,8 +29,10 @@ from typing import Any
 
 import pytest
 
-# 真 jsonschema 是本测试的参考实现；缺库则无法证明等价，直接 skip。
-jsonschema = pytest.importorskip("jsonschema")
+# 真 jsonschema 是本测试的参考实现。GPT 第七轮 repro：jsonschema 已纳入
+# pyproject.toml dependencies + uv.lock（frozen），不再依赖本机偶然环境，故用
+# 硬 import 而非 importorskip——缺库应是安装/锁文件缺陷，必须硬失败而非静默 skip。
+import jsonschema  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "test-receipt.v1.schema.json"

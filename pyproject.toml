@@ -6,7 +6,12 @@ description = "AI Coding Factory — Python monorepo 根配置"
 readme = "README.md"
 requires-python = ">=3.12"
 
-dependencies = []
+# jsonschema：receipts.py 的 TestReceipt.validate() 运行时用它做**权威全量** JSON
+# Schema 校验（GPT 第七轮 repro：不能靠 importorskip 依赖本机偶然环境）。声明为运行
+# 时依赖并写入 uv.lock，CI 用 frozen 安装锁定版本，验收环境行为可复现。
+dependencies = [
+    "jsonschema>=4.20.0",
+]
 
 [dependency-groups]
 # 所有缓存/数据均在 D 盘，由 scripts/dev.ps1 环境包装器控制。

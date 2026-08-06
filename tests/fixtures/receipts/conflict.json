@@ -23,6 +23,7 @@
     ],
     "result": "PASS",
     "createdAt": "2026-08-04T00:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
     "implementationContributors": [
       "factory-contracts"
     ],
@@ -55,6 +56,7 @@
     "result": "FAIL",
     "failureReason": "Rust DurableEventV2 hash 与 Python baseline 不一致；此 fixture 预期被 verify_receipts 以 CONFLICTING_RESULTS 拒绝",
     "createdAt": "2026-08-04T01:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
     "implementationContributors": [
       "factory-contracts"
     ],
