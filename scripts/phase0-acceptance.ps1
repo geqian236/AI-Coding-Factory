@@ -85,6 +85,10 @@ $DATA_ROOT = Join-Path $PROJECT_ROOT "AI-Coding-Factory-Data\dev"
 # SHA-256 of the normalized $REPO_ROOT so each checkout is isolated. dev.ps1,
 # check.ps1 and the durable-io/runner-identity wrappers dot-source the same helper.
 . (Join-Path $PSScriptRoot "_worktree-target.ps1")
+# GPT round-13 P1-1: the uv-locked Python probe is a single shared function (used by
+# B-2 here AND check.ps1's pre-gate probe AND the regression test), so a mutation can
+# be caught in one place. See scripts/_python-probe.ps1.
+. (Join-Path $PSScriptRoot "_python-probe.ps1")
 
 # --- W3 storage contract: every cache/temp path must live under the project ---
 # root. GPT round-5 item 3: the runner set only Rust paths, leaving TEMP/TMP/
@@ -352,9 +356,11 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
 # py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 338 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/9:
-# the 8 Windows-only contract tests skip off-platform AND the sqlite-receipt test
-# skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first).
+# baseline is now 338 passed / 1 skipped (Windows runner; Ubuntu fresh = 199/8:
+# 7 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first.
+# round-13 P1-1: the pin-probe's Test B is cross-platform (reads script text), so it
+# runs on Ubuntu too - one fewer Windows-only skip than round-12, hence 199/8 not 198/9).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -587,29 +593,20 @@ Add-CheckResult "A-3b-count" "cargo test frozen count == $FROZEN_CARGO_PASSED" (
 # `uv run --locked python`, so setting UV_PYTHON=3.13 can no longer let A-1 run on 3.13
 # while B-2 silently passes on system 3.12. The exact version string feeds the receipt.
 Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned (uv-locked env)" {
-    # Capture into a var, read $LASTEXITCODE immediately, THEN use it (never pipe a
-    # native command straight into Select-Object before reading the exit code - that
-    # trips StopUpstreamCommandsException and pollutes $LASTEXITCODE, see check.ps1).
-    #
-    # GPT round-12 P2: redirect stderr to $null (NOT 2>&1). uv emits warnings to stderr
-    # (e.g. "warning: VIRTUAL_ENV=... will be ignored" when a mismatched VIRTUAL_ENV is
-    # set); 2>&1 merged that warning INTO the stream and the old "first line" grab put it
-    # into receipt.pythonVersion, breaking the machine-readable receipt. The exit-code
-    # assertion was still sound (no false PASS), but the string was polluted. Now stdout
-    # (version only) is captured clean; stderr is dropped for the VALUE.
-    $pyProbe = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>$null
-    $probeExit = $LASTEXITCODE
-    # Strict parse: exactly ONE line matching ^\d+\.\d+\.\d+$. Zero / multiple / malformed
-    # => fail-closed (do NOT accept a polluted or ambiguous version into the receipt).
-    $verLines = @(("$pyProbe" -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' })
-    if ($probeExit -eq 0 -and $verLines.Count -eq 1) {
-        $script:uvPythonVersion = $verLines[0]
-        Write-Host "uv-locked python = $script:uvPythonVersion (3.12 confirmed)"
+    # GPT round-13 P1-1: delegate to the shared Get-UvLockedPythonVersion (scripts/
+    # _python-probe.ps1) so B-2, check.ps1's pre-gate probe, and the regression test all
+    # exercise ONE implementation. The function separates stderr (2>$null, round-12 P2),
+    # strict-parses exactly one ^\d+\.\d+\.\d+$ line, and pins major.minor from
+    # .python-version (round-13 P1-2: no hardcoded patch). It records the clean version
+    # into receipt.pythonVersion; fail-closed on mismatch / bad parse.
+    $probe = Get-UvLockedPythonVersion -RepoRoot $REPO_ROOT
+    if ($probe.ok) {
+        $script:uvPythonVersion = $probe.version
+        Write-Host "uv-locked python = $($probe.version) ($($probe.expectedMajorMinor) confirmed)"
         $global:LASTEXITCODE = 0
     } else {
-        # Leave $script:uvPythonVersion as-is ($null unless a prior clean parse set it);
-        # emit the raw probe for diagnosis. Fail-closed on version mismatch OR bad parse.
-        Write-Host "B-2 fail-closed: exit=$probeExit, version lines matched=$($verLines.Count); raw='$pyProbe'"
+        # Leave $script:uvPythonVersion as-is ($null unless a prior clean parse set it).
+        Write-Host "B-2 fail-closed: ok=$($probe.ok) exit=$($probe.exitCode) matchCount=$($probe.matchCount) version='$($probe.version)' expected=$($probe.expectedMajorMinor).x"
         $global:LASTEXITCODE = 1
     }
 } | Out-Null

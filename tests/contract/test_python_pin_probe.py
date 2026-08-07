@@ -1,24 +1,28 @@
 r"""
 tests/contract/test_python_pin_probe.py
 
-GPT 第十二轮 P2：回执 pythonVersion 字段抗 uv warning 污染的回归测试。
+GPT 第十二轮 P2 + 第十三轮 P1-1/P1-2/P2：uv 锁定 Python 探针的回归测试，锁定
+receipt.pythonVersion 抗 uv warning 污染，且**绑定正式生产入口**（不再自实现）。
 
-第十二轮根因：phase0-acceptance.ps1 的 B-2 探针与 check.ps1 的版本探针都用 `2>&1`
-把 stderr 合并进 stdout，再"取首行"。当父环境注入不匹配的 VIRTUAL_ENV 时，uv 向
-stderr 打印 `warning: VIRTUAL_ENV=... will be ignored`，该 warning 被合并且落在版本行
-之前 → 旧"取首行"把 warning 写进 receipt.environment.pythonVersion，破坏机器可读回执
-（exit-code 断言仍有效，故不是假 PASS，但回执字段被污染）。
+第十二轮根因：phase0-acceptance.ps1 的 B-2 探针与 check.ps1 的版本探针用 `2>&1`
+合并 stderr，敌意 VIRTUAL_ENV 触发的 uv warning 被并入流、污染 receipt.pythonVersion。
+修复：`2>$null` 分离 stderr + 严格解析唯一 ^\d+\.\d+\.\d+$。
 
-修复：探针 stderr 分离（`2>$null`，只留纯 stdout 版本行）+ 严格解析唯一的
-`^\d+\.\d+\.\d+$`（缺失/多条/格式异常均 fail-closed）。本测试锁死该行为不回退。
+第十三轮根因（本文件自身的缺陷）：
+  P1-1：旧回归测试自己重实现 uv 命令与正则，未调用正式脚本 → mutation（把生产入口
+        改回 2>&1）测试仍假绿。修法：探针逻辑抽成共享函数 Get-UvLockedPythonVersion
+        （scripts/_python-probe.ps1），两个正式入口 + 本测试**共用同一实现**；本测试
+        Test A 直接调用该共享函数，Test B 锁定两入口确实 dot-source 并调用它、且不再
+        内联旧探针（mutation 防线）。
+  P1-2：旧测试硬编码补丁版本 3.12.10，但 .python-version/CI/合同只冻结 3.12.x，
+        合法补丁升级会 CI 假红。修法：从 .python-version 读 major.minor，断言输出满足
+        ^<major.minor>\.\d+$，并断言 returncode==0 与函数 exitCode==0。
+  P2：旧测试在 uv 不再打 warning 时 pytest.xfail，但冻结门禁要求固定计数，xfail 会变
+      337/1/1xfailed 被 A-1-count 拒。修法：去掉 xfail——无 warning 时普通 PASS，
+      冻结计数不变。
 
-设计：核心测试在 PowerShell 内跑与 runner/门禁**逐字相同**的提取管线（`2>$null` +
-严格解析），只回传 ASCII 字段（EXIT/COUNT/VER），断言在**注入敌意 VIRTUAL_ENV** 下
-提取值恰为 `3.12.10`——这正是写进 receipt.environment.pythonVersion 的值。第二个测试
-以 Python 分离管道**独立复现**漏洞：证明敌意 VIRTUAL_ENV 的 warning 确实落在 stderr、
-若并入 stdout 首行就会污染，而 stderr 分离后 stdout 恰为纯版本。
-
-仅在 Windows 上运行（PS 5.1 / pwsh 7 可用）；CI windows-probes job 会执行。
+Test A 仅在 Windows 运行（需 PowerShell + uv 锁定 .venv）；Test B 纯读脚本文本，
+跨平台运行（ubuntu CI 也执行，锁定生产入口引用）。
 """
 from __future__ import annotations
 
@@ -30,84 +34,135 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+PROBE_PS1 = REPO_ROOT / "scripts" / "_python-probe.ps1"
+ACCEPTANCE_PS1 = REPO_ROOT / "scripts" / "phase0-acceptance.ps1"
+CHECK_PS1 = REPO_ROOT / "scripts" / "check.ps1"
+PYTHON_VERSION_FILE = REPO_ROOT / ".python-version"
 
-# 与 phase0-acceptance.ps1 B-2 / check.ps1 完全相同的探针 Python（单一真源，逐字一致）。
-PROBE_PY = (
-    "import sys; print('%d.%d.%d' % sys.version_info[:3]); "
-    "sys.exit(0 if sys.version_info[:2]==(3,12) else 3)"
-)
 # 敌意 VIRTUAL_ENV：指向不存在的路径，触发 uv 的 "will be ignored" stderr warning。
 HOSTILE_VENV = r"D:\codex项目\nonexistent-hostile-venv"
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
-def _run_ps(script: str) -> subprocess.CompletedProcess[str]:
-    """跑一段 PowerShell，stdout/stderr 分别由 Python 独立捕获（不在 PS 内做 2>&1）。"""
-    return subprocess.run(
+def _frozen_major_minor() -> str:
+    """从 .python-version 读冻结的 major.minor（如 "3.12"）；缺失回退 "3.12"。
+
+    GPT 第十三轮 P1-2：断言基于此，不硬编码补丁版本——任何 3.12.x 补丁合法。
+    """
+    if PYTHON_VERSION_FILE.exists():
+        raw = PYTHON_VERSION_FILE.read_text(encoding="utf-8").strip()
+        m = re.match(r"^(\d+)\.(\d+)", raw)
+        if m:
+            return f"{m.group(1)}.{m.group(2)}"
+    return "3.12"
+
+
+def _parse_fields(stdout: str) -> dict[str, str]:
+    """从 KEY=VALUE 行解析字段字典（共享函数经 PS 包装只回传 ASCII 字段）。"""
+    out: dict[str, str] = {}
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="uv-locked python 探针需 Windows PowerShell + 锁定 .venv")
+def test_shared_probe_returns_frozen_major_minor_under_hostile_virtualenv() -> None:
+    """P1-1 + P1-2 + P2 核心：在**敌意 VIRTUAL_ENV** 下调用**正式共享探针**
+    Get-UvLockedPythonVersion（生产入口 B-2 / check.ps1 用的同一函数），断言：
+      - ok=True、函数 exitCode=0、PS 进程 returncode=0（P1-2 补的退出码断言）；
+      - version 满足 ^<.python-version 的 major.minor>\\.\\d+$（P1-2：不硬编码补丁）；
+      - version 不含 'warning'（P2 修法在共享函数内的 2>$null 分离生效）。
+
+    因为直接调用生产函数，若把共享函数改回 2>&1 / 去掉严格解析，本断言会真失败
+    （不再像旧版自实现那样假绿）。
+    """
+    mm = _frozen_major_minor()
+    # PS 包装：dot-source 共享探针 → 设敌意 VIRTUAL_ENV → 调用函数 → 只回传 ASCII 字段。
+    # 探针内部已 2>$null 分离 stderr、严格解析、从 .python-version 读 major.minor。
+    script = (
+        f". '{PROBE_PS1}'; "
+        f'$env:UV_PYTHON="{mm}"; '
+        f'$env:VIRTUAL_ENV="{HOSTILE_VENV}"; '
+        f"$r = Get-UvLockedPythonVersion -RepoRoot '{REPO_ROOT}'; "
+        r'Write-Output ("OK=" + $r.ok); '
+        r'Write-Output ("VER=" + $r.version); '
+        r'Write-Output ("EXIT=" + $r.exitCode); '
+        r'Write-Output ("COUNT=" + $r.matchCount); '
+        r'Write-Output ("MM=" + $r.expectedMajorMinor)'
+    )
+    proc = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        cwd=str(REPO_ROOT), timeout=120,
+        cwd=str(REPO_ROOT), timeout=180,
     )
+    assert proc.returncode == 0, (
+        f"共享探针 PS 包装应正常退出: rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    fields = _parse_fields(proc.stdout)
+    assert fields.get("OK") == "True", (
+        f"共享探针在敌意 VIRTUAL_ENV 下应 ok=True: fields={fields} stdout={proc.stdout!r}"
+    )
+    assert fields.get("EXIT") == "0", (
+        f"探针 exitCode 应为 0（uv 锁定 env 就是 {mm}）: fields={fields}"
+    )
+    assert fields.get("COUNT") == "1", (
+        f"严格解析必须恰得 1 条版本行（stderr 已 2>$null 分离，无 warning 混入）: fields={fields}"
+    )
+    assert fields.get("MM") == mm, (
+        f"探针读取的 major.minor 应等于 .python-version 的 {mm}: fields={fields}"
+    )
+    ver = fields.get("VER", "")
+    assert re.match(rf"^{re.escape(mm)}\.\d+$", ver), (
+        f"写入 receipt.pythonVersion 的值必须满足 ^{mm}.<patch>$（任意补丁合法，无 warning 污染）: got {ver!r}"
+    )
+    assert "warning" not in ver.lower(), f"版本值不得含 uv warning: {ver!r}"
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="uv-locked python 探针需 Windows PowerShell")
-def test_python_version_field_strict_312_under_hostile_virtualenv() -> None:
-    """核心断言（GPT 第十二轮 P2 修法 1+2）：敌意 VIRTUAL_ENV 下，PS 内跑与 runner/门禁
-    **逐字相同**的探针命令并 `2>$null` 分离 stderr（这是本轮的实际修法），只回收纯 stdout；
-    再用与 PS 脚本**字节相同**的正则 ^\\d+\\.\\d+\\.\\d+$ 严格解析，断言恰得一条 3.12.10——
-    这正是写入 receipt.environment.pythonVersion 的值。
+def _read(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
 
-    只在 PS 内做"探针 + stderr 分离"这一段（test 2 已证其可稳定跑通），严格解析放到
-    Python 用同一正则复刻：既避免多语句内联 PS 的脆弱转义（`r?`n / 嵌套引号），又忠实
-    覆盖修法两部分——stderr 分离由 PS 的 2>$null 真实执行，严格解析由同源正则验证。
+
+def _strip_ps_comments(text: str) -> str:
+    """去掉 PowerShell 注释后返回纯代码，供**负向**断言（不得含某模式）用。
+
+    先删块注释 <# ... #>，再删行注释（# 到行尾）。本仓这些脚本的代码字符串里不含
+    '#'，故行注释删除不会误伤代码；正向断言仍跑在原始文本上，不受影响。这样
+    "禁止出现 2>&1 / 内联探针" 只针对真实代码，不再被解释性注释里的字面误伤。
     """
-    script = (
-        f'$env:UV_PYTHON="3.12"; '
-        f'$env:VIRTUAL_ENV="{HOSTILE_VENV}"; '
-        f'& uv run --locked python -c "{PROBE_PY}" 2>$null'
-    )
-    proc = _run_ps(script)  # stderr 已在 PS 内 2>$null 丢弃；stdout 应为纯版本行
-    # 与 phase0-acceptance.ps1 B-2 / check.ps1 字节相同的严格解析：恰一条 ^\d+\.\d+\.\d+$。
-    versions = [ln.strip() for ln in proc.stdout.splitlines() if VERSION_RE.match(ln.strip())]
-    assert versions == ["3.12.10"], (
-        f"stderr 分离（2>$null）+ 严格解析后必须恰得 ['3.12.10']（无 warning 污染），"
-        f"这是写入 receipt.pythonVersion 的值: 得到 {versions!r}; raw stdout={proc.stdout!r}"
-    )
-    # 分离 stderr 后，stdout 中绝不含 uv warning（污染源）。
-    assert "warning" not in proc.stdout.lower(), (
-        f"分离 stderr 后 stdout 不应含 uv warning: {proc.stdout!r}"
-    )
+    no_block = re.sub(r"<#.*?#>", "", text, flags=re.S)
+    return re.sub(r"(?m)#.*$", "", no_block)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="uv-locked python 探针需 Windows PowerShell")
-def test_hostile_virtualenv_warning_lands_on_stderr_not_stdout() -> None:
-    """反向证明漏洞真实存在（GPT 第十二轮复现）：敌意 VIRTUAL_ENV 下，uv 的
-    "will be ignored" warning 落在 **stderr**，stdout 恰为纯版本行。因此旧 `2>&1` 把
-    stderr 并入 stdout 才会污染"首行"；修复后 `2>$null` 分离 stderr 使 stdout 纯净。
+def test_production_entry_points_use_shared_probe_no_inline_probe() -> None:
+    """P1-1 mutation 防线（跨平台）：锁定两个正式入口确实**引用共享探针**、且**不再内联**
+    旧探针逻辑；并锁定共享探针本身用 2>$null 分离 stderr（非 2>&1）。
 
-    用 Python 分离管道（不在 PS 内 2>&1，避开 PS 5.1 把 native stderr 包成
-    NativeCommandError 的 exit 1 干扰）：直接观察 stdout 与 stderr 的实际归属。
-    若某天 uv 不再对敌意 VIRTUAL_ENV 打 warning，则无污染可查 → xfail 容忍，
-    核心保证由上一条 strict-parse 测试提供。
+    这样 reviewer 的 mutation（把生产入口改回有漏洞的 2>&1 / 去严格解析）必被捕获：
+      - 若某入口不再 dot-source 或不再调用 Get-UvLockedPythonVersion → 本测试失败；
+      - 若某入口重新内联 `sys.version_info[:2]==` 探针 → 本测试失败；
+      - 若共享探针把 2>$null 改回 2>&1 → 本测试失败。
+
+    正向断言（必须出现某 token）跑在原始文本上；负向断言（不得出现某模式）跑在
+    **去注释后的纯代码**上——否则解释性注释里提到 "2>&1"/"sys.version_info" 会误伤。
     """
-    script = (
-        f'$env:UV_PYTHON="3.12"; '
-        f'$env:VIRTUAL_ENV="{HOSTILE_VENV}"; '
-        f'& uv run --locked python -c "{PROBE_PY}"'
-    )
-    proc = _run_ps(script)  # stdout / stderr 由 Python 分别捕获
+    probe_src = _read(PROBE_PS1)
+    probe_code = _strip_ps_comments(probe_src)
+    # 共享探针（正向跑原始文本，负向跑纯代码）：
+    assert "2>$null" in probe_code, "共享探针必须在**代码**中用 2>$null 分离 stderr（P2 修法）"
+    assert "2>&1" not in probe_code, "共享探针**代码**绝不能用 2>&1（会把 uv warning 并入版本流）"
+    assert r"^\d+\.\d+\.\d+$" in probe_src, "共享探针必须含严格版本解析正则 ^\\d+\\.\\d+\\.\\d+$"
+    assert ".python-version" in probe_src, "共享探针必须从 .python-version 读 major.minor（P1-2）"
 
-    stdout_versions = [ln.strip() for ln in proc.stdout.splitlines() if VERSION_RE.match(ln.strip())]
-    assert stdout_versions == ["3.12.10"], (
-        f"分离后 stdout 应恰为纯版本 3.12.10（无 warning）: stdout={proc.stdout!r}"
-    )
-    assert "warning" not in proc.stdout.lower(), (
-        f"分离后 stdout 不应含 uv warning: {proc.stdout!r}"
-    )
-
-    if "warning" not in proc.stderr.lower():
-        pytest.xfail("此 uv 版本未对敌意 VIRTUAL_ENV 打 warning；核心保证见 strict-parse 测试")
-    # 漏洞根源确认：warning 确实存在于 stderr——旧 2>&1 会把它并入 stdout 首行造成污染。
-    assert "ignored" in proc.stderr.lower() or "virtual_env" in proc.stderr.lower(), (
-        f"期望 stderr 含 VIRTUAL_ENV will-be-ignored warning: {proc.stderr!r}"
-    )
+    for label, path in (("phase0-acceptance.ps1", ACCEPTANCE_PS1), ("check.ps1", CHECK_PS1)):
+        src = _read(path)
+        code = _strip_ps_comments(src)
+        assert "_python-probe.ps1" in src, f"{label} 必须 dot-source 共享探针 _python-probe.ps1"
+        assert "Get-UvLockedPythonVersion" in code, (
+            f"{label} 必须在**代码**中调用共享探针 Get-UvLockedPythonVersion"
+        )
+        # 不得再内联旧探针（该逻辑现在只应存在于 _python-probe.ps1 单一真源）。
+        assert "sys.version_info" not in code, (
+            f"{label} **代码**不得再内联 sys.version_info 探针（逻辑应只在共享探针里）"
+        )

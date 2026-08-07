@@ -31,6 +31,10 @@ $REPO_ROOT = Split-Path $PSScriptRoot -Parent
 # 二进制（对方删除即假失败，对方尚存即假通过）。Get-WorktreeTargetDir 按规范化
 # $REPO_ROOT 的 SHA-256 摘要派生独立 target；与 dev.ps1 / phase0-acceptance.ps1 同源。
 . (Join-Path $PSScriptRoot "_worktree-target.ps1")
+# GPT 第十三轮 P1-1：uv 锁定 Python 探针抽成共享函数 Get-UvLockedPythonVersion
+# （scripts/_python-probe.ps1），本门禁前置探针、phase0-acceptance.ps1 的 B-2、回归测试
+# 三处共用同一实现；任一入口回退到有漏洞的 2>&1 / 去掉严格解析都能被测试锁定。
+. (Join-Path $PSScriptRoot "_python-probe.ps1")
 $failures = [System.Collections.Generic.List[string]]::new()
 $gate_results = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -88,24 +92,17 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 # GPT 第十一轮 P0：不仅探针"python 能否启动"，还必须**断言它是 3.12**（旧版只查退出码，
-# 允许 3.13 通过）。在 uv 锁定 .venv 内跑 sys.version_info[:2]==(3,12)，非 3.12 即 exit 3。
-# 先落变量、立即读 $LASTEXITCODE，再切片：绝不把 native 命令直接管道给 Select-Object，
-# 那会提前中断上游（StopUpstreamCommandsException）把 $LASTEXITCODE 污染成 -1（此坑与
-# test-runner-identity.ps1 的 docker version 探针同源，第十轮曾误伤）。
-#
-# GPT 第十二轮 P2：用 2>$null 分离 stderr（不再 2>&1）。uv 会向 stderr 写 warning
-# （如 VIRTUAL_ENV 不匹配时 "warning: VIRTUAL_ENV=... will be ignored"）；2>&1 会把它并入流，
-# 旧版"取第一行"会误取 warning 当版本号。改为只取 stdout（纯版本），并**严格解析**唯一一条
-# ^\d+\.\d+\.\d+$：缺失/多条/格式异常一律 fail-closed（与 phase0-acceptance.ps1 B-2 同源）。
-$verRaw   = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>$null
-$verExit  = $LASTEXITCODE
-$verLines = @(("$verRaw" -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' })
-if ($verExit -ne 0 -or $verLines.Count -ne 1) {
-    Write-Error "[check.ps1] fail-closed: uv 锁定 .venv 非 Python 3.12 或版本解析异常（exit=$verExit，匹配行数=$($verLines.Count)，raw='$verRaw'）"
+# 允许 3.13 通过）。GPT 第十二轮 P2：2>$null 分离 stderr（uv 的 VIRTUAL_ENV warning 不得
+# 混入版本）+ 严格解析唯一 ^\d+\.\d+\.\d+$。GPT 第十三轮 P1-1：这套逻辑抽成共享函数
+# Get-UvLockedPythonVersion（scripts/_python-probe.ps1），与 phase0-acceptance.ps1 B-2、
+# 回归测试三处共用同一实现（不再各写一份），major.minor 从 .python-version 读（不硬编码补丁）。
+$probe = Get-UvLockedPythonVersion -RepoRoot $REPO_ROOT
+if (-not $probe.ok) {
+    Write-Error "[check.ps1] fail-closed: uv 锁定 .venv 非 Python $($probe.expectedMajorMinor).x 或版本解析异常（exit=$($probe.exitCode)，匹配行数=$($probe.matchCount)，version='$($probe.version)'）"
     exit 1
 }
-$lockedVer = $verLines[0]
-Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer（3.12 已断言）"
+$lockedVer = $probe.version
+Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer（$($probe.expectedMajorMinor) 已断言）"
 # 用别名 python 指向锁定 .venv：所有门禁经 uv run --locked python 分发，与 A-1 同源。
 function python { & uv run --locked python @args }
 
