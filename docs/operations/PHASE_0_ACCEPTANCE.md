@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 330 passed, 1 skipped（contract 199 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 199 含第六轮 item 3 新增 `test_receipt_schema_conformance.py`（3 项：反例锁定 + stdlib 回退校验器与真 jsonschema 逐例等价 + 基准），证明运行时校验语义与 schema 单一真源一致 |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 332 passed, 1 skipped（contract 201 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 201 含第六轮 item 3 conformance（3 项）和第八轮 item 1 binding shape 负例（2 项，Windows-only） |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -120,7 +120,7 @@
 | windows_durable_io | PASS | 跨进程硬杀 + 独立进程读回 |
 | named_pipe | PASS | 双进程 nonce + 重放拒绝 |
 | git_object_bridge | PASS | 双进程 pack roundtrip + 零污染 |
-| runner_identity | **PASS 或 BLOCKED_UNCERTIFIED** | Docker 可用时 broker 硬杀后容器孤儿存活 → PASS；Docker 不可用 → BLOCKED_UNCERTIFIED（allowlist ID `spike:runner_identity/docker_daemon`） |
+| runner_identity | **PASS**（Docker 可用时，broker 硬杀后容器孤儿存活全部断言通过）；Docker daemon 不可用 → BLOCKED_UNCERTIFIED，但**不在 allowlist，topStatus 不 PASS** |
 | sqlite_wal_full | **BLOCKED_UNCERTIFIED** | 核心（process-kill 恢复 / group-commit 原子 / events/bytes/age 三阈值 / PRAGMA 读回）全 PASS；必选 disk-full ENOSPC 子项无 admin VHD 无法认证 → 按优先级顶层 = BLOCKED_UNCERTIFIED（allowlist ID `spike:sqlite_wal_full/disk_full_enospc`） |
 | tauri_e2e | **BLOCKED_UNCERTIFIED**（Phase 0 spike ownership 保留） | Phase 0 拥有该 spike；本机无 WebView2/Tauri 运行时 → 正式 BLOCKED（allowlist ID `spike:tauri_e2e/webview_runtime`），非"待 Phase 2"移交 |
 
@@ -138,13 +138,14 @@
 > 因此"sqlite/tauri spike 自身顶层 = BLOCKED_UNCERTIFIED"与"验收运行 topStatus = PASS"
 > **不矛盾**——前者是 spike 级事实标注，后者是 allowlist 归约后的运行级判定。
 
-**冻结 BLOCKED allowlist（只有以下环境兼容 ID 允许 BLOCKED_UNCERTIFIED，其余必须 PASS）**：
+**冻结 BLOCKED allowlist（仅此两项，其余全部必须 PASS）**：
 
 | allowlist ID | 解封条件 |
 |---|---|
 | `spike:sqlite_wal_full/disk_full_enospc` | admin 挂载 ≤16MiB VHD（`create_enospc_vhd.ps1`）后 bench `--probe-dir <VHD>` |
 | `spike:tauri_e2e/webview_runtime` | 装 WebView2 Runtime + Tauri CLI 的环境跑 E2E spike |
-| `spike:runner_identity/docker_daemon` | 安装 Docker Desktop（WSL2 后端）并启动 daemon；验证容器孤儿存活（broker 硬杀后容器仍 Running） |
+
+> `spike:runner_identity/docker_daemon`（Docker daemon 不可用）和 `spike:runner_identity/container_image`（镜像缺失）**不在**冻结 allowlist 中。runner_identity 是核心 spike，必须 PASS；Docker 不可用时 wrapper 诚实报 BLOCKED_UNCERTIFIED，但验收 topStatus 不会 PASS。若要将其加入 allowlist，必须明确裁定并同步整个冻结定义。
 
 > **核心合同检查（codegen/schema/golden/三语言测试/receipt/lint/type）必须 PASS，不在 allowlist、不接受 BLOCKED。**
 

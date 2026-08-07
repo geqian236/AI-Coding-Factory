@@ -85,14 +85,45 @@ function Test-SpikeReceiptEvidence {
         }
     }
 
-    # Run binding (item 2d): only enforced when the caller supplies the round nonce.
-    #   - six probes: runner stamps a top-level runBinding {runId,runNonce,candidateSha,spike}.
-    #   - sqlite: owns run_nonce end-to-end (stamping would break emit_manifest's
-    #     digest recompute over eventBatchParameters), so we bind via run_nonce.
+    # Run binding: enforced when the caller supplies the round nonce.
+    # SHAPE IS FROZEN BY SPIKE NAME, not by what fields the receipt happens to carry.
+    # Routing by receipt content allows a forger to switch shape (e.g. give a
+    # sqlite-labelled receipt runBinding instead of run_nonce, or give a non-sqlite
+    # receipt only run_nonce + candidateSha to skip the runId check).
+    #   - sqlite_wal_full  MUST use run_nonce + candidateSha + probeDigest  (never runBinding)
+    #   - all other spikes MUST use runBinding with runId/runNonce/candidateSha/spike (never run_nonce)
     if ($ExpectRunNonce -ne "") {
-        $hasBinding = ($obj.PSObject.Properties.Name -contains "runBinding")
-        $hasNonce   = ($obj.PSObject.Properties.Name -contains "run_nonce")
-        if ($hasBinding) {
+        if ($Name -eq "sqlite_wal_full") {
+            # SQLITE PATH - must have run_nonce; runBinding is wrong shape and rejected.
+            if ($obj.PSObject.Properties.Name -contains "runBinding") {
+                return @{ ok = $false; status = "BINDING_WRONG_SHAPE"; detail = "sqlite_wal_full must bind via run_nonce (not runBinding); found runBinding - possible receipt identity switch" }
+            }
+            if (-not ($obj.PSObject.Properties.Name -contains "run_nonce")) {
+                return @{ ok = $false; status = "BINDING_MISSING"; detail = "sqlite_wal_full receipt missing run_nonce; not bound to this run" }
+            }
+            if ([string]$obj.run_nonce -ne $ExpectRunNonce) {
+                return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "run_nonce='$($obj.run_nonce)' != '$ExpectRunNonce'" }
+            }
+            if ($ExpectCandidateSha -ne "") {
+                $rcptSha = if ($obj.PSObject.Properties.Name -contains "candidateSha") { [string]$obj.candidateSha } else { "" }
+                if ($rcptSha -ne $ExpectCandidateSha) {
+                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt candidateSha='$rcptSha' != '$ExpectCandidateSha'" }
+                }
+            }
+            if ($ExpectProbeDigest -ne "") {
+                $rcptProbe = if ($obj.PSObject.Properties.Name -contains "probeDigest") { [string]$obj.probeDigest } else { "" }
+                if ($rcptProbe -ne $ExpectProbeDigest) {
+                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt probeDigest='$rcptProbe' != expected '$ExpectProbeDigest' (probe source mismatch/forgery)" }
+                }
+            }
+        } else {
+            # NON-SQLITE PATH - must have runBinding; run_nonce alone is wrong shape.
+            if ($obj.PSObject.Properties.Name -contains "run_nonce" -and -not ($obj.PSObject.Properties.Name -contains "runBinding")) {
+                return @{ ok = $false; status = "BINDING_WRONG_SHAPE"; detail = "'$Name' must bind via runBinding (not run_nonce); found only run_nonce - possible receipt identity switch (run_nonce path skips runId)" }
+            }
+            if (-not ($obj.PSObject.Properties.Name -contains "runBinding")) {
+                return @{ ok = $false; status = "BINDING_MISSING"; detail = "no runBinding; '$Name' receipt not bound to this run" }
+            }
             $rb = $obj.runBinding
             if ([string]$rb.runNonce -ne $ExpectRunNonce) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.runNonce='$($rb.runNonce)' != '$ExpectRunNonce'" }
@@ -106,29 +137,6 @@ function Test-SpikeReceiptEvidence {
             if ([string]$rb.spike -ne $Name) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.spike='$($rb.spike)' != '$Name'" }
             }
-        } elseif ($hasNonce) {
-            # sqlite path: bench.py writes run_nonce + candidateSha + probeDigest natively.
-            # Round-6 item 2 (GPT round-7): the old run_nonce branch checked ONLY the
-            # nonce and ignored candidateSha/probeDigest, so a forged receipt with the
-            # right nonce but candidateSha/probeDigest all-zero was accepted. We now bind
-            # ALL THREE: nonce + candidate (exact commit) + probe (sha256 of bench.py).
-            if ([string]$obj.run_nonce -ne $ExpectRunNonce) {
-                return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "run_nonce='$($obj.run_nonce)' != '$ExpectRunNonce'" }
-            }
-            if ($ExpectCandidateSha -ne "") {
-                $rcptSha = if ($obj.PSObject.Properties.Name -contains "candidateSha") { [string]$obj.candidateSha } else { "" }
-                if ($rcptSha -ne $ExpectCandidateSha) {
-                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt candidateSha='$rcptSha' != '$ExpectCandidateSha' (nonce alone is insufficient)" }
-                }
-            }
-            if ($ExpectProbeDigest -ne "") {
-                $rcptProbe = if ($obj.PSObject.Properties.Name -contains "probeDigest") { [string]$obj.probeDigest } else { "" }
-                if ($rcptProbe -ne $ExpectProbeDigest) {
-                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt probeDigest='$rcptProbe' != expected '$ExpectProbeDigest' (probe source mismatch/forgery)" }
-                }
-            }
-        } else {
-            return @{ ok = $false; status = "BINDING_MISSING"; detail = "no runBinding and no run_nonce; receipt not bound to this run" }
         }
     }
 

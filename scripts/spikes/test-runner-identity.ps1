@@ -52,6 +52,7 @@ if ($env:OS -notmatch "Windows") {
 
 # ── 1. 检查 docker 可用性(缺失如实 BLOCKED,不伪造)──────────────────────────────
 $dockerVersion = $null
+$verExit = -1  # P1 crash fix: initialize before try so the catch path can reference it safely
 try {
     # 原生命令管道给 Select-Object -First 1 会因上游被提前中断(StopUpstreamCommandsException)
     # 把 $LASTEXITCODE 污染成 -1,令 daemon 明明可用却误判不可用(假 BLOCKED)。
@@ -80,8 +81,8 @@ Write-Host "检查 python:3.12-slim 本地镜像 ..."
 docker image inspect "python:3.12-slim" 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
     $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     subcheckId="spike:runner_identity/docker_daemon"
-                     reason="本地无 python:3.12-slim 镜像且 registry 不可达 —— 基建问题,非能力缺陷;请先 docker pull python:3.12-slim"
+                     subcheckId="spike:runner_identity/container_image"
+                     reason="本地无 python:3.12-slim 镜像 —— 基建问题,非能力缺陷;请先 docker pull python:3.12-slim"
                      observable_facts=@{ docker_available=$true; image_available=$false }
                      assertions=@(@{name="docker_image_available"; passed=$false;
                                     detail="docker image inspect python:3.12-slim returned exit != 0 (image not cached locally)"})

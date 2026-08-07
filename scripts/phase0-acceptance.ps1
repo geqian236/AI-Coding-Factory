@@ -185,7 +185,7 @@ $ACCEPTANCE_SET_VERSION = "phase0-acceptance-v1"
 $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.md"
 
 # Frozen baseline counts (V5: parsed from output and enforced, not eyeballed).
-$FROZEN_PYTEST_PASSED  = 330
+$FROZEN_PYTEST_PASSED  = 332
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -197,7 +197,10 @@ $FROZEN_SKIP_MATCH = "test_config.py"
 $BLOCKED_ALLOWLIST = [ordered]@{
     "spike:sqlite_wal_full/disk_full_enospc"  = "admin mounts a <=16MiB VHD then bench --probe-dir <VHD> certifies real ENOSPC"
     "spike:tauri_e2e/webview_runtime"         = "run the E2E spike on a host with WebView2 Runtime + Tauri CLI installed"
-    "spike:runner_identity/docker_daemon"     = "install Docker Desktop (WSL2 backend) and start the daemon to certify orphan-process isolation"
+    # NOTE: runner_identity is NOT in this allowlist. It is a core spike that must PASS.
+    # The wrapper emits BLOCKED_UNCERTIFIED when Docker is unavailable, but that causes
+    # topStatus=FAIL (not PASS). Adding runner_identity here requires an explicit
+    # reviewer decision and would expand the frozen acceptance set.
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -347,7 +350,7 @@ $spikeWrappers = [ordered]@{
     "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
     "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
 }
-$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e", "runner_identity")
+$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e")
 $stampScript = Join-Path $PSScriptRoot "spikes\stamp_run_binding.py"
 
 # Per-run identity: bound into the total receipt and stamped into each receipt.
@@ -432,7 +435,10 @@ foreach ($name in ($spikeReceipts.Keys)) {
     if ($name -ne "sqlite_wal_full" -and (Test-Path -LiteralPath $receiptPath)) {
         python $stampScript $receiptPath $name | Write-Host
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "  [spike:$name] WARNING stamp_run_binding exit=$LASTEXITCODE (binding check fails closed)"
+            # Fail-closed: stamp failure means runBinding is absent, so the validator
+            # will see BINDING_MISSING and reject. Make the runner consistent with CI
+            # (which also fails hard on stamp failure) rather than merely warning.
+            Add-CheckResult "stamp:$name" "stamp runBinding into receipt" $false "stamp_run_binding exit=$LASTEXITCODE"
         }
     }
     # Shared evidence validation (single source of truth with CI; item 4). ReceiptMtime
@@ -461,13 +467,20 @@ foreach ($name in ($spikeReceipts.Keys)) {
 }
 
 # --- A-1 + B-1 + A-2 (V1: install before vitest) ---------------------------
+# GPT round-8: A-1 must consume uv.lock (not rely on whatever the system Python
+# happens to have installed). Run uv sync --frozen --all-groups first to populate
+# .venv from the lockfile, then use uv run pytest so the locked environment is used.
+# UV_CACHE_DIR is already set to the project data root (storage contract compliant).
+# .venv is gitignored, so this sync does not dirty the tree.
+Invoke-AcceptanceCheck "A-1-sync" "uv sync --frozen (populate locked .venv before pytest)" {
+    & uv sync --frozen --all-groups
+} | Out-Null
 
 $a1out = Invoke-AcceptanceCheck "A-1" "Python three-dir tests" {
     $env:PYTHONIOENCODING = "utf-8"
-    # -rs: report skipped with reason lines (SKIPPED [1] <file>:<line>: <reason>),
-    # so the V5 skip-identity check below can match the frozen skip node. -q alone
-    # prints only the "N passed, M skipped" summary without the skip's file path.
-    python -m pytest tests/contract tests/agent tests/security -q -rs
+    # uv run pytest: uses the locked .venv synced above (reproducible across machines).
+    # -rs: report skipped with reason lines so V5 skip-identity check can match node.
+    & uv run pytest tests/contract tests/agent tests/security -q -rs
 }
 # V5: enforce frozen counts + single skip identity.
 if ($a1out -match "(\d+)\s+passed,\s+(\d+)\s+skipped") {
