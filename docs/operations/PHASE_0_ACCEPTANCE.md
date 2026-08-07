@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 336 passed, 1 skipped（contract 205 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 205 含第六轮 item 3 conformance（3 项）、第八轮 item 1 binding shape 负例（2 项，Windows-only）与 cargo-target 隔离回归（4 项，Windows-only，见 `test_cargo_target_isolation.py`：第九轮 2 项 + 第十轮 P1 大小写碰撞与 test.ps1 覆盖各 1 项）。**平台/运行序差异（非失败）**：验收唯一入口先跑 spike（生成 sqlite receipt），故 runner 上 contract 205 全 pass；而 ubuntu CI 的 `contracts` job 直接 `pytest tests/contract/`（无 spike 前置），6 项 Windows-only 测试 + `test_compatibility_manifest.py` 的 sqlite-receipt 用例（receipt 缺失时 skip）共 7 项 skip，故 ubuntu contract = 198 passed / 7 skipped |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 338 passed, 1 skipped（contract 207 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 207 含第六轮 item 3 conformance（3 项）、第八轮 item 1 binding shape 负例（2 项，Windows-only）、cargo-target 隔离回归（4 项，Windows-only，见 `test_cargo_target_isolation.py`：第九轮 2 项 + 第十轮 P1 大小写碰撞与 test.ps1 覆盖各 1 项）与第十二轮 P2 pythonVersion 抗污染回归（2 项，Windows-only，见 `test_python_pin_probe.py`）。**平台/运行序差异（非失败）**：验收唯一入口先跑 spike（生成 sqlite receipt），故 runner 上 contract 207 全 pass；而 ubuntu CI 的 `contracts` job 直接 `pytest tests/contract/`（无 spike 前置），8 项 Windows-only 测试 + `test_compatibility_manifest.py` 的 sqlite-receipt 用例（receipt 缺失时 skip）共 9 项 skip，故 ubuntu contract = 198 passed / 9 skipped |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -74,8 +74,8 @@
 > - plan_vectors.rs：7 passed（canonical/barrier_id/plan_revision_digest/semantic_plan_hash）
 >
 > 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：三语言合同套件
-> （Python 336 / TS 70 / Rust 14，与 §2.1 冻结基线一致）中的**向量测试**对同一份
-> golden 做 RFC 8785 字节相等断言（Python 侧全套件 336，其中向量子集与 TS/Rust
+> （Python 338 / TS 70 / Rust 14，与 §2.1 冻结基线一致）中的**向量测试**对同一份
+> golden 做 RFC 8785 字节相等断言（Python 侧全套件 338，其中向量子集与 TS/Rust
 > 同源；非向量测试覆盖 agent/security 等其它合同）；三侧对同一 golden 字节一致即跨语言认证。
 
 ### 2.2 门禁（scripts/check.ps1，15 项全 PASS）

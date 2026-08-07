@@ -92,13 +92,19 @@ if ($LASTEXITCODE -ne 0) {
 # 先落变量、立即读 $LASTEXITCODE，再切片：绝不把 native 命令直接管道给 Select-Object，
 # 那会提前中断上游（StopUpstreamCommandsException）把 $LASTEXITCODE 污染成 -1（此坑与
 # test-runner-identity.ps1 的 docker version 探针同源，第十轮曾误伤）。
-$verRaw   = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>&1
+#
+# GPT 第十二轮 P2：用 2>$null 分离 stderr（不再 2>&1）。uv 会向 stderr 写 warning
+# （如 VIRTUAL_ENV 不匹配时 "warning: VIRTUAL_ENV=... will be ignored"）；2>&1 会把它并入流，
+# 旧版"取第一行"会误取 warning 当版本号。改为只取 stdout（纯版本），并**严格解析**唯一一条
+# ^\d+\.\d+\.\d+$：缺失/多条/格式异常一律 fail-closed（与 phase0-acceptance.ps1 B-2 同源）。
+$verRaw   = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>$null
 $verExit  = $LASTEXITCODE
-$lockedVer = ("$verRaw" -split "`r?`n" | Select-Object -First 1).Trim()
-if ($verExit -ne 0) {
-    Write-Error "[check.ps1] fail-closed: uv 锁定 .venv 非 Python 3.12（实测 '$lockedVer'，exit=$verExit）"
+$verLines = @(("$verRaw" -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' })
+if ($verExit -ne 0 -or $verLines.Count -ne 1) {
+    Write-Error "[check.ps1] fail-closed: uv 锁定 .venv 非 Python 3.12 或版本解析异常（exit=$verExit，匹配行数=$($verLines.Count)，raw='$verRaw'）"
     exit 1
 }
+$lockedVer = $verLines[0]
 Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer（3.12 已断言）"
 # 用别名 python 指向锁定 .venv：所有门禁经 uv run --locked python 分发，与 A-1 同源。
 function python { & uv run --locked python @args }

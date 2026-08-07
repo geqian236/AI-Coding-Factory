@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (336/1,
+        (only the gitignored receipt may appear dirty); frozen counts (338/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -171,7 +171,9 @@ foreach ($k in $_cacheDirs.Keys) {
 # never call uv (they use dev.ps1 + cargo), so it is a no-op for them.
 $env:UV_PYTHON = "3.12"
 # uvPythonVersion: single source for B-2 assert + receipt.pythonVersion (set in B-2).
-$uvPythonVersion = "unknown"
+# GPT round-12 P2: init to $null (NOT a placeholder string). If B-2 never runs or its
+# strict parse fails, the receipt must carry $null, not a stale/fake version string.
+$uvPythonVersion = $null
 
 # Python 3.12 lock (mirrors check.ps1): PATH python may be anaconda 3.11 and
 # drift results. Resolve 3.12 by: .python-version -> local install -> uv find.
@@ -208,7 +210,9 @@ $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.m
 # round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests).
 # round-10 P1: 334 -> 336 (+2 more Windows-only tests in test_cargo_target_isolation.py:
 # case-variant collision + test.ps1 caller-level override; runner is Windows so all run).
-$FROZEN_PYTEST_PASSED  = 336
+# round-12 P2: 336 -> 338 (+2 Windows-only tests in test_python_pin_probe.py: pythonVersion
+# strict-parse under hostile VIRTUAL_ENV + warning-lands-on-stderr repro; runner is Windows).
+$FROZEN_PYTEST_PASSED  = 338
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -348,8 +352,8 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
 # py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 336 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/7:
-# the 6 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# baseline is now 338 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/9:
+# the 8 Windows-only contract tests skip off-platform AND the sqlite-receipt test
 # skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
@@ -586,14 +590,26 @@ Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned (uv-locked env)" {
     # Capture into a var, read $LASTEXITCODE immediately, THEN use it (never pipe a
     # native command straight into Select-Object before reading the exit code - that
     # trips StopUpstreamCommandsException and pollutes $LASTEXITCODE, see check.ps1).
-    $pyProbe = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>&1
+    #
+    # GPT round-12 P2: redirect stderr to $null (NOT 2>&1). uv emits warnings to stderr
+    # (e.g. "warning: VIRTUAL_ENV=... will be ignored" when a mismatched VIRTUAL_ENV is
+    # set); 2>&1 merged that warning INTO the stream and the old "first line" grab put it
+    # into receipt.pythonVersion, breaking the machine-readable receipt. The exit-code
+    # assertion was still sound (no false PASS), but the string was polluted. Now stdout
+    # (version only) is captured clean; stderr is dropped for the VALUE.
+    $pyProbe = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>$null
     $probeExit = $LASTEXITCODE
-    $script:uvPythonVersion = ("$pyProbe" -split "`r?`n" | Select-Object -First 1).Trim()
-    if ($probeExit -eq 0) {
+    # Strict parse: exactly ONE line matching ^\d+\.\d+\.\d+$. Zero / multiple / malformed
+    # => fail-closed (do NOT accept a polluted or ambiguous version into the receipt).
+    $verLines = @(("$pyProbe" -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' })
+    if ($probeExit -eq 0 -and $verLines.Count -eq 1) {
+        $script:uvPythonVersion = $verLines[0]
         Write-Host "uv-locked python = $script:uvPythonVersion (3.12 confirmed)"
         $global:LASTEXITCODE = 0
     } else {
-        Write-Host "expected 3.12.x from uv-locked env, got '$script:uvPythonVersion' (exit=$probeExit)"
+        # Leave $script:uvPythonVersion as-is ($null unless a prior clean parse set it);
+        # emit the raw probe for diagnosis. Fail-closed on version mismatch OR bad parse.
+        Write-Host "B-2 fail-closed: exit=$probeExit, version lines matched=$($verLines.Count); raw='$pyProbe'"
         $global:LASTEXITCODE = 1
     }
 } | Out-Null
