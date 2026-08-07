@@ -62,10 +62,16 @@ try {
 } catch { $dockerVersion = $null }
 
 if (-not $dockerVersion) {
+    # Round-7 fix: BLOCKED receipt MUST carry at least one assertion (observable
+    # evidence) and a subcheckId so the allowlist check can admit it. The empty
+    # assertions=@() caused the validator to reject with "assertions empty".
     $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
+                     subcheckId="spike:runner_identity/docker_daemon"
                      reason="Docker CLI/daemon 不可用 —— 安装 Docker Desktop(WSL2 后端)并启动 daemon 后方可认证"
                      observable_facts=@{ docker_available=$false }
-                     assertions=@(); timestamp=(Get-Date -Format "o") }
+                     assertions=@(@{name="docker_daemon_available"; passed=$false;
+                                    detail="docker version returned exit=$verExit or empty output (daemon not running)"})
+                     timestamp=(Get-Date -Format "o") }
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
 
@@ -74,9 +80,12 @@ Write-Host "检查 python:3.12-slim 本地镜像 ..."
 docker image inspect "python:3.12-slim" 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
     $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
+                     subcheckId="spike:runner_identity/docker_daemon"
                      reason="本地无 python:3.12-slim 镜像且 registry 不可达 —— 基建问题,非能力缺陷;请先 docker pull python:3.12-slim"
                      observable_facts=@{ docker_available=$true; image_available=$false }
-                     assertions=@(); timestamp=(Get-Date -Format "o") }
+                     assertions=@(@{name="docker_image_available"; passed=$false;
+                                    detail="docker image inspect python:3.12-slim returned exit != 0 (image not cached locally)"})
+                     timestamp=(Get-Date -Format "o") }
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
 

@@ -195,8 +195,9 @@ $FROZEN_SKIP_MATCH = "test_config.py"
 # Frozen BLOCKED allowlist: only these subcheck IDs may be BLOCKED_UNCERTIFIED.
 # Any other non-PASS check = overall FAIL. Keyed by subcheckId (V5: unified id).
 $BLOCKED_ALLOWLIST = [ordered]@{
-    "spike:sqlite_wal_full/disk_full_enospc" = "admin mounts a <=16MiB VHD then bench --probe-dir <VHD> certifies real ENOSPC"
-    "spike:tauri_e2e/webview_runtime"        = "run the E2E spike on a host with WebView2 Runtime + Tauri CLI installed"
+    "spike:sqlite_wal_full/disk_full_enospc"  = "admin mounts a <=16MiB VHD then bench --probe-dir <VHD> certifies real ENOSPC"
+    "spike:tauri_e2e/webview_runtime"         = "run the E2E spike on a host with WebView2 Runtime + Tauri CLI installed"
+    "spike:runner_identity/docker_daemon"     = "install Docker Desktop (WSL2 backend) and start the daemon to certify orphan-process isolation"
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
@@ -346,7 +347,7 @@ $spikeWrappers = [ordered]@{
     "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
     "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
 }
-$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e")
+$envCompatSpikes = @("sqlite_wal_full", "tauri_e2e", "runner_identity")
 $stampScript = Join-Path $PSScriptRoot "spikes\stamp_run_binding.py"
 
 # Per-run identity: bound into the total receipt and stamped into each receipt.

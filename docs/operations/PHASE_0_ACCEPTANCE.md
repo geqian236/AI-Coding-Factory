@@ -120,7 +120,7 @@
 | windows_durable_io | PASS | 跨进程硬杀 + 独立进程读回 |
 | named_pipe | PASS | 双进程 nonce + 重放拒绝 |
 | git_object_bridge | PASS | 双进程 pack roundtrip + 零污染 |
-| runner_identity | PASS | broker 硬杀后容器孤儿存活 |
+| runner_identity | **PASS 或 BLOCKED_UNCERTIFIED** | Docker 可用时 broker 硬杀后容器孤儿存活 → PASS；Docker 不可用 → BLOCKED_UNCERTIFIED（allowlist ID `spike:runner_identity/docker_daemon`） |
 | sqlite_wal_full | **BLOCKED_UNCERTIFIED** | 核心（process-kill 恢复 / group-commit 原子 / events/bytes/age 三阈值 / PRAGMA 读回）全 PASS；必选 disk-full ENOSPC 子项无 admin VHD 无法认证 → 按优先级顶层 = BLOCKED_UNCERTIFIED（allowlist ID `spike:sqlite_wal_full/disk_full_enospc`） |
 | tauri_e2e | **BLOCKED_UNCERTIFIED**（Phase 0 spike ownership 保留） | Phase 0 拥有该 spike；本机无 WebView2/Tauri 运行时 → 正式 BLOCKED（allowlist ID `spike:tauri_e2e/webview_runtime`），非"待 Phase 2"移交 |
 
@@ -144,6 +144,7 @@
 |---|---|
 | `spike:sqlite_wal_full/disk_full_enospc` | admin 挂载 ≤16MiB VHD（`create_enospc_vhd.ps1`）后 bench `--probe-dir <VHD>` |
 | `spike:tauri_e2e/webview_runtime` | 装 WebView2 Runtime + Tauri CLI 的环境跑 E2E spike |
+| `spike:runner_identity/docker_daemon` | 安装 Docker Desktop（WSL2 后端）并启动 daemon；验证容器孤儿存活（broker 硬杀后容器仍 Running） |
 
 > **核心合同检查（codegen/schema/golden/三语言测试/receipt/lint/type）必须 PASS，不在 allowlist、不接受 BLOCKED。**
 

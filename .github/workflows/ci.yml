@@ -181,11 +181,12 @@ jobs:
             "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
             "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
           }
-          $envCompat = @("sqlite_wal_full", "tauri_e2e")
+          $envCompat = @("sqlite_wal_full", "tauri_e2e", "runner_identity")
           # 冻结 BLOCKED allowlist（与 PHASE_0_ACCEPTANCE.md §1 + phase0-acceptance.ps1 一致）。
           $allowlist = @(
             "spike:sqlite_wal_full/disk_full_enospc",
-            "spike:tauri_e2e/webview_runtime"
+            "spike:tauri_e2e/webview_runtime",
+            "spike:runner_identity/docker_daemon"
           )
 
           # 本轮运行身份：绑定 candidate/run/probe（item 4 缺失项）。
