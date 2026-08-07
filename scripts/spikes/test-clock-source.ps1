@@ -11,6 +11,15 @@ $scriptRoot  = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
 $probeDir    = "$scriptRoot\tools\compat-probes\clock_source"
 $receiptPath = "$probeDir\receipt.json"
 
+# GPT 第十一轮 P1：clock_source 直接跑 cargo build（不经 dev.ps1），过去优先用继承的
+# CARGO_TARGET_DIR。若独立执行时进程残留旧版**共享** cargo-target，构建/取二进制会跨
+# worktree 污染（消费另一 checkout 的产物）。此处按本 worktree **强制**派生 per-worktree
+# namespace 覆盖任何继承值，与 dev.ps1 / phase0-acceptance.ps1 / test.ps1 同一
+# Get-WorktreeTargetDir（$scriptRoot = 本 worktree 根）。$dataRoot 与其它 wrapper 同源。
+$dataRoot    = "D:\codex项目\AI-Coding-Factory-Data\dev"
+. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+$env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
+
 function Get-CargoPath {
     # 注意：必须把 `cargo --version` 的 stdout 丢弃（Out-Null），否则版本字符串会
     # 混入函数返回值，调用方拿到的 $cargo 变成 ["cargo 1.x ...","cargo"] 数组，
@@ -40,8 +49,9 @@ if ($cargo) {
 }
 
 if ($cargo) {
-    # dev.ps1 会把 CARGO_TARGET_DIR 重定向到共享 ASCII 根，构建产物落在那里而非
-    # $probeDir\target；优先用该环境变量定位二进制，未设时回退到本地 target。
+    # CARGO_TARGET_DIR 已在脚本顶部**强制**设为本 worktree 的 per-worktree namespace
+    # （覆盖任何继承值），构建产物落在那里而非 $probeDir\target；据此定位二进制，与
+    # 刚才 cargo build 的输出目录同一，绝不取到另一 worktree 的产物。
     $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "$probeDir\target" }
     $bin = "$targetRoot\release\clock_source.exe"
     $prevEap = $ErrorActionPreference

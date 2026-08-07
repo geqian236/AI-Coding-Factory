@@ -32,8 +32,12 @@ function Get-WorktreeTargetDir {
     .SYNOPSIS
         Per-worktree Cargo target dir under the shared DATA_ROOT.
     .PARAMETER WorktreeRoot
-        Absolute path to the worktree (repo) root. Normalized before hashing so
-        two spellings of the same tree (case / trailing slash) map to one digest.
+        Absolute path to the worktree (repo) root. Normalized (GetFullPath +
+        TrimEnd '\') before hashing so a trailing separator does not split one
+        tree into two digests. Case is NOT folded (round-10 P1): two genuinely
+        different worktrees on a case-sensitive root must NOT collide, and every
+        caller derives this from its own $PSScriptRoot so one tree keeps one
+        spelling anyway.
     .PARAMETER DataRoot
         Shared <PROJECT_ROOT>\AI-Coding-Factory-Data\dev root.
     .OUTPUTS

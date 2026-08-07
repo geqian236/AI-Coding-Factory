@@ -39,19 +39,32 @@ $exitCode  = 0
 # 仅当能定位到项目根（AI-Coding-Factory-Data 祖先）时设定，找不到即 fail-closed，
 # 绝不静默沿用可疑的继承值。
 . (Join-Path $PSScriptRoot "_worktree-target.ps1")
-$_projRoot = $null
-$_probe = $REPO_ROOT
-while ($_probe) {
-    if (Test-Path (Join-Path $_probe "AI-Coding-Factory-Data")) { $_projRoot = $_probe; break }
-    $_parent = Split-Path $_probe -Parent
-    if (-not $_parent -or $_parent -eq $_probe) { break }
-    $_probe = $_parent
+
+# GPT 第十一轮 P1：调用方级回归（test_cargo_target_isolation.py）在 GitHub Windows
+# runner 上 checkout 于 D:\a\... —— 无 AI-Coding-Factory-Data 祖先，旧逻辑会 fail-closed，
+# 令关键的"test.ps1 覆盖继承 CARGO_TARGET_DIR"断言在 CI 静默不跑。为让 CI 真实执行该
+# 断言，提供**仅测试用**的受控 DataRoot 合同：环境变量 FACTORY_TEST_DATA_ROOT 仅在
+# -PrintTargetDir（纯打印、绝不跑 cargo/pytest）时被采纳，用它作 DataRoot 派生 namespace
+# 并跳过项目根 walk-up。正式跑测试（无 -PrintTargetDir）永不采纳该覆盖，仍必须定位真实
+# 项目根，故它不能成为绕过存储合同的通道。
+if ($PrintTargetDir -and $env:FACTORY_TEST_DATA_ROOT) {
+    $_dataRoot = $env:FACTORY_TEST_DATA_ROOT
+    Write-Host "[test.ps1] (-PrintTargetDir) 受控 DataRoot = $_dataRoot"
+} else {
+    $_projRoot = $null
+    $_probe = $REPO_ROOT
+    while ($_probe) {
+        if (Test-Path (Join-Path $_probe "AI-Coding-Factory-Data")) { $_projRoot = $_probe; break }
+        $_parent = Split-Path $_probe -Parent
+        if (-not $_parent -or $_parent -eq $_probe) { break }
+        $_probe = $_parent
+    }
+    if (-not $_projRoot) {
+        Write-Error "[test.ps1] fail-closed: 找不到 AI-Coding-Factory-Data 项目根（$REPO_ROOT 的任何祖先），拒绝在未隔离的 CARGO_TARGET_DIR 下跑 cargo test"
+        exit 1
+    }
+    $_dataRoot = Join-Path $_projRoot "AI-Coding-Factory-Data\dev"
 }
-if (-not $_projRoot) {
-    Write-Error "[test.ps1] fail-closed: 找不到 AI-Coding-Factory-Data 项目根（$REPO_ROOT 的任何祖先），拒绝在未隔离的 CARGO_TARGET_DIR 下跑 cargo test"
-    exit 1
-}
-$_dataRoot = Join-Path $_projRoot "AI-Coding-Factory-Data\dev"
 $env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT -DataRoot $_dataRoot
 Write-Host "[test.ps1] CARGO_TARGET_DIR = $env:CARGO_TARGET_DIR （per-worktree 隔离）"
 

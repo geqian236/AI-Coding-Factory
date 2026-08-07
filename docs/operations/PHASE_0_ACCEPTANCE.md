@@ -194,11 +194,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 - **A-1-sync** `uv sync --locked --all-groups`（消费 uv.lock，在锁定 `.venv` 内跑
   后续 A-1；GPT 第八轮 item 5：A-1 必须跑在锁定环境而非系统 Python 偶然装到的包。
   该 check 强制存在，failure fail-closed）
-- **A-1** `uv run python -m pytest tests/contract tests/agent tests/security`（锁定 `.venv`）
+- **A-1** `uv run --locked python -m pytest tests/contract tests/agent tests/security`（锁定 `.venv`）
 - **A-2** `pnpm --filter @factory/contracts test`（vitest）
 - **A-3b** `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked`
 - **B-1** `pnpm install --frozen-lockfile`
-- **B-2** Python 3.12 锁定校验
+- **B-2** Python 3.12 锁定校验（`UV_PYTHON=3.12` 固定 uv 环境，`uv run --locked python` 内断言 `sys.version_info[:2]==(3,12)`；receipt 的 `pythonVersion` 亦取自该 uv 环境，与 A-1/GATES 同源）
 - **C-1** ci.yml 无 `echo OK/neutral` 占位（机器判定）
 - **C-2** 无重复 workflow（plan-validation.yml 已删）
 - **GATES** `check.ps1` 15 项门禁

@@ -14,10 +14,13 @@ worktree B 会跑 worktree A 编译的二进制：A 被删则 B 因路径消失�
 的 SHA-256 摘要派生 <DATA_ROOT>\\cargo-target\\<digest>，每个 checkout 独立。
 本测试锁死该隔离不回退：两个不同 worktree 根 + **同一** DATA_ROOT 必须映射到
 **不同** target namespace，且都在共享 cargo-target 根下、对同一路径确定性一致、
-大小写/尾斜杠规范化到同一摘要。
+**尾斜杠**规范化到同一摘要。GPT 第十轮 P1 后**不再强制小写**：大小写不同的路径视为
+不同树，得不同摘要（见 test_case_variant_paths_get_distinct_namespaces）。
 
-测试通过 PowerShell subprocess 调用 Get-WorktreeTargetDir（单一真源，与 5 个调用方
-同一函数），仅在 Windows 上运行（PS 5.1 / pwsh 7 可用）；CI windows-probes job 执行。
+测试通过 PowerShell subprocess 调用 Get-WorktreeTargetDir（单一真源，与 7 个调用方
+同一函数：dev.ps1 / phase0-acceptance.ps1(Set-RustGnuEnv) / check.ps1 / test.ps1 /
+test-durable-io.ps1 / test-runner-identity.ps1 / test-clock-source.ps1），仅在 Windows
+上运行（PS 5.1 / pwsh 7 可用）；CI windows-probes job 执行。含 test.ps1 调用方级回归。
 """
 from __future__ import annotations
 
@@ -126,20 +129,11 @@ def test_case_variant_paths_get_distinct_namespaces() -> None:
 
 TEST_PS1 = REPO_ROOT / "scripts" / "test.ps1"
 
-
-def _project_data_root() -> str | None:
-    """从 REPO_ROOT 向上找含 AI-Coding-Factory-Data 的项目根，返回 <root>\\AI-Coding-Factory-Data\\dev。
-
-    与 test.ps1 / check.ps1 内的项目根定位逻辑同源。找不到返回 None（测试将 skip）。
-    """
-    probe = REPO_ROOT
-    while True:
-        if (probe / "AI-Coding-Factory-Data").exists():
-            return str(probe / "AI-Coding-Factory-Data" / "dev")
-        parent = probe.parent
-        if parent == probe:
-            return None
-        probe = parent
+# 受控 DataRoot（GPT 第十一轮 P1）：合成、含 CJK、复刻真实项目根形态；仅参与纯字符串
+# 摘要，不落地。通过 FACTORY_TEST_DATA_ROOT 传给 test.ps1，使调用方级回归在**任何**
+# checkout 布局下都能真实执行——GitHub Windows runner 常在 D:\a\...，其祖先无
+# AI-Coding-Factory-Data，旧版靠 pytest.skip 静默跳过，关键断言从不在 CI 真跑。
+CONTROLLED_DATA_ROOT = r"D:\codex项目\AI-Coding-Factory-Data\dev"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="test.ps1 是 Windows PowerShell 入口")
@@ -150,20 +144,22 @@ def test_test_ps1_overrides_inherited_stale_cargo_target_dir() -> None:
     复现威胁：父进程残留 CARGO_TARGET_DIR=<DATA_ROOT>\\cargo-target（旧版共享目录）。
     若 test.ps1 不覆盖，它的 cargo test 会跑到另一 worktree 编译的二进制并读其 golden。
     本测试给子进程注入一个 bogus 共享值，调用 `test.ps1 -PrintTargetDir`（只设 namespace
-    并打印、不跑 cargo），断言打印值 == Get-WorktreeTargetDir(REPO_ROOT, 真实 DataRoot)，
+    并打印、不跑 cargo），断言打印值 == Get-WorktreeTargetDir(REPO_ROOT, 受控 DataRoot)，
     且 != 注入的 bogus 值，证明覆盖生效。
+
+    GPT 第十一轮 P1：改用 FACTORY_TEST_DATA_ROOT 传受控 DataRoot（test.ps1 仅在
+    -PrintTargetDir 下认此覆盖），不再依赖"祖先目录含 AI-Coding-Factory-Data"——因此
+    本断言在 GitHub Windows runner（D:\\a\\...）上也真实执行，绝不静默 skip。
     """
-    data_root = _project_data_root()
-    if data_root is None:
-        pytest.skip("REPO_ROOT 无 AI-Coding-Factory-Data 祖先（非真实项目布局）")
+    # 期望值：test.ps1 应把 CARGO_TARGET_DIR 设为本 worktree 根 + 受控 DataRoot 的派生 target。
+    expected = _target_dir(str(REPO_ROOT), data_root=CONTROLLED_DATA_ROOT)
 
-    # 期望值：test.ps1 应把 CARGO_TARGET_DIR 设为本 worktree 根 + 真实 DataRoot 的派生 target。
-    expected = _target_dir(str(REPO_ROOT), data_root=data_root)
-
-    # 注入一个 bogus 的旧版**共享** target 作为继承值（test.ps1 必须覆盖它）。
-    bogus_shared = data_root + r"\cargo-target"
+    # 注入一个 bogus 的旧版**共享** target 作为继承值（test.ps1 必须覆盖它），并经
+    # FACTORY_TEST_DATA_ROOT 提供受控 DataRoot，使 test.ps1 无需真实项目布局即可派生。
+    bogus_shared = CONTROLLED_DATA_ROOT + r"\cargo-target"
     env = dict(os.environ)
     env["CARGO_TARGET_DIR"] = bogus_shared
+    env["FACTORY_TEST_DATA_ROOT"] = CONTROLLED_DATA_ROOT
 
     result = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

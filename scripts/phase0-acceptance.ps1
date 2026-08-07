@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (334/1,
+        (only the gitignored receipt may appear dirty); frozen counts (336/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -161,6 +161,17 @@ foreach ($k in $_cacheDirs.Keys) {
     }
     Set-Item -Path "Env:$k" -Value $dir
 }
+
+# GPT round-11 P0: pin the uv-locked environment to Python 3.12. pyproject.toml's
+# requires-python is >=3.12, so WITHOUT this uv may resolve 3.13 for A-1/GATES while
+# B-2 checked a system 3.12 -> false PASS (reviewer's UV_PYTHON=3.13 attack). Setting
+# UV_PYTHON here (before the first uv command, A-1-sync) forces the single .venv that
+# A-1 / GATES / B-2 all use to be 3.12; B-2 then asserts (3,12) FROM that env and the
+# receipt records that env's version. Child spike wrappers inherit this env var but
+# never call uv (they use dev.ps1 + cargo), so it is a no-op for them.
+$env:UV_PYTHON = "3.12"
+# uvPythonVersion: single source for B-2 assert + receipt.pythonVersion (set in B-2).
+$uvPythonVersion = "unknown"
 
 # Python 3.12 lock (mirrors check.ps1): PATH python may be anaconda 3.11 and
 # drift results. Resolve 3.12 by: .python-version -> local install -> uv find.
@@ -336,9 +347,10 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # them THIS round, then A-1 deterministically reads the fresh sqlite receipt so
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
-# py312) and the round-9 Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 334 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/5,
-# the 5 Windows-only tests skip off-platform).
+# py312) and the Windows-only isolation/binding tests, the frozen A-1
+# baseline is now 336 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/7:
+# the 6 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -566,9 +578,24 @@ foreach ($m in [regex]::Matches($a3out, "test result: ok\.\s+(\d+)\s+passed")) {
 Add-CheckResult "A-3b-count" "cargo test frozen count == $FROZEN_CARGO_PASSED" ($cargoPassed -eq $FROZEN_CARGO_PASSED) "observed $cargoPassed passed"
 
 # --- B-2 Python pin -------------------------------------------------------
-Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned" {
-    $pv = (python --version 2>&1 | Out-String).Trim()
-    if ($pv -match "3\.12\.") { $global:LASTEXITCODE = 0 } else { Write-Host "expected 3.12.x, got $pv"; $global:LASTEXITCODE = 1 }
+# GPT round-11 P0: assert 3.12 FROM the uv-locked env (the one A-1/GATES ran in),
+# NOT a system python that may differ. sys.version_info[:2]==(3,12) is checked inside
+# `uv run --locked python`, so setting UV_PYTHON=3.13 can no longer let A-1 run on 3.13
+# while B-2 silently passes on system 3.12. The exact version string feeds the receipt.
+Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned (uv-locked env)" {
+    # Capture into a var, read $LASTEXITCODE immediately, THEN use it (never pipe a
+    # native command straight into Select-Object before reading the exit code - that
+    # trips StopUpstreamCommandsException and pollutes $LASTEXITCODE, see check.ps1).
+    $pyProbe = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>&1
+    $probeExit = $LASTEXITCODE
+    $script:uvPythonVersion = ("$pyProbe" -split "`r?`n" | Select-Object -First 1).Trim()
+    if ($probeExit -eq 0) {
+        Write-Host "uv-locked python = $script:uvPythonVersion (3.12 confirmed)"
+        $global:LASTEXITCODE = 0
+    } else {
+        Write-Host "expected 3.12.x from uv-locked env, got '$script:uvPythonVersion' (exit=$probeExit)"
+        $global:LASTEXITCODE = 1
+    }
 } | Out-Null
 
 # --- C-1 CI fail-closed (V6/C-1 strengthened) ------------------------------
@@ -658,7 +685,11 @@ $receipt = [ordered]@{
     schemaDigests        = $schemaDigests
     environment          = [ordered]@{
         os            = [System.Environment]::OSVersion.VersionString
-        pythonVersion = $actualPyVer
+        # round-11 P0: pythonVersion is the uv-locked env version (asserted ==3.12 by
+        # B-2), NOT the system python $actualPyVer - so the receipt records the exact
+        # interpreter A-1/GATES/B-2 actually ran under, not one that merely happened to
+        # be on PATH. Falls back to $actualPyVer only if B-2 somehow did not set it.
+        pythonVersion = $(if ($uvPythonVersion) { $uvPythonVersion } else { $actualPyVer })
         nodeVersion   = (node --version 2>&1 | Out-String).Trim()
     }
 }

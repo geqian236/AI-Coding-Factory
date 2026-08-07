@@ -76,24 +76,30 @@ $requiredPython = if (Test-Path $pythonVersionFile) {
 } else { "3.12" }
 Write-Host "[check.ps1] 要求 Python $requiredPython（经 uv 锁定 .venv）"
 
+# GPT 第十一轮 P0：强制 UV_PYTHON=3.12。pyproject.toml 的 requires-python 是 >=3.12，
+# 不钉死时 uv 可能给门禁解析出 3.13（reviewer 的 UV_PYTHON=3.13 攻击）。此处在 uv sync
+# 前设定，令门禁的 .venv 与 phase0-acceptance.ps1 A-1 同为 3.12。
+$env:UV_PYTHON = "3.12"
+
 # 从 uv.lock 物化锁定 .venv；--locked 漂移即 fail-closed（与 A-1-sync 一致）。
 & uv sync --locked --all-groups
 if ($LASTEXITCODE -ne 0) {
     Write-Error "[check.ps1] fail-closed: uv sync --locked --all-groups 失败（uv.lock 与 pyproject.toml 漂移？）exit=$LASTEXITCODE"
     exit 1
 }
-# 版本探针：先落变量、立即读 $LASTEXITCODE，再切片。绝不把 native 命令直接管道给
-# Select-Object -First 1——那会提前中断上游（StopUpstreamCommandsException）把
-# $LASTEXITCODE 污染成 -1，令 uv run 明明成功（stdout 就是 "Python 3.12.10"）却误判
-# 失败、fail-closed 假红。此坑与 test-runner-identity.ps1 的 docker version 探针同源。
-$verRaw   = & uv run --locked python --version 2>$null
+# GPT 第十一轮 P0：不仅探针"python 能否启动"，还必须**断言它是 3.12**（旧版只查退出码，
+# 允许 3.13 通过）。在 uv 锁定 .venv 内跑 sys.version_info[:2]==(3,12)，非 3.12 即 exit 3。
+# 先落变量、立即读 $LASTEXITCODE，再切片：绝不把 native 命令直接管道给 Select-Object，
+# 那会提前中断上游（StopUpstreamCommandsException）把 $LASTEXITCODE 污染成 -1（此坑与
+# test-runner-identity.ps1 的 docker version 探针同源，第十轮曾误伤）。
+$verRaw   = & uv run --locked python -c "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(0 if sys.version_info[:2]==(3,12) else 3)" 2>&1
 $verExit  = $LASTEXITCODE
+$lockedVer = ("$verRaw" -split "`r?`n" | Select-Object -First 1).Trim()
 if ($verExit -ne 0) {
-    Write-Error "[check.ps1] fail-closed: uv run --locked python 不可用（锁定 .venv 未就绪？）exit=$verExit"
+    Write-Error "[check.ps1] fail-closed: uv 锁定 .venv 非 Python 3.12（实测 '$lockedVer'，exit=$verExit）"
     exit 1
 }
-$lockedVer = ($verRaw | Select-Object -First 1)
-Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer"
+Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer（3.12 已断言）"
 # 用别名 python 指向锁定 .venv：所有门禁经 uv run --locked python 分发，与 A-1 同源。
 function python { & uv run --locked python @args }
 
