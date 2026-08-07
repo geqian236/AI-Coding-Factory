@@ -49,9 +49,9 @@ jobs:
         # 三语言生成树必须无漂移；漂移即整体红（fail-closed）。
         run: python contracts/codegen/generate.py --check
       - name: 合同测试
-        # 全套合同测试（含 schema 有效性、golden vectors、catalog 47 ID、
-        # receipt 聚合 fail-closed、compatibility manifest digest 绑定）。
-        run: uv run pytest tests/contract/ -q
+        # uv run python -m pytest: -m ensures cwd is on sys.path so tests that do
+        # 'from tests.conftest import REPO_ROOT' can resolve the 'tests' package.
+        run: uv run python -m pytest tests/contract/ -q
 
   python:
     name: python
@@ -255,4 +255,4 @@ jobs:
           }
           if ($hardFail) { exit 1 }
       - name: 合同测试（Windows runner）
-        run: uv run pytest tests/contract/ -q
+        run: uv run python -m pytest tests/contract/ -q

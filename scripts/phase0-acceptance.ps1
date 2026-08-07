@@ -478,9 +478,11 @@ Invoke-AcceptanceCheck "A-1-sync" "uv sync --frozen (populate locked .venv befor
 
 $a1out = Invoke-AcceptanceCheck "A-1" "Python three-dir tests" {
     $env:PYTHONIOENCODING = "utf-8"
-    # uv run pytest: uses the locked .venv synced above (reproducible across machines).
-    # -rs: report skipped with reason lines so V5 skip-identity check can match node.
-    & uv run pytest tests/contract tests/agent tests/security -q -rs
+    # uv run python -m pytest: -m flag adds cwd to sys.path (same as python -m pytest),
+    # required for tests that do 'from tests.conftest import REPO_ROOT'. Without -m,
+    # uv run pytest (script mode) does not add cwd, causing ModuleNotFoundError on
+    # test_event_hash_vectors.py and test_plan_hash_vectors.py.
+    & uv run python -m pytest tests/contract tests/agent tests/security -q -rs
 }
 # V5: enforce frozen counts + single skip identity.
 if ($a1out -match "(\d+)\s+passed,\s+(\d+)\s+skipped") {
