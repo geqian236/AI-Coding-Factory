@@ -58,39 +58,38 @@ function Invoke-GateCheck {
 
 Set-Location $REPO_ROOT
 
-# ── Python 3.12 锁定（GPT 第二轮审核指出）─────────────────────────────────
-# 仓库 .python-version 声明 3.12，但 PATH 中的 python 可能被 anaconda 等
-# 覆写为 3.11，导致 CI 与本机结果漂移。本段按以下优先级解析 Python 3.12：
-#   1. .python-version 指定 3.12（pyenv / GitHub Actions standard）
-#   2. Windows 标准安装路径 %LOCALAPPDATA%\Programs\Python\Python312\python.exe
-#   3. uv python find 3.12（跨平台回退）
-# 锁定失败直接 fail closed（exit 1），不再回退到 PATH 中任意 python。
+# ── Python 锁定环境（GPT 第十轮 P1：门禁必须与 A-1 同一个锁定 .venv）───────────
+# 旧做法从系统 PATH / 本地安装解析一个"3.12 解释器"，与 phase0-acceptance.ps1 的
+# A-1（跑在 uv 锁定的 .venv 里）用的是**两个不同环境**：实测系统 python 为
+# pytest 9.0.3，.venv 为 9.1.1。门禁与 A-1 版本漂移 → 同一候选在两处结果可能不一致，
+# PASS 无法证明"锁定环境下通过"。
+#
+# 修法：check.ps1 也强制走 uv 锁定环境。
+#   1. uv sync --locked --all-groups：从 uv.lock 物化 .venv（--locked 断言 lock 与
+#      pyproject.toml 一致，漂移即 fail-closed），并按 .python-version 锁定 3.12。
+#   2. python 别名改为经 `uv run --locked python` 分发：所有门禁（1-9 用 python 别名、
+#      4-7 直调）都在这个锁定 .venv 里跑，与 A-1 同源；--locked 使运行期再校验锁未漂移。
+# 这样门禁与 A-1 用的是同一个 pytest / ruff / mypy，不再有 9.0.3 vs 9.1.1 的分裂。
 $pythonVersionFile = Join-Path $REPO_ROOT ".python-version"
 $requiredPython = if (Test-Path $pythonVersionFile) {
     (Get-Content $pythonVersionFile -Raw -Encoding utf8).Trim()
 } else { "3.12" }
-Write-Host "[check.ps1] 要求 Python $requiredPython"
+Write-Host "[check.ps1] 要求 Python $requiredPython（经 uv 锁定 .venv）"
 
-# 候选解析路径：env PYTHON_BIN 覆盖 > 用户本地安装 > uv 解析
-$candidatePy = $env:PYTHON_BIN
-if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
-    $localPy = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($requiredPython.Replace('.',''))\python.exe"
-    if (Test-Path $localPy) { $candidatePy = $localPy }
-}
-if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
-    try {
-        $uvPy = (& uv python find $requiredPython 2>$null | Select-Object -First 1)
-        if ($uvPy -and (Test-Path $uvPy)) { $candidatePy = $uvPy }
-    } catch {}
-}
-if (-not $candidatePy -or -not (Test-Path $candidatePy)) {
-    Write-Error "[check.ps1] fail-closed: 未找到 Python $requiredPython。设置 `$env:PYTHON_BIN 指向 python.exe 或安装 Python $requiredPython。"
+# 从 uv.lock 物化锁定 .venv；--locked 漂移即 fail-closed（与 A-1-sync 一致）。
+& uv sync --locked --all-groups
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "[check.ps1] fail-closed: uv sync --locked --all-groups 失败（uv.lock 与 pyproject.toml 漂移？）exit=$LASTEXITCODE"
     exit 1
 }
-$actualVer = (& $candidatePy --version 2>$null | Select-Object -First 1)
-Write-Host "[check.ps1] 使用 $candidatePy ($actualVer)"
-# 用别名 python 指向锁定的 3.12，覆盖 PATH 中的旧版
-function python { & $candidatePy @args }
+$lockedVer = (& uv run --locked python --version 2>$null | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "[check.ps1] fail-closed: uv run --locked python 不可用（锁定 .venv 未就绪？）"
+    exit 1
+}
+Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer"
+# 用别名 python 指向锁定 .venv：所有门禁经 uv run --locked python 分发，与 A-1 同源。
+function python { & uv run --locked python @args }
 
 # 1. Codegen drift
 Invoke-GateCheck "1-codegen-drift" {
@@ -120,24 +119,24 @@ Invoke-GateCheck "3-golden-vectors" {
     }
 }
 
-# 4. Chinese coverage (via helper script, locked Python 3.12)
+# 4. Chinese coverage (via helper script, locked .venv Python 3.12)
 Invoke-GateCheck "4-chinese-coverage" {
-    & $candidatePy scripts/_gate_checks.py chinese-coverage
+    python scripts/_gate_checks.py chinese-coverage
 }
 
 # 5. No bare print/console.log (via helper script)
 Invoke-GateCheck "5-no-bare-print" {
-    & $candidatePy scripts/_gate_checks.py no-bare-print
+    python scripts/_gate_checks.py no-bare-print
 }
 
 # 6. Secret scan (via helper script)
 Invoke-GateCheck "6-secret-scan" {
-    & $candidatePy scripts/_gate_checks.py secret-scan
+    python scripts/_gate_checks.py secret-scan
 }
 
 # 7. C-drive paths (via helper script)
 Invoke-GateCheck "7-c-drive-paths" {
-    & $candidatePy scripts/_gate_checks.py c-drive-paths
+    python scripts/_gate_checks.py c-drive-paths
 }
 
 # 8. Catalog 47 IDs
@@ -151,14 +150,14 @@ Invoke-GateCheck "9-no-doc-placeholders" {
 }
 
 # ── GPT 第二轮审核要求：check.ps1 真调用全栈（不能再 9 项假绿）──────────────
-# ruff
+# ruff（GPT 第十轮 P1：--locked 与 gate 1-9 同一锁定 .venv，锁漂移即整体红）
 Invoke-GateCheck "10-ruff-lint" {
-    uv run ruff check apps/agent/src scripts tests/contract tests/security
+    uv run --locked ruff check apps/agent/src scripts tests/contract tests/security
 }
 
-# mypy
+# mypy（同上，--locked）
 Invoke-GateCheck "11-mypy-strict" {
-    uv run mypy apps/agent/src --config-file pyproject.toml
+    uv run --locked mypy apps/agent/src --config-file pyproject.toml
 }
 
 # TypeScript tsc + vitest

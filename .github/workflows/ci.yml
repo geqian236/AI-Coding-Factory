@@ -158,6 +158,13 @@ jobs:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # GPT 第十轮 P1：本 CI 的"全量锁定"合同范围 = **验收 harness**（合同/门禁测试、
+      # codegen 检查、ruff/mypy、stamp_run_binding 盖章脚本）全部经 uv==0.11.7 +
+      # uv sync --locked + uv run --locked 在锁定 .venv 内跑。**compatibility spike
+      # wrapper 本身不在此范围**：它们的职责就是探测**平台上实际存在**的 python/cargo/
+      # docker（例如 clock_source 的 python fallback、各 wrapper 经 dev.ps1 cargo build），
+      # 能力由 receipt 证据（assertions/绑定/exit code）判定，与依赖锁无关。若强行让
+      # wrapper 也走锁定 .venv，反而掩盖它要探测的真实平台差异。此边界即"锁定"合同。
       - name: 安装 pytest + uv（windows-probes 合同测试）
         # GPT round-8: 通过 uv 消费 uv.lock，锁定环境与本地 runner 一致。
         # GPT round-9 P1: 固定 uv 版本 + --locked（不是 --frozen）。--locked 在 sync 时
@@ -243,7 +250,10 @@ jobs:
             # 六份非 sqlite receipt 盖 runBinding（sqlite 走 run_nonce，避免扰动
             # emit_manifest 对 eventBatchParameters 的 digest 重算）。
             if ($name -ne "sqlite_wal_full" -and (Test-Path $receipt)) {
-              python scripts/spikes/stamp_run_binding.py $receipt $name
+              # GPT 第十轮 P1：盖章脚本（CI harness）走锁定 .venv，与 A-1/门禁同源，
+              # 不再裸调 PATH python。spike wrapper 自身仍按设计探测平台上的 python/cargo
+              # （其能力由 receipt 证据 + 退出码判定，非依赖锁；见本 job 末尾合同范围说明）。
+              uv run --locked python scripts/spikes/stamp_run_binding.py $receipt $name
               if ($LASTEXITCODE -ne 0) { Write-Error "[$name] 盖章失败 exit=$LASTEXITCODE，fail-closed"; $hardFail = $true }
             }
             $vArgs = @{

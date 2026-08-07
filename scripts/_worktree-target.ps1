@@ -44,10 +44,18 @@ function Get-WorktreeTargetDir {
         [Parameter(Mandatory = $true)][string]$WorktreeRoot,
         [Parameter(Mandatory = $true)][string]$DataRoot
     )
-    # Normalize: full path, drop trailing separator, lowercase. Windows paths are
-    # case-insensitive, so C:\A and c:\a\ are the SAME tree and must not split
-    # into two target namespaces (which would defeat the shared-toolchain reuse).
-    $normalized = [System.IO.Path]::GetFullPath($WorktreeRoot).TrimEnd('\').ToLowerInvariant()
+    # Normalize: full path + drop trailing separator ONLY. Do NOT lowercase.
+    # GPT round-10 P1: an unconditional .ToLowerInvariant() would map two GENUINELY
+    # DIFFERENT worktrees on a case-sensitive root (e.g. NTFS dir with per-directory
+    # case sensitivity enabled, or a case-sensitive network/dev-drive mount) to the
+    # SAME digest -> shared target -> the very cross-worktree pollution this helper
+    # exists to prevent. Consistency across callers does not need lowercasing: every
+    # caller derives WorktreeRoot from its own $PSScriptRoot on disk, so the same tree
+    # yields the same spelling (Windows GetFullPath preserves case), and two spellings
+    # differing only in case never arise for one tree in practice. Dropping lowercase
+    # is therefore strictly safer: identical trees still collapse, different trees stay
+    # distinct on any filesystem.
+    $normalized = [System.IO.Path]::GetFullPath($WorktreeRoot).TrimEnd('\')
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -55,8 +63,9 @@ function Get-WorktreeTargetDir {
     } finally {
         $sha.Dispose()
     }
-    # 6 bytes = 12 hex chars = 2^48 space: collision-free for the handful of
-    # worktrees any dev/CI host ever holds, short enough to keep paths sane.
+    # 6 bytes = 12 hex chars = 2^48 space. Collision-RESISTANT, not collision-free:
+    # birthday-bound probability is negligible for the handful of worktrees any dev/CI
+    # host ever holds (~1e-14 at 100 worktrees), and short enough to keep paths sane.
     $digest = -join ($hashBytes[0..5] | ForEach-Object { $_.ToString('x2') })
     return (Join-Path (Join-Path $DataRoot 'cargo-target') $digest)
 }

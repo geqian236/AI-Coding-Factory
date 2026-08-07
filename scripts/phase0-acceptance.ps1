@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (330/1,
+        (only the gitignored receipt may appear dirty); frozen counts (334/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -194,9 +194,10 @@ $ACCEPTANCE_SET_VERSION = "phase0-acceptance-v1"
 $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.md"
 
 # Frozen baseline counts (V5: parsed from output and enforced, not eyeballed).
-# round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests
-# in tests/contract/test_cargo_target_isolation.py; runner is Windows so they run).
-$FROZEN_PYTEST_PASSED  = 334
+# round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests).
+# round-10 P1: 334 -> 336 (+2 more Windows-only tests in test_cargo_target_isolation.py:
+# case-variant collision + test.ps1 caller-level override; runner is Windows so all run).
+$FROZEN_PYTEST_PASSED  = 336
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -335,7 +336,9 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # them THIS round, then A-1 deterministically reads the fresh sqlite receipt so
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
-# py312), the frozen A-1 baseline is now 330 passed / 1 skipped.
+# py312) and the round-9 Windows-only isolation/binding tests, the frozen A-1
+# baseline is now 334 passed / 1 skipped (Windows runner; Ubuntu fresh = 198/5,
+# the 5 Windows-only tests skip off-platform).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -482,21 +485,29 @@ foreach ($name in ($spikeReceipts.Keys)) {
 
 # --- A-1 + B-1 + A-2 (V1: install before vitest) ---------------------------
 # GPT round-8: A-1 must consume uv.lock (not rely on whatever the system Python
-# happens to have installed). Run uv sync --frozen --all-groups first to populate
-# .venv from the lockfile, then use uv run pytest so the locked environment is used.
-# UV_CACHE_DIR is already set to the project data root (storage contract compliant).
-# .venv is gitignored, so this sync does not dirty the tree.
-Invoke-AcceptanceCheck "A-1-sync" "uv sync --frozen (populate locked .venv before pytest)" {
-    & uv sync --frozen --all-groups
+# happens to have installed). Run uv sync --locked --all-groups first to populate
+# .venv from the lockfile, then use uv run --locked pytest so the locked environment
+# is used. UV_CACHE_DIR is already set to the project data root (storage contract
+# compliant). .venv is gitignored, so this sync does not dirty the tree.
+#
+# GPT round-10 P0: use --locked (NOT --frozen) here and on every uv run below, to
+# MATCH the frozen contract in PHASE_0_ACCEPTANCE.md line 194 (`uv sync --locked`).
+# --frozen only refuses to CHANGE the lock; --locked additionally ASSERTS uv.lock is
+# consistent with pyproject.toml and fails on drift. A PASS receipt recording --frozen
+# does not prove the lock-consistency the doc promises, so the doc and the single
+# entry point were out of sync. uv run --locked re-checks the lock at run time too.
+Invoke-AcceptanceCheck "A-1-sync" "uv sync --locked (assert lock consistent + populate .venv before pytest)" {
+    & uv sync --locked --all-groups
 } | Out-Null
 
 $a1out = Invoke-AcceptanceCheck "A-1" "Python three-dir tests" {
     $env:PYTHONIOENCODING = "utf-8"
-    # uv run python -m pytest: -m flag adds cwd to sys.path (same as python -m pytest),
-    # required for tests that do 'from tests.conftest import REPO_ROOT'. Without -m,
-    # uv run pytest (script mode) does not add cwd, causing ModuleNotFoundError on
-    # test_event_hash_vectors.py and test_plan_hash_vectors.py.
-    & uv run python -m pytest tests/contract tests/agent tests/security -q -rs
+    # uv run --locked python -m pytest: -m flag adds cwd to sys.path (same as
+    # python -m pytest), required for tests that do 'from tests.conftest import
+    # REPO_ROOT'. Without -m, uv run pytest (script mode) does not add cwd, causing
+    # ModuleNotFoundError on test_event_hash_vectors.py and test_plan_hash_vectors.py.
+    # --locked re-asserts lock consistency at run time (round-10 P0).
+    & uv run --locked python -m pytest tests/contract tests/agent tests/security -q -rs
 }
 # V5: enforce frozen counts + single skip identity.
 if ($a1out -match "(\d+)\s+passed,\s+(\d+)\s+skipped") {

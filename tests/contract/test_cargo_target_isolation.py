@@ -21,6 +21,8 @@ worktree B 会跑 worktree A 编译的二进制：A 被删则 B 因路径消失�
 """
 from __future__ import annotations
 
+import base64
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,13 +31,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PS1 = REPO_ROOT / "scripts" / "_worktree-target.ps1"
+TEST_PS1 = REPO_ROOT / "scripts" / "test.ps1"
 
 # 固定的合成 DATA_ROOT（含 CJK，复刻真实项目根形态；不落地、仅参与纯字符串摘要）。
 DATA_ROOT = r"D:\codex项目\AI-Coding-Factory-Data\dev"
 SHARED_CARGO_TARGET = DATA_ROOT + r"\cargo-target"
 
 
-def _target_dir(worktree_root: str) -> str:
+def _target_dir(worktree_root: str, data_root: str = DATA_ROOT) -> str:
     """通过 PS subprocess 调用 Get-WorktreeTargetDir，返回其派生的 target 路径。
 
     经 .NET UTF8 编码写子进程管道再回读：为避免 GBK 代码页在 stdout 上损坏 CJK 字节，
@@ -44,7 +47,7 @@ def _target_dir(worktree_root: str) -> str:
     """
     ps_script = f"""
 . '{HELPER_PS1}'
-$t = Get-WorktreeTargetDir -WorktreeRoot '{worktree_root}' -DataRoot '{DATA_ROOT}'
+$t = Get-WorktreeTargetDir -WorktreeRoot '{worktree_root}' -DataRoot '{data_root}'
 $b = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($t))
 Write-Output "B64=$b"
 """
@@ -59,7 +62,6 @@ Write-Output "B64=$b"
     )
     line = next((ln for ln in result.stdout.splitlines() if ln.startswith("B64=")), None)
     assert line is not None, f"未取到 B64= 输出行, stdout={result.stdout!r}"
-    import base64
     return base64.b64decode(line[len("B64="):]).decode("utf-8")
 
 
@@ -87,18 +89,100 @@ def test_two_worktrees_share_data_root_but_differ_in_target_namespace() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Get-WorktreeTargetDir 需 Windows PowerShell")
-def test_target_namespace_is_deterministic_and_path_normalized() -> None:
-    """同一 worktree 根确定性一致；大小写/尾斜杠规范化到同一 namespace。
+def test_target_namespace_is_deterministic_and_trailing_slash_normalized() -> None:
+    """同一 worktree 根确定性一致；尾斜杠规范化到同一 namespace。
 
-    确定性保证同一 worktree 的 cargo build 与 wrapper 取 exe 命中同一 target；
-    规范化保证 C:\\A 与 c:\\a\\ 视为同一树、不误分裂成两个 namespace（否则会破坏
-    共享工具链复用、且让 wrapper 与 dev.ps1 因路径拼写不同而错位）。
+    确定性保证同一 worktree 的 cargo build 与 wrapper 取 exe 命中同一 target
+    （所有调用方都从各自 $PSScriptRoot 派生同一 worktree 根，路径来源一致）；
+    尾斜杠规范化（GetFullPath + TrimEnd）保证 ...\\tree 与 ...\\tree\\ 视为同一树。
     """
     canonical = _target_dir(r"D:\codex项目\.codex-worktrees\factory-phase-0")
     again = _target_dir(r"D:\codex项目\.codex-worktrees\factory-phase-0")
-    variant = _target_dir("D:\\CODEX项目\\.codex-worktrees\\FACTORY-PHASE-0\\")
+    trailing = _target_dir("D:\\codex项目\\.codex-worktrees\\factory-phase-0\\")
 
     assert canonical == again, f"非确定性: {canonical} != {again}"
-    assert canonical == variant, (
-        f"大小写/尾斜杠未规范化到同一 namespace: {canonical} != {variant}"
+    assert canonical == trailing, (
+        f"尾斜杠未规范化到同一 namespace: {canonical} != {trailing}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Get-WorktreeTargetDir 需 Windows PowerShell")
+def test_case_variant_paths_get_distinct_namespaces() -> None:
+    """GPT 第十轮 P1：大小写不同的路径必须映射到**不同** namespace（碰撞修复）。
+
+    旧实现无条件 ToLowerInvariant()，在启用 case sensitivity 的 Windows 目录下会把
+    两个真实不同的 worktree（如 .../tree 与 .../TREE）折叠到同一 target namespace →
+    互相污染编译产物。修复后摘要基于**未强制小写**的规范化路径，故大小写不同的根
+    得到不同摘要。所有调用方从同一 $PSScriptRoot 源派生，天然大小写一致，不会因此
+    分裂同一棵树。
+    """
+    lower = _target_dir(r"D:\codex项目\.codex-worktrees\factory-phase-0")
+    upper = _target_dir(r"D:\CODEX项目\.codex-worktrees\FACTORY-PHASE-0")
+
+    assert lower != upper, (
+        f"大小写不同的路径不应折叠到同一 namespace（碰撞）: {lower} == {upper}"
+    )
+
+
+TEST_PS1 = REPO_ROOT / "scripts" / "test.ps1"
+
+
+def _project_data_root() -> str | None:
+    """从 REPO_ROOT 向上找含 AI-Coding-Factory-Data 的项目根，返回 <root>\\AI-Coding-Factory-Data\\dev。
+
+    与 test.ps1 / check.ps1 内的项目根定位逻辑同源。找不到返回 None（测试将 skip）。
+    """
+    probe = REPO_ROOT
+    while True:
+        if (probe / "AI-Coding-Factory-Data").exists():
+            return str(probe / "AI-Coding-Factory-Data" / "dev")
+        parent = probe.parent
+        if parent == probe:
+            return None
+        probe = parent
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="test.ps1 是 Windows PowerShell 入口")
+def test_test_ps1_overrides_inherited_stale_cargo_target_dir() -> None:
+    """GPT 第十轮 P1（调用方级回归）：test.ps1 必须**强制**用 per-worktree namespace
+    覆盖任何继承的（尤其是旧版**共享**）CARGO_TARGET_DIR，绝不沿用可疑继承值。
+
+    复现威胁：父进程残留 CARGO_TARGET_DIR=<DATA_ROOT>\\cargo-target（旧版共享目录）。
+    若 test.ps1 不覆盖，它的 cargo test 会跑到另一 worktree 编译的二进制并读其 golden。
+    本测试给子进程注入一个 bogus 共享值，调用 `test.ps1 -PrintTargetDir`（只设 namespace
+    并打印、不跑 cargo），断言打印值 == Get-WorktreeTargetDir(REPO_ROOT, 真实 DataRoot)，
+    且 != 注入的 bogus 值，证明覆盖生效。
+    """
+    data_root = _project_data_root()
+    if data_root is None:
+        pytest.skip("REPO_ROOT 无 AI-Coding-Factory-Data 祖先（非真实项目布局）")
+
+    # 期望值：test.ps1 应把 CARGO_TARGET_DIR 设为本 worktree 根 + 真实 DataRoot 的派生 target。
+    expected = _target_dir(str(REPO_ROOT), data_root=data_root)
+
+    # 注入一个 bogus 的旧版**共享** target 作为继承值（test.ps1 必须覆盖它）。
+    bogus_shared = data_root + r"\cargo-target"
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = bogus_shared
+
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-File", str(TEST_PS1), "-PrintTargetDir"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(REPO_ROOT), timeout=60, env=env,
+    )
+    assert result.returncode == 0, (
+        f"test.ps1 -PrintTargetDir 失败: rc={result.returncode} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    line = next((ln for ln in result.stdout.splitlines() if ln.startswith("TARGETDIR_B64=")), None)
+    assert line is not None, f"未取到 TARGETDIR_B64= 输出行, stdout={result.stdout!r}"
+    actual = base64.b64decode(line[len("TARGETDIR_B64="):]).decode("utf-8")
+
+    assert actual == expected, (
+        f"test.ps1 未把 CARGO_TARGET_DIR 设为 per-worktree namespace: "
+        f"actual={actual} expected={expected}"
+    )
+    assert actual != bogus_shared, (
+        f"test.ps1 沿用了继承的共享 CARGO_TARGET_DIR（未隔离）: {actual}"
     )
