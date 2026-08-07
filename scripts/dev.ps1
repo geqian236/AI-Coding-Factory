@@ -36,6 +36,14 @@ $ErrorActionPreference = 'Stop'
 $PROJECT_ROOT = "D:\codex项目"
 $DATA_ROOT    = Join-Path $PROJECT_ROOT "AI-Coding-Factory-Data\dev"
 
+# GPT 第九轮 P0：按 worktree 路径哈希隔离 Cargo target。本 dev.ps1 位于
+# <worktree>\scripts，故 worktree 根 = 本脚本目录的上一级（每个 worktree 有自己的
+# dev.ps1，$PSScriptRoot 恒指向当前 worktree，跨 worktree 不串）。共享 target 曾让
+# worktree B 跑到 worktree A 编译的二进制并读 A 的 golden（A 删除即假失败，A 尚存即
+# 假通过）。Get-WorktreeTargetDir 用规范化 worktree 路径的 SHA-256 摘要派生独立 target。
+$WORKTREE_ROOT = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot "_worktree-target.ps1")
+
 # 确保数据根目录及全部子目录存在（Rust 三件套亦在 DATA_ROOT 下，随项目根合规）。
 $subDirs = @(
     "tmp", "cargo-home", "cargo-target", "rustup-home",
@@ -86,7 +94,8 @@ function Assert-UnderProjectRoot {
 $env:TEMP                     = Join-Path $DATA_ROOT "tmp"
 $env:TMP                      = $env:TEMP
 $env:CARGO_HOME               = Join-Path $DATA_ROOT "cargo-home"
-$env:CARGO_TARGET_DIR         = Join-Path $DATA_ROOT "cargo-target"
+# 第九轮 P0：per-worktree target（非共享 cargo-target），隔离编译产物。
+$env:CARGO_TARGET_DIR         = Get-WorktreeTargetDir -WorktreeRoot $WORKTREE_ROOT -DataRoot $DATA_ROOT
 $env:RUSTUP_HOME              = Join-Path $DATA_ROOT "rustup-home"
 $env:PNPM_HOME                = Join-Path $DATA_ROOT "pnpm-home"
 $env:NPM_CONFIG_CACHE         = Join-Path $DATA_ROOT "npm-cache"

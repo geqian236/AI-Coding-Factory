@@ -29,11 +29,16 @@ $manifest     = "$probeDir\Cargo.toml"
 $devWrapper   = "$scriptRoot\scripts\dev.ps1"
 $brokerOut    = "$probeDir\_broker_stdout.log"
 $brokerErr    = "$probeDir\_broker_stderr.log"
-# dev.ps1 将 CARGO_TARGET_DIR 绑定到 D:\codex项目\AI-Coding-Factory-Data\dev\cargo-target。
+# dev.ps1 将 CARGO_TARGET_DIR 绑定到项目根下 DATA_ROOT 内的 per-worktree target。
 # broker 是自足 exe,运行期不依赖 dev.ps1 环境(仅**构建**需要 ld.lld 链接器),
 # 故构建后直接 Start-Process 该 exe 以取真实 PID 做定点硬杀。
+# GPT 第九轮 P0：target 已按 worktree 哈希隔离(dev.ps1 构建时用 Get-WorktreeTargetDir
+# 派生同一路径)。本 wrapper 用同一函数、同一 $scriptRoot(=worktree 根)算出相同 target,
+# 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 runner_identity.exe。
 $dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
-$brokerExe    = "$dataRoot\cargo-target\debug\runner_identity.exe"
+. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+$targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
+$brokerExe    = "$targetDir\debug\runner_identity.exe"
 
 # receipt 统一用无 BOM UTF-8 写:PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM,
 # 令下游 Python json.load 报 "Unexpected UTF-8 BOM"。

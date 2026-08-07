@@ -25,6 +25,12 @@ param()
 
 $ErrorActionPreference = 'Continue'
 $REPO_ROOT = Split-Path $PSScriptRoot -Parent
+# GPT 第九轮 P0：per-worktree Cargo target 隔离。gate-14 跑 cargo test，Rust 测试
+# 二进制把编译期 worktree 路径（env!("CARGO_MANIFEST_DIR")）烧进自身并据此读
+# contracts/golden/*.json；共享 cargo-target 会让一个 worktree 跑到另一个编译出的
+# 二进制（对方删除即假失败，对方尚存即假通过）。Get-WorktreeTargetDir 按规范化
+# $REPO_ROOT 的 SHA-256 摘要派生独立 target；与 dev.ps1 / phase0-acceptance.ps1 同源。
+. (Join-Path $PSScriptRoot "_worktree-target.ps1")
 $failures = [System.Collections.Generic.List[string]]::new()
 $gate_results = [System.Collections.Generic.List[hashtable]]::new()
 
@@ -197,7 +203,9 @@ Invoke-GateCheck "14-rust-test" {
     # 否则 cargo/rustc 解析成 gnu 工具链里的真实 exe，不认 +toolchain 语法
     # （报 "no such command: +stable-..."）。shim 才能分发 +toolchain。
     $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
-    $env:CARGO_TARGET_DIR = Join-Path $_dataRoot "cargo-target"
+    # 第九轮 P0：per-worktree target（非共享 cargo-target），与 dev.ps1 /
+    # phase0-acceptance.ps1 同一 Get-WorktreeTargetDir，隔离跨 worktree 编译产物。
+    $env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT -DataRoot $_dataRoot
     # 根因修复（第五轮 REVISE 后诊断）：ld.lld 路径必须从字面 $env:RUSTUP_HOME 拼接，
     # 绝不从 `rustc --print sysroot` 的 stdout 捕获。前置门禁（node/pnpm/vitest）会把
     # [Console]::OutputEncoding 改成 GBK；随后 rustc stdout 捕获到的含 CJK 的 sysroot

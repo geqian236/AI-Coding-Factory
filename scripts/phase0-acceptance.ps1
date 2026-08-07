@@ -77,6 +77,15 @@ if (-not $PROJECT_ROOT) {
 # Project-root data dir (mirrors dev.ps1); Rust toolchain/target all under it.
 $DATA_ROOT = Join-Path $PROJECT_ROOT "AI-Coding-Factory-Data\dev"
 
+# GPT round-9 P0: per-worktree Cargo target isolation. Rust test binaries bake
+# env!("CARGO_MANIFEST_DIR") (the compile-time worktree path) into themselves and
+# read contracts/golden/*.json through it; a shared cargo-target let one worktree
+# run another's binary (false FAIL if that tree was deleted, false PASS if it still
+# exists). Get-WorktreeTargetDir derives <DATA_ROOT>\cargo-target\<digest> from a
+# SHA-256 of the normalized $REPO_ROOT so each checkout is isolated. dev.ps1,
+# check.ps1 and the durable-io/runner-identity wrappers dot-source the same helper.
+. (Join-Path $PSScriptRoot "_worktree-target.ps1")
+
 # --- W3 storage contract: every cache/temp path must live under the project ---
 # root. GPT round-5 item 3: the runner set only Rust paths, leaving TEMP/TMP/
 # COREPACK_HOME/PNPM_STORE_DIR on C:. Mirror dev.ps1: bind all of them under
@@ -185,7 +194,9 @@ $ACCEPTANCE_SET_VERSION = "phase0-acceptance-v1"
 $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.md"
 
 # Frozen baseline counts (V5: parsed from output and enforced, not eyeballed).
-$FROZEN_PYTEST_PASSED  = 332
+# round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests
+# in tests/contract/test_cargo_target_isolation.py; runner is Windows so they run).
+$FROZEN_PYTEST_PASSED  = 334
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -278,7 +289,10 @@ function Add-CheckResult {
 function Set-RustGnuEnv {
     $env:CARGO_HOME       = Join-Path $DATA_ROOT "cargo-home"
     $env:RUSTUP_HOME      = Join-Path $DATA_ROOT "rustup-home"
-    $env:CARGO_TARGET_DIR = Join-Path $DATA_ROOT "cargo-target"
+    # round-9 P0: per-worktree target (not the shared cargo-target) so this run's
+    # cargo build/test both produce AND consume binaries under this worktree's own
+    # digest; a leftover binary from another checkout can never be executed here.
+    $env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT -DataRoot $DATA_ROOT
     # Prepend CARGO_HOME\bin so `cargo` resolves to the rustup shim (the shim
     # understands +toolchain; the real gnu cargo.exe does not). Do NOT prepend
     # the gnu toolchain bin, or it shadows the shim.

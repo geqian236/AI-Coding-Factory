@@ -17,8 +17,11 @@ expected.minProperties / actual.minProperties），未执行完整 JSON Schema �
      拒绝决定完全一致——这证明缺库环境下的回退器与参考实现语义等价，验收环境
      （锁定 py312 有 jsonschema）走的则是真库本身。
 
-真 jsonschema 不可用时本测试整体 skip（缺库环境不能证明等价）；验收唯一命令在
-锁定 py312 下运行，该环境已安装 jsonschema 4.26.0，故 A-1 中本测试真实执行。
+jsonschema 现为**硬运行时依赖**（pyproject.toml `dependencies` 声明、uv.lock 锁定
+4.26.0），本模块顶层 `import jsonschema` 直接导入：缺库不是 skip 而是**收集期
+ImportError（硬失败）**——验收在锁定 py312 下必装 jsonschema，故本测试真实执行，
+绝不会因缺库被静默跳过。GPT 第九轮 P1：修正旧 docstring 关于"缺库整体 skip"的过时
+表述（那是 jsonschema 尚为可选依赖时的行为，现已升级为硬依赖）。
 """
 from __future__ import annotations
 

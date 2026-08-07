@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 332 passed, 1 skipped（contract 201 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 201 含第六轮 item 3 conformance（3 项）和第八轮 item 1 binding shape 负例（2 项，Windows-only） |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 334 passed, 1 skipped（contract 203 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 203 含第六轮 item 3 conformance（3 项）、第八轮 item 1 binding shape 负例（2 项，Windows-only）与第九轮 P0 cargo-target 隔离回归（2 项，Windows-only，见 `test_cargo_target_isolation.py`）。非 Windows（如 ubuntu CI）上 4 项 Windows-only 测试 skip，故 contract 199 passed / 4 skipped，属平台差异非失败 |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -73,8 +73,10 @@
 > - event_vectors.rs：7 passed（event_id/payload_digest/materialize/reject/interleaved）
 > - plan_vectors.rs：7 passed（canonical/barrier_id/plan_revision_digest/semantic_plan_hash）
 >
-> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：Python(330) + TS(70) +
-> Rust(14) 均对同一份 golden 做 RFC 8785 字节相等断言，三侧一致即跨语言认证。
+> 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：三语言合同套件
+> （Python 334 / TS 70 / Rust 14，与 §2.1 冻结基线一致）中的**向量测试**对同一份
+> golden 做 RFC 8785 字节相等断言（Python 侧全套件 334，其中向量子集与 TS/Rust
+> 同源；非向量测试覆盖 agent/security 等其它合同）；三侧对同一 golden 字节一致即跨语言认证。
 
 ### 2.2 门禁（scripts/check.ps1，15 项全 PASS）
 
@@ -189,7 +191,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 
 该脚本按顺序执行并逐条记录退出码：
 
-- **A-1** `pytest tests/contract tests/agent tests/security`
+- **A-1-sync** `uv sync --locked --all-groups`（消费 uv.lock，在锁定 `.venv` 内跑
+  后续 A-1；GPT 第八轮 item 5：A-1 必须跑在锁定环境而非系统 Python 偶然装到的包。
+  该 check 强制存在，failure fail-closed）
+- **A-1** `uv run python -m pytest tests/contract tests/agent tests/security`（锁定 `.venv`）
 - **A-2** `pnpm --filter @factory/contracts test`（vitest）
 - **A-3b** `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked`
 - **B-1** `pnpm install --frozen-lockfile`
