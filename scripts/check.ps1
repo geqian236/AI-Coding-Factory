@@ -82,11 +82,17 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "[check.ps1] fail-closed: uv sync --locked --all-groups 失败（uv.lock 与 pyproject.toml 漂移？）exit=$LASTEXITCODE"
     exit 1
 }
-$lockedVer = (& uv run --locked python --version 2>$null | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "[check.ps1] fail-closed: uv run --locked python 不可用（锁定 .venv 未就绪？）"
+# 版本探针：先落变量、立即读 $LASTEXITCODE，再切片。绝不把 native 命令直接管道给
+# Select-Object -First 1——那会提前中断上游（StopUpstreamCommandsException）把
+# $LASTEXITCODE 污染成 -1，令 uv run 明明成功（stdout 就是 "Python 3.12.10"）却误判
+# 失败、fail-closed 假红。此坑与 test-runner-identity.ps1 的 docker version 探针同源。
+$verRaw   = & uv run --locked python --version 2>$null
+$verExit  = $LASTEXITCODE
+if ($verExit -ne 0) {
+    Write-Error "[check.ps1] fail-closed: uv run --locked python 不可用（锁定 .venv 未就绪？）exit=$verExit"
     exit 1
 }
+$lockedVer = ($verRaw | Select-Object -First 1)
 Write-Host "[check.ps1] 使用锁定 .venv：$lockedVer"
 # 用别名 python 指向锁定 .venv：所有门禁经 uv run --locked python 分发，与 A-1 同源。
 function python { & uv run --locked python @args }
