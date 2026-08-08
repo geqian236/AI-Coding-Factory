@@ -239,13 +239,19 @@ def test_shared_probe_fail_closed_on_bad_python_version_contract() -> None:
     """
     import tempfile
 
+    # GPT 第十五轮 P2：补齐 reviewer 点名的边界负例。除 missing/empty/简单 malformed 外，
+    # 新增：合法首行+非法次行（必须 multiline 拒绝，非首行放行）、超长数字（[int] 溢出但
+    # TryParse 有界不抛）、非规范前导零（03.012 拒绝）。
     cases = [
-        ("missing", None),                 # 不建 .python-version
-        ("empty", ""),                     # 空文件
-        ("empty", "   \n\t "),             # 仅空白 → 归类 empty
-        ("malformed", "not-a-version"),    # 非法格式
-        ("malformed", "3"),                # 缺 minor
-        ("malformed", "x.y"),              # 非数字
+        ("missing", None),                          # 不建 .python-version
+        ("empty", ""),                              # 空文件
+        ("empty", "   \n\t "),                      # 仅空白 → 归类 empty
+        ("malformed", "not-a-version"),             # 非法格式
+        ("malformed", "3"),                         # 缺 minor
+        ("malformed", "x.y"),                       # 非数字
+        ("multiline", "3.12\nnot-a-version"),       # 合法首行+非法次行 → 恰一条记录约束拒绝
+        ("malformed", ("9" * 200) + ".12"),         # 超长 major：正则可过、[int] 溢出、TryParse 稳定拒绝（不抛）
+        ("malformed", "03.012"),                    # 非规范前导零 → 规范化正则拒绝
     ]
     for expected_cat, content in cases:
         with tempfile.TemporaryDirectory() as td:
@@ -262,6 +268,11 @@ def test_shared_probe_fail_closed_on_bad_python_version_contract() -> None:
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=str(REPO_ROOT), timeout=60,
             )
+            # returncode==0 == 函数未抛异常（超长数字必须走 TryParse 稳定拒绝而非抛 OverflowException）。
+            assert proc.returncode == 0, (
+                f"契约坏值（{expected_cat}, content={content!r}）不得让函数抛异常: "
+                f"rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            )
             fields = _parse_fields(proc.stdout)
             assert fields.get("OK") == "False", (
                 f"契约坏值（{expected_cat}, content={content!r}）必须 fail-closed ok=False: "
@@ -271,3 +282,76 @@ def test_shared_probe_fail_closed_on_bad_python_version_contract() -> None:
             assert cerr.startswith(expected_cat), (
                 f"contractError 应以 '{expected_cat}' 归类: got {cerr!r} (content={content!r})"
             )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Get-UvLockedPythonVersion 需 Windows PowerShell")
+def test_shared_probe_fail_closed_on_nonterminating_read_error_without_calling_uv() -> None:
+    """P1 核心负例（GPT 第十五轮）：Get-Content 发生**非终止**读取错误（先吐内容再报错）时，
+    共享探针必须 fail-closed（contractError=unreadable）且**绝不调用 uv**（uvCalls=0）。
+
+    reviewer 实测第十四轮遗漏：Get-Content 无 -ErrorAction Stop 时，mock"先返回 3.12
+    再产生非终止错误"仍被当合法内容放行（ok=true/uvCalls=1/contractError=null）。修复
+    在读取处加 -ErrorAction Stop，把非终止错误升级为终止错误 → catch → unreadable。
+
+    做法：写一段 PS harness 到临时 .ps1，dot-source 生产探针后，用同名函数**遮蔽**
+    Get-Content（Write-Output 内容 + Write-Error 非终止错误）与 uv（计数），再调用共享
+    函数。以 -File 运行（避免 -Command 的嵌套引号脆弱）。断言 OK=False / CERR=unreadable /
+    UVCALLS=0——uvCalls=0 证明在跑探针**之前**就 fail-fast。
+    """
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        # 建一个"看似合法"的 .python-version：真实 Test-Path 通过、进入 Get-Content 分支，
+        # 从而让被遮蔽的 Get-Content（模拟非终止错误）真正生效。
+        (tdp / ".python-version").write_text("3.12\n", encoding="utf-8")
+        harness = tdp / "_r15_nonterm_read.ps1"
+        # 关键（GPT 第十五轮教训）：harness 正文必须**纯 ASCII**，探针路径与 RepoRoot
+        # 经**环境变量**传入（$env:R15_PROBE / $env:R15_REPO）。若把含 CJK 的绝对路径
+        # 直接写进 harness 正文，Python 以 UTF-8(no BOM) 落盘、PS 5.1 在 GBK 代码页下读
+        # 会把 CJK 路径解码成乱码 → dot-source 找不到探针 → 函数未定义（本测试初版即此坑）。
+        # 环境变量走 Windows API（UTF-16），不受 .ps1 文件编码影响，最稳。
+        # PS 变量/函数遮蔽仅在本进程内，绝不改动任何生产文件。
+        harness_src = (
+            "Set-StrictMode -Version Latest\n"
+            "$ErrorActionPreference = 'Continue'\n"
+            ". $env:R15_PROBE\n"
+            "$script:uvCalls = 0\n"
+            "function Get-Content {\n"
+            "    [CmdletBinding()]\n"
+            "    param(\n"
+            "        [Parameter(ValueFromRemainingArguments = $true)]$Rest,\n"
+            "        [string]$LiteralPath, [switch]$Raw, $Encoding\n"
+            "    )\n"
+            "    Write-Output '3.12'\n"
+            "    Write-Error 'simulated non-terminating read error'\n"
+            "}\n"
+            "function uv { $script:uvCalls++; Write-Output '3.12.10'; $global:LASTEXITCODE = 0 }\n"
+            "$r = Get-UvLockedPythonVersion -RepoRoot $env:R15_REPO\n"
+            "Write-Output ('OK=' + $r.ok)\n"
+            "Write-Output ('CERR=' + $r.contractError)\n"
+            "Write-Output ('UVCALLS=' + $script:uvCalls)\n"
+        )
+        harness.write_text(harness_src, encoding="ascii")
+        env = dict(os.environ)
+        env["R15_PROBE"] = str(PROBE_PS1)
+        env["R15_REPO"] = str(tdp)
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(REPO_ROOT), timeout=60, env=env,
+        )
+        assert proc.returncode == 0, (
+            f"harness 不应崩溃: rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        fields = _parse_fields(proc.stdout)
+        assert fields.get("OK") == "False", (
+            f"非终止读取错误必须 fail-closed ok=False: fields={fields} stdout={proc.stdout!r}"
+        )
+        assert fields.get("CERR") == "unreadable", (
+            f"非终止读取错误应归类 unreadable（-ErrorAction Stop 升级为终止错误）: fields={fields}"
+        )
+        assert fields.get("UVCALLS") == "0", (
+            f"契约无效时绝不调用 uv（fail-fast in step 1）: uvCalls={fields.get('UVCALLS')} stdout={proc.stdout!r}"
+        )

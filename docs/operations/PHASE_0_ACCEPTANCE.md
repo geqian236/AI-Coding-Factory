@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 340 passed, 1 skipped（contract 209 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 209 含第六轮 item 3 conformance（3 项）、第八轮 item 1 binding shape 负例（2 项，Windows-only）、cargo-target 隔离回归（4 项，Windows-only，见 `test_cargo_target_isolation.py`：第九轮 2 项 + 第十轮 P1 大小写碰撞与 test.ps1 覆盖各 1 项）与 pythonVersion 探针回归（`test_python_pin_probe.py` 共 4 项：2 项 Windows-only [共享探针端到端 hostile-VIRTUAL_ENV + 第十四轮 P1 fail-closed 契约负例] + 2 项跨平台 [第十三轮 mutation 防线 + 第十四轮 P2 dot-source 注释免疫]，跨平台项读脚本文本、ubuntu 亦执行）。**平台/运行序差异（非失败）**：验收唯一入口先跑 spike（生成 sqlite receipt），故 runner 上 contract 209 全 pass；而 ubuntu CI 的 `contracts` job 直接 `pytest tests/contract/`（无 spike 前置），8 项 Windows-only 测试（binding shape 2 + cargo-target 隔离 4 + pin-probe 2）+ `test_compatibility_manifest.py` 的 sqlite-receipt 用例（receipt 缺失时 skip）共 9 项 skip，故 ubuntu contract = 200 passed / 9 skipped |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | 341 passed, 1 skipped（contract 210 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测，环境受限非失败；runner 精确校验此 node，出现其它 skip 即 FAIL）。contract 210 含第六轮 item 3 conformance（3 项）、第八轮 item 1 binding shape 负例（2 项，Windows-only）、cargo-target 隔离回归（4 项，Windows-only，见 `test_cargo_target_isolation.py`：第九轮 2 项 + 第十轮 P1 大小写碰撞与 test.ps1 覆盖各 1 项）与 pythonVersion 探针回归（`test_python_pin_probe.py` 共 5 项：3 项 Windows-only [共享探针端到端 hostile-VIRTUAL_ENV + 第十四轮 P1 fail-closed 契约负例 + 第十五轮 P1 非终止读取错误不调用 uv] + 2 项跨平台 [第十三轮 mutation 防线 + 第十四轮 P2 dot-source 注释免疫]，跨平台项读脚本文本、ubuntu 亦执行）。**平台/运行序差异（非失败）**：验收唯一入口先跑 spike（生成 sqlite receipt），故 runner 上 contract 210 全 pass；而 ubuntu CI 的 `contracts` job 直接 `pytest tests/contract/`（无 spike 前置），9 项 Windows-only 测试（binding shape 2 + cargo-target 隔离 4 + pin-probe 3）+ `test_compatibility_manifest.py` 的 sqlite-receipt 用例（receipt 缺失时 skip）共 10 项 skip，故 ubuntu contract = 200 passed / 10 skipped |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -74,8 +74,8 @@
 > - plan_vectors.rs：7 passed（canonical/barrier_id/plan_revision_digest/semantic_plan_hash）
 >
 > 三语言字节一致性由**共享 `contracts/golden/*.json` 锚定**：三语言合同套件
-> （Python 340 / TS 70 / Rust 14，与 §2.1 冻结基线一致）中的**向量测试**对同一份
-> golden 做 RFC 8785 字节相等断言（Python 侧全套件 340，其中向量子集与 TS/Rust
+> （Python 341 / TS 70 / Rust 14，与 §2.1 冻结基线一致）中的**向量测试**对同一份
+> golden 做 RFC 8785 字节相等断言（Python 侧全套件 341，其中向量子集与 TS/Rust
 > 同源；非向量测试覆盖 agent/security 等其它合同）；三侧对同一 golden 字节一致即跨语言认证。
 
 ### 2.2 门禁（scripts/check.ps1，15 项全 PASS）
@@ -207,7 +207,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 完成后写出**唯一总回执** `.phase0-acceptance-receipt.json`，绑定：
 `testedCandidateSha`（40 位）、`acceptanceSetVersion`、`cleanTree` + `dirtyFiles`、
 每条 check 的 `id/exitCode/passed/tail`、`spikeStatuses`、`blockedAllowlist`、
-`scriptDigests`（脚本 + 验收文档）、`schemaDigests`（全 schema）、环境版本。
+`acceptanceSetDigest`（验收文档单独绑定）、`scriptDigests`（5 个执行脚本：
+phase0-acceptance.ps1 / check.ps1 / dev.ps1 / _python-probe.ps1 / _worktree-target.ps1）、
+`schemaDigests`（全 schema）、环境版本。
 
 **顶层 PASS 判定**：所有 check `passed=true`（spike 按 allowlist：核心必 PASS，
 仅 allowlist ID 允许 BLOCKED_UNCERTIFIED）→ `topStatus=PASS` = Phase 0 达成。

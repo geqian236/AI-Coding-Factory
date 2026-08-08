@@ -51,37 +51,51 @@ function Get-UvLockedPythonVersion {
         [Parameter(Mandatory = $true)][string]$RepoRoot
     )
     # ── 步骤 1：读取并严格校验冻结契约 .python-version（fail-closed）──────────────
-    # 缺失/空/不可读/格式非法一律返回 ok=$false + contractError，且不跑探针、不默认版本。
+    # GPT 第十五轮 P1/P2：把"所有异常一律 fail-closed"做实做稳。要点：
+    #   1) Get-Content 加 -ErrorAction Stop：把**非终止**读取错误升级为终止错误 → 落入
+    #      catch → contractError=unreadable。否则"部分读取（先吐内容再报非终止错误）"会
+    #      漏过校验、被当合法内容放行（第十四轮遗漏，reviewer 实测 ok=true/uvCalls=1）。
+    #   2) 恰好一条非空记录：0 条=empty，>1 条=multiline（防"合法首行+非法次行"如
+    #      "3.12`nnot-a-version" 被首行放行）。
+    #   3) 规范化 + 有界解析：正则各段禁前导零（03/012 拒绝），且用 [int]::TryParse 有界
+    #      解析——200 位数字正则可过但 [int] 会溢出；TryParse 稳定返回 $false，绝不抛异常。
+    #   4) 全程 try/catch 兜底：任何异常都稳定返回约定的六字段错误对象，绝不跑探针、
+    #      绝不默认任何版本。
     $pyVerFile = Join-Path $RepoRoot ".python-version"
     $contractError = $null
     $mm = $null
     $major = $null
     $minor = $null
-    if (-not (Test-Path -LiteralPath $pyVerFile)) {
-        $contractError = "missing"
-    } else {
-        $reqRaw = $null
-        try {
-            $reqRaw = (Get-Content -LiteralPath $pyVerFile -Raw -Encoding utf8)
-        } catch {
-            $contractError = "unreadable"
-        }
-        if ($null -eq $contractError) {
-            # 取第一条非空行（容忍尾随换行/空行），再严格匹配 major.minor[.patch]。
-            $firstLine = (("$reqRaw" -split "`r?`n") |
-                ForEach-Object { $_.Trim() } |
-                Where-Object { $_ -ne "" } |
-                Select-Object -First 1)
-            if (-not $firstLine) {
+    try {
+        if (-not (Test-Path -LiteralPath $pyVerFile)) {
+            $contractError = "missing"
+        } else {
+            # -ErrorAction Stop：非终止读取错误在此升级为终止错误 → catch → unreadable。
+            $reqRaw = Get-Content -LiteralPath $pyVerFile -Raw -Encoding utf8 -ErrorAction Stop
+            $nonEmpty = @(("$reqRaw" -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+            if ($nonEmpty.Count -eq 0) {
                 $contractError = "empty"
-            } elseif ($firstLine -match '^(\d+)\.(\d+)(?:\.\d+)?$') {
-                $mm = "$($Matches[1]).$($Matches[2])"
-                $major = [int]$Matches[1]
-                $minor = [int]$Matches[2]
+            } elseif ($nonEmpty.Count -gt 1) {
+                # 合同必须恰一条非空记录；多记录（合法首行+非法次行等）一律拒绝。
+                $contractError = "multiline:$($nonEmpty.Count)"
+            } elseif ($nonEmpty[0] -match '^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$') {
+                # 规范化正则已禁前导零；再用 [int]::TryParse 有界解析，超界（如 200 位）稳定拒绝。
+                $pMajor = 0
+                $pMinor = 0
+                if ([int]::TryParse($Matches[1], [ref]$pMajor) -and [int]::TryParse($Matches[2], [ref]$pMinor)) {
+                    $major = $pMajor
+                    $minor = $pMinor
+                    $mm = "$pMajor.$pMinor"
+                } else {
+                    $contractError = "malformed:$($nonEmpty[0])"
+                }
             } else {
-                $contractError = "malformed:$firstLine"
+                $contractError = "malformed:$($nonEmpty[0])"
             }
         }
+    } catch {
+        # 任何异常（读取终止错误在此收口）稳定 fail-closed；不覆盖已判定的具体错误。
+        if ($null -eq $contractError) { $contractError = "unreadable" }
     }
     if ($contractError) {
         # fail-closed：契约无效即返回，绝不跑探针、绝不默认任何版本。

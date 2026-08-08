@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (340/1,
+        (only the gitignored receipt may appear dirty); frozen counts (341/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -218,7 +218,10 @@ $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.m
 # negative [Windows-only] + dot-source comment-immune mutation defense [cross-platform]).
 # round-12 P2: 336 -> 338 (+2 Windows-only tests in test_python_pin_probe.py: pythonVersion
 # strict-parse under hostile VIRTUAL_ENV + warning-lands-on-stderr repro; runner is Windows).
-$FROZEN_PYTEST_PASSED  = 340
+# round-15 P1/P2: 340 -> 341 (+1 Windows-only test in test_python_pin_probe.py: non-terminating
+# read error -> unreadable + uvCalls=0; the fail-closed-contract test also gained multiline /
+# oversized-digit / leading-zero boundary cases but stays one test).
+$FROZEN_PYTEST_PASSED  = 341
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -358,13 +361,14 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
 # py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 340 passed / 1 skipped (Windows runner; Ubuntu fresh = 200/9:
-# 8 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# baseline is now 341 passed / 1 skipped (Windows runner; Ubuntu fresh = 200/10:
+# 9 Windows-only contract tests skip off-platform AND the sqlite-receipt test
 # skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first.
-# round-13/14: the pin-probe file has 4 tests - 2 Windows-only (shared-probe end-to-end
-# under hostile VIRTUAL_ENV + fail-closed .python-version contract negatives) and 2
-# cross-platform (mutation defense + dot-source comment-immunity), so 2 of the 4 run on
-# Ubuntu too. 8 Windows-only + 1 sqlite skip = Ubuntu 200/9).
+# round-13/14/15: the pin-probe file has 5 tests - 3 Windows-only (shared-probe end-to-end
+# under hostile VIRTUAL_ENV + fail-closed .python-version contract negatives + round-15
+# non-terminating-read-error-without-calling-uv) and 2 cross-platform (mutation defense +
+# dot-source comment-immunity), so 2 of the 5 run on Ubuntu too. 9 Windows-only + 1 sqlite
+# skip = Ubuntu 200/10).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
