@@ -33,6 +33,11 @@ from pathlib import Path
 
 import pytest
 
+# 行级 dot-source 正则（GPT 第十四轮 P2）：匹配"以 dot-source 运算符 . 开头、最终引用
+# _python-probe.ps1"的真实代码行。去注释后，被注释掉的 dot-source 行整行消失，此正则
+# 不再命中——故"把真实 dot-source 行注释掉"的 mutation 会被捕获。
+DOTSOURCE_PROBE_RE = re.compile(r"(?m)^\s*\.\s+.*_python-probe\.ps1")
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROBE_PS1 = REPO_ROOT / "scripts" / "_python-probe.ps1"
 ACCEPTANCE_PS1 = REPO_ROOT / "scripts" / "phase0-acceptance.ps1"
@@ -41,6 +46,12 @@ PYTHON_VERSION_FILE = REPO_ROOT / ".python-version"
 
 # 敌意 VIRTUAL_ENV：指向不存在的路径，触发 uv 的 "will be ignored" stderr warning。
 HOSTILE_VENV = r"D:\codex项目\nonexistent-hostile-venv"
+
+# 行级 dot-source 正则（GPT 第十四轮 P2）：匹配**真实**的 dot-source 语句
+# `. <path...>_python-probe.ps1`（行首可有空白，'.' 后必须有空白）。在**去注释**后的
+# 纯代码上匹配——注释掉真实 dot-source 行（前加 '#'）后该行会被 _strip_ps_comments
+# 删除，正则不再命中，从而捕获"注释代偿"这类 mutation（旧版在原始文本里搜子串会假绿）。
+DOTSOURCE_RE = re.compile(r"(?m)^\s*\.\s+.*_python-probe\.ps1")
 
 
 def _frozen_major_minor() -> str:
@@ -121,18 +132,27 @@ def test_shared_probe_returns_frozen_major_minor_under_hostile_virtualenv() -> N
 
 
 def _read(p: Path) -> str:
-    return p.read_text(encoding="utf-8")
+    # utf-8-sig：_python-probe.ps1 现为 UTF-8 with BOM（第十四轮 P1 中文注释），
+    # utf-8-sig 会剥掉 BOM，避免首行前缀污染行级正则与 token 匹配。
+    return p.read_text(encoding="utf-8-sig")
 
 
 def _strip_ps_comments(text: str) -> str:
-    """去掉 PowerShell 注释后返回纯代码，供**负向**断言（不得含某模式）用。
+    """去掉 PowerShell 注释后返回纯代码，供断言用。
 
     先删块注释 <# ... #>，再删行注释（# 到行尾）。本仓这些脚本的代码字符串里不含
-    '#'，故行注释删除不会误伤代码；正向断言仍跑在原始文本上，不受影响。这样
-    "禁止出现 2>&1 / 内联探针" 只针对真实代码，不再被解释性注释里的字面误伤。
+    '#'，故行注释删除不会误伤代码。GPT 第十四轮 P2：**正向**断言（必须引用共享探针）
+    也改跑在去注释代码上——否则把真实 dot-source 行注释掉、仅靠注释里残留的
+    "_python-probe.ps1" 字面就能让测试假绿（reviewer 实测）。
     """
     no_block = re.sub(r"<#.*?#>", "", text, flags=re.S)
     return re.sub(r"(?m)#.*$", "", no_block)
+
+
+# 行级 dot-source 正则：匹配以 dot-source 运算符 `.` 开头、引用 _python-probe.ps1 的
+# **真实代码行**（如 `. (Join-Path $PSScriptRoot "_python-probe.ps1")`）。跑在去注释
+# 代码上：把该行注释掉后，_strip_ps_comments 会整行删除，正则不再命中 → mutation 被抓。
+DOTSOURCE_PROBE_RE = re.compile(r"(?m)^\s*\.\s+.*_python-probe\.ps1")
 
 
 def test_production_entry_points_use_shared_probe_no_inline_probe() -> None:
@@ -158,7 +178,14 @@ def test_production_entry_points_use_shared_probe_no_inline_probe() -> None:
     for label, path in (("phase0-acceptance.ps1", ACCEPTANCE_PS1), ("check.ps1", CHECK_PS1)):
         src = _read(path)
         code = _strip_ps_comments(src)
-        assert "_python-probe.ps1" in src, f"{label} 必须 dot-source 共享探针 _python-probe.ps1"
+        # GPT 第十四轮 P2：dot-source 断言必须跑在**去注释后的代码**上，并用**行级正则**
+        # 锁定真实 dot-source 语句（`. <path>\_python-probe.ps1`）。旧版在**原始文本**里
+        # 找子串 "_python-probe.ps1"——把真正的 dot-source 行注释掉后，注释里仍有该子串，
+        # 测试假绿（reviewer 实测）。行级正则 + 去注释使被注释掉的 dot-source 行消失即失败。
+        assert DOTSOURCE_PROBE_RE.search(code), (
+            f"{label} 必须在**代码**中以行级 dot-source 语句引用 _python-probe.ps1"
+            f"（不能只在注释里出现）"
+        )
         assert "Get-UvLockedPythonVersion" in code, (
             f"{label} 必须在**代码**中调用共享探针 Get-UvLockedPythonVersion"
         )
@@ -166,3 +193,81 @@ def test_production_entry_points_use_shared_probe_no_inline_probe() -> None:
         assert "sys.version_info" not in code, (
             f"{label} **代码**不得再内联 sys.version_info 探针（逻辑应只在共享探针里）"
         )
+
+
+def test_dotsource_assertion_is_immune_to_commenting_out_the_line() -> None:
+    """P2 mutation 负例（跨平台）：证明 dot-source 断言用的是**去注释 + 行级正则**，
+    而非在原始文本里找子串。reviewer 实测把 phase0-acceptance.ps1 里真实的 dot-source
+    行注释掉后旧测试仍 2 passed（注释里仍有 "_python-probe.ps1" 子串）。这里就地模拟
+    该 mutation：把每个入口的真实 dot-source 行前置 '# ' 注释掉，去注释后行级正则必须
+    不再命中——即上面的 test 会真失败。
+
+    不落地改动任何生产文件：只在内存里对读到的文本做 mutation 后断言。
+    """
+    for label, path in (("phase0-acceptance.ps1", ACCEPTANCE_PS1), ("check.ps1", CHECK_PS1)):
+        src = _read(path)
+        # 原始（未 mutation）代码：行级正则应命中真实 dot-source 语句。
+        assert DOTSOURCE_PROBE_RE.search(_strip_ps_comments(src)), (
+            f"{label} 前置条件：未 mutation 时应命中真实 dot-source 行"
+        )
+        # mutation：把真实 dot-source 行整行注释掉（前置 '# '），模拟 reviewer 的攻击。
+        mutated = re.sub(
+            r"(?m)^(\s*)(\.\s+.*_python-probe\.ps1.*)$",
+            r"\1# \2",
+            src,
+        )
+        assert mutated != src, f"{label}：未能定位真实 dot-source 行以施加 mutation"
+        mutated_code = _strip_ps_comments(mutated)
+        # 关键断言：注释掉真实 dot-source 行后，去注释代码里行级正则必须不再命中
+        #（若仍命中，说明断言又退化成"原始文本找子串"，会被注释代偿假绿）。
+        assert not DOTSOURCE_PROBE_RE.search(mutated_code), (
+            f"{label}：把真实 dot-source 行注释掉后，行级正则仍命中——断言可被注释代偿（P2 回归）"
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Get-UvLockedPythonVersion 需 Windows PowerShell")
+def test_shared_probe_fail_closed_on_bad_python_version_contract() -> None:
+    """P1 负例（GPT 第十四轮）：.python-version 缺失/空/不可读格式一律 fail-closed。
+
+    旧版在 .python-version 缺失/非法时静默回退 "3.12" 并 ok=true（reviewer 实测：文件
+    不存在仍返回 ok=true/version=3.12.10）。修复后共享探针在跑 uv 探针**之前**就对契约
+    做校验：缺失/空/格式非法 → ok=$false + contractError，绝不放行。
+
+    用受控临时目录做 RepoRoot（各含一个坏的或缺失的 .python-version），直接调用共享
+    函数，断言 ok=False 且 contractError 命中对应分类。因走 fail-fast 分支、在 uv 探针
+    之前返回，故不依赖网络/锁定 .venv，跑得快且确定。
+    """
+    import tempfile
+
+    cases = [
+        ("missing", None),                 # 不建 .python-version
+        ("empty", ""),                     # 空文件
+        ("empty", "   \n\t "),             # 仅空白 → 归类 empty
+        ("malformed", "not-a-version"),    # 非法格式
+        ("malformed", "3"),                # 缺 minor
+        ("malformed", "x.y"),              # 非数字
+    ]
+    for expected_cat, content in cases:
+        with tempfile.TemporaryDirectory() as td:
+            if content is not None:
+                (Path(td) / ".python-version").write_text(content, encoding="utf-8")
+            script = (
+                f". '{PROBE_PS1}'; "
+                f"$r = Get-UvLockedPythonVersion -RepoRoot '{td}'; "
+                r'Write-Output ("OK=" + $r.ok); '
+                r'Write-Output ("CERR=" + $r.contractError)'
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=str(REPO_ROOT), timeout=60,
+            )
+            fields = _parse_fields(proc.stdout)
+            assert fields.get("OK") == "False", (
+                f"契约坏值（{expected_cat}, content={content!r}）必须 fail-closed ok=False: "
+                f"fields={fields} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            )
+            cerr = fields.get("CERR", "")
+            assert cerr.startswith(expected_cat), (
+                f"contractError 应以 '{expected_cat}' 归类: got {cerr!r} (content={content!r})"
+            )

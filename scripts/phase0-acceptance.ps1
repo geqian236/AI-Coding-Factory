@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (338/1,
+        (only the gitignored receipt may appear dirty); frozen counts (340/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -214,9 +214,11 @@ $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.m
 # round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests).
 # round-10 P1: 334 -> 336 (+2 more Windows-only tests in test_cargo_target_isolation.py:
 # case-variant collision + test.ps1 caller-level override; runner is Windows so all run).
+# round-14 P1/P2: 338 -> 340 (+2 net tests in test_python_pin_probe.py: fail-closed contract
+# negative [Windows-only] + dot-source comment-immune mutation defense [cross-platform]).
 # round-12 P2: 336 -> 338 (+2 Windows-only tests in test_python_pin_probe.py: pythonVersion
 # strict-parse under hostile VIRTUAL_ENV + warning-lands-on-stderr repro; runner is Windows).
-$FROZEN_PYTEST_PASSED  = 338
+$FROZEN_PYTEST_PASSED  = 340
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -356,11 +358,13 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
 # py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 338 passed / 1 skipped (Windows runner; Ubuntu fresh = 199/8:
-# 7 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# baseline is now 340 passed / 1 skipped (Windows runner; Ubuntu fresh = 200/9:
+# 8 Windows-only contract tests skip off-platform AND the sqlite-receipt test
 # skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first.
-# round-13 P1-1: the pin-probe's Test B is cross-platform (reads script text), so it
-# runs on Ubuntu too - one fewer Windows-only skip than round-12, hence 199/8 not 198/9).
+# round-13/14: the pin-probe file has 4 tests - 2 Windows-only (shared-probe end-to-end
+# under hostile VIRTUAL_ENV + fail-closed .python-version contract negatives) and 2
+# cross-platform (mutation defense + dot-source comment-immunity), so 2 of the 4 run on
+# Ubuntu too. 8 Windows-only + 1 sqlite skip = Ubuntu 200/9).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -660,10 +664,17 @@ $topStatus = if ($failed.Count -eq 0) { "PASS" } else { "FAIL" }
 
 # --- digest binding (acceptance-set doc / scripts / schema / env) ----------
 $acceptanceSetDigest = Get-FileSha256 $ACCEPTANCE_SET_DOC
+# GPT round-14 P1: the receipt's scriptDigests bound only the three "top-level"
+# scripts and OMITTED the dot-sourced production helpers. _python-probe.ps1 (the
+# uv-locked Python probe, round-13) and _worktree-target.ps1 (per-worktree Cargo
+# target isolation, round-9) are BOTH real production code that acceptance depends
+# on; a tamper there previously left no digest trace in the evidence. Bind them too.
 $scriptDigests = [ordered]@{
     "phase0-acceptance.ps1" = Get-FileSha256 (Join-Path $PSScriptRoot "phase0-acceptance.ps1")
     "check.ps1"             = Get-FileSha256 (Join-Path $PSScriptRoot "check.ps1")
     "dev.ps1"               = Get-FileSha256 (Join-Path $PSScriptRoot "dev.ps1")
+    "_python-probe.ps1"     = Get-FileSha256 (Join-Path $PSScriptRoot "_python-probe.ps1")
+    "_worktree-target.ps1"  = Get-FileSha256 (Join-Path $PSScriptRoot "_worktree-target.ps1")
 }
 $schemaDigests = [ordered]@{}
 Get-ChildItem (Join-Path $REPO_ROOT "contracts/schemas") -Filter *.json | Sort-Object Name | ForEach-Object {
