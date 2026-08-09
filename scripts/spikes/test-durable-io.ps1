@@ -20,26 +20,18 @@ $ErrorActionPreference = "Stop"
 $spikeName    = "windows_durable_io"
 $scriptRoot   = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
 $probeDir     = "$scriptRoot\tools\compat-probes\windows_durable_io"
-$receiptPath  = "$probeDir\receipt.json"
-$manifest     = "$probeDir\Cargo.toml"
-$devWrapper   = "$scriptRoot\scripts\dev.ps1"
-$tmpDir       = "$probeDir\probe_tmp"
-$childOut     = "$probeDir\_child_stdout.log"
-$childErr     = "$probeDir\_child_stderr.log"
-# dev.ps1 将 CARGO_TARGET_DIR 绑定到项目根下 DATA_ROOT 内的 per-worktree target。
-# writer 是自足 exe,运行期不依赖 dev.ps1 环境(仅**构建**需要 ld.lld 链接器),
-# 故构建后直接 Start-Process 该 exe 以取真实 PID 做定点硬杀。
-# GPT 第九轮 P0：target 已按 worktree 哈希隔离(dev.ps1 构建时用 Get-WorktreeTargetDir
-# 派生同一路径)。本 wrapper 用同一函数、同一 $scriptRoot(=worktree 根)算出相同 target,
-# 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 windows_durable_io.exe。
-$dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
-. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+# 回执路径：默认写探针目录下 receipt.json。DURABLE_IO_RECEIPT_OVERRIDE（仅供回归测试用）
+# 可把 BLOCKED 回执改写到唯一临时文件，使"非 Windows 分支可达性"测试不污染真实 receipt.json
+# 也不与其它 worktree/进程竞争。生产 CI 不设该变量，行为完全不变（仍 fail-closed）。
+if ($env:DURABLE_IO_RECEIPT_OVERRIDE) { $receiptPath = $env:DURABLE_IO_RECEIPT_OVERRIDE }
+else { $receiptPath = "$probeDir\receipt.json" }
+
 # GPT Phase 0 PR #2：non-Windows 与 build/linker 失败两条 BLOCKED 回执改用共享
 # New-DurableIoBlockedReceipt（单一真源），补齐 validator 必需的 assertions/
 # observable_facts/subcheckId，使拒因从 INVALID 变为合法 core BLOCKED（仍 fail-closed）。
+# 该 helper 只依赖 $scriptRoot（本 worktree 根），绝不触碰 D 盘，故可在平台前置检查前加载，
+# 保证非 Windows 宿主也能构造并写出合法 BLOCKED 回执。
 . (Join-Path $scriptRoot "scripts\spikes\_durable-io-receipt.ps1")
-$targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
-$writerExe    = "$targetDir\debug\windows_durable_io.exe"
 
 # receipt 统一用无 BOM UTF-8 写:PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM,
 # 令下游 Python json.load 报 "Unexpected UTF-8 BOM"。
@@ -48,13 +40,35 @@ function Write-Receipt($obj) {
     [System.IO.File]::WriteAllText($receiptPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# ── 0. 平台前置检查 ─────────────────────────────────────────────────────────────
+# ── 0. 平台前置检查（GPT round-16 二审 P1-1：必须在任何 D 盘引用之前）─────────────
+# 根因：旧版在判断操作系统**之前**就用硬编码 D:\... 调用 Get-WorktreeTargetDir，非 Windows
+# 无 D: provider 时会先抛 DriveNotFoundException，non-Windows 分支实际不可达、写不出合法
+# BLOCKED 回执。现把 non-Windows guard 提到最前：仅依赖 $scriptRoot 与已加载的 receipt
+# helper，绝不触碰 $dataRoot / _worktree-target.ps1 / Get-WorktreeTargetDir。通过该 guard
+# 之后才初始化 D 盘 DataRoot 并派生 Cargo target/writer 路径。
 if ($env:OS -notmatch "Windows") {
     # 非 Windows 宿主：合法 core BLOCKED（含 assertions/observable_facts/subcheckId），
     # validator 会以"core spike may not be BLOCKED_UNCERTIFIED"拒绝并让 CI fail-closed。
     $r = New-DurableIoBlockedReceipt -Kind non_windows -Detail ([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
+
+# ── 0b. 通过 Windows guard 后，才初始化 D 盘 DataRoot 与 per-worktree Cargo target ──
+# dev.ps1 将 CARGO_TARGET_DIR 绑定到项目根下 DATA_ROOT 内的 per-worktree target。
+# writer 是自足 exe,运行期不依赖 dev.ps1 环境(仅**构建**需要 ld.lld 链接器),
+# 故构建后直接 Start-Process 该 exe 以取真实 PID 做定点硬杀。
+# GPT 第九轮 P0：target 已按 worktree 哈希隔离(dev.ps1 构建时用 Get-WorktreeTargetDir
+# 派生同一路径)。本 wrapper 用同一函数、同一 $scriptRoot(=worktree 根)算出相同 target,
+# 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 windows_durable_io.exe。
+$manifest     = "$probeDir\Cargo.toml"
+$devWrapper   = "$scriptRoot\scripts\dev.ps1"
+$tmpDir       = "$probeDir\probe_tmp"
+$childOut     = "$probeDir\_child_stdout.log"
+$childErr     = "$probeDir\_child_stderr.log"
+$dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
+. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+$targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
+$writerExe    = "$targetDir\debug\windows_durable_io.exe"
 
 # ── 1. 经 dev.ps1 + cargo 预构建 Rust writer(双 -- 调用协议)──────────────────────
 # 第一个 -- 被 PowerShell & 当作"停止解析参数"标记吞掉,第二个 -- 才原样进入

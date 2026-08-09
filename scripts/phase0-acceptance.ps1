@@ -232,7 +232,17 @@ $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.m
 # receipt helper-SHA256 cross-check] and +3 Windows-only [wrapper AST dotsource+both-branch calls,
 # dotsource-comment mutation, legacy-branch mutation]). Windows runner (spikes-first) = 358/1; all 6
 # run on Windows. Ubuntu contracts (bare) = 210/17: 16 Windows-only contract items + 1 sqlite-receipt.
-$FROZEN_PYTEST_PASSED  = 358
+# PR#2 CI-fix round-16-R2: 358 -> 367 (net +9 items in test_ci_blocker_fixes.py closing Codex R2
+# blockers). Cross-platform net 0 (removed 1 vacuous receipt-reverse-lookup test; added
+# dynamic-receipt-gate-present + wrapper-source-ordering-guard). Windows-only net +9: replaced the
+# single dotsources+both-branch AST test with a stricter value-flow-locks-both-branches test, plus
+# added non-Windows-branch reachability runtime proof (P1-1), preheat real-CommandAst AST (P1-3),
+# preheat unused-string-mutation immunity (P1-3), off-C unique-temp-path uniqueness (P1-4),
+# production-PS-under-pwsh evidence (P2-2), and 6 parametrized value-flow mutations (swap-kind,
+# overwrite-$r, wrong-var, legacy-nonwin, legacy-buildfail, dotsource-comment). Windows runner
+# (spikes-first) = 367/1; the +9 all run on Windows. Ubuntu contracts (bare) = 210/26: 25
+# Windows-only contract items + 1 sqlite-receipt.
+$FROZEN_PYTEST_PASSED  = 367
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -754,6 +764,47 @@ if ($outFull -ne $rootFull -and -not $outFull.StartsWith($rootFull + '\', [Syste
 }
 $json = $receipt | ConvertTo-Json -Depth 12
 [System.IO.File]::WriteAllText($outFull, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+# --- dynamic fail-closed reverse-lookup of scriptDigests (GPT round-16 R2 P2-1) ---
+# ASCII-ONLY (like the rest of this file): PS 5.1 reads this BOM-less .ps1 as GBK on a
+# Chinese codepage; CJK inside a STRING LITERAL corrupts string terminators (a Write-Error
+# with CJK broke parsing at round-16-R2). Keep this gate pure ASCII.
+#
+# The static wiring test (test_ci_blocker_fixes.py parses the comment-stripped $scriptDigests
+# block) only proves "at runtime the helper SHA256 is computed into the receipt". But during
+# bare pytest the top-level receipt does not exist yet, so the Python-side reverse-lookup can
+# pass vacuously and never compare. Therefore, AFTER the receipt has been written to disk
+# (guaranteed present here), do the AUTHORITATIVE dynamic reverse-lookup: re-read the just-
+# written receipt and, for every key in scriptDigests, recompute the CURRENT on-disk file's
+# real SHA256 and compare. Missing key / missing scriptDigests / digest mismatch (hardcoded or
+# stale) all fail-closed (exit 1); never silently pass. This complements the static wiring
+# check: static guards against "wiring deleted", dynamic guards against "written digest drifts
+# from the real file".
+$writtenReceipt = Get-Content -LiteralPath $outFull -Raw -Encoding utf8 | ConvertFrom-Json
+if (-not ($writtenReceipt.PSObject.Properties.Name -contains "scriptDigests")) {
+    Write-Error "[acceptance] fail-closed: written receipt lacks scriptDigests field (P2-1 reverse-lookup impossible)."
+    exit 1
+}
+$writtenDigests = $writtenReceipt.scriptDigests
+foreach ($digestKey in $scriptDigests.Keys) {
+    # Key -> on-disk path: identical Join-Path to the $scriptDigests block above (same relative path).
+    $digestPath = Join-Path $PSScriptRoot $digestKey
+    $realDigest = Get-FileSha256 $digestPath
+    if ($null -eq $realDigest) {
+        Write-Error "[acceptance] fail-closed: scriptDigests key '$digestKey' has no file at '$digestPath'."
+        exit 1
+    }
+    if (-not ($writtenDigests.PSObject.Properties.Name -contains $digestKey)) {
+        Write-Error "[acceptance] fail-closed: written receipt scriptDigests missing key '$digestKey' (wiring gap)."
+        exit 1
+    }
+    $boundDigest = [string]$writtenDigests.$digestKey
+    if ($boundDigest -ne $realDigest) {
+        Write-Error "[acceptance] fail-closed: receipt scriptDigests['$digestKey']='$boundDigest' != current file real SHA256 '$realDigest' (hardcoded or stale digest)."
+        exit 1
+    }
+}
+Write-Host "[phase0-acceptance] scriptDigests reverse-lookup OK: $($scriptDigests.Keys.Count) script digests match disk"
 
 Write-Host ""
 Write-Host "========================================"
