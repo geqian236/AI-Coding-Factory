@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (352/1,
+        (only the gitignored receipt may appear dirty); frozen counts (358/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -227,7 +227,12 @@ $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.m
 # and 4 Windows-only [durable-io BLOCKED receipt evidence x2 params + validator core-blocked-not-
 # INVALID + envcompat structural anchor]). Windows runner (spikes-first) = 352/1; the 11 all run
 # on Windows. Ubuntu contracts (bare) = 207/14: 13 Windows-only contract items + 1 sqlite-receipt.
-$FROZEN_PYTEST_PASSED  = 352
+# PR#2 CI-fix round-16: 352 -> 358 (+6 items in test_ci_blocker_fixes.py hardening the round-16
+# blockers: +3 cross-platform [preheat comment-immunity mutation, scriptDigests helper-wiring AST,
+# receipt helper-SHA256 cross-check] and +3 Windows-only [wrapper AST dotsource+both-branch calls,
+# dotsource-comment mutation, legacy-branch mutation]). Windows runner (spikes-first) = 358/1; all 6
+# run on Windows. Ubuntu contracts (bare) = 210/17: 16 Windows-only contract items + 1 sqlite-receipt.
+$FROZEN_PYTEST_PASSED  = 358
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -367,17 +372,19 @@ Write-Host "cleanTreeStart= $cleanTreeStart"
 # that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
 # tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
 # py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 352 passed / 1 skipped (Windows runner; Ubuntu fresh = 207/14:
-# 13 Windows-only contract tests skip off-platform AND the sqlite-receipt test
+# baseline is now 358 passed / 1 skipped (Windows runner; Ubuntu fresh = 210/17:
+# 16 Windows-only contract tests skip off-platform AND the sqlite-receipt test
 # skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first.
 # round-13/14/15: the pin-probe file has 5 tests - 3 Windows-only (shared-probe end-to-end
 # under hostile VIRTUAL_ENV + fail-closed .python-version contract negatives + round-15
 # non-terminating-read-error-without-calling-uv) and 2 cross-platform (mutation defense +
 # dot-source comment-immunity), so 2 of the 5 run on Ubuntu too.
-# PR#2 CI-fix: tests/contract/test_ci_blocker_fixes.py adds 11 items - 4 Windows-only
-# (durable-io BLOCKED receipt evidence x2 + validator core-blocked verdict x2) and 7
-# cross-platform (ci.yml/package.json/pnpm-lock structural parses). 13 Windows-only
-# (cargo 4 + ci-blocker 4 + pin-probe 3 + binding 2) + 1 sqlite skip = Ubuntu 207/14).
+# PR#2 CI-fix + round-16: tests/contract/test_ci_blocker_fixes.py has 17 items - 7 Windows-only
+# (durable-io BLOCKED receipt evidence x2 + validator core-blocked verdict x2 + wrapper-AST
+# dotsource/both-branches + 2 wrapper-AST mutation proofs) and 10 cross-platform (ci.yml/
+# package.json/pnpm-lock structural parses + preheat comment-immunity mutation + scriptDigests
+# helper wiring + receipt helper-sha256 cross-check). 16 Windows-only
+# (cargo 4 + ci-blocker 7 + pin-probe 3 + binding 2) + 1 sqlite skip = Ubuntu 210/17).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -682,12 +689,18 @@ $acceptanceSetDigest = Get-FileSha256 $ACCEPTANCE_SET_DOC
 # uv-locked Python probe, round-13) and _worktree-target.ps1 (per-worktree Cargo
 # target isolation, round-9) are BOTH real production code that acceptance depends
 # on; a tamper there previously left no digest trace in the evidence. Bind them too.
+# GPT round-16 blocker 1: spikes/_durable-io-receipt.ps1 (round-16 shared BLOCKED
+# receipt builder, dot-sourced by scripts/spikes/test-durable-io.ps1) is likewise
+# real production code the durable-io spike depends on; bind it so a tamper there
+# leaves a digest trace. Key carries the "spikes/" prefix to disambiguate from the
+# top-level helpers (it lives under scripts/spikes/, not scripts/).
 $scriptDigests = [ordered]@{
-    "phase0-acceptance.ps1" = Get-FileSha256 (Join-Path $PSScriptRoot "phase0-acceptance.ps1")
-    "check.ps1"             = Get-FileSha256 (Join-Path $PSScriptRoot "check.ps1")
-    "dev.ps1"               = Get-FileSha256 (Join-Path $PSScriptRoot "dev.ps1")
-    "_python-probe.ps1"     = Get-FileSha256 (Join-Path $PSScriptRoot "_python-probe.ps1")
-    "_worktree-target.ps1"  = Get-FileSha256 (Join-Path $PSScriptRoot "_worktree-target.ps1")
+    "phase0-acceptance.ps1"          = Get-FileSha256 (Join-Path $PSScriptRoot "phase0-acceptance.ps1")
+    "check.ps1"                      = Get-FileSha256 (Join-Path $PSScriptRoot "check.ps1")
+    "dev.ps1"                        = Get-FileSha256 (Join-Path $PSScriptRoot "dev.ps1")
+    "_python-probe.ps1"              = Get-FileSha256 (Join-Path $PSScriptRoot "_python-probe.ps1")
+    "_worktree-target.ps1"           = Get-FileSha256 (Join-Path $PSScriptRoot "_worktree-target.ps1")
+    "spikes/_durable-io-receipt.ps1" = Get-FileSha256 (Join-Path $PSScriptRoot "spikes/_durable-io-receipt.ps1")
 }
 $schemaDigests = [ordered]@{}
 Get-ChildItem (Join-Path $REPO_ROOT "contracts/schemas") -Filter *.json | Sort-Object Name | ForEach-Object {

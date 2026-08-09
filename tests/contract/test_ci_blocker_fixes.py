@@ -24,10 +24,13 @@ GPT Phase 0 PR #2 CI blocker 修复的回归测试（锁定行为不回退）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,28 @@ PNPM_LOCK = REPO_ROOT / "pnpm-lock.yaml"
 NODE_VERSION_FILE = REPO_ROOT / ".node-version"
 VALIDATOR_PS1 = REPO_ROOT / "scripts" / "spikes" / "_receipt-validator.ps1"
 DURABLE_IO_RECEIPT_PS1 = REPO_ROOT / "scripts" / "spikes" / "_durable-io-receipt.ps1"
+DURABLE_IO_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-durable-io.ps1"
+ACCEPTANCE_PS1 = REPO_ROOT / "scripts" / "phase0-acceptance.ps1"
+RECEIPT_JSON = REPO_ROOT / ".phase0-acceptance-receipt.json"
+# scriptDigests 里 helper 的键（reviewer 指定带 spikes/ 前缀）。
+DURABLE_IO_RECEIPT_DIGEST_KEY = "spikes/_durable-io-receipt.ps1"
+
+
+def _strip_ps_comments(text: str) -> str:
+    """去掉 PowerShell 注释后返回**纯可执行代码**（供"不得被注释绕过"的断言用）。
+
+    先删块注释 <# ... #>，再删行注释（# 到行尾）。本仓 CI/spike 脚本的代码字符串里
+    不含裸 '#'，故行注释删除不会误伤可执行代码。GPT round-16 blocker 2/3：断言必须跑在
+    去注释代码上——把真实命令注释掉、只在注释里留关键词时，测试必须失败。
+    """
+    no_block = re.sub(r"<#.*?#>", "", text, flags=re.S)
+    return re.sub(r"(?m)#.*$", "", no_block)
+
+
+def _normalize_ws(text: str) -> str:
+    """折叠空白 + 去引号，便于把多行/多空格命令按 token 序列做确定性子串匹配。"""
+    no_quotes = text.replace('"', " ").replace("'", " ")
+    return re.sub(r"\s+", " ", no_quotes).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,41 +314,59 @@ def _windows_probes_steps() -> list[dict[str, Any]]:
     return _load_jobs(CI_YML.read_text(encoding="utf-8"))["windows-probes"]
 
 
+# 预热步骤必须**实际执行**的完整命令（reviewer 指定；按 token 序列匹配，非注释子串）。
+PREHEAT_REQUIRED_CMD = (
+    "scripts/dev.ps1 -- -- rustup toolchain install "
+    "stable-x86_64-pc-windows-gnu --profile minimal"
+)
+
+
 def _is_spike_loop_step(step: dict[str, Any]) -> bool:
-    """spike 执行步骤：其 run 正文 dot-source 校验器并遍历 $spikes（可执行结构，非注释）。"""
-    run = str(step.get("run", ""))
-    return "_receipt-validator.ps1" in run and "$spikes" in run
+    """spike 执行步骤：其**去注释可执行** run 正文 dot-source 校验器并遍历 $spikes。"""
+    code = _strip_ps_comments(str(step.get("run", "")))
+    return "_receipt-validator.ps1" in code and "$spikes" in code
 
 
 def _is_preheat_step(step: dict[str, Any]) -> bool:
-    """预热步骤：run 正文经 dev.ps1 调 rustup 安装 gnu 工具链。"""
-    run = str(step.get("run", ""))
-    return "dev.ps1" in run and "rustup" in run and "stable-x86_64-pc-windows-gnu" in run
+    """预热步骤识别：**去注释可执行代码**里出现完整预热命令（把真实命令注释掉即不再命中）。
+
+    GPT round-16 blocker 2：旧版在**原始 run 文本**里搜 dev.ps1/rustup/... 关键词——
+    把真实命令注释掉、只在注释里留这些词即可假绿。现改为对去注释代码归一化后，按 token
+    序列匹配 reviewer 指定的完整命令，注释绕过必然失败。
+    """
+    code_norm = _normalize_ws(_strip_ps_comments(str(step.get("run", ""))))
+    return PREHEAT_REQUIRED_CMD in code_norm
 
 
 def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
-    """windows-probes 必须在 spike loop **之前**有预热步骤：经 scripts/dev.ps1 安装
-    stable-x86_64-pc-windows-gnu --profile minimal。GPT 要求二.1/二.2。"""
+    """windows-probes 必须在 spike loop **之前**有预热步骤，其**去注释可执行代码**完整包含
+    `scripts/dev.ps1 -- -- rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal`，
+    且 shell 为 pwsh。GPT round-16 blocker 2（AST/去注释解析，非注释子串）。"""
     steps = _windows_probes_steps()
     preheat = _find_step(steps, _is_preheat_step)
     spike = _find_step(steps, _is_spike_loop_step)
     assert preheat is not None, (
-        "windows-probes 缺少经 dev.ps1 安装 gnu 工具链的预热步骤"
+        "windows-probes 缺少预热步骤（去注释代码须含完整 dev.ps1 -- -- rustup ... 命令）"
     )
     assert spike is not None, "windows-probes 缺少 spike 执行步骤（解析器或 CI 结构异常）"
+    # 顺序：预热必须在 spike loop 之前。
     assert preheat["_order"] < spike["_order"], (
         f"预热步骤（order={preheat['_order']}）必须在 spike loop（order={spike['_order']}）之前"
     )
-    run = str(preheat["run"])
-    # 经 dev.ps1（使 RUSTUP_HOME=D-root，与 spike 查 ld.lld 的位置一致）+ minimal profile。
-    assert "dev.ps1" in run, "预热必须经过 scripts/dev.ps1（令 RUSTUP_HOME 指向 D-root）"
-    assert "--profile minimal" in run, "预热安装必须用 --profile minimal"
-    assert "stable-x86_64-pc-windows-gnu" in run, "预热必须安装 stable-x86_64-pc-windows-gnu"
+    # shell: pwsh（step 属性经解析器捕获）。
+    assert str(preheat.get("shell", "")).strip() == "pwsh", (
+        f"预热步骤 shell 必须为 pwsh；实际 ={preheat.get('shell')!r}"
+    )
+    # 去注释可执行代码里必须完整包含 reviewer 指定命令（token 序列，注释绕过会失败）。
+    code_norm = _normalize_ws(_strip_ps_comments(str(preheat["run"])))
+    assert PREHEAT_REQUIRED_CMD in code_norm, (
+        f"预热**可执行代码**必须完整包含 '{PREHEAT_REQUIRED_CMD}'；实际归一化后 ={code_norm!r}"
+    )
 
 
 def test_windows_probes_preheat_is_fail_closed() -> None:
-    """windows-probes 的所有步骤都不得 continue-on-error（预热失败必须 fail-closed）。
-    GPT 要求二.3。"""
+    """windows-probes 无 continue-on-error；预热**可执行代码**显式检查 $LASTEXITCODE 且非零退出。
+    GPT round-16 blocker 2（跑在去注释代码上）。"""
     steps = _windows_probes_steps()
     offenders = [
         s for s in steps
@@ -333,12 +376,40 @@ def test_windows_probes_preheat_is_fail_closed() -> None:
     assert not offenders, (
         f"windows-probes 不得有 continue-on-error: true 的步骤；违规 ={offender_labels}"
     )
-    # 预热步骤正文必须显式检查 $LASTEXITCODE 并在非零时 exit（fail-closed，不吞错）。
     preheat = _find_step(steps, _is_preheat_step)
     assert preheat is not None, "无预热步骤"
+    # 去注释可执行代码里必须真正检查 $LASTEXITCODE 并在非零时 exit 1（不吞错）。
+    code = _strip_ps_comments(str(preheat["run"]))
+    assert re.search(r"\$LASTEXITCODE\s+-ne\s+0", code), (
+        f"预热可执行代码必须检查 $LASTEXITCODE -ne 0；实际去注释代码 ={code!r}"
+    )
+    assert re.search(r"(?m)^\s*exit\s+1\s*$", code) or "exit 1" in _normalize_ws(code), (
+        f"预热可执行代码必须在安装失败时 exit 1（fail-closed）；实际去注释代码 ={code!r}"
+    )
+
+
+def test_windows_probes_preheat_detection_is_immune_to_commenting_out() -> None:
+    """Mutation 实证（GPT round-16 blocker 2）：把预热步骤 run 里真实命令行整行注释掉后，
+    去注释代码不再含完整命令 → _is_preheat_step 必须不再命中（证明断言非注释子串搜索）。"""
+    steps = _windows_probes_steps()
+    preheat = _find_step(steps, _is_preheat_step)
+    assert preheat is not None, "前置条件：未 mutation 时应识别到预热步骤"
     run = str(preheat["run"])
-    assert "LASTEXITCODE" in run and ("exit 1" in run or "throw" in run), (
-        "预热步骤必须在安装失败时 fail-closed（检查 $LASTEXITCODE 并 exit/throw）"
+    # mutation：把包含 dev.ps1 -- -- 的真实命令行整行前置 '# ' 注释掉。
+    mutated_lines = []
+    mutated = False
+    for ln in run.split("\n"):
+        if "dev.ps1" in ln and "rustup" in ln and not ln.lstrip().startswith("#"):
+            mutated_lines.append("# " + ln)
+            mutated = True
+        else:
+            mutated_lines.append(ln)
+    assert mutated, "未能定位真实预热命令行以施加 mutation"
+    mutated_step = dict(preheat)
+    mutated_step["run"] = "\n".join(mutated_lines)
+    # 关键：注释掉真实命令后，去注释代码不再含完整命令 → 识别必须失败。
+    assert not _is_preheat_step(mutated_step), (
+        "把真实预热命令注释掉后仍识别为预热步骤——断言可被注释绕过（blocker 2 回归）"
     )
 
 
@@ -484,4 +555,200 @@ Write-Output "ok=$($v.ok)|status=$($v.status)|detail=$($v.detail)"
     assert ok, (
         "证据结构合法性反证失败：BLOCKED 回执在 EnvCompat=$true + allowlist 命中时应被接受 "
         f"（说明结构完整）；实际 detail={parts.get('detail')}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 五、wrapper 调用关系（GPT round-16 blocker 3）：用 PowerShell **AST**（非注释子串）
+# 证明 test-durable-io.ps1 确实 (a) dot-source 该 helper，(b) non-Windows 分支调用它，
+# (c) build/linker-failure 分支调用它；并做 mutation 实证（注释 dot-source / 改回旧回执
+# → 测试必失败）。durable-IO 仍是 core spike，绝不进 allowlist。
+# ─────────────────────────────────────────────────────────────────────────────
+# AST 分析器（纯 ASCII，无需 BOM）：ParseFile 得 AST + parseErrors；用 AST 节点判定
+#   - dotSourcesHelper：存在 InvocationOperator=Dot 且 extent 命中 _durable-io-receipt.ps1 的命令
+#   - helperCallCount：GetCommandName()=='New-DurableIoBlockedReceipt' 的命令数
+#   - nonWindowsCallsHelper / buildFailCallsHelper：该调用是否落在条件含 env:OS / buildExit 的 if 体内
+# wrapper 路径经 $env:R16_WRAPPER 传入（含 CJK，走 Windows API=UTF-16，不受文件编码影响）。
+_WRAPPER_AST_ANALYZER = r"""
+$ErrorActionPreference = 'Stop'
+$path = $env:R16_WRAPPER
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+$parseErrors = @($errors).Count
+$cmds = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+$dotSourcesHelper = $false
+foreach ($c in $cmds) {
+    if ($c.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot -and
+        $c.Extent.Text -match '_durable-io-receipt\.ps1') {
+        $dotSourcesHelper = $true
+    }
+}
+$helperCalls = @($cmds | Where-Object { $_.GetCommandName() -eq 'New-DurableIoBlockedReceipt' })
+$ifs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] }, $true)
+$nonWindowsCallsHelper = $false
+$buildFailCallsHelper = $false
+foreach ($call in $helperCalls) {
+    $s = $call.Extent.StartOffset; $e = $call.Extent.EndOffset
+    foreach ($if in $ifs) {
+        foreach ($clause in $if.Clauses) {
+            $cond = $clause.Item1; $body = $clause.Item2
+            if ($s -ge $body.Extent.StartOffset -and $e -le $body.Extent.EndOffset) {
+                if ($cond.Extent.Text -match 'env:OS')   { $nonWindowsCallsHelper = $true }
+                if ($cond.Extent.Text -match 'buildExit') { $buildFailCallsHelper = $true }
+            }
+        }
+    }
+}
+[pscustomobject]@{
+    parseErrors           = $parseErrors
+    dotSourcesHelper      = $dotSourcesHelper
+    helperCallCount       = $helperCalls.Count
+    nonWindowsCallsHelper = $nonWindowsCallsHelper
+    buildFailCallsHelper  = $buildFailCallsHelper
+} | ConvertTo-Json -Compress
+"""
+
+
+def _analyze_wrapper_ast(wrapper_path: Path) -> dict[str, Any]:
+    """把 AST 分析器写临时 .ps1（ASCII），经 $env:R16_WRAPPER 指向 wrapper_path 运行，回传 JSON。"""
+    analyzer = Path(tempfile.gettempdir()) / "_r16_wrapper_ast_analyzer.ps1"
+    analyzer.write_text(_WRAPPER_AST_ANALYZER, encoding="ascii")
+    env = dict(os.environ)
+    env["R16_WRAPPER"] = str(wrapper_path)
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(analyzer)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(REPO_ROOT), timeout=60, env=env,
+    )
+    assert result.returncode == 0, (
+        f"AST 分析器失败 rc={result.returncode} stderr={result.stderr!r} stdout={result.stdout!r}"
+    )
+    parsed: dict[str, Any] = json.loads(result.stdout)
+    return parsed
+
+
+def _write_mutated_copy(mutated_text: str, suffix: str) -> Path:
+    """把 mutation 后的 wrapper 文本写临时 .ps1，**UTF-8 with BOM**（PS 5.1 ParseFile 才能
+    正确解码含 CJK 的正文，parseErrors 才不会因编码假阳）。返回临时路径。"""
+    p = Path(tempfile.gettempdir()) / f"_r16_wrapper_mut_{suffix}.ps1"
+    data = b"\xef\xbb\xbf" + mutated_text.encode("utf-8")
+    p.write_bytes(data)
+    return p
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
+def test_wrapper_ast_dotsources_and_calls_helper_in_both_branches() -> None:
+    """Blocker 3：用 AST 证明 test-durable-io.ps1 (a) dot-source _durable-io-receipt.ps1、
+    (b) non-Windows 分支、(c) build-fail 分支都调用 New-DurableIoBlockedReceipt。"""
+    a = _analyze_wrapper_ast(DURABLE_IO_WRAPPER_PS1)
+    assert a["parseErrors"] == 0, f"wrapper 应无解析错误；parseErrors={a['parseErrors']}"
+    assert a["dotSourcesHelper"] is True, "wrapper 必须 dot-source _durable-io-receipt.ps1（AST 判定）"
+    assert a["helperCallCount"] >= 2, (
+        f"wrapper 至少两处调用 New-DurableIoBlockedReceipt（non-Windows + build-fail）；实际 ={a['helperCallCount']}"
+    )
+    assert a["nonWindowsCallsHelper"] is True, "non-Windows 分支必须调用 New-DurableIoBlockedReceipt（AST 判定）"
+    assert a["buildFailCallsHelper"] is True, (
+        "build/linker-failure 分支必须调用 New-DurableIoBlockedReceipt（AST 判定）"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
+def test_wrapper_dotsource_mutation_fails() -> None:
+    """Mutation 实证（blocker 3）：把 dot-source helper 那一行注释掉后，AST 必须报
+    dotSourcesHelper=False（证明用的是 AST 而非注释子串——注释掉真实行即失效）。"""
+    src = DURABLE_IO_WRAPPER_PS1.read_text(encoding="utf-8-sig")
+    mutated_lines = []
+    did = False
+    for ln in src.split("\n"):
+        # 命中真实 dot-source 行（'. (Join-Path ... _durable-io-receipt.ps1)'），非注释。
+        if "_durable-io-receipt.ps1" in ln and ln.lstrip().startswith(".") and not ln.lstrip().startswith("#"):
+            mutated_lines.append("# " + ln)
+            did = True
+        else:
+            mutated_lines.append(ln)
+    assert did, "未能定位真实 dot-source 行以施加 mutation"
+    mp = _write_mutated_copy("\n".join(mutated_lines), "nodotsrc")
+    try:
+        a = _analyze_wrapper_ast(mp)
+        assert a["parseErrors"] == 0, f"mutation 后仍应可解析；parseErrors={a['parseErrors']}"
+        assert a["dotSourcesHelper"] is False, (
+            "注释掉真实 dot-source 行后 AST 仍报 dotSourcesHelper=True——断言可被注释绕过（blocker 3 回归）"
+        )
+    finally:
+        mp.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
+def test_wrapper_branch_call_mutation_fails() -> None:
+    """Mutation 实证（blocker 3）：把 non-Windows 分支的 New-DurableIoBlockedReceipt 调用
+    改回手写旧回执（缺字段）后，AST 必须报 nonWindowsCallsHelper=False——证明测试锁定的是
+    真实的分支→helper 调用关系，wrapper 退回旧回执即失败。"""
+    src = DURABLE_IO_WRAPPER_PS1.read_text(encoding="utf-8-sig")
+    # 定位 non-Windows 分支里的 helper 调用行（-Kind non_windows），替换为旧的手写回执。
+    old_call = "$r = New-DurableIoBlockedReceipt -Kind non_windows"
+    assert old_call in src, "前置条件：wrapper non-Windows 分支应调用 New-DurableIoBlockedReceipt"
+    # non-Windows 分支的完整调用行（拼接构造，避免单行超长）。
+    full_call = (
+        old_call
+        + " -Detail ([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+    )
+    legacy = '$r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"; reason="legacy" }'
+    mutated = src.replace(full_call, legacy)
+    assert mutated != src, "未能施加 non-Windows 分支 mutation（调用行文本不匹配）"
+    mp = _write_mutated_copy(mutated, "legacybranch")
+    try:
+        a = _analyze_wrapper_ast(mp)
+        assert a["parseErrors"] == 0, f"mutation 后仍应可解析；parseErrors={a['parseErrors']}"
+        assert a["nonWindowsCallsHelper"] is False, (
+            "non-Windows 分支改回手写旧回执后 AST 仍报 nonWindowsCallsHelper=True——"
+            "测试未真正锁定分支→helper 调用关系（blocker 3 回归）"
+        )
+    finally:
+        mp.unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 六、新 helper 进入验收摘要链（GPT round-16 blocker 1）：scriptDigests 必须含 helper 键，
+# 且总回执里该键的值 == helper 当前真实 SHA256。用去注释可执行代码解析 + hashlib 机器验证。
+# ─────────────────────────────────────────────────────────────────────────────
+def _real_sha256(path: Path) -> str:
+    """返回 'sha256:<lowercase-hex>'，与 phase0-acceptance.ps1 的 Get-FileSha256 同格式。"""
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_durable_io_helper_wired_into_script_digests() -> None:
+    """Blocker 1：phase0-acceptance.ps1 的 $scriptDigests（**去注释可执行代码**）必须把键
+    'spikes/_durable-io-receipt.ps1' 接到 Get-FileSha256(Join-Path $PSScriptRoot ...)——
+    即运行时会对该 helper 真实文件算 SHA256 写入总回执（非注释、非硬编码）。"""
+    code = _strip_ps_comments(ACCEPTANCE_PS1.read_text(encoding="utf-8"))
+    m = re.search(r"\$scriptDigests\s*=\s*\[ordered\]@\{(.*?)\n\s*\}", code, re.S)
+    assert m is not None, "phase0-acceptance.ps1 未找到 $scriptDigests [ordered]@{...} 块"
+    block = m.group(1)
+    # 键必须接到 Get-FileSha256(Join-Path $PSScriptRoot "spikes/_durable-io-receipt.ps1")。
+    wired = re.search(
+        r'"spikes/_durable-io-receipt\.ps1"\s*=\s*Get-FileSha256\s*\(\s*Join-Path\s+\$PSScriptRoot\s+"spikes/_durable-io-receipt\.ps1"\s*\)',
+        block,
+    )
+    assert wired is not None, (
+        "scriptDigests 必须把 'spikes/_durable-io-receipt.ps1' 接到 "
+        "Get-FileSha256(Join-Path $PSScriptRoot \"spikes/_durable-io-receipt.ps1\")（去注释代码解析）"
+    )
+
+
+def test_receipt_binds_durable_io_helper_real_sha256_when_present() -> None:
+    """Blocker 1 反查：若总回执存在且已含 helper 键，则其值必须 == helper 当前真实 SHA256。
+    （回执由验收末尾写出；A-1 阶段读到的是上一轮回执，故键缺失时容忍——权威反查在验收后单独做。
+    但**一旦键存在**就必须与当前文件字节 SHA256 一致，杜绝硬编码/陈旧摘要。）
+
+    注意：用**空过返回**而非 pytest.skip——验收 A-1 阶段读到的是上一轮（陈旧）回执，
+    若用 skip 会额外产生一个 skip，破坏"恰好 1 个冻结 skip=test_config.py"的身份门禁。
+    改为 return：回执缺失/键缺失时空过（不扰动 skip 计数），键存在时严格反查。"""
+    if not RECEIPT_JSON.exists():
+        return  # 裸 pytest 无 spikes-first，回执未生成；权威反查在完整验收后单独做
+    receipt = json.loads(RECEIPT_JSON.read_text(encoding="utf-8"))
+    digests = receipt.get("scriptDigests", {})
+    if DURABLE_IO_RECEIPT_DIGEST_KEY not in digests:
+        return  # 回执为加入 helper 键之前所写（陈旧）；权威反查在完整验收后进行
+    assert digests[DURABLE_IO_RECEIPT_DIGEST_KEY] == _real_sha256(DURABLE_IO_RECEIPT_PS1), (
+        "总回执里 helper 摘要与当前文件真实 SHA256 不一致（硬编码或陈旧）"
     )
