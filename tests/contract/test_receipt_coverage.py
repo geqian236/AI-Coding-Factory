@@ -432,6 +432,10 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     class _AsciiErrorSink:
         """收集 fail-closed 分类，验证不泄露路径、回执或底层异常。"""
 
+        # stdout 负例的配对 stderr 也必须独立满足流合同，不能由自身配置失败掩盖回归。
+        encoding = "utf-8"
+        errors = "strict"
+
         def __init__(self) -> None:
             self.text = ""
 

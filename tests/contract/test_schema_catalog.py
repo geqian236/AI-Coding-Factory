@@ -459,6 +459,10 @@ def test_codegen_no_drift(monkeypatch: pytest.MonkeyPatch) -> None:
     class _AsciiErrorSink:
         """收集稳定失败分类，避免将底层异常或文件路径带到 stderr。"""
 
+        # stdout 负例的配对 stderr 也必须独立满足流合同，不能由自身配置失败掩盖回归。
+        encoding = "utf-8"
+        errors = "strict"
+
         def __init__(self) -> None:
             self.text = ""
 
