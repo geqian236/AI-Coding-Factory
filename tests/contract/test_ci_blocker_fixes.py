@@ -628,24 +628,27 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         assert analysis.get("unsafeTerminalInAuditChain") is True and analysis["dRootValid"] is False, (
             f"post-create foreach 首轮 audit 后的 {terminal!r} 必须被拒绝：{analysis}"
         )
-    d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
-    junction = d_root_tmp / "reparse-link"
-    junction_target = d_root_tmp / "target"
-    safe_missing_leaf = d_root_tmp / "safe" / "missing" / "leaf"
-    junction_target.mkdir()
-    try:
-        _create_windows_junction(junction, junction_target)
-        rejected = _invoke_d_root_path_guard(d_root_code, junction / "child")
-        assert rejected["ok"] is False and "reparse" in rejected["detail"].lower(), (
-            f"真实 junction 必须在创建前被路径 guard 拒绝：{rejected}"
-        )
-        accepted = _invoke_d_root_path_guard(d_root_code, safe_missing_leaf)
-        assert accepted["ok"] is True, (
-            f"不存在的叶节点必须回退到最近已有祖先继续审计，不能误拒：{accepted}"
-        )
-    finally:
-        _remove_junction_strict(junction)
-        _remove_tree_strict(d_root_tmp)
+    # YAML/AST 静态合同在所有平台都要继续执行；但真实 D 根目录、junction 与
+    # Windows PowerShell 路径 guard 会改变 Windows 文件系统，只能在 Windows 运行时验证。
+    if sys.platform == "win32":
+        d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
+        junction = d_root_tmp / "reparse-link"
+        junction_target = d_root_tmp / "target"
+        safe_missing_leaf = d_root_tmp / "safe" / "missing" / "leaf"
+        junction_target.mkdir()
+        try:
+            _create_windows_junction(junction, junction_target)
+            rejected = _invoke_d_root_path_guard(d_root_code, junction / "child")
+            assert rejected["ok"] is False and "reparse" in rejected["detail"].lower(), (
+                f"真实 junction 必须在创建前被路径 guard 拒绝：{rejected}"
+            )
+            accepted = _invoke_d_root_path_guard(d_root_code, safe_missing_leaf)
+            assert accepted["ok"] is True, (
+                f"不存在的叶节点必须回退到最近已有祖先继续审计，不能误拒：{accepted}"
+            )
+        finally:
+            _remove_junction_strict(junction)
+            _remove_tree_strict(d_root_tmp)
 
     unsafe_early_exit = d_root_code.replace(
         "$paths = [ordered]@{", "exit 0\n          $paths = [ordered]@{", 1
