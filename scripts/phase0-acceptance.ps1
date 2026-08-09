@@ -57,10 +57,9 @@ Set-Location $REPO_ROOT
 
 # Project root (storage contract): every artifact must live under this prefix.
 # Derived at RUNTIME by walking up from $REPO_ROOT to the ancestor that holds
-# the AI-Coding-Factory-Data sibling. This avoids a CJK path literal in this
-# pure-ASCII, BOM-less script: PS 5.1 would read such a literal as GBK
-# and corrupt every derived path (CARGO_HOME/RUSTUP_HOME/OutFile prefix). The
-# runtime path from $PSScriptRoot carries correct filesystem bytes.
+# the AI-Coding-Factory-Data sibling. UTF-8 BOM 已保证 PS 5.1 能正确解析本文件的
+# 中文审计说明；仍在运行时派生路径以避免硬编码 CJK 目录，并让 CARGO_HOME、
+# RUSTUP_HOME 和 OutFile 前缀始终跟随 $PSScriptRoot 的实际文件系统字节。
 $PROJECT_ROOT = $null
 $probe = $REPO_ROOT
 while ($probe) {

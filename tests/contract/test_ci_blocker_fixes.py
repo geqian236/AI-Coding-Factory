@@ -1552,6 +1552,9 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
         "失败清理",
     ):
         assert required_comment in source, f"缺少动态回执安全规则的中文说明：{required_comment}"
+    assert re.search(r"(?i)(?:pure[- ]ascii|ascii-only).{0,64}bom[- ]less", source) is None, (
+        "UTF-8 BOM 脚本不得残留 pure-ASCII/ASCII-only 与 BOM-less 组合的过期说明"
+    )
     code = _strip_ps_comments(source)
     assert re.search(r"function\s+Publish-AcceptanceReceipt\b", code), (
         "动态反查与发布必须收敛为 Publish-AcceptanceReceipt，避免先写 final PASS"
