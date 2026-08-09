@@ -77,21 +77,19 @@ try {
 if ($buildExit -ne 0 -or -not (Test-Path $brokerExe)) {
     # 平台已经通过而 broker 无法构建时，这是可复核的 toolchain BLOCKED；必须保留平台
     # facts 与一条明确失败断言，避免 validator 将其误判为证据结构无效的 INVALID。
+    # 复制而非就地扩写 helper 返回的 facts：同一个平台对象还会被后续路径消费，BLOCKED
+    # receipt 需要完整保留 Windows/WSL/Docker 身份，同时附上此次构建的最小失败证据。
+    $blockedFacts = [ordered]@{}
+    foreach ($fact in $platform.facts.GetEnumerator()) {
+        $blockedFacts[$fact.Key] = $fact.Value
+    }
+    $blockedFacts["broker_exe"] = $brokerExe
+    $blockedFacts["build_exit"] = $buildExit
     $r = [ordered]@{
         spike = $spikeName; status = "BLOCKED_UNCERTIFIED"
         subcheckId = "spike:runner_identity/toolchain_unavailable"
         reason = "Rust broker build failed or exe missing (toolchain/linker unavailable)"
-        observable_facts = [ordered]@{
-            windows_host = $platform.facts["windows_host"]
-            docker_server_version = $platform.facts["docker_server_version"]
-            docker_ostype = $platform.facts["docker_ostype"]
-            docker_operating_system = $platform.facts["docker_operating_system"]
-            docker_context = $platform.facts["docker_context"]
-            docker_context_endpoint = $platform.facts["docker_context_endpoint"]
-            wsl_docker_desktop_v2 = $platform.facts["wsl_docker_desktop_v2"]
-            image_os = $platform.facts["image_os"]
-            broker_exe = $brokerExe; build_exit = $buildExit
-        }
+        observable_facts = $blockedFacts
         assertions = @($platform.assertions) + @(@{
             name = "runner_identity_broker_build"
             passed = $false
@@ -259,6 +257,11 @@ try {
         )
         observable_facts = [ordered]@{
             windows_host          = $platform.facts["windows_host"]
+            windows_nt            = $platform.facts["windows_nt"]
+            windows_product_type  = $platform.facts["windows_product_type"]
+            windows_build         = $platform.facts["windows_build"]
+            candidate_sha         = $platform.facts["candidate_sha"]
+            docker_env_overrides  = $platform.facts["docker_env_overrides"]
             docker_server_version = $platform.facts["docker_server_version"]
             docker_ostype         = $platform.facts["docker_ostype"]
             docker_operating_system = $platform.facts["docker_operating_system"]

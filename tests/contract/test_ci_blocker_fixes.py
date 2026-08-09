@@ -59,6 +59,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RUNNER_CERTIFIED_YML = REPO_ROOT / ".github" / "workflows" / "runner-identity-certified.yml"
 CONTRACTS_PKG = REPO_ROOT / "packages" / "factory-contracts" / "package.json"
 PNPM_LOCK = REPO_ROOT / "pnpm-lock.yaml"
 NODE_VERSION_FILE = REPO_ROOT / ".node-version"
@@ -71,6 +72,7 @@ DURABLE_IO_WRAPPER_RECEIPT = (
 ACCEPTANCE_PS1 = REPO_ROOT / "scripts" / "phase0-acceptance.ps1"
 STAMP_RUN_BINDING_PY = REPO_ROOT / "scripts" / "spikes" / "stamp_run_binding.py"
 PLATFORM_HELPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "_runner-identity-platform.ps1"
+RUNNER_IDENTITY_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-runner-identity.ps1"
 RUNNER_CERTIFIED_JOB = "runner-identity-certified"
 RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
 
@@ -237,19 +239,26 @@ def _load_job_blocks(text: str) -> dict[str, list[str]]:
     return jobs
 
 
-def _load_jobs(text: str) -> dict[str, list[dict[str, Any]]]:
-    """解析整个 workflow，返回 {job_name: [step, ...]}。自带 sanity 断言。"""
+def _load_jobs(
+    text: str, *, required_jobs: tuple[str, ...] = ("desktop", "windows-probes", "contracts"),
+) -> dict[str, list[dict[str, Any]]]:
+    """解析一个 workflow，返回 {job_name: [step, ...]}，并验证调用方声明的必需 job。"""
     jobs = _load_job_blocks(text)
     parsed = {name: _parse_steps(body) for name, body in jobs.items()}
-    for required_job in ("desktop", "windows-probes", "contracts"):
+    for required_job in required_jobs:
         assert required_job in parsed, f"解析器未提取到 job '{required_job}'（解析器可能失效）"
         assert len(parsed[required_job]) >= 2, f"job '{required_job}' 解析出的 step 过少（解析器可能失效）"
     return parsed
 
 
-def _job_metadata(name: str, workflow_text: str | None = None) -> dict[str, Any]:
+def _job_metadata(
+    name: str,
+    workflow_text: str | None = None,
+    *,
+    workflow_path: Path = CI_YML,
+) -> dict[str, Any]:
     """读取 job 顶层结构字段与 permissions 子映射，避免把注释文本当成调度策略。"""
-    text = CI_YML.read_text(encoding="utf-8") if workflow_text is None else workflow_text
+    text = workflow_path.read_text(encoding="utf-8") if workflow_text is None else workflow_text
     blocks = _load_job_blocks(text)
     assert name in blocks, f"ci.yml 缺少 job '{name}'"
     block = "\n".join(blocks[name])
@@ -370,9 +379,13 @@ def _windows_probes_steps() -> list[dict[str, Any]]:
 
 def _runner_identity_certified_steps() -> list[dict[str, Any]]:
     """受信 self-hosted job 是 runner_identity 唯一可认证入口，缺失即 fail-closed。"""
-    jobs = _load_jobs(CI_YML.read_text(encoding="utf-8"))
+    assert RUNNER_CERTIFIED_YML.exists(), "缺少独立 runner_identity 认证 workflow"
+    jobs = _load_jobs(
+        RUNNER_CERTIFIED_YML.read_text(encoding="utf-8"),
+        required_jobs=(RUNNER_CERTIFIED_JOB,),
+    )
     assert RUNNER_CERTIFIED_JOB in jobs, (
-        "ci.yml 必须提供 runner-identity-certified；hosted Windows Docker 不能认证 WSL2 Linux 容器语义"
+        "独立认证 workflow 必须提供 runner-identity-certified；hosted Windows Docker 不能认证 WSL2 Linux 容器语义"
     )
     return jobs[RUNNER_CERTIFIED_JOB]
 
@@ -461,17 +474,33 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "hosted Windows 的任何 step 均不得 docker pull/inspect Linux runner_identity 镜像"
     )
 
-    meta = _job_metadata(RUNNER_CERTIFIED_JOB)
+    main_jobs = _load_jobs(CI_YML.read_text(encoding="utf-8"))
+    assert RUNNER_CERTIFIED_JOB not in main_jobs, (
+        "主 ci.yml 不得声明 runner_identity 认证 job；否则 PR 会出现 skipped 的同名 check"
+    )
+    meta = _job_metadata(RUNNER_CERTIFIED_JOB, workflow_path=RUNNER_CERTIFIED_YML)
     assert _parse_inline_labels(str(meta.get("runs-on", ""))) == RUNNER_CERTIFIED_LABELS, (
         "runner_identity 必须只投递到受信 Windows+WSL2 Linux-container 专用标签"
     )
     assert meta["permissions"].get("contents") == "read", "认证 job 必须最小权限 contents: read"
-    certified_block = "\n".join(_load_job_blocks(CI_YML.read_text(encoding="utf-8"))[RUNNER_CERTIFIED_JOB])
+    runner_workflow = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
+    assert re.search(r"(?m)^name:\s*runner-identity-certified\s*$", runner_workflow), (
+        "独立 workflow 名必须是唯一的 runner-identity-certified"
+    )
+    assert re.search(r"(?m)^on:\s*$", runner_workflow), "独立 workflow 必须显式监听 push"
+    assert re.search(r"(?m)^\s*push:\s*$", runner_workflow), "独立 workflow 必须监听 push"
+    assert re.search(r"(?m)^\s*-\s*codex/\*\*\s*$", runner_workflow), (
+        "独立 workflow 只能监听 codex/** 分支"
+    )
+    assert "pull_request" not in _strip_ps_comments(runner_workflow)
+    assert "pull_request_target" not in _strip_ps_comments(runner_workflow)
+    certified_block = "\n".join(_load_job_blocks(runner_workflow)[RUNNER_CERTIFIED_JOB])
     assert re.search(r"^    timeout-minutes:\s*[1-9]\d*\s*$", certified_block, re.M), (
         "self-hosted 认证 job 必须设置正的 timeout-minutes，失控 Docker/WSL 命令不能无限占用专用 runner"
     )
+    # 触发器负责事件类型和分支白名单；job guard 只再约束认证机所属仓库，避免
+    # 主 ci 的 PR 运行产生同名 skipped check，也避免 fork 自己注册同名标签后调度。
     expected_if = (
-        "github.event_name == 'push' && "
         "github.repository == 'geqian236/AI-Coding-Factory' && "
         "startsWith(github.ref, 'refs/heads/codex/')"
     )
@@ -481,16 +510,17 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
 
     # 这三项分别是公共仓库 self-hosted 认证的信任边界。直接对结构化 job 字段施加
     # mutation，证明删除任一条件都会被当前测试拒绝，而不是只在注释里写了安全承诺。
-    workflow = CI_YML.read_text(encoding="utf-8")
+    workflow = runner_workflow
     policy = str(meta.get("if", ""))
     for removed, replacement in (
-        ("github.event_name == 'push'", "github.event_name == 'pull_request'"),
         ("github.repository == 'geqian236/AI-Coding-Factory'", "github.repository == 'attacker/fork'"),
         ("startsWith(github.ref, 'refs/heads/codex/')", "startsWith(github.ref, 'refs/heads/main')"),
     ):
         mutated = workflow.replace(policy, policy.replace(removed, replacement), 1)
         assert mutated != workflow, f"未能对认证 job trust guard 施加 mutation：{removed!r}"
-        altered = _job_metadata(RUNNER_CERTIFIED_JOB, mutated)
+        altered = _job_metadata(
+            RUNNER_CERTIFIED_JOB, mutated, workflow_path=RUNNER_CERTIFIED_YML,
+        )
         assert _normalize_expression(str(altered.get("if", ""))) != _normalize_expression(expected_if), (
             f"删除/替换 trust guard {removed!r} 后仍与受信策略等价，测试无法防止 self-hosted 误调度"
         )
@@ -507,7 +537,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     )
     credential_mutant = workflow.replace("persist-credentials: false", "persist-credentials: true", 1)
     altered_checkout = _find_step(
-        _load_jobs(credential_mutant)[RUNNER_CERTIFIED_JOB],
+        _load_jobs(credential_mutant, required_jobs=(RUNNER_CERTIFIED_JOB,))[RUNNER_CERTIFIED_JOB],
         lambda step: "actions/checkout" in str(step.get("uses", "")),
     )
     assert altered_checkout is not None
@@ -524,7 +554,9 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     d_root_code = _strip_ps_comments(str(d_root_guard.get("run", "")))
     d_root_requirements = (
         "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE", "CURRENT_WORKING_DIRECTORY",
-        "Get-CimInstance", "Get-PSDrive -Name D", "ReparsePoint", "StartsWith($approvedRoot", "exit 1",
+        "TEMP", "TMP", "FACTORY_TEST_DATA_ROOT", "CARGO_HOME", "RUSTUP_HOME",
+        "Get-CimInstance", "Get-PSDrive -Name D", "ReparsePoint", "StartsWith($approvedRoot",
+        "New-Item", "post-create", "exit 1",
     )
     for required in d_root_requirements:
         assert required in d_root_code, f"认证机 D 根首步缺少可执行断言：{required!r}"
@@ -533,14 +565,50 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     assert not all(required in junction_mutant for required in d_root_requirements), (
         "移除真实 ReparsePoint 审计后，D 根路径合同必须失效，不能只保留 lexical StartsWith"
     )
+
+    # D 根首步不能只靠文本包含 ReparsePoint：取出 workflow 中真正定义的路径函数，在
+    # D 盘创建真实 junction 后直接调用，证明缺失叶节点会向上找到祖先而 junction 必定拒绝。
+    # 同时对 guard 前插入 exit 0 的可执行源码施加 PowerShell AST mutation，避免有人把
+    # 安全退出藏在校验循环之前而静态 token 检查仍误判通过。
+    d_root_analysis = _analyze_d_root_guard_run(d_root_code)
+    assert d_root_analysis["parseErrors"] == 0, f"D 根首步必须可由 PowerShell AST 解析：{d_root_analysis}"
+    assert d_root_analysis["dRootValid"] is True, f"D 根首步缺少实际路径审计顺序：{d_root_analysis}"
+    d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
+    junction = d_root_tmp / "reparse-link"
+    junction_target = d_root_tmp / "target"
+    safe_missing_leaf = d_root_tmp / "safe" / "missing" / "leaf"
+    junction_target.mkdir()
+    try:
+        _create_windows_junction(junction, junction_target)
+        rejected = _invoke_d_root_path_guard(d_root_code, junction / "child")
+        assert rejected["ok"] is False and "reparse" in rejected["detail"].lower(), (
+            f"真实 junction 必须在创建前被路径 guard 拒绝：{rejected}"
+        )
+        accepted = _invoke_d_root_path_guard(d_root_code, safe_missing_leaf)
+        assert accepted["ok"] is True, (
+            f"不存在的叶节点必须回退到最近已有祖先继续审计，不能误拒：{accepted}"
+        )
+    finally:
+        _remove_junction_strict(junction)
+        _remove_tree_strict(d_root_tmp)
+
+    unsafe_early_exit = d_root_code.replace(
+        "$paths = [ordered]@{", "exit 0\n          $paths = [ordered]@{", 1
+    )
+    assert unsafe_early_exit != d_root_code, "未能在 D 根路径审计前注入 exit 0 mutation"
+    unsafe_analysis = _analyze_d_root_guard_run(unsafe_early_exit)
+    assert unsafe_analysis["parseErrors"] == 0
+    assert unsafe_analysis["dRootValid"] is False and unsafe_analysis["unsafeTerminalBeforeAudit"] is True, (
+        f"D 根审计前的 exit 0 必须翻转结构化合同：{unsafe_analysis}"
+    )
     toolchain_code = _strip_ps_comments(str(toolchain_check.get("run", "")))
     for required in ("sys.version_info[:2] == (3, 12)", '"rustup"', '"cargo"', "Get-Command", "exit 1"):
         assert required in toolchain_code, f"认证机受控工具链检查缺少 fail-closed 规则：{required!r}"
     assert preflight["_order"] < toolchain_check["_order"] < image_prep["_order"] < execute["_order"], (
         "候选/WSL2/Linux-backend 前置检查、镜像准备、真实 wrapper+receipt 验证必须严格按此顺序执行"
     )
-    assert all(str(step.get("shell", "")).strip() == "pwsh" for step in (preflight, image_prep, execute)), (
-        "runner_identity 认证步骤必须在 pwsh 下执行，与生产 wrapper 宿主保持一致"
+    assert all(str(step.get("shell", "")).strip() == "powershell" for step in (preflight, image_prep, execute)), (
+        "runner_identity 认证步骤必须使用已冻结并在本机验证的 Windows PowerShell，而非未认证的 pwsh 依赖"
     )
     execute_code = _strip_ps_comments(str(execute.get("run", "")))
     for required in (
@@ -627,6 +695,214 @@ def _run_ps_analyzer(
     )
     parsed: dict[str, Any] = json.loads(result.stdout)
     return parsed
+
+
+# runner_identity 独立认证的首步既要检查 D 根，也要避免有人在真正的路径审计前插入成功
+# 退出。这里用 PowerShell AST 读取 workflow 的可执行 run block，而不是搜索注释或 token。
+_D_ROOT_GUARD_AST_ANALYZER = r"""
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+
+$fn = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq 'Assert-ApprovedRunnerPath'
+}, $true))
+$pathsAssignment = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Left.Extent.Text -eq '$paths'
+}, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+$pathsOffset = if ($pathsAssignment.Count -eq 1) { $pathsAssignment[0].Extent.StartOffset } else { -1 }
+$auditCommands = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+    $args[0].GetCommandName() -eq 'Assert-ApprovedRunnerPath'
+}, $true) | Where-Object { $_.Extent.StartOffset -gt $pathsOffset } | Sort-Object { $_.Extent.StartOffset })
+$newItems = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+    $args[0].GetCommandName() -eq 'New-Item'
+}, $true) | Sort-Object { $_.Extent.StartOffset })
+$firstAuditOffset = if ($auditCommands.Count -gt 0) { $auditCommands[0].Extent.StartOffset } else { [int]::MaxValue }
+$firstNewItemOffset = if ($newItems.Count -gt 0) { $newItems[0].Extent.StartOffset } else { [int]::MaxValue }
+
+function Test-InFunctionScope($node) {
+    $cursor = $node.Parent
+    while ($null -ne $cursor) {
+        if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+        $cursor = $cursor.Parent
+    }
+    return $false
+}
+
+$unsafeTerminalBeforeAudit = $false
+$functionEnd = if ($fn.Count -eq 1) { $fn[0].Extent.EndOffset } else { -1 }
+$terminals = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
+    $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
+    $args[0] -is [System.Management.Automation.Language.BreakStatementAst] -or
+    $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
+}, $true))
+foreach ($terminal in $terminals) {
+    if ((Test-InFunctionScope $terminal) -or $terminal.Extent.StartOffset -le $functionEnd -or
+        $terminal.Extent.StartOffset -ge $firstAuditOffset) { continue }
+    $text = $terminal.Extent.Text.Trim()
+    if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
+        if ($text -match '(?i)^exit(?:\s+0)?\s*$') { $unsafeTerminalBeforeAudit = $true }
+    } else {
+        $unsafeTerminalBeforeAudit = $true
+    }
+}
+
+$pathAuditBeforeCreate = ($pathsOffset -ge 0 -and $auditCommands.Count -ge 2 -and
+    $newItems.Count -ge 1 -and $auditCommands[0].Extent.StartOffset -lt $newItems[0].Extent.StartOffset)
+[ordered]@{
+    parseErrors = @($errors).Count
+    parseErrorMessages = @($errors | ForEach-Object { $_.Message })
+    approvedPathFunctionCount = $fn.Count
+    pathsAssignmentFound = ($pathsOffset -ge 0)
+    pathAuditBeforeCreate = $pathAuditBeforeCreate
+    unsafeTerminalBeforeAudit = $unsafeTerminalBeforeAudit
+    dRootValid = (
+        @($errors).Count -eq 0 -and $fn.Count -eq 1 -and
+        $pathAuditBeforeCreate -and -not $unsafeTerminalBeforeAudit
+    )
+} | ConvertTo-Json -Compress
+"""
+
+
+def _analyze_d_root_guard_run(run: str) -> dict[str, Any]:
+    """用真实 PowerShell AST 检查 D 根首步的路径审计和值流顺序。"""
+    return _run_ps_analyzer(_D_ROOT_GUARD_AST_ANALYZER, run)
+
+
+# 直接从 YAML run block 提取生产路径函数执行；fixture 只在 D 盘临时根创建真实 junction，
+# 不复制一份 Python 路径逻辑，从而防止测试与 workflow 的 reparse 规则漂移。
+_D_ROOT_PATH_GUARD_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$payloadJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+$payload = $payloadJson | ConvertFrom-Json
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput([string]$payload.run, [ref]$tokens, [ref]$errors)
+if (@($errors).Count -ne 0) {
+    [ordered]@{ ok = $false; detail = 'workflow run parse failed' } | ConvertTo-Json -Compress
+    exit 0
+}
+$definitions = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq 'Assert-ApprovedRunnerPath'
+}, $true))
+if ($definitions.Count -ne 1) {
+    [ordered]@{ ok = $false; detail = 'Assert-ApprovedRunnerPath missing or ambiguous' } | ConvertTo-Json -Compress
+    exit 0
+}
+$approvedRoot = 'D:\codex项目'
+. ([scriptblock]::Create($definitions[0].Extent.Text))
+try {
+    # 先把 JSON 属性物化为局部变量；PowerShell 5.1 会把 -Value ([string]$payload.target)
+    # 解析为歧义参数集，反而没有执行生产路径函数。
+    $targetPath = [string]$payload.target
+    $value = Assert-ApprovedRunnerPath -Name 'test-path' -Value $targetPath -Stage 'dynamic-test'
+    [ordered]@{ ok = $true; detail = 'accepted'; value = [string]$value } | ConvertTo-Json -Compress
+} catch {
+    [ordered]@{
+        ok = $false
+        detail = [string]$_.Exception.Message
+        parameterNames = @((Get-Command Assert-ApprovedRunnerPath).Parameters.Keys)
+    } | ConvertTo-Json -Compress
+}
+"""
+
+
+def _invoke_d_root_path_guard(run: str, target: Path) -> dict[str, Any]:
+    """让 workflow 内的生产 Assert-ApprovedRunnerPath 审计一个真实 D 盘路径。"""
+    payload = json.dumps({"run": run, "target": str(target)}, ensure_ascii=False)
+    return _run_ps_analyzer(_D_ROOT_PATH_GUARD_HARNESS, payload)
+
+
+# runner_identity 的本地 wrapper 也可能直接产生 authoritative receipt，不能只依赖 CI
+# preflight 记住平台条件。这里从生产 PowerShell AST 取两类 receipt 的 observable_facts：
+# toolchain BLOCKED 必须克隆完整 platform facts，最终 PASS/FAIL receipt 必须逐项写入。
+_RUNNER_IDENTITY_FACTS_AST_ANALYZER = r"""
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+
+function Get-Pair($htable, [string]$Name) {
+    return @($htable.KeyValuePairs | Where-Object { $_.Item1.Extent.Text -eq $Name } | Select-Object -First 1)
+}
+
+function Get-InnerFacts($htable) {
+    $pair = Get-Pair $htable 'observable_facts'
+    if ($pair.Count -ne 1) { return $null }
+    $inner = @($pair[0].Item2.FindAll({
+        $args[0] -is [System.Management.Automation.Language.HashtableAst]
+    }, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+    if ($inner.Count -ne 1) { return $null }
+    $values = [ordered]@{}
+    foreach ($entry in $inner[0].KeyValuePairs) {
+        $values[$entry.Item1.Extent.Text] = $entry.Item2.Extent.Text.Trim()
+    }
+    return $values
+}
+
+$tables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.HashtableAst] }, $true))
+$toolchain = @($tables | Where-Object {
+    $pair = Get-Pair $_ 'subcheckId'
+    $pair.Count -eq 1 -and $pair[0].Item2.Extent.Text -match 'toolchain_unavailable'
+} | Select-Object -First 1)
+$final = @($tables | Where-Object {
+    $status = Get-Pair $_ 'status'
+    $facts = Get-Pair $_ 'observable_facts'
+    $status.Count -eq 1 -and $status[0].Item2.Extent.Text.Trim() -eq '$status' -and $facts.Count -eq 1
+} | Select-Object -First 1)
+
+$expected = @(
+    'windows_host', 'windows_nt', 'windows_product_type', 'windows_build', 'candidate_sha',
+    'docker_env_overrides', 'docker_server_version', 'docker_ostype', 'docker_operating_system',
+    'docker_context', 'docker_context_endpoint', 'wsl_docker_desktop_v2', 'image_available', 'image_os'
+)
+$finalFacts = if ($final.Count -eq 1) { Get-InnerFacts $final[0] } else { $null }
+$finalMappingsExact = ($null -ne $finalFacts)
+if ($finalMappingsExact) {
+    foreach ($name in $expected) {
+        if (-not $finalFacts.Contains($name) -or $finalFacts[$name] -ne ('$platform.facts["' + $name + '"]')) {
+            $finalMappingsExact = $false
+        }
+    }
+}
+
+$toolchainFactsPair = if ($toolchain.Count -eq 1) { Get-Pair $toolchain[0] 'observable_facts' } else { @() }
+$toolchainUsesClone = ($toolchainFactsPair.Count -eq 1 -and
+    $toolchainFactsPair[0].Item2.Extent.Text.Trim() -eq '$blockedFacts')
+$cloneLoops = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] -and
+    $args[0].Extent.Text -match '\$platform\.facts\.GetEnumerator\(\)'
+}, $true))
+$cloneAssignments = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $args[0].Left.Extent.Text -match '^\$blockedFacts\[\$fact\.Key\]$' -and
+    $args[0].Right.Extent.Text.Trim() -eq '$fact.Value'
+}, $true))
+$toolchainCloneExact = ($toolchainUsesClone -and $cloneLoops.Count -eq 1 -and $cloneAssignments.Count -eq 1)
+
+[ordered]@{
+    parseErrors = @($errors).Count
+    finalFound = ($final.Count -eq 1)
+    finalMappingsExact = $finalMappingsExact
+    toolchainFound = ($toolchain.Count -eq 1)
+    toolchainCloneExact = $toolchainCloneExact
+    valid = (@($errors).Count -eq 0 -and $finalMappingsExact -and $toolchainCloneExact)
+} | ConvertTo-Json -Compress
+"""
+
+
+def _analyze_runner_identity_platform_facts(source_text: str) -> dict[str, Any]:
+    """用生产 AST 证明本地 toolchain/final receipt 都留存完整平台身份事实。"""
+    return _run_ps_analyzer(_RUNNER_IDENTITY_FACTS_AST_ANALYZER, source_text)
 
 
 # wrapper 值流 AST 分析器（P1-2）：证明每个分支的完整值流
@@ -1114,11 +1390,171 @@ def _analyze_runner_identity_image_run(run_text: str) -> dict[str, Any]:
     return _run_ps_analyzer(_CI_RUNNER_IMAGE_AST_ANALYZER, run_text)
 
 
+# runner_identity 最终执行链必须是一个可证明的值流：真实 wrapper 命令 -> 立即捕获
+# LASTEXITCODE -> 立即 reject 非零 -> 已执行 exe 摘要 -> stamp -> stamp guard -> validator
+# -> PASS guard。这里按顶层 PowerShell AST statement 的真实顺序锁定，拒绝注释、字符串、
+# 参数折叠、提前 guard 或插入原生命令造成的假绿。
+_CI_RUNNER_EXECUTE_AST_ANALYZER = r"""
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+
+function Get-TopCommand($statement) {
+    if ($statement -isnot [System.Management.Automation.Language.PipelineAst]) { return $null }
+    $parts = @($statement.PipelineElements)
+    if ($parts.Count -ne 1 -or $parts[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $null }
+    return $parts[0]
+}
+function Get-ElementText($element) {
+    $value = $element.Extent.Text.Trim()
+    if ($value.Length -ge 2 -and (
+        ($value[0] -eq [char]34 -and $value[$value.Length - 1] -eq [char]34) -or
+        ($value[0] -eq [char]39 -and $value[$value.Length - 1] -eq [char]39)
+    )) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+    return ($value -replace '\\', '/')
+}
+function Test-ExactCommand($statement, [string[]]$expected, [bool]$requireAmpersand) {
+    $cmd = Get-TopCommand $statement
+    if ($null -eq $cmd) { return $false }
+    if ($requireAmpersand -and
+        $cmd.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Ampersand) {
+        return $false
+    }
+    $els = @($cmd.CommandElements)
+    if ($els.Count -ne $expected.Count) { return $false }
+    for ($i = 0; $i -lt $els.Count; $i++) { if ((Get-ElementText $els[$i]) -cne $expected[$i]) { return $false } }
+    return $true
+}
+function Test-LastExitCapture($statement) {
+    if ($statement -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
+    $right = $statement.Right
+    if ($right -is [System.Management.Automation.Language.PipelineAst]) {
+        $parts = @($right.PipelineElements)
+        if ($parts.Count -eq 1 -and $parts[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            $right = $parts[0].Expression
+        }
+    }
+    elseif ($right -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        $right = $right.Expression
+    }
+    return ($statement.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $statement.Left.VariablePath.UserPath -eq 'wrapperExit' -and
+        $right -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $right.VariablePath.UserPath -eq 'LASTEXITCODE')
+}
+function Test-RejectGuard($statement, [string]$requiredCondition) {
+    if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
+    $clauses = @($statement.Clauses)
+    if ($clauses.Count -ne 1 -or $null -ne $statement.ElseClause) { return $false }
+    $condition = ($clauses[0].Item1.Extent.Text -replace '\s+', '')
+    if ($condition -cne $requiredCondition) { return $false }
+    $body = $clauses[0].Item2
+    $top = @($body.Statements)
+    if ($top.Count -ne 2 -or $top[1] -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $false }
+    $pipe = @($top[1].Pipeline.PipelineElements)
+    if ($pipe.Count -ne 1 -or $pipe[0] -isnot [System.Management.Automation.Language.CommandExpressionAst] -or
+        $pipe[0].Expression -isnot [System.Management.Automation.Language.ConstantExpressionAst] -or
+        $pipe[0].Expression.Value -ne 1) { return $false }
+    $unsafe = @($body.FindAll({
+        param($node)
+        ($node -is [System.Management.Automation.Language.ReturnStatementAst]) -or
+        ($node -is [System.Management.Automation.Language.ThrowStatementAst]) -or
+        ($node -is [System.Management.Automation.Language.BreakStatementAst]) -or
+        ($node -is [System.Management.Automation.Language.ContinueStatementAst]) -or
+        ($node -is [System.Management.Automation.Language.ExitStatementAst] -and
+            $node.Extent.Text -notmatch '^\s*exit\s+1\s*$')
+    }, $true))
+    return ($unsafe.Count -eq 0)
+}
+function Find-StatementIndex([object[]]$statements, [int]$start, [scriptblock]$predicate) {
+    for ($i = $start; $i -lt $statements.Count; $i++) { if (& $predicate $statements[$i]) { return $i } }
+    return -1
+}
+function Has-Command($statement, [string]$name) {
+    $commands = @($statement.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq $name
+    }, $true))
+    return $commands.Count -eq 1
+}
+
+$top = @($ast.EndBlock.Statements)
+$wrapperExpected = @(
+    'powershell','-NoProfile','-ExecutionPolicy','Bypass','-File',
+    'scripts/spikes/test-runner-identity.ps1'
+)
+$wrapperIndex = Find-StatementIndex $top 0 { param($s) Test-ExactCommand $s $wrapperExpected $true }
+$captureIndex = if ($wrapperIndex -ge 0) { $wrapperIndex + 1 } else { -1 }
+$captureValid = ($captureIndex -ge 0 -and $captureIndex -lt $top.Count -and (Test-LastExitCapture $top[$captureIndex]))
+$wrapperGuardIndex = if ($captureValid) { $captureIndex + 1 } else { -1 }
+$wrapperGuardValid = ($wrapperGuardIndex -ge 0 -and $wrapperGuardIndex -lt $top.Count -and
+    (Test-RejectGuard $top[$wrapperGuardIndex] '$null-eq$wrapperExit-or$wrapperExit-ne0'))
+$hashIndex = if ($wrapperGuardValid) {
+    Find-StatementIndex $top ($wrapperGuardIndex + 1) {
+        param($s)
+        Has-Command $s 'Get-FileHash'
+    }
+} else { -1 }
+$stampIndex = if ($hashIndex -ge 0) { Find-StatementIndex $top ($hashIndex + 1) {
+    param($s)
+    Test-ExactCommand $s @(
+        'python','scripts/spikes/stamp_run_binding.py','$receiptPath','runner_identity',
+        '--probe-digest','$probeDigest'
+    ) $false
+} } else { -1 }
+$stampGuardIndex = if ($stampIndex -ge 0) { $stampIndex + 1 } else { -1 }
+$stampGuardValid = (
+    $stampGuardIndex -ge 0 -and $stampGuardIndex -lt $top.Count -and
+    (Test-RejectGuard $top[$stampGuardIndex] '$LASTEXITCODE-ne0')
+)
+$validatorIndex = if ($stampGuardValid) {
+    Find-StatementIndex $top ($stampGuardIndex + 1) {
+        param($s)
+        Has-Command $s 'Test-SpikeReceiptEvidence'
+    }
+} else { -1 }
+$validatorGuardIndex = if ($validatorIndex -ge 0) { $validatorIndex + 1 } else { -1 }
+$validatorGuardValid = (
+    $validatorGuardIndex -ge 0 -and $validatorGuardIndex -lt $top.Count -and
+    (Test-RejectGuard $top[$validatorGuardIndex] '-not$v.ok-or$v.status-ne"PASS"')
+)
+
+[pscustomobject]@{
+    parseErrors = @($errors).Count
+    wrapperIndex = $wrapperIndex
+    captureValid = $captureValid
+    wrapperGuardValid = $wrapperGuardValid
+    hashIndex = $hashIndex
+    stampIndex = $stampIndex
+    stampGuardValid = $stampGuardValid
+    validatorIndex = $validatorIndex
+    validatorGuardValid = $validatorGuardValid
+    executeValid = (
+        $wrapperIndex -ge 0 -and $captureValid -and $wrapperGuardValid -and
+        $hashIndex -gt $wrapperGuardIndex -and $stampIndex -gt $hashIndex -and
+        $stampGuardValid -and $validatorIndex -gt $stampGuardIndex -and $validatorGuardValid
+    )
+} | ConvertTo-Json -Compress
+"""
+
+
+def _analyze_runner_identity_execute_run(run_text: str) -> dict[str, Any]:
+    """以 PowerShell AST 校验 runner_identity 最终执行链的真实命令和值流顺序。"""
+    return _run_ps_analyzer(_CI_RUNNER_EXECUTE_AST_ANALYZER, run_text)
+
+
 def _run_runner_platform_helper_mock(
     helper_path: Path, *, ostype: str = "linux", operating_system: str = "Docker Desktop",
     context: str = "desktop-linux", endpoint: str = "npipe:////./pipe/dockerDesktopLinuxEngine",
     image_os: str = "linux", wsl_has_nul: bool = False,
     candidate_sha: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    product_type: int = 1, build_number: str = "22631", os_value: str = "Windows_NT",
+    missing_command: str = "", throwing_command: str = "", docker_override: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """在不接触真实 Docker 的 Windows PowerShell 子进程中执行生产 helper。
 
@@ -1129,11 +1565,26 @@ def _run_runner_platform_helper_mock(
 $ErrorActionPreference = 'Stop'
 function git {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    if ($env:FACTORY_MOCK_THROWING_COMMAND -eq 'git') { throw 'mock git exception' }
     $global:LASTEXITCODE = 0
     $env:FACTORY_MOCK_GIT_SHA
 }
+function Get-CimInstance {
+    param([Parameter(ValueFromRemainingArguments = $true)][object[]]$Args)
+    [pscustomobject]@{
+        ProductType = [int]$env:FACTORY_MOCK_PRODUCT_TYPE
+        BuildNumber = $env:FACTORY_MOCK_BUILD_NUMBER
+        Caption = 'Microsoft Windows mock'
+    }
+}
+function Get-Command {
+    param([string]$Name, [Parameter(ValueFromRemainingArguments = $true)][object[]]$Args)
+    if ($Name -eq $env:FACTORY_MOCK_MISSING_COMMAND) { return $null }
+    [pscustomobject]@{ Name = $Name; CommandType = 'Application'; Path = $Name }
+}
 function docker {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    if ($env:FACTORY_MOCK_THROWING_COMMAND -eq 'docker') { throw 'mock docker exception' }
     $joined = $CmdArgs -join ' '
     if ($joined -like 'version *') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_VERSION; return }
     if ($joined -like 'info *OSType*') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_OSTYPE; return }
@@ -1145,6 +1596,7 @@ function docker {
 }
 function wsl.exe {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    if ($env:FACTORY_MOCK_THROWING_COMMAND -eq 'wsl.exe') { throw 'mock wsl exception' }
     $global:LASTEXITCODE = 0
     if ($env:FACTORY_MOCK_WSL_NUL -eq '1') { "  docker-desktop`0 Running`0 2`0" }
     else { '  docker-desktop Running 2' }
@@ -1168,9 +1620,18 @@ $result = Test-RunnerIdentityPlatform `
         "FACTORY_MOCK_IMAGE_OS": image_os,
         "FACTORY_MOCK_WSL_NUL": "1" if wsl_has_nul else "0",
         "FACTORY_MOCK_GIT_SHA": candidate_sha,
+        "FACTORY_MOCK_PRODUCT_TYPE": str(product_type),
+        "FACTORY_MOCK_BUILD_NUMBER": build_number,
+        "FACTORY_MOCK_MISSING_COMMAND": missing_command,
+        "FACTORY_MOCK_THROWING_COMMAND": throwing_command,
+        "OS": os_value,
         "TEMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
         "TMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
     })
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+        env.pop(name, None)
+    if docker_override is not None:
+        env[docker_override[0]] = docker_override[1]
     result = subprocess.run(
         [_ps_host(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", _encoded_command(ps)],
         capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO_ROOT),
@@ -1231,7 +1692,7 @@ def test_durable_io_blocked_receipt_has_valid_evidence(kind: str, expected_subch
 
 
 def _pwsh_validate_receipt(
-    receipt: dict[str, Any], env_compat: bool, *, name: str = "windows_durable_io",
+    receipt: object, env_compat: bool, *, name: str = "windows_durable_io",
     run_id: str = "", run_nonce: str = "", candidate_sha: str = "", probe_digest: str = "",
 ) -> dict[str, Any]:
     """把 receipt 写唯一临时文件，经生产 validator 判定；可传运行/候选/probe 三重绑定。"""
@@ -1253,6 +1714,10 @@ Write-Output "ok=$($v.ok)|status=$($v.status)|detail=$($v.detail)"
             [_ps_host(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=str(REPO_ROOT), timeout=60,
+        )
+        assert result.returncode == 0, (
+            "生产 validator 必须把坏 receipt 转为稳定 verdict，不能因顶层 null/非对象等输入抛出："
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
         )
         out = result.stdout.strip()
         parts = {p.split("=", 1)[0]: p.split("=", 1)[1] for p in out.split("|") if "=" in p}
@@ -1694,18 +2159,22 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     )
     helper_run = PLATFORM_HELPER_PS1.read_text(encoding="utf-8-sig")
     helper_code = _strip_ps_comments(helper_run)
+    # 所有 git/docker/wsl 原生命令必须走同一 fail-closed 封装；不能再通过搜裸命令
+    # 字串误判安全性。下方 mock 直接运行生产 helper 覆盖命令缺失、异常及顺序。
     for required in (
-        "git rev-parse HEAD 2>$null",
-        'docker info --format "{{.OSType}}" 2>$null',
-        'docker context inspect --format "{{.Endpoints.docker.Host}}" $facts.docker_context 2>$null',
-        "wsl.exe --list --verbose 2>$null",
+        "Invoke-RunnerIdentityNativeProbe",
+        "Get-Command -Name $Name -CommandType Application",
+        "docker_environment_overrides_clear",
+        "windows_11_workstation",
+        "[Environment]::OSVersion.Platform",
+        "Get-CimInstance -ClassName Win32_OperatingSystem",
         '$facts.docker_ostype -ceq "linux"',
         '$facts.docker_operating_system -match "Docker Desktop"',
         '$facts.docker_context -in @("desktop-linux", "docker-desktop")',
-        'docker_desktop_local_endpoint',
-        'docker-desktop\\s+\\S+\\s+2',
+        "docker_desktop_local_endpoint",
+        "docker-desktop\\s+\\S+\\s+2",
         '$facts.image_os -ceq "linux"',
-        'candidate_sha_exact',
+        "candidate_sha_exact",
     ):
         assert required in helper_code, f"共享 helper 缺少平台事实/断言：{required!r}"
 
@@ -1729,7 +2198,47 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
         )
         assert wrong_candidate["ok"] is False and "candidate_sha_exact" in wrong_candidate["failed"]
 
-        nul_mutant = helper_run.replace(' -replace "`0", ""', "", 1)
+        # 认证环境不可被 DOCKER_* 覆盖到远端 daemon；每个变量都必须在任何 docker
+        # 调用前统一拒绝。逐个实际运行生产 helper，避免只扫描变量名的假绿。
+        for name, value in (
+            ("DOCKER_HOST", "tcp://remote.example:2376"),
+            ("DOCKER_CONTEXT", "attacker-context"),
+            ("DOCKER_TLS_VERIFY", "1"),
+            ("DOCKER_CERT_PATH", r"D:\untrusted-cert"),
+        ):
+            overridden = _run_runner_platform_helper_mock(
+                PLATFORM_HELPER_PS1, docker_override=(name, value),
+            )
+            assert overridden["ok"] is False and "docker_environment_overrides_clear" in overridden["failed"], (
+                f"{name} 非空时必须在 docker 调用前 fail-closed：{overridden}"
+            )
+
+        # $env:OS 只能作为辅助事实，真实认证还必须是 Windows NT 的 Windows 11
+        # workstation；Server 和 Windows 10 都不能借文字环境变量混入认证路径。
+        server = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, product_type=3)
+        assert server["ok"] is False and "windows_11_workstation" in server["failed"]
+        win10 = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, build_number="19045")
+        assert win10["ok"] is False and "windows_11_workstation" in win10["failed"]
+        non_nt = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, os_value="Unix")
+        assert non_nt["ok"] is False and "windows_nt" in non_nt["failed"]
+
+        # git/docker/wsl 原生命令缺失或抛异常都必须返回稳定失败对象，wrapper 才能
+        # 写出合法 BLOCKED receipt，而不是在 dot-source 阶段异常退出且没有证据。
+        for command, assertion in (
+            ("git", "candidate_sha_exact"),
+            ("docker", "docker_daemon_available"),
+            ("wsl.exe", "docker_desktop_wsl2"),
+        ):
+            absent = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, missing_command=command)
+            assert absent["ok"] is False and assertion in absent["failed"], (
+                f"缺少 {command} 必须产生稳定的 {assertion} 失败：{absent}"
+            )
+            thrown = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, throwing_command=command)
+            assert thrown["ok"] is False and assertion in thrown["failed"], (
+                f"{command} 异常必须产生稳定的 {assertion} 失败：{thrown}"
+            )
+
+        nul_mutant = helper_run.replace('$wslProbe.text -replace "`0", ""', "$wslProbe.text", 1)
         assert nul_mutant != helper_run, "未能定位生产 helper 的 WSL NUL 清理以施加 mutation"
         mutant_path = helper_tmp / "runner-identity-platform-no-nul.ps1"
         mutant_path.write_text(nul_mutant, encoding="utf-8-sig")
@@ -1739,6 +2248,33 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
         )
     finally:
         shutil.rmtree(helper_tmp, ignore_errors=True)
+
+    # 本地 wrapper 是 Phase 0 的权威验收入口之一：即使 CI 已经 preflight，wrapper 自己
+    # 写出的 toolchain BLOCKED 与最终 receipt 也必须可复核 Windows/WSL/Docker 身份。
+    wrapper_source = RUNNER_IDENTITY_WRAPPER_PS1.read_text(encoding="utf-8-sig")
+    wrapper_facts = _analyze_runner_identity_platform_facts(wrapper_source)
+    assert wrapper_facts["parseErrors"] == 0, f"runner wrapper 必须可由 PowerShell AST 解析：{wrapper_facts}"
+    assert wrapper_facts["valid"] is True, (
+        "runner wrapper 的 toolchain BLOCKED 必须克隆完整 platform facts，最终 receipt 必须逐项留存；"
+        f"实际={wrapper_facts}"
+    )
+    final_endpoint_mutant = wrapper_source.rsplit(
+        'docker_context_endpoint = $platform.facts["docker_context_endpoint"]', 1,
+    )
+    assert len(final_endpoint_mutant) == 2, "未能定位最终 receipt 的 Docker context endpoint 映射"
+    final_endpoint_mutant_source = final_endpoint_mutant[0] + (
+        '# docker_context_endpoint = $platform.facts["docker_context_endpoint"]'
+    ) + final_endpoint_mutant[1]
+    final_endpoint_analysis = _analyze_runner_identity_platform_facts(final_endpoint_mutant_source)
+    assert final_endpoint_analysis["finalMappingsExact"] is False, (
+        "注释掉最终 receipt 的真实 endpoint 映射后 AST 必须拒绝，不能由注释或其他 receipt 代偿"
+    )
+    clone_mutant = wrapper_source.replace("$platform.facts.GetEnumerator()", "@().GetEnumerator()", 1)
+    assert clone_mutant != wrapper_source, "未能定位 toolchain receipt 的 platform facts clone"
+    clone_analysis = _analyze_runner_identity_platform_facts(clone_mutant)
+    assert clone_analysis["toolchainCloneExact"] is False, (
+        "将 toolchain clone 改为空集合后 AST 必须拒绝，不能仅因 observable_facts 非空而放行"
+    )
 
     image_code = _strip_ps_comments(str(_runner_identity_image_step().get("run", "")))
     expected_image_call = (
@@ -1825,6 +2361,56 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
             )
             assert verdict["status"] == "BINDING_MISMATCH", (
                 f"probeDigest={label} 必须报 BINDING_MISMATCH，而非被静默跳过：{verdict}"
+            )
+
+        # runner_identity 是实际二进制身份绑定的唯一消费者：遗漏 --probe-digest 或用全零占位
+        # 都不能被盖章器默许，否则 CI 只绑源码候选而没有绑已执行的 probe。
+        missing_digest = subprocess.run(
+            [sys.executable, str(STAMP_RUN_BINDING_PY), str(receipt_path), "runner_identity"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO_ROOT),
+            env=stamp_env, timeout=60,
+        )
+        assert missing_digest.returncode != 0 and "STAMP_PROBE_DIGEST_REQUIRED" in missing_digest.stderr
+        zero_digest = subprocess.run(
+            [
+                sys.executable, str(STAMP_RUN_BINDING_PY), str(receipt_path), "runner_identity",
+                "--probe-digest", "sha256:" + "0" * 64,
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO_ROOT),
+            env=stamp_env, timeout=60,
+        )
+        assert zero_digest.returncode != 0 and "STAMP_INVALID_PROBE_DIGEST" in zero_digest.stderr
+
+        # validator 接受的是外部 receipt，任何 JSON 顶层类型、断言布尔或 required 字段的
+        # 异常都必须稳定 fail-closed，绝不能让 PowerShell 的隐式转换或属性访问异常绕过。
+        base = {
+            "spike": "runner_identity",
+            "status": "PASS",
+            "assertions": [{"name": "fixture", "passed": True}],
+            "runBinding": good["runBinding"],
+        }
+        malformed_cases: tuple[tuple[str, Any], ...] = (
+            ("null_top", None),
+            ("array_top", []),
+            ("string_top", "not-an-object"),
+            ("null_assertion", {**base, "assertions": [None]}),
+            ("string_passed", {**base, "assertions": [{"name": "fixture", "passed": "true"}]}),
+            (
+                "missing_required",
+                {**base, "subResults": [{"aspect": "disk_full", "status": "PASS"}]},
+            ),
+            (
+                "string_required",
+                {**base, "subResults": [{"aspect": "disk_full", "status": "PASS", "required": "false"}]},
+            ),
+        )
+        for label, malformed in malformed_cases:
+            verdict = _pwsh_validate_receipt(
+                malformed, False, name="runner_identity", run_id=run_id, run_nonce=run_nonce,
+                candidate_sha=candidate_sha, probe_digest=probe_digest,
+            )
+            assert verdict["ok"] is False and verdict["status"] in {"INVALID", "BINDING_MISMATCH"}, (
+                f"坏 receipt {label} 必须稳定 fail-closed，实际={verdict}"
             )
     finally:
         _remove_tree_strict(tmp_dir)
@@ -1964,6 +2550,44 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     image_a = _analyze_runner_identity_image_run(image_nested_exit_zero)
     assert image_a["parseErrors"] == 0
     assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
+    # 最终 execute 不能只包含这些关键字：必须由 AST 证明 wrapper 的真实 native 调用、
+    # LASTEXITCODE 捕获、非零拒绝、exe digest、盖章及 validator 的顺序没有可插队空隙。
+    execute_run = str(_required_named_step(
+        _runner_identity_certified_steps(), RUNNER_IDENTITY_EXECUTE_STEP_NAME
+    ).get("run", ""))
+    execute_a = _analyze_runner_identity_execute_run(execute_run)
+    assert execute_a["parseErrors"] == 0, f"execute run 必须可由 PowerShell AST 解析：{execute_a}"
+    assert execute_a["executeValid"] is True, f"最终认证执行值流不完整或顺序被绕过：{execute_a}"
+
+    # 注释真实 wrapper 再塞未使用字符串、把参数折叠、捕获后插入另一原生命令，或在拒绝
+    # guard 内提前 exit 0，均不得被任何文字匹配误当为完整认证链。
+    wrapper_command = '& powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/spikes/test-runner-identity.ps1"'
+    commented_execute = _mut_comment_exact_command(execute_run, wrapper_command, add_unused_string=True)
+    assert commented_execute != execute_run
+    assert _analyze_runner_identity_execute_run(commented_execute)["executeValid"] is False
+
+    folded_execute = execute_run.replace(
+        wrapper_command,
+        '& powershell "-NoProfile -ExecutionPolicy Bypass -File scripts/spikes/test-runner-identity.ps1"',
+        1,
+    )
+    assert folded_execute != execute_run
+    assert _analyze_runner_identity_execute_run(folded_execute)["executeValid"] is False
+
+    interleaved_execute = execute_run.replace(
+        "$wrapperExit = $LASTEXITCODE", "$wrapperExit = $LASTEXITCODE\ncmd /d /c ver | Out-Null", 1
+    )
+    assert interleaved_execute != execute_run
+    assert _analyze_runner_identity_execute_run(interleaved_execute)["executeValid"] is False
+
+    early_exit_execute = execute_run.replace(
+        'Write-Error "[runner_identity] wrapper exit=$wrapperExit，拒绝认证"',
+        'exit 0\n  Write-Error "[runner_identity] wrapper exit=$wrapperExit，拒绝认证"',
+        1,
+    )
+    assert early_exit_execute != execute_run
+    assert _analyze_runner_identity_execute_run(early_exit_execute)["executeValid"] is False
 
 _PREHEAT_COMMAND = (
     '& "$PWD/scripts/dev.ps1" -- -- rustup toolchain install '
@@ -2370,12 +2994,16 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
         "UTF-8 BOM 脚本不得残留 pure-ASCII/ASCII-only 与 BOM-less 组合的过期说明"
     )
     code = _strip_ps_comments(source)
-    assert re.search(r"function\s+Test-RunnerIdentityCiContract\b", code), (
-        "C-1 必须有独立的 runner_identity CI split 机械合同，不能只靠 A-1 静态测试"
+    # C-1 不复制一套脆弱的正则审计：它必须实际重跑包含 YAML 结构解析、PowerShell AST 与
+    # 动态 mutation 的同一 CI 合同测试。旧的 Test-RunnerIdentityCiContract 只能搜 token，
+    # 无法证明 early exit/未使用字符串等绕过路径，因此不得继续作为验收判据。
+    assert not re.search(r"function\s+Test-RunnerIdentityCiContract\b", code), (
+        "C-1 不得保留并调用弱字符串版 runner_identity CI 审计"
     )
-    assert re.search(r"Test-RunnerIdentityCiContract\s+-CiText\s+\$ci", code), (
-        "C-1 必须实际调用 runner_identity CI split 合同，不能定义后不执行"
-    )
+    assert re.search(
+        r"uv\s+run\s+--locked\s+python\s+-m\s+pytest\s+tests/contract/test_ci_blocker_fixes\.py\s+-q",
+        code,
+    ), "C-1 必须重跑结构化 CI contract 测试，而非只依赖 A-1 的历史结果"
     for required in (
         'if ($name -eq "runner_identity")', "Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT",
         "runner_identity.exe", '"--probe-digest", $expectProbeDigest', "ExpectProbeDigest  = $expectProbeDigest",

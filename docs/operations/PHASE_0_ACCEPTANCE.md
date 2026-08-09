@@ -54,7 +54,7 @@
 
 | 编号 | 检查 | 命令 | 冻结基线 |
 |------|------|------|---------|
-| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | **386 passed, 1 skipped**（contract 255 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测；runner 精确校验该 node，任何额外 skip 即 FAIL）。`test_ci_blocker_fixes.py` 共 45 项（12 项跨平台、33 项 Windows-only）：覆盖正式 `scriptDigests` 反查失败不留 PASS、默认 receipt 跨平台路径/无任意 override、真实 non-Windows pwsh 隔离仓库执行、D 根/`..`/reparse 拒绝与严格清理、wrapper helper→`Write-Receipt $r` 的顺序和值流、CI 预热逐个 `CommandElements` 与紧邻 `$LASTEXITCODE` guard；均含针对性 mutation。**平台/运行序差异（非失败）**：验收入口先跑 spike，故 Windows runner 上 contract 255 全 pass；ubuntu `contracts` job 不跑 spike，42 项 Windows-only + sqlite receipt 缺失共 43 项 skip，故 ubuntu contract = **212 passed / 43 skipped**。durable-IO 为核心 spike，未进入 BLOCKED allowlist。 |
+| A-1 | Python 三目录测试 | `python -m pytest tests/contract tests/agent tests/security -q` | **386 passed, 1 skipped**（contract 255 + agent 78 + security 53）；唯一冻结 skip node = `tests/agent/unit/test_config.py::TestValidateDRoot::test_d_root_passes_on_d_drive`（D 盘固定卷检测；runner 精确校验该 node，任何额外 skip 即 FAIL）。`test_ci_blocker_fixes.py` 共 45 项（12 项跨平台、33 项 Windows-only）：覆盖正式 `scriptDigests` 反查失败不留 PASS、默认 receipt 跨平台路径/无任意 override、真实 non-Windows pwsh 隔离仓库执行、D 根/`..`/reparse 拒绝与严格清理、wrapper helper→`Write-Receipt $r` 的顺序和值流、`runner_identity` 本地 receipt 的完整平台事实、CI 预热逐个 `CommandElements` 与紧邻 `$LASTEXITCODE` guard；均含针对性 mutation。**平台/运行序差异（非失败）**：验收入口先跑 spike，故 Windows runner 上 contract 255 全 pass；ubuntu `contracts` job 不跑 spike，42 项 Windows-only + sqlite receipt 缺失共 43 项 skip，故 ubuntu contract = **212 passed / 43 skipped**。durable-IO 为核心 spike，未进入 BLOCKED allowlist。 |
 | A-2 | TypeScript 合同向量 | `pnpm --filter @factory/contracts test` | 70 passed |
 | A-3 | Rust 合同编译 + 类型检查 | `cargo +stable-x86_64-pc-windows-gnu check -p factory-contracts --tests` | exit 0（gate #14） |
 | A-3b | Rust 合同**运行时断言** | `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked` | **14 passed, 0 failed**（event_vectors 7 + plan_vectors 7） |
@@ -109,7 +109,7 @@
 
 | 编号 | 检查 | 判定 |
 |------|------|------|
-| C-1 | `.github/workflows/ci.yml` 无 `echo OK/neutral` 占位，且 runner_identity 平台分层不可降级 | hosted Windows 不得执行该 Linux 容器 spike/拉取镜像；唯一认证 job 必须是受信 self-hosted 专用标签、仅本仓 `codex/*` push、精确 SHA/WSL2/Docker Desktop Linux backend/probe digest/共享 validator 均 fail-closed |
+| C-1 | `.github/workflows/ci.yml` 无 `echo OK/neutral` 占位，且 `runner-identity-certified.yml` 的 runner_identity 平台分层不可降级 | hosted Windows 不得执行该 Linux 容器 spike/拉取镜像；独立认证 workflow 只能监听本仓 `codex/**` push，必须是受信 self-hosted 专用标签，D 根与 reparse、精确 SHA/WSL2/Docker Desktop Linux backend/probe digest/共享 validator 均由 YAML 结构、PowerShell AST 与动态 mutation fail-closed 验证 |
 | C-2 | 无重复 workflow | plan-validation.yml 已删 |
 
 ---
@@ -199,7 +199,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 - **A-3b** `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked`
 - **B-1** `pnpm install --frozen-lockfile`
 - **B-2** Python 3.12 锁定校验（`UV_PYTHON=3.12` 固定 uv 环境，`uv run --locked python` 内断言 `sys.version_info[:2]==(3,12)`；receipt 的 `pythonVersion` 亦取自该 uv 环境，与 A-1/GATES 同源）
-- **C-1** ci.yml 无 `echo OK/neutral` 占位；机械拒绝 hosted Windows 认证 runner_identity 或拉取 Linux image，机械要求 self-hosted 专用标签、仅本仓 `codex/*` push、共享平台 helper 与 PASS/probe 绑定 validator（机器判定）
+- **C-1** ci.yml 无 `echo OK/neutral` 占位；机械拒绝 hosted Windows 认证 runner_identity 或拉取 Linux image；独立 `runner-identity-certified.yml` 只允许本仓 `codex/**` push，并通过 YAML 结构、PowerShell AST 与动态 mutation 锁定 self-hosted 专用标签、D 根/reparse、共享平台 helper 与 PASS/probe 绑定 validator（机器判定）
 - **C-2** 无重复 workflow（plan-validation.yml 已删）
 - **GATES** `check.ps1` 15 项门禁
 - **spike:** 7 个 spike receipt 状态按 §3 allowlist 判定

@@ -33,6 +33,9 @@ import re
 import sys
 from pathlib import Path
 
+# runner_identity 的 digest 绑定的是已执行二进制；全零值不是可审计的 SHA-256 身份。
+_NONZERO_PROBE_DIGEST = re.compile(r"sha256:(?!0{64}$)[0-9a-f]{64}\Z")
+
 
 def main() -> int:
     """给指定 receipt 追加顶层 runBinding；可选绑定真实 probe，异常一律非零。"""
@@ -53,9 +56,15 @@ def main() -> int:
         probe_digest = sys.argv[4]
         # 真实二进制摘要必须使用固定的小写 sha256 格式；接受任意字符串会让全零/伪造
         # 值混入 receipt，后续 validator 无法机械区分有效身份绑定与占位符。
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", probe_digest) is None:
+        if _NONZERO_PROBE_DIGEST.fullmatch(probe_digest) is None:
             print("STAMP_INVALID_PROBE_DIGEST: expected sha256:<64-lowercase-hex>", file=sys.stderr)
             return 7
+
+    # runner_identity 是唯一要求把实际 Rust probe 二进制写入 receipt provenance 的 core
+    # spike。调用方漏传参数时必须在盖章前失败，不能制造一份只有源码 SHA 的假完整回执。
+    if spike_name == "runner_identity" and not probe_digest:
+        print("STAMP_PROBE_DIGEST_REQUIRED: runner_identity requires --probe-digest", file=sys.stderr)
+        return 7
 
     run_id = os.environ.get("SPIKE_RUN_ID", "")
     run_nonce = os.environ.get("SPIKE_RUN_NONCE", "")

@@ -810,90 +810,18 @@ Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned (uv-locked env)" {
     }
 } | Out-Null
 
-# 从顶层 jobs 提取一个 YAML 块。C-1 只做冻结 CI 合同的机械审计，不尝试充当完整
-# YAML 解释器；未知结构、缺 job 或缺关键字段一律返回问题并使验收失败。
-function Get-CiJobBlock {
-    param([string]$CiText, [string]$JobName)
-    $escaped = [regex]::Escape($JobName)
-    $match = [regex]::Match($CiText, "(?ms)^  ${escaped}:\s*$.*?(?=^  [A-Za-z0-9_-]+:\s*$|\z)")
-    if (-not $match.Success) { return "" }
-    return $match.Value
-}
-
-function Get-CiExecutableText {
-    param([string]$JobBlock)
-    # 只检查实际 YAML 字段/run 文本；整行注释不得替代可执行认证动作。
-    return (($JobBlock -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n")
-}
-
-function Test-RunnerIdentityCiContract {
-    param([string]$CiText)
-    # runner_identity 是 Windows+WSL2+Docker Desktop Linux backend 的核心 spike。
-    # C-1 必须独立拒绝 hosted 误跑/假绿、认证机丢失或 receipt 验证降级，不能只寄望 A-1。
-    $issues = [System.Collections.Generic.List[string]]::new()
-    $hosted = Get-CiJobBlock -CiText $CiText -JobName "windows-probes"
-    $certified = Get-CiJobBlock -CiText $CiText -JobName "runner-identity-certified"
-    if ([string]::IsNullOrWhiteSpace($hosted)) { $issues.Add("windows-probes job missing") }
-    if ([string]::IsNullOrWhiteSpace($certified)) { $issues.Add("runner-identity-certified job missing") }
-    if ($issues.Count -gt 0) { return @($issues) }
-
-    $hostedCode = Get-CiExecutableText $hosted
-    if ($hostedCode -match 'runner_identity') { $issues.Add("hosted windows-probes executes runner_identity") }
-    if ($hostedCode -match 'python:3\.12-slim') { $issues.Add("hosted windows-probes pulls/inspects Linux image") }
-
-    $certifiedCode = Get-CiExecutableText $certified
-    if ($certified -notmatch '(?m)^    runs-on:\s*\[self-hosted,\s*Windows,\s*X64,\s*acf-wsl2-linux,\s*ephemeral\]\s*$') {
-        $issues.Add("certified job lacks exact dedicated self-hosted labels")
+# --- C-1 CI fail-closed -----------------------------------------------------
+Invoke-AcceptanceCheck "C-1" "structured CI workflow contract" {
+    # C-1 直接重跑同一份合同测试：其中以 YAML 结构、PowerShell AST 和实际 mutation
+    # 锁定 hosted/self-hosted 分层、D 根、平台 preflight、镜像和 receipt 执行链，避免
+    # 在此复制一份可被注释、未使用字符串或 early exit 绕过的弱正则审计。
+    & "$PSScriptRoot\dev.ps1" -- -- uv run --locked python -m pytest tests/contract/test_ci_blocker_fixes.py -q
+    $contractExit = $LASTEXITCODE
+    if ($contractExit -ne 0) {
+        Write-Host "structured CI contract failed exit=$contractExit"
+        $global:LASTEXITCODE = 1
+        return
     }
-    $ifMatch = [regex]::Match($certified, '(?m)^    if:\s*(.+?)\s*$')
-    $expectedIf = "github.event_name == 'push' && github.repository == 'geqian236/AI-Coding-Factory' && startsWith(github.ref, 'refs/heads/codex/')"
-    if (-not $ifMatch.Success -or (($ifMatch.Groups[1].Value -replace '\s', '') -cne ($expectedIf -replace '\s', ''))) {
-        $issues.Add("certified job is not push-only trusted codex branch")
-    }
-    if ($certifiedCode -match 'pull_request') { $issues.Add("certified job permits PR-triggered self-hosted execution") }
-    $firstStep = [regex]::Match($certified, '(?m)^      - name:\s*(.+?)\s*$')
-    if (-not $firstStep.Success -or $firstStep.Groups[1].Value -cne "认证机 D 根路径前置（fail-closed）") {
-        $issues.Add("certified job does not make D-root runner path verification its first step")
-    }
-    if ($certified -notmatch '(?m)^      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\s*$') {
-        $issues.Add("certified checkout is not pinned to the approved immutable SHA")
-    }
-    if ($certified -notmatch '(?m)^          persist-credentials:\s*false\s*$') { $issues.Add("certified checkout persists credentials") }
-    if ($certified -notmatch '(?m)^    permissions:[ \t]*\r?$\r?\n^      contents:[ \t]*read[ \t]*$') { $issues.Add("certified job lacks contents: read") }
-    if ($certified -notmatch '(?m)^      EXPECTED_CANDIDATE_SHA:\s*\$\{\{\s*github\.sha\s*\}\}\s*$' -or
-        $certified -notmatch '(?m)^          ref:\s*\$\{\{\s*github\.sha\s*\}\}\s*$') {
-        $issues.Add("certified job does not bind checkout and expected candidate to github.sha")
-    }
-    if ($certified -notmatch '(?m)^    timeout-minutes:\s*[1-9]\d*\s*$') { $issues.Add("certified job lacks timeout") }
-    foreach ($cacheVar in @("TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME")) {
-        $expectedCache = [regex]::Escape("      ${cacheVar}: D:\codex项目\")
-        if ($certified -notmatch "(?m)^$expectedCache") { $issues.Add("certified $cacheVar is not bound to D root") }
-    }
-    if ($certifiedCode -notmatch 'RUNNER_TEMP' -or $certifiedCode -notmatch 'RUNNER_TOOL_CACHE' -or $certifiedCode -notmatch 'StartsWith\(\$approvedRoot') {
-        $issues.Add("certified runner temp/tool cache lacks runtime D-root assertion")
-    }
-    if ($certifiedCode -notmatch 'GITHUB_WORKSPACE' -or $certifiedCode -notmatch 'CURRENT_WORKING_DIRECTORY' -or
-        $certifiedCode -notmatch 'Get-CimInstance' -or $certifiedCode -notmatch 'Get-PSDrive\s+-Name\s+D' -or
-        $certifiedCode -notmatch 'ReparsePoint' -or
-        $certifiedCode -notmatch 'sys\.version_info\[:2\]\s*==\s*\(3,\s*12\)' -or
-        $certifiedCode -notmatch 'Get-Command\s+-Name\s+\$tool') {
-        $issues.Add("certified first-step D-root or externally managed toolchain verification is incomplete")
-    }
-    if ($certifiedCode -notmatch '_runner-identity-platform\.ps1' -or
-        $certifiedCode -notmatch 'Test-RunnerIdentityPlatform\s+-ExpectedCandidateSha\s+\$env:EXPECTED_CANDIDATE_SHA\s+-RequireImage\s+\$false') {
-        $issues.Add("certified preflight does not use shared platform helper before pull")
-    }
-    if ($certifiedCode -notmatch 'Test-RunnerIdentityPlatform\s+-ExpectedCandidateSha\s+\$env:EXPECTED_CANDIDATE_SHA\s+-RequireImage\s+\$true') {
-        $issues.Add("certified pull path does not recheck Linux image through shared helper")
-    }
-    foreach ($required in @('Get-FileHash -Algorithm SHA256', 'runner_identity.exe', 'python scripts/spikes/stamp_run_binding.py', 'Test-SpikeReceiptEvidence', '-EnvCompat \$false', '-ExpectRunId \$env:SPIKE_RUN_ID', '-ExpectRunNonce \$env:SPIKE_RUN_NONCE', '-ExpectCandidateSha \$env:SPIKE_CANDIDATE_SHA', '-ExpectProbeDigest \$probeDigest', '\$v\.status\s+-ne\s+"PASS"')) {
-        if ($certifiedCode -notmatch $required) { $issues.Add("certified receipt validation missing $required") }
-    }
-    return @($issues)
-}
-
-# --- C-1 CI fail-closed (V6/C-1 strengthened) ------------------------------
-Invoke-AcceptanceCheck "C-1" "ci.yml has no fail-open patterns" {
     $ci = Get-Content ".github/workflows/ci.yml" -Raw -Encoding utf8
     $bad = @()
     # (a) echo OK/neutral placeholders
@@ -911,7 +839,6 @@ Invoke-AcceptanceCheck "C-1" "ci.yml has no fail-open patterns" {
             $bad += "windows-probes runs no spike"
         }
     }
-    $bad += @(Test-RunnerIdentityCiContract -CiText $ci)
     if ($bad.Count -gt 0) { Write-Host ("fail-open: " + ($bad -join "; ")); $global:LASTEXITCODE = 1 }
     else { $global:LASTEXITCODE = 0 }
 } | Out-Null

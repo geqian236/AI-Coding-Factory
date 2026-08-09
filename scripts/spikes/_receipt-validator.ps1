@@ -60,6 +60,11 @@ function Test-SpikeReceiptEvidence {
         return @{ ok = $false; status = "UNPARSEABLE"; detail = "JSON parse failed" }
     }
 
+    # Top level must be a JSON object; reject null, arrays, and scalars before property access.
+    if ($null -eq $obj -or $obj -isnot [pscustomobject]) {
+        return @{ ok = $false; status = "INVALID"; detail = "receipt top-level must be a JSON object" }
+    }
+
     # Required fields: a minimal {"status":"PASS"} lacks these.
     foreach ($f in @("spike", "status", "assertions")) {
         if (-not ($obj.PSObject.Properties.Name -contains $f)) {
@@ -95,6 +100,11 @@ function Test-SpikeReceiptEvidence {
     #   - sqlite_wal_full  MUST use run_nonce + candidateSha + probeDigest  (never runBinding)
     #   - all other spikes MUST use runBinding with runId/runNonce/candidateSha/spike (never run_nonce)
     if ($ExpectRunNonce -ne "") {
+        # Both expected and receipt probe digests must be lowercase nonzero SHA-256 identities.
+        $nonzeroDigestPattern = '^sha256:(?!0{64}$)[0-9a-f]{64}$'
+        if ($ExpectProbeDigest -ne "" -and $ExpectProbeDigest -notmatch $nonzeroDigestPattern) {
+            return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "expected probeDigest is not a nonzero sha256 digest" }
+        }
         if ($Name -eq "sqlite_wal_full") {
             # SQLITE PATH - must have run_nonce; runBinding is wrong shape and rejected.
             if ($obj.PSObject.Properties.Name -contains "runBinding") {
@@ -114,7 +124,7 @@ function Test-SpikeReceiptEvidence {
             }
             if ($ExpectProbeDigest -ne "") {
                 $rcptProbe = if ($obj.PSObject.Properties.Name -contains "probeDigest") { [string]$obj.probeDigest } else { "" }
-                if ($rcptProbe -ne $ExpectProbeDigest) {
+                if ($rcptProbe -notmatch $nonzeroDigestPattern -or $rcptProbe -ne $ExpectProbeDigest) {
                     return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt probeDigest='$rcptProbe' != expected '$ExpectProbeDigest' (probe source mismatch/forgery)" }
                 }
             }
@@ -127,6 +137,9 @@ function Test-SpikeReceiptEvidence {
                 return @{ ok = $false; status = "BINDING_MISSING"; detail = "no runBinding; '$Name' receipt not bound to this run" }
             }
             $rb = $obj.runBinding
+            if ($null -eq $rb -or $rb -isnot [pscustomobject]) {
+                return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding must be a JSON object" }
+            }
             if ([string]$rb.runNonce -ne $ExpectRunNonce) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.runNonce='$($rb.runNonce)' != '$ExpectRunNonce'" }
             }
@@ -141,7 +154,7 @@ function Test-SpikeReceiptEvidence {
             # real probe digest, missing, zero, and wrong values must fail closed.
             if ($ExpectProbeDigest -ne "") {
                 $rbProbe = if ($rb.PSObject.Properties.Name -contains "probeDigest") { [string]$rb.probeDigest } else { "" }
-                if ($rbProbe -ne $ExpectProbeDigest) {
+                if ($rbProbe -notmatch $nonzeroDigestPattern -or $rbProbe -ne $ExpectProbeDigest) {
                     return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.probeDigest='$rbProbe' != expected '$ExpectProbeDigest' (executed probe mismatch/forgery)" }
                 }
             }
@@ -160,11 +173,15 @@ function Test-SpikeReceiptEvidence {
     # (a) STRICT boolean: every assertion must carry `passed` AND it must be a real
     # [bool]. This rejects {"passed":"false"} (a [string], truthy in PS).
     foreach ($a in $assertions) {
+        if ($null -eq $a -or $a -isnot [pscustomobject]) {
+            return @{ ok = $false; status = "INVALID"; detail = "an assertion must be a JSON object" }
+        }
         if (-not ($a.PSObject.Properties.Name -contains "passed")) {
-            return @{ ok = $false; status = $status; detail = "an assertion lacks 'passed'" }
+            return @{ ok = $false; status = "INVALID"; detail = "an assertion lacks 'passed'" }
         }
         if (-not ($a.passed -is [bool])) {
-            return @{ ok = $false; status = $status; detail = "an assertion 'passed' is not a JSON boolean (got '$($a.passed)' typed $($a.passed.GetType().Name)); string forgery rejected" }
+            $passedType = if ($null -eq $a.passed) { "null" } else { $a.passed.GetType().Name }
+            return @{ ok = $false; status = "INVALID"; detail = "an assertion 'passed' is not a JSON boolean (got '$($a.passed)' typed $passedType); string forgery rejected" }
         }
     }
     $failedAsserts = @($assertions | Where-Object { $_.passed -eq $false })
@@ -177,10 +194,21 @@ function Test-SpikeReceiptEvidence {
     # "uncertified_aspects" (no "required" field) is informational, never blocking.
     $blockingSubIds = @()
     if ($obj.PSObject.Properties.Name -contains "subResults") {
+        if ($null -eq $obj.subResults) {
+            return @{ ok = $false; status = "INVALID"; detail = "subResults must be a JSON array of objects" }
+        }
         foreach ($sr in @($obj.subResults)) {
+            if ($null -eq $sr -or $sr -isnot [pscustomobject]) {
+                return @{ ok = $false; status = "INVALID"; detail = "a subResult must be a JSON object" }
+            }
+            if (-not ($sr.PSObject.Properties.Name -contains "required")) {
+                return @{ ok = $false; status = "INVALID"; detail = "a subResult lacks required boolean" }
+            }
+            if (-not ($sr.required -is [bool])) {
+                return @{ ok = $false; status = "INVALID"; detail = "a subResult required is not a JSON boolean" }
+            }
             $srStatus = [string]$sr.status
-            $srRequired = $false
-            if ($sr.PSObject.Properties.Name -contains "required") { $srRequired = [bool]$sr.required }
+            $srRequired = $sr.required
             if ($srRequired -and ($srStatus -eq "BLOCKED_UNCERTIFIED" -or $srStatus -eq "FAIL")) {
                 $blockingSubIds += "spike:$Name/$($sr.aspect)"
             }
