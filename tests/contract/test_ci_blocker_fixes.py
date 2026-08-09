@@ -573,6 +573,20 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     d_root_analysis = _analyze_d_root_guard_run(d_root_code)
     assert d_root_analysis["parseErrors"] == 0, f"D 根首步必须可由 PowerShell AST 解析：{d_root_analysis}"
     assert d_root_analysis["dRootValid"] is True, f"D 根首步缺少实际路径审计顺序：{d_root_analysis}"
+    # 安全短路若在 run block 第一行成功退出，后续完整路径审计即使仍存在也永远不可达；
+    # 这里必须直接前置 `exit 0`，不能只在函数体/guard 内注入而漏掉顶层早退。
+    first_line_exit_droot = "exit 0\n" + d_root_code
+    first_line_droot = _analyze_d_root_guard_run(first_line_exit_droot)
+    assert first_line_droot["parseErrors"] == 0
+    assert first_line_droot["dRootValid"] is False and first_line_droot["unsafeTerminalBeforeAudit"] is True, (
+        f"D 根 run block 第一行 exit 0 必须被拒绝：{first_line_droot}"
+    )
+    for terminal in ("exit", "return"):
+        shorted = _analyze_d_root_guard_run(terminal + "\n" + d_root_code)
+        assert shorted["parseErrors"] == 0
+        assert shorted["dRootValid"] is False and shorted["unsafeTerminalBeforeAudit"] is True, (
+            f"D 根 run block 首行 {terminal!r} 必须被视为成功短路：{shorted}"
+        )
     d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
     junction = d_root_tmp / "reparse-link"
     junction_target = d_root_tmp / "target"
@@ -736,7 +750,6 @@ function Test-InFunctionScope($node) {
 }
 
 $unsafeTerminalBeforeAudit = $false
-$functionEnd = if ($fn.Count -eq 1) { $fn[0].Extent.EndOffset } else { -1 }
 $terminals = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
     $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
@@ -744,11 +757,13 @@ $terminals = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
 }, $true))
 foreach ($terminal in $terminals) {
-    if ((Test-InFunctionScope $terminal) -or $terminal.Extent.StartOffset -le $functionEnd -or
-        $terminal.Extent.StartOffset -ge $firstAuditOffset) { continue }
-    $text = $terminal.Extent.Text.Trim()
+    # 只能以 AST 父链判断终止语句是否位于函数定义内；原先按 functionEnd 的源码
+    # offset 跳过会把整个首段 workflow 误当函数体，从而放行 run block 首行 exit 0。
+    if ((Test-InFunctionScope $terminal) -or $terminal.Extent.StartOffset -ge $firstAuditOffset) { continue }
+    # D 根路径检查前已有的 `exit 1` 是明确 fail-closed guard；而 bare exit、exit 0、
+    # 变量退出码以及 return/break/continue 都可能成功短路，令后续路径审计不可达。
     if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
-        if ($text -match '(?i)^exit(?:\s+0)?\s*$') { $unsafeTerminalBeforeAudit = $true }
+        if ($terminal.Extent.Text.Trim() -cne 'exit 1') { $unsafeTerminalBeforeAudit = $true }
     } else {
         $unsafeTerminalBeforeAudit = $true
     }
@@ -1119,6 +1134,37 @@ function Test-ExactPreheatElements($cmd) {
     return $true
 }
 
+function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
+    # 只审计首个必需顶层动作之前真正会执行的终止语句；函数定义内部的 return/exit
+    # 只是未来调用体，不能与 run block 首行 exit 0 混为一谈。
+    for ($i = 0; $i -lt $limitIndex; $i++) {
+        $terminals = @($statements[$i].FindAll({
+            $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.BreakStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
+        }, $true))
+        foreach ($terminal in $terminals) {
+            $cursor = $terminal.Parent
+            $inFunction = $false
+            while ($null -ne $cursor) {
+                if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    $inFunction = $true; break
+                }
+                $cursor = $cursor.Parent
+            }
+            if (-not $inFunction) {
+                # 认证前已有 `exit 1` 的失败 guard 是允许的；其余 exit（bare/0/变量）
+                # 可能以成功状态跳过 preheat，和 return/break/continue 一样必须拒绝。
+                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
+                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
+                } else { return $true }
+            }
+        }
+    }
+    return $false
+}
+
 function Get-ExitGuardDetails($statement) {
     $result = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
     if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $result }
@@ -1202,6 +1248,9 @@ for ($i = 0; $i -lt $topStatements.Count; $i++) {
 
 $commandElementsExact = ($devExactCount -eq 1)
 $devPreheatAtTopLevel = $commandElementsExact
+$unsafeTerminalBeforePreheat = if ($devIndex -ge 0) {
+    Test-UnsafeTopLevelTerminalBefore -statements $topStatements -limitIndex $devIndex
+} else { $true }
 $nextTopLevelIsExitGuard = $false
 $guardConditionExact = $false
 $guardExitsOne = $false
@@ -1214,7 +1263,8 @@ if ($devPreheatAtTopLevel -and $devIndex + 1 -lt $topStatements.Count) {
 $devInvokes = $commandElementsExact
 $hasExitGuard = ($nextTopLevelIsExitGuard -and $guardConditionExact)
 $preheatValid = ($commandElementsExact -and $devPreheatAtTopLevel -and
-    $nextTopLevelIsExitGuard -and $guardConditionExact -and $guardExitsOne)
+    -not $unsafeTerminalBeforePreheat -and $nextTopLevelIsExitGuard -and
+    $guardConditionExact -and $guardExitsOne)
 
 [pscustomobject]@{
     parseErrors              = $parseErrors
@@ -1223,6 +1273,7 @@ $preheatValid = ($commandElementsExact -and $devPreheatAtTopLevel -and
     hasExitGuard             = $hasExitGuard
     commandElementsExact     = $commandElementsExact
     devPreheatAtTopLevel     = $devPreheatAtTopLevel
+    unsafeTerminalBeforePreheat = $unsafeTerminalBeforePreheat
     nextTopLevelIsExitGuard  = $nextTopLevelIsExitGuard
     guardConditionExact      = $guardConditionExact
     guardExitsOne            = $guardExitsOne
@@ -1267,6 +1318,37 @@ function Test-ExactPull($command) {
 
 function Test-ExactInspect($command) {
     return (Test-ExactElements -command $command -expected @('docker', 'image', 'inspect', 'python:3.12-slim'))
+}
+
+function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
+    # docker pull 前的成功终止会令后续 pull/inspect 文本永远不可达；只忽略函数定义
+    # 内的终止语句，避免把未来调用体误判为当前 workflow 的执行短路。
+    for ($i = 0; $i -lt $limitIndex; $i++) {
+        $terminals = @($statements[$i].FindAll({
+            $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.BreakStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
+        }, $true))
+        foreach ($terminal in $terminals) {
+            $cursor = $terminal.Parent
+            $inFunction = $false
+            while ($null -ne $cursor) {
+                if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    $inFunction = $true; break
+                }
+                $cursor = $cursor.Parent
+            }
+            if (-not $inFunction) {
+                # 镜像准备之前只允许标准 fail-closed `exit 1` guard；任何可成功退出或
+                # 不透明退出码都会令后续 Linux image 认证不可达。
+                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
+                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
+                } else { return $true }
+            }
+        }
+    }
+    return $false
 }
 
 function Get-ExitGuardDetails($statement) {
@@ -1350,6 +1432,9 @@ for ($i = 0; $i -lt $topStatements.Count; $i++) {
 
 $pullGuard = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
 $inspectGuard = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
+$unsafeTerminalBeforePull = if ($pullIndex -ge 0) {
+    Test-UnsafeTopLevelTerminalBefore -statements $topStatements -limitIndex $pullIndex
+} else { $true }
 if ($pullCount -eq 1 -and $pullIndex + 1 -lt $topStatements.Count) {
     $pullGuard = Get-ExitGuardDetails $topStatements[$pullIndex + 1]
 }
@@ -1361,7 +1446,8 @@ $pullImmediatelyGuarded = ($pullGuard.isGuard -and $pullGuard.conditionExact -an
 $inspectImmediatelyGuarded = ($inspectGuard.isGuard -and $inspectGuard.conditionExact -and $inspectGuard.exitsOne)
 $sequenceExact = ($pullCount -eq 1 -and $inspectCount -eq 1 -and
     $inspectIndex -eq ($pullIndex + 2))
-$imagePreparationValid = ($sequenceExact -and $pullImmediatelyGuarded -and $inspectImmediatelyGuarded)
+$imagePreparationValid = ($sequenceExact -and -not $unsafeTerminalBeforePull -and
+    $pullImmediatelyGuarded -and $inspectImmediatelyGuarded)
 
 [pscustomobject]@{
     parseErrors               = $parseErrors
@@ -1370,6 +1456,7 @@ $imagePreparationValid = ($sequenceExact -and $pullImmediatelyGuarded -and $insp
     pullImmediatelyGuarded    = $pullImmediatelyGuarded
     inspectImmediatelyGuarded = $inspectImmediatelyGuarded
     sequenceExact             = $sequenceExact
+    unsafeTerminalBeforePull  = $unsafeTerminalBeforePull
     imagePreparationValid     = $imagePreparationValid
 } | ConvertTo-Json -Compress
 """
@@ -1470,6 +1557,36 @@ function Test-RejectGuard($statement, [string]$requiredCondition) {
     }, $true))
     return ($unsafe.Count -eq 0)
 }
+function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
+    # 真正 wrapper 调用前的 exit 0、bare exit、return 等都会让后续 receipt 盖章和
+    # validator 文本不可达；仅函数定义内的终止语句可忽略。
+    for ($i = 0; $i -lt $limitIndex; $i++) {
+        $terminals = @($statements[$i].FindAll({
+            $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.BreakStatementAst] -or
+            $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
+        }, $true))
+        foreach ($terminal in $terminals) {
+            $cursor = $terminal.Parent
+            $inFunction = $false
+            while ($null -ne $cursor) {
+                if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    $inFunction = $true; break
+                }
+                $cursor = $cursor.Parent
+            }
+            if (-not $inFunction) {
+                # wrapper 前的历史 receipt purge guard 可标准化失败 exit 1；bare exit、
+                # exit 0、变量退出码以及 return/break/continue 都可能产生成功短路。
+                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
+                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
+                } else { return $true }
+            }
+        }
+    }
+    return $false
+}
 function Find-StatementIndex([object[]]$statements, [int]$start, [scriptblock]$predicate) {
     for ($i = $start; $i -lt $statements.Count; $i++) { if (& $predicate $statements[$i]) { return $i } }
     return -1
@@ -1489,6 +1606,9 @@ $wrapperExpected = @(
     'scripts/spikes/test-runner-identity.ps1'
 )
 $wrapperIndex = Find-StatementIndex $top 0 { param($s) Test-ExactCommand $s $wrapperExpected $true }
+$unsafeTerminalBeforeWrapper = if ($wrapperIndex -ge 0) {
+    Test-UnsafeTopLevelTerminalBefore -statements $top -limitIndex $wrapperIndex
+} else { $true }
 $captureIndex = if ($wrapperIndex -ge 0) { $wrapperIndex + 1 } else { -1 }
 $captureValid = ($captureIndex -ge 0 -and $captureIndex -lt $top.Count -and (Test-LastExitCapture $top[$captureIndex]))
 $wrapperGuardIndex = if ($captureValid) { $captureIndex + 1 } else { -1 }
@@ -1534,8 +1654,10 @@ $validatorGuardValid = (
     stampGuardValid = $stampGuardValid
     validatorIndex = $validatorIndex
     validatorGuardValid = $validatorGuardValid
+    unsafeTerminalBeforeWrapper = $unsafeTerminalBeforeWrapper
     executeValid = (
-        $wrapperIndex -ge 0 -and $captureValid -and $wrapperGuardValid -and
+        $wrapperIndex -ge 0 -and -not $unsafeTerminalBeforeWrapper -and
+        $captureValid -and $wrapperGuardValid -and
         $hashIndex -gt $wrapperGuardIndex -and $stampIndex -gt $hashIndex -and
         $stampGuardValid -and $validatorIndex -gt $stampGuardIndex -and $validatorGuardValid
     )
@@ -2287,7 +2409,9 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
             "移除 NUL 清理后必须复现 PS5 WSL2 假阴性，证明生产兼容修复有回归牙齿"
         )
     finally:
-        shutil.rmtree(helper_tmp, ignore_errors=True)
+        # 该目录由 _unique_tmp_dir 独占创建；清理失败必须显式失败，不能以 ignore_errors
+        # 掩盖残留而让后续 mutation 使用过期临时脚本。
+        _remove_tree_strict(helper_tmp)
 
     # 本地 wrapper 是 Phase 0 的权威验收入口之一：即使 CI 已经 preflight，wrapper 自己
     # 写出的 toolchain BLOCKED 与最终 receipt 也必须可复核 Windows/WSL/Docker 身份。
@@ -2386,6 +2510,7 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
             ("missing", None),
             ("zero", "sha256:" + "0" * 64),
             ("wrong", "sha256:" + "f" * 64),
+            ("uppercase_receipt", probe_digest.upper()),
         ):
             mutated = json.loads(json.dumps(good))
             if bad_digest is None:
@@ -2402,6 +2527,16 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
             assert verdict["status"] == "BINDING_MISMATCH", (
                 f"probeDigest={label} 必须报 BINDING_MISMATCH，而非被静默跳过：{verdict}"
             )
+
+        # 摘要是字节身份，不是普通文本：期望值仅大小写不同也必须拒绝。该反例与上面的
+        # receipt 大写反例共同锁住 -cnotmatch/-cne，防止 PowerShell 默认大小写不敏感比较。
+        uppercase_expected = _pwsh_validate_receipt(
+            good, False, name="runner_identity", run_id=run_id, run_nonce=run_nonce,
+            candidate_sha=candidate_sha, probe_digest=probe_digest.upper(),
+        )
+        assert uppercase_expected["ok"] is False and uppercase_expected["status"] == "BINDING_MISMATCH", (
+            f"仅大小写不同的 expected probeDigest 必须被拒绝：{uppercase_expected}"
+        )
 
         # runner_identity 是实际二进制身份绑定的唯一消费者：遗漏 --probe-digest 或用全零占位
         # 都不能被盖章器默许，否则 CI 只绑源码候选而没有绑已执行的 probe。
@@ -2443,13 +2578,42 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
                 "string_required",
                 {**base, "subResults": [{"aspect": "disk_full", "status": "PASS", "required": "false"}]},
             ),
+            ("empty_run_binding", {**base, "runBinding": {}}),
+            (
+                "missing_run_nonce",
+                {**base, "runBinding": {k: v for k, v in good["runBinding"].items() if k != "runNonce"}},
+            ),
+            (
+                "missing_run_id",
+                {**base, "runBinding": {k: v for k, v in good["runBinding"].items() if k != "runId"}},
+            ),
+            (
+                "missing_candidate_sha",
+                {**base, "runBinding": {k: v for k, v in good["runBinding"].items() if k != "candidateSha"}},
+            ),
+            (
+                "missing_binding_spike",
+                {**base, "runBinding": {k: v for k, v in good["runBinding"].items() if k != "spike"}},
+            ),
+            (
+                "required_subresult_missing_status",
+                {**base, "subResults": [{"aspect": "disk_full", "required": True}]},
+            ),
+            (
+                "optional_subresult_missing_status",
+                {**base, "subResults": [{"aspect": "disk_full", "required": False}]},
+            ),
+            (
+                "subresult_missing_aspect",
+                {**base, "subResults": [{"status": "BLOCKED_UNCERTIFIED", "required": True}]},
+            ),
         )
         for label, malformed in malformed_cases:
             verdict = _pwsh_validate_receipt(
                 malformed, False, name="runner_identity", run_id=run_id, run_nonce=run_nonce,
                 candidate_sha=candidate_sha, probe_digest=probe_digest,
             )
-            assert verdict["ok"] is False and verdict["status"] in {"INVALID", "BINDING_MISMATCH"}, (
+            assert verdict["ok"] is False and verdict["status"] == "INVALID", (
                 f"坏 receipt {label} 必须稳定 fail-closed，实际={verdict}"
             )
     finally:
@@ -2462,6 +2626,17 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     AST 必须报 devInvokes=False；同时 guard 中嵌套/字符串形式的 ``exit 1`` 也不得冒充直接失败退出。"""
     step = _preheat_step()
     run = str(step.get("run", ""))
+    # 首行成功退出会让真正 dev.ps1 预热不可达；不能只检查“后面存在命令和 guard”。
+    first_line_exit_preheat = _analyze_ci_run_block("exit 0\n" + run)
+    assert first_line_exit_preheat["parseErrors"] == 0
+    assert first_line_exit_preheat["preheatValid"] is False, (
+        f"预热 run block 第一行 exit 0 必须被拒绝：{first_line_exit_preheat}"
+    )
+    for terminal in ("exit", "return"):
+        shorted = _analyze_ci_run_block(terminal + "\n" + run)
+        assert shorted["parseErrors"] == 0 and shorted["preheatValid"] is False, (
+            f"预热 run block 首行 {terminal!r} 必须被拒绝：{shorted}"
+        )
     unused = (
         '$unused = "& $PWD/scripts/dev.ps1 -- -- rustup toolchain install '
         'stable-x86_64-pc-windows-gnu --profile minimal"'
@@ -2531,6 +2706,17 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     # 新镜像准备规则的 mutation 也放在既有节点中，保持冻结测试节点数量不变。注释整行或
     # 仅保留未使用字符串都不能算作 Docker 命令；守卫提前、参数折叠、原生命令插队均必须红。
     image_run = str(_runner_identity_image_step().get("run", ""))
+    # 镜像拉取同样不能被 run block 首行成功退出短路；后续 pull/inspect 仍存在并不等于可达。
+    first_line_exit_image = _analyze_runner_identity_image_run("exit 0\n" + image_run)
+    assert first_line_exit_image["parseErrors"] == 0
+    assert first_line_exit_image["imagePreparationValid"] is False, (
+        f"镜像准备 run block 第一行 exit 0 必须被拒绝：{first_line_exit_image}"
+    )
+    for terminal in ("exit", "return"):
+        shorted = _analyze_runner_identity_image_run(terminal + "\n" + image_run)
+        assert shorted["parseErrors"] == 0 and shorted["imagePreparationValid"] is False, (
+            f"镜像准备 run block 首行 {terminal!r} 必须被拒绝：{shorted}"
+        )
     commented_pull = _mut_comment_exact_command(
         image_run, _RUNNER_IMAGE_PULL_COMMAND, add_unused_string=False
     )
@@ -2599,6 +2785,17 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     execute_a = _analyze_runner_identity_execute_run(execute_run)
     assert execute_a["parseErrors"] == 0, f"execute run 必须可由 PowerShell AST 解析：{execute_a}"
     assert execute_a["executeValid"] is True, f"最终认证执行值流不完整或顺序被绕过：{execute_a}"
+    # 最终 wrapper→stamp→validator 链的每个元素即使齐全，首行 exit 0 也会让认证从未发生。
+    first_line_exit_execute = _analyze_runner_identity_execute_run("exit 0\n" + execute_run)
+    assert first_line_exit_execute["parseErrors"] == 0
+    assert first_line_exit_execute["executeValid"] is False, (
+        f"最终 execute run block 第一行 exit 0 必须被拒绝：{first_line_exit_execute}"
+    )
+    for terminal in ("exit", "return"):
+        shorted = _analyze_runner_identity_execute_run(terminal + "\n" + execute_run)
+        assert shorted["parseErrors"] == 0 and shorted["executeValid"] is False, (
+            f"最终 execute run block 首行 {terminal!r} 必须被拒绝：{shorted}"
+        )
 
     # 注释真实 wrapper 再塞未使用字符串、把参数折叠、捕获后插入另一原生命令，或在拒绝
     # guard 内提前 exit 0，均不得被任何文字匹配误当为完整认证链。

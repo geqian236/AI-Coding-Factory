@@ -35,6 +35,13 @@
 
 Set-StrictMode -Version Latest
 
+# Test JSON object membership without enumerating `.Properties.Name`: StrictMode treats the
+# empty collection's missing Name member as an exception, while indexed lookup is stable.
+function Test-ReceiptProperty {
+    param([Parameter(Mandatory = $true)] $Object, [Parameter(Mandatory = $true)] [string] $Name)
+    return ($null -ne $Object.PSObject.Properties[$Name])
+}
+
 # Deep-validate one spike receipt. Returns @{ ok=<bool>; status=<string>; detail=<string> }.
 function Test-SpikeReceiptEvidence {
     param(
@@ -67,7 +74,7 @@ function Test-SpikeReceiptEvidence {
 
     # Required fields: a minimal {"status":"PASS"} lacks these.
     foreach ($f in @("spike", "status", "assertions")) {
-        if (-not ($obj.PSObject.Properties.Name -contains $f)) {
+        if (-not (Test-ReceiptProperty -Object $obj -Name $f)) {
             return @{ ok = $false; status = "INVALID"; detail = "missing required field '$f'" }
         }
     }
@@ -102,43 +109,50 @@ function Test-SpikeReceiptEvidence {
     if ($ExpectRunNonce -ne "") {
         # Both expected and receipt probe digests must be lowercase nonzero SHA-256 identities.
         $nonzeroDigestPattern = '^sha256:(?!0{64}$)[0-9a-f]{64}$'
-        if ($ExpectProbeDigest -ne "" -and $ExpectProbeDigest -notmatch $nonzeroDigestPattern) {
+        if ($ExpectProbeDigest -ne "" -and $ExpectProbeDigest -cnotmatch $nonzeroDigestPattern) {
             return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "expected probeDigest is not a nonzero sha256 digest" }
         }
         if ($Name -eq "sqlite_wal_full") {
             # SQLITE PATH - must have run_nonce; runBinding is wrong shape and rejected.
-            if ($obj.PSObject.Properties.Name -contains "runBinding") {
+            if (Test-ReceiptProperty -Object $obj -Name "runBinding") {
                 return @{ ok = $false; status = "BINDING_WRONG_SHAPE"; detail = "sqlite_wal_full must bind via run_nonce (not runBinding); found runBinding - possible receipt identity switch" }
             }
-            if (-not ($obj.PSObject.Properties.Name -contains "run_nonce")) {
+            if (-not (Test-ReceiptProperty -Object $obj -Name "run_nonce")) {
                 return @{ ok = $false; status = "BINDING_MISSING"; detail = "sqlite_wal_full receipt missing run_nonce; not bound to this run" }
             }
             if ([string]$obj.run_nonce -ne $ExpectRunNonce) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "run_nonce='$($obj.run_nonce)' != '$ExpectRunNonce'" }
             }
             if ($ExpectCandidateSha -ne "") {
-                $rcptSha = if ($obj.PSObject.Properties.Name -contains "candidateSha") { [string]$obj.candidateSha } else { "" }
+                $rcptSha = if (Test-ReceiptProperty -Object $obj -Name "candidateSha") { [string]$obj.candidateSha } else { "" }
                 if ($rcptSha -ne $ExpectCandidateSha) {
                     return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt candidateSha='$rcptSha' != '$ExpectCandidateSha'" }
                 }
             }
             if ($ExpectProbeDigest -ne "") {
-                $rcptProbe = if ($obj.PSObject.Properties.Name -contains "probeDigest") { [string]$obj.probeDigest } else { "" }
-                if ($rcptProbe -notmatch $nonzeroDigestPattern -or $rcptProbe -ne $ExpectProbeDigest) {
+                $rcptProbe = if (Test-ReceiptProperty -Object $obj -Name "probeDigest") { [string]$obj.probeDigest } else { "" }
+                if ($rcptProbe -cnotmatch $nonzeroDigestPattern -or $rcptProbe -cne $ExpectProbeDigest) {
                     return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "receipt probeDigest='$rcptProbe' != expected '$ExpectProbeDigest' (probe source mismatch/forgery)" }
                 }
             }
         } else {
             # NON-SQLITE PATH - must have runBinding; run_nonce alone is wrong shape.
-            if ($obj.PSObject.Properties.Name -contains "run_nonce" -and -not ($obj.PSObject.Properties.Name -contains "runBinding")) {
+            if ((Test-ReceiptProperty -Object $obj -Name "run_nonce") -and -not (Test-ReceiptProperty -Object $obj -Name "runBinding")) {
                 return @{ ok = $false; status = "BINDING_WRONG_SHAPE"; detail = "'$Name' must bind via runBinding (not run_nonce); found only run_nonce - possible receipt identity switch (run_nonce path skips runId)" }
             }
-            if (-not ($obj.PSObject.Properties.Name -contains "runBinding")) {
+            if (-not (Test-ReceiptProperty -Object $obj -Name "runBinding")) {
                 return @{ ok = $false; status = "BINDING_MISSING"; detail = "no runBinding; '$Name' receipt not bound to this run" }
             }
             $rb = $obj.runBinding
             if ($null -eq $rb -or $rb -isnot [pscustomobject]) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding must be a JSON object" }
+            }
+            # Missing nested identity fields make the evidence invalid; check existence first
+            # so StrictMode cannot throw while reading an absent PSCustomObject property.
+            foreach ($bindingField in @("runId", "runNonce", "candidateSha", "spike")) {
+                if (-not (Test-ReceiptProperty -Object $rb -Name $bindingField)) {
+                    return @{ ok = $false; status = "INVALID"; detail = "runBinding lacks required field '$bindingField'" }
+                }
             }
             if ([string]$rb.runNonce -ne $ExpectRunNonce) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.runNonce='$($rb.runNonce)' != '$ExpectRunNonce'" }
@@ -153,8 +167,8 @@ function Test-SpikeReceiptEvidence {
             # replaced executable could still pass. When a caller supplies the
             # real probe digest, missing, zero, and wrong values must fail closed.
             if ($ExpectProbeDigest -ne "") {
-                $rbProbe = if ($rb.PSObject.Properties.Name -contains "probeDigest") { [string]$rb.probeDigest } else { "" }
-                if ($rbProbe -notmatch $nonzeroDigestPattern -or $rbProbe -ne $ExpectProbeDigest) {
+                $rbProbe = if (Test-ReceiptProperty -Object $rb -Name "probeDigest") { [string]$rb.probeDigest } else { "" }
+                if ($rbProbe -cnotmatch $nonzeroDigestPattern -or $rbProbe -cne $ExpectProbeDigest) {
                     return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.probeDigest='$rbProbe' != expected '$ExpectProbeDigest' (executed probe mismatch/forgery)" }
                 }
             }
@@ -176,7 +190,7 @@ function Test-SpikeReceiptEvidence {
         if ($null -eq $a -or $a -isnot [pscustomobject]) {
             return @{ ok = $false; status = "INVALID"; detail = "an assertion must be a JSON object" }
         }
-        if (-not ($a.PSObject.Properties.Name -contains "passed")) {
+        if (-not (Test-ReceiptProperty -Object $a -Name "passed")) {
             return @{ ok = $false; status = "INVALID"; detail = "an assertion lacks 'passed'" }
         }
         if (-not ($a.passed -is [bool])) {
@@ -193,7 +207,7 @@ function Test-SpikeReceiptEvidence {
     #     status BLOCKED_UNCERTIFIED/FAIL; its id is spike:<name>/<aspect>.
     # "uncertified_aspects" (no "required" field) is informational, never blocking.
     $blockingSubIds = @()
-    if ($obj.PSObject.Properties.Name -contains "subResults") {
+    if (Test-ReceiptProperty -Object $obj -Name "subResults") {
         if ($null -eq $obj.subResults) {
             return @{ ok = $false; status = "INVALID"; detail = "subResults must be a JSON array of objects" }
         }
@@ -201,11 +215,18 @@ function Test-SpikeReceiptEvidence {
             if ($null -eq $sr -or $sr -isnot [pscustomobject]) {
                 return @{ ok = $false; status = "INVALID"; detail = "a subResult must be a JSON object" }
             }
-            if (-not ($sr.PSObject.Properties.Name -contains "required")) {
+            if (-not (Test-ReceiptProperty -Object $sr -Name "required")) {
                 return @{ ok = $false; status = "INVALID"; detail = "a subResult lacks required boolean" }
             }
             if (-not ($sr.required -is [bool])) {
                 return @{ ok = $false; status = "INVALID"; detail = "a subResult required is not a JSON boolean" }
+            }
+            # Both required=true and false entries need stable status/aspect fields; otherwise
+            # StrictMode can throw before the structural evidence check reaches a verdict.
+            foreach ($subResultField in @("status", "aspect")) {
+                if (-not (Test-ReceiptProperty -Object $sr -Name $subResultField)) {
+                    return @{ ok = $false; status = "INVALID"; detail = "a subResult lacks required field '$subResultField'" }
+                }
             }
             $srStatus = [string]$sr.status
             $srRequired = $sr.required
@@ -214,7 +235,7 @@ function Test-SpikeReceiptEvidence {
             }
         }
     }
-    $topSubId = if ($obj.PSObject.Properties.Name -contains "subcheckId") { [string]$obj.subcheckId } else { $null }
+    $topSubId = if (Test-ReceiptProperty -Object $obj -Name "subcheckId") { [string]$obj.subcheckId } else { $null }
 
     if ($status -eq "PASS") {
         if (-not $allPassed) {
