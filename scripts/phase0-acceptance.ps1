@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Phase 0 single acceptance script - runs the full A/B/C/spike set and emits
     a single total receipt bound to the 40-char candidate SHA.
@@ -8,10 +8,9 @@
     C-1/C-2 + 15 gates + spike evidence validation, and emits a single total
     receipt bound to the 40-char candidate SHA.
 
-    ASCII-only on purpose: PowerShell 5.1 reads a BOM-less .ps1 as GBK on a
-    Chinese Windows codepage; CJK comments/strings then corrupt string
-    terminators and break the parse. Keeping this file pure ASCII removes the
-    BOM dependency entirely.
+    本文件有意使用 UTF-8 BOM：Windows PowerShell 5.1 依赖 BOM 才能在中文
+    系统代码页下稳定识别下方的中文审计说明。不得移除 BOM 或另存为无 BOM 文本，
+    否则注释中的 CJK 字符可能破坏脚本解析。
 
     Design (each backed by verified evidence this round):
       - V1: B-1 (pnpm install) runs BEFORE A-2 (vitest). On a clean checkout
@@ -301,9 +300,10 @@ function Add-CheckResult {
     Write-Host "  [$Id] passed=$Passed - $Detail"
 }
 
-# Build and verify the total receipt in a unique file under the already verified
-# D-root cache directory. Only a verified receipt is atomically published to
-# OutFile: a reverse-lookup failure can therefore never leave a final PASS file.
+# 回执发布职责：先在已验证的 D-root 缓存目录写入唯一 provisional，再回读并校验，
+# 只有通过校验的回执才允许发布到 OutFile，避免动态摘要失败遗留最终 PASS 回执。
+# 受控 provisional：路径必须留在已验证目录及 DataRoot 内，且 reparse 链路必须干净，
+# 使验证期间的文件不能逃逸到批准范围以外。
 function Publish-AcceptanceReceipt {
     param(
         [System.Collections.IDictionary]$Receipt,
@@ -373,7 +373,7 @@ function Publish-AcceptanceReceipt {
     } else {
         "fail-closed: " + ($digestIssues -join "; ")
     }
-    # This is a formal result, not a late side exit: it changes the final topStatus.
+    # 摘要反查失败必须成为正式检查结果，而非写盘后的旁路退出；它会重算并影响最终 topStatus。
     Add-CheckResult "script-digests" "written receipt scriptDigests reverse-lookup" $digestOk $digestDetail
 
     $failedNow = @($results | Where-Object { -not $_.passed })
@@ -385,6 +385,7 @@ function Publish-AcceptanceReceipt {
     try {
         $finalJson = $Receipt | ConvertTo-Json -Depth 12
         [System.IO.File]::WriteAllText($provisionalFull, $finalJson, (New-Object System.Text.UTF8Encoding($false)))
+        # 同卷原子替换：已有最终文件使用 File.Replace 发布已验证 provisional；首次发布使用 Move。
         if (Test-Path -LiteralPath $OutFull) {
             [System.IO.File]::Replace($provisionalFull, $OutFull, $null)
         } else {
@@ -392,8 +393,7 @@ function Publish-AcceptanceReceipt {
         }
         $published = $true
     } catch {
-        # If publishing itself fails, remove any old final receipt rather than leave
-        # a stale PASS claim. The caller exits non-zero and the final path is absent.
+        # 失败清理：发布异常时移除旧 final，不能让历史 PASS 继续代表本次失败；调用方会非零退出。
         try {
             if (Test-Path -LiteralPath $OutFull) {
                 Remove-Item -LiteralPath $OutFull -Force -ErrorAction Stop
@@ -404,6 +404,7 @@ function Publish-AcceptanceReceipt {
         Write-Error "[acceptance] fail-closed: could not publish receipt '$OutFull': $_"
         $topStatusNow = "FAIL"
     } finally {
+        # 无论发布成功或失败，都严格清理未移动的 provisional，避免下次运行误用残留验证文件。
         if (Test-Path -LiteralPath $provisionalFull) {
             Remove-Item -LiteralPath $provisionalFull -Force -ErrorAction Stop
         }

@@ -1538,7 +1538,21 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
     测试结构保证：缺字段/缺键/错摘要都先令 script-digests=false，随后才原子发布 FAIL；
     发布失败还会删除旧 final，不能遗留历史 PASS。
     """
-    code = _strip_ps_comments(ACCEPTANCE_PS1.read_text(encoding="utf-8"))
+    # 这里刻意验证源码交付约束：PS 5.1 需要 BOM 才能可靠读取同文件中的中文审计说明。
+    raw = ACCEPTANCE_PS1.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), (
+        "phase0-acceptance.ps1 必须以 UTF-8 BOM 保存，供 Windows PowerShell 5.1 识别中文注释"
+    )
+    source = raw.decode("utf-8-sig")
+    for required_comment in (
+        "回执发布职责",
+        "摘要反查失败",
+        "受控 provisional",
+        "同卷原子替换",
+        "失败清理",
+    ):
+        assert required_comment in source, f"缺少动态回执安全规则的中文说明：{required_comment}"
+    code = _strip_ps_comments(source)
     assert re.search(r"function\s+Publish-AcceptanceReceipt\b", code), (
         "动态反查与发布必须收敛为 Publish-AcceptanceReceipt，避免先写 final PASS"
     )
