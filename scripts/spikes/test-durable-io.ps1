@@ -34,6 +34,10 @@ $childErr     = "$probeDir\_child_stderr.log"
 # 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 windows_durable_io.exe。
 $dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
 . (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+# GPT Phase 0 PR #2：non-Windows 与 build/linker 失败两条 BLOCKED 回执改用共享
+# New-DurableIoBlockedReceipt（单一真源），补齐 validator 必需的 assertions/
+# observable_facts/subcheckId，使拒因从 INVALID 变为合法 core BLOCKED（仍 fail-closed）。
+. (Join-Path $scriptRoot "scripts\spikes\_durable-io-receipt.ps1")
 $targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
 $writerExe    = "$targetDir\debug\windows_durable_io.exe"
 
@@ -46,9 +50,9 @@ function Write-Receipt($obj) {
 
 # ── 0. 平台前置检查 ─────────────────────────────────────────────────────────────
 if ($env:OS -notmatch "Windows") {
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     reason="Windows durable-IO semantics require Windows host"
-                     timestamp=(Get-Date -Format "o") }
+    # 非 Windows 宿主：合法 core BLOCKED（含 assertions/observable_facts/subcheckId），
+    # validator 会以"core spike may not be BLOCKED_UNCERTIFIED"拒绝并让 CI fail-closed。
+    $r = New-DurableIoBlockedReceipt -Kind non_windows -Detail ([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
 
@@ -64,9 +68,12 @@ try {
     Pop-Location
 }
 if ($buildExit -ne 0 -or -not (Test-Path $writerExe)) {
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     reason="Rust writer build failed or exe missing (toolchain/linker unavailable)"
-                     build_exit=$buildExit; writer_exe=$writerExe; timestamp=(Get-Date -Format "o") }
+    # 构建/链接失败：合法 core BLOCKED（含 assertions/observable_facts/subcheckId）。
+    # 补齐证据结构只为让 validator 的拒因从"INVALID 缺字段"变成合法 core BLOCKED；
+    # durable-IO 绝不进 allowlist，BLOCKED 仍让 CI fail-closed，绝不伪造 PASS。
+    $r = New-DurableIoBlockedReceipt -Kind toolchain `
+            -Detail "build_exit=$buildExit writer_exe=$writerExe" `
+            -ExtraFacts @{ build_exit = $buildExit; writer_exe = $writerExe }
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
 

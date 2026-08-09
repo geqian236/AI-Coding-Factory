@@ -102,7 +102,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # GPT round-16 desktop blocker: 读取唯一真源 .node-version（仓库声明 Node 22），
+          # 不再硬编码 '20'。硬编码 20 与 .node-version/package engines 不一致，fresh
+          # frozen install 后 tsc 环境与本地/预期漂移；node-version-file 使 CI 与真源同步。
+          node-version-file: '.node-version'
       - name: 启用 corepack + pnpm
         # corepack 自带 pnpm；pnpm 必须能离线/在线解析 package.json。
         run: |
@@ -172,6 +175,23 @@ jobs:
         # 无法发现锁与声明依赖漂移。固定 uv==0.11.7（生成本 uv.lock 的版本）消除
         # uv 自身版本差异导致的解析漂移。
         run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: 预热 D-root GNU 工具链（fail-closed，spike loop 之前）
+        # GPT Phase 0 PR #2 修复（windows-probes toolchain blocker）：
+        # 根因——dev.ps1 把 RUSTUP_HOME 改到 D 盘后，在**首次** D-root GNU 工具链尚未
+        # 下载完成前就检查 ld.lld；第一次 cargo build 无 lld、回退 GNU ld，含 CJK 的
+        # 项目根路径变成 'D:\codex??\...' 链接 exit 101。故必须在 spike loop **之前**，
+        # 经 scripts/dev.ps1（令 RUSTUP_HOME 指向与 spike 查 ld.lld 完全相同的 D-root）
+        # 显式安装 stable-x86_64-pc-windows-gnu --profile minimal，使 gcc-ld/ld.lld 就位。
+        # fail-closed：安装失败即 exit 1（禁止 continue-on-error）。安装逻辑只在此 CI 步骤，
+        # 不塞进 dev.ps1（否则 dev.ps1 每次运行都隐式联网）。双 -- 调用协议同 durable-io wrapper：
+        # 第一个 -- 被 & 当"停止解析"吞掉，第二个 -- 原样进 dev.ps1 $args 作子命令分隔符。
+        shell: pwsh
+        run: |
+          & "$PWD/scripts/dev.ps1" -- -- rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[preheat] D-root GNU 工具链安装失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
       - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
         shell: pwsh
         run: |
