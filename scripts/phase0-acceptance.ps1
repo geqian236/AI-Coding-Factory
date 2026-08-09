@@ -24,7 +24,7 @@
       - V5: acceptanceSetVersion matches the doc (phase0-acceptance-v1);
         acceptanceSetDigest is computed from the frozen doc and written to the
         receipt; cleanTree is a pass condition and is re-checked after the run
-        (only the gitignored receipt may appear dirty); frozen counts (358/1,
+        (only the gitignored receipt may appear dirty); frozen counts (386/1,
         70, 14) are parsed from output and enforced.
       - V7: Rust env uses project-root paths (<PROJECT_ROOT>\AI-Coding-Factory-Data\
         dev), never D:\acf-dev; the storage contract keeps every artifact under
@@ -211,38 +211,11 @@ $ACCEPTANCE_SET_VERSION = "phase0-acceptance-v1"
 $ACCEPTANCE_SET_DOC = Join-Path $REPO_ROOT "docs/operations/PHASE_0_ACCEPTANCE.md"
 
 # Frozen baseline counts (V5: parsed from output and enforced, not eyeballed).
-# round-9 P0: 332 -> 334 (+2 Windows-only cargo-target isolation regression tests).
-# round-10 P1: 334 -> 336 (+2 more Windows-only tests in test_cargo_target_isolation.py:
-# case-variant collision + test.ps1 caller-level override; runner is Windows so all run).
-# round-14 P1/P2: 338 -> 340 (+2 net tests in test_python_pin_probe.py: fail-closed contract
-# negative [Windows-only] + dot-source comment-immune mutation defense [cross-platform]).
-# round-12 P2: 336 -> 338 (+2 Windows-only tests in test_python_pin_probe.py: pythonVersion
-# strict-parse under hostile VIRTUAL_ENV + warning-lands-on-stderr repro; runner is Windows).
-# round-15 P1/P2: 340 -> 341 (+1 Windows-only test in test_python_pin_probe.py: non-terminating
-# read error -> unreadable + uvCalls=0; the fail-closed-contract test also gained multiline /
-# oversized-digit / leading-zero boundary cases but stays one test).
-# PR#2 CI-fix: 341 -> 352 (+11 items in tests/contract/test_ci_blocker_fixes.py: 7 cross-platform
-# [desktop node-version-file + .node-version=22 + @types/node in package & pnpm-lock importer +
-# windows-probes preheat-before-spike-loop + preheat-fail-closed + dev.ps1-no-implicit-install]
-# and 4 Windows-only [durable-io BLOCKED receipt evidence x2 params + validator core-blocked-not-
-# INVALID + envcompat structural anchor]). Windows runner (spikes-first) = 352/1; the 11 all run
-# on Windows. Ubuntu contracts (bare) = 207/14: 13 Windows-only contract items + 1 sqlite-receipt.
-# PR#2 CI-fix round-16: 352 -> 358 (+6 items in test_ci_blocker_fixes.py hardening the round-16
-# blockers: +3 cross-platform [preheat comment-immunity mutation, scriptDigests helper-wiring AST,
-# receipt helper-SHA256 cross-check] and +3 Windows-only [wrapper AST dotsource+both-branch calls,
-# dotsource-comment mutation, legacy-branch mutation]). Windows runner (spikes-first) = 358/1; all 6
-# run on Windows. Ubuntu contracts (bare) = 210/17: 16 Windows-only contract items + 1 sqlite-receipt.
-# PR#2 CI-fix round-16-R2: 358 -> 367 (net +9 items in test_ci_blocker_fixes.py closing Codex R2
-# blockers). Cross-platform net 0 (removed 1 vacuous receipt-reverse-lookup test; added
-# dynamic-receipt-gate-present + wrapper-source-ordering-guard). Windows-only net +9: replaced the
-# single dotsources+both-branch AST test with a stricter value-flow-locks-both-branches test, plus
-# added non-Windows-branch reachability runtime proof (P1-1), preheat real-CommandAst AST (P1-3),
-# preheat unused-string-mutation immunity (P1-3), off-C unique-temp-path uniqueness (P1-4),
-# production-PS-under-pwsh evidence (P2-2), and 6 parametrized value-flow mutations (swap-kind,
-# overwrite-$r, wrong-var, legacy-nonwin, legacy-buildfail, dotsource-comment). Windows runner
-# (spikes-first) = 367/1; the +9 all run on Windows. Ubuntu contracts (bare) = 210/26: 25
-# Windows-only contract items + 1 sqlite-receipt.
-$FROZEN_PYTEST_PASSED  = 367
+# Phase-0 R4: 367 -> 386 (+19 contract tests). The receipt reverse lookup is a
+# formal check, durable-io path isolation is cross-platform, and AST tests lock
+# helper/write order plus the immediate CI preheat exit-code guard. Windows
+# spikes-first = 386/1; bare Ubuntu contracts = 212/43 (42 Windows-only + sqlite).
+$FROZEN_PYTEST_PASSED  = 386
 $FROZEN_PYTEST_SKIPPED = 1
 $FROZEN_VITEST_PASSED  = 70
 $FROZEN_CARGO_PASSED   = 14
@@ -328,6 +301,122 @@ function Add-CheckResult {
     Write-Host "  [$Id] passed=$Passed - $Detail"
 }
 
+# Build and verify the total receipt in a unique file under the already verified
+# D-root cache directory. Only a verified receipt is atomically published to
+# OutFile: a reverse-lookup failure can therefore never leave a final PASS file.
+function Publish-AcceptanceReceipt {
+    param(
+        [System.Collections.IDictionary]$Receipt,
+        [System.Collections.IDictionary]$ScriptDigests,
+        [string]$ScriptRoot,
+        [string]$OutFull,
+        [string]$VerifiedProvisionalDir,
+        [string]$DataRoot
+    )
+
+    $provisionalRoot = [System.IO.Path]::GetFullPath($VerifiedProvisionalDir).TrimEnd('\')
+    $dataRootFull = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\')
+    $provisional = Join-Path $provisionalRoot ("phase0-acceptance-" + [guid]::NewGuid().ToString("N") + ".provisional.json")
+    $provisionalFull = [System.IO.Path]::GetFullPath($provisional)
+    if ($provisionalFull -ne $provisionalRoot -and -not $provisionalFull.StartsWith($provisionalRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "provisional receipt path escaped verified directory: '$provisionalFull'"
+    }
+    if ($provisionalRoot -ne $dataRootFull -and -not $provisionalRoot.StartsWith($dataRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "provisional receipt directory escaped data root: '$provisionalRoot'"
+    }
+    if (-not (Test-Path -LiteralPath $provisionalRoot)) {
+        throw "verified provisional receipt directory does not exist: '$provisionalRoot'"
+    }
+    $provisionalReparse = Test-ReparsePointInChain -Leaf $provisionalRoot -Root $DataRoot
+    if ($provisionalReparse) {
+        throw "provisional receipt directory contains reparse point: '$provisionalReparse'"
+    }
+
+    $digestOk = $true
+    $digestIssues = [System.Collections.Generic.List[string]]::new()
+    try {
+        $json = $Receipt | ConvertTo-Json -Depth 12
+        [System.IO.File]::WriteAllText($provisionalFull, $json, (New-Object System.Text.UTF8Encoding($false)))
+        $writtenReceipt = Get-Content -LiteralPath $provisionalFull -Raw -Encoding utf8 | ConvertFrom-Json
+        if (-not ($writtenReceipt.PSObject.Properties.Name -contains "scriptDigests")) {
+            $digestOk = $false
+            $digestIssues.Add("written receipt lacks scriptDigests field")
+        } else {
+            $writtenDigests = $writtenReceipt.scriptDigests
+            foreach ($digestKey in $ScriptDigests.Keys) {
+                $digestPath = Join-Path $ScriptRoot $digestKey
+                $realDigest = Get-FileSha256 $digestPath
+                if ($null -eq $realDigest) {
+                    $digestOk = $false
+                    $digestIssues.Add("scriptDigests key '$digestKey' has no file")
+                    continue
+                }
+                if (-not ($writtenDigests.PSObject.Properties.Name -contains $digestKey)) {
+                    $digestOk = $false
+                    $digestIssues.Add("written receipt scriptDigests missing key '$digestKey'")
+                    continue
+                }
+                $boundDigest = [string]$writtenDigests.$digestKey
+                if ($boundDigest -ne $realDigest) {
+                    $digestOk = $false
+                    $digestIssues.Add("scriptDigests key '$digestKey' does not match current file SHA256")
+                }
+            }
+        }
+    } catch {
+        $digestOk = $false
+        $digestIssues.Add("reverse_lookup exception: $($_.Exception.Message)")
+    }
+
+    $digestDetail = if ($digestOk) {
+        "scriptDigests reverse-lookup OK: $($ScriptDigests.Keys.Count) script digests match disk"
+    } else {
+        "fail-closed: " + ($digestIssues -join "; ")
+    }
+    # This is a formal result, not a late side exit: it changes the final topStatus.
+    Add-CheckResult "script-digests" "written receipt scriptDigests reverse-lookup" $digestOk $digestDetail
+
+    $failedNow = @($results | Where-Object { -not $_.passed })
+    $topStatusNow = if ($failedNow.Count -eq 0) { "PASS" } else { "FAIL" }
+    $Receipt["checks"] = $results
+    $Receipt["topStatus"] = $topStatusNow
+
+    $published = $false
+    try {
+        $finalJson = $Receipt | ConvertTo-Json -Depth 12
+        [System.IO.File]::WriteAllText($provisionalFull, $finalJson, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $OutFull) {
+            [System.IO.File]::Replace($provisionalFull, $OutFull, $null)
+        } else {
+            [System.IO.File]::Move($provisionalFull, $OutFull)
+        }
+        $published = $true
+    } catch {
+        # If publishing itself fails, remove any old final receipt rather than leave
+        # a stale PASS claim. The caller exits non-zero and the final path is absent.
+        try {
+            if (Test-Path -LiteralPath $OutFull) {
+                Remove-Item -LiteralPath $OutFull -Force -ErrorAction Stop
+            }
+        } catch {
+            Write-Error "[acceptance] fail-closed: could not remove stale final receipt '$OutFull': $_"
+        }
+        Write-Error "[acceptance] fail-closed: could not publish receipt '$OutFull': $_"
+        $topStatusNow = "FAIL"
+    } finally {
+        if (Test-Path -LiteralPath $provisionalFull) {
+            Remove-Item -LiteralPath $provisionalFull -Force -ErrorAction Stop
+        }
+    }
+
+    return [ordered]@{
+        topStatus = $topStatusNow
+        failed    = $failedNow
+        published = $published
+        detail    = $digestDetail
+    }
+}
+
 # Rust gnu toolchain env: project-root paths only (V7 storage contract).
 # Linker path is built from the literal $env:RUSTUP_HOME (never captured from
 # rustc stdout, which PS 5.1 corrupts on a GBK codepage). config.toml supplies
@@ -372,29 +461,10 @@ Write-Host "candidateSha  = $candidateSha"
 Write-Host "cleanTreeStart= $cleanTreeStart"
 
 # --- spikes FIRST (round-6 item 1): execute every wrapper and validate evidence
-# BEFORE A-1. Root cause of the fresh-worktree failure: A-1's
-# test_emit_manifest_accepts_blocked_spike_receipt SKIPS when the sqlite receipt
-# is absent, so a truly fresh detached worktree (no gitignored receipt) counted
-# 326/2 (the reviewer's exact observation), NOT the leftover-receipt 327/1 that
-# a prior dry-run receipt `git status` cannot see had leaned on. Running spikes
-# first makes the single command self-contained: purge all 7 receipts, regenerate
-# them THIS round, then A-1 deterministically reads the fresh sqlite receipt so
-# that skip flips to pass. Combined with the 3 new round-6 item-3 conformance
-# tests (test_receipt_schema_conformance.py, real jsonschema present in the locked
-# py312) and the Windows-only isolation/binding tests, the frozen A-1
-# baseline is now 358 passed / 1 skipped (Windows runner; Ubuntu fresh = 210/17:
-# 16 Windows-only contract tests skip off-platform AND the sqlite-receipt test
-# skips because the Ubuntu `contracts` CI job runs pytest WITHOUT spikes-first.
-# round-13/14/15: the pin-probe file has 5 tests - 3 Windows-only (shared-probe end-to-end
-# under hostile VIRTUAL_ENV + fail-closed .python-version contract negatives + round-15
-# non-terminating-read-error-without-calling-uv) and 2 cross-platform (mutation defense +
-# dot-source comment-immunity), so 2 of the 5 run on Ubuntu too.
-# PR#2 CI-fix + round-16: tests/contract/test_ci_blocker_fixes.py has 17 items - 7 Windows-only
-# (durable-io BLOCKED receipt evidence x2 + validator core-blocked verdict x2 + wrapper-AST
-# dotsource/both-branches + 2 wrapper-AST mutation proofs) and 10 cross-platform (ci.yml/
-# package.json/pnpm-lock structural parses + preheat comment-immunity mutation + scriptDigests
-# helper wiring + receipt helper-sha256 cross-check). 16 Windows-only
-# (cargo 4 + ci-blocker 7 + pin-probe 3 + binding 2) + 1 sqlite skip = Ubuntu 210/17).
+# BEFORE A-1. A fresh worktree has no gitignored sqlite receipt, so the receipt
+# consumer would otherwise skip. Running spikes first purges and regenerates all
+# receipts in this run; A-1 then deterministically observes sqlite evidence and
+# has the frozen Windows runner count (386 passed / 1 skipped).
 #
 # Evidence validation is delegated to the shared Test-SpikeReceiptEvidence (see
 # scripts/spikes/_receipt-validator.ps1, also dot-sourced by CI) so runner and CI
@@ -762,49 +832,19 @@ if ($outFull -ne $rootFull -and -not $outFull.StartsWith($rootFull + '\', [Syste
     Write-Error "[acceptance] fail-closed: OutFile '$outFull' is not under project root '$PROJECT_ROOT'."
     exit 1
 }
-$json = $receipt | ConvertTo-Json -Depth 12
-[System.IO.File]::WriteAllText($outFull, $json, (New-Object System.Text.UTF8Encoding($false)))
-
-# --- dynamic fail-closed reverse-lookup of scriptDigests (GPT round-16 R2 P2-1) ---
-# ASCII-ONLY (like the rest of this file): PS 5.1 reads this BOM-less .ps1 as GBK on a
-# Chinese codepage; CJK inside a STRING LITERAL corrupts string terminators (a Write-Error
-# with CJK broke parsing at round-16-R2). Keep this gate pure ASCII.
-#
-# The static wiring test (test_ci_blocker_fixes.py parses the comment-stripped $scriptDigests
-# block) only proves "at runtime the helper SHA256 is computed into the receipt". But during
-# bare pytest the top-level receipt does not exist yet, so the Python-side reverse-lookup can
-# pass vacuously and never compare. Therefore, AFTER the receipt has been written to disk
-# (guaranteed present here), do the AUTHORITATIVE dynamic reverse-lookup: re-read the just-
-# written receipt and, for every key in scriptDigests, recompute the CURRENT on-disk file's
-# real SHA256 and compare. Missing key / missing scriptDigests / digest mismatch (hardcoded or
-# stale) all fail-closed (exit 1); never silently pass. This complements the static wiring
-# check: static guards against "wiring deleted", dynamic guards against "written digest drifts
-# from the real file".
-$writtenReceipt = Get-Content -LiteralPath $outFull -Raw -Encoding utf8 | ConvertFrom-Json
-if (-not ($writtenReceipt.PSObject.Properties.Name -contains "scriptDigests")) {
-    Write-Error "[acceptance] fail-closed: written receipt lacks scriptDigests field (P2-1 reverse-lookup impossible)."
-    exit 1
+$publishedReceipt = Publish-AcceptanceReceipt `
+    -Receipt $receipt `
+    -ScriptDigests $scriptDigests `
+    -ScriptRoot $PSScriptRoot `
+    -OutFull $outFull `
+    -VerifiedProvisionalDir (Join-Path $DATA_ROOT "tmp") `
+    -DataRoot $DATA_ROOT
+$failed = @($publishedReceipt.failed)
+$topStatus = $publishedReceipt.topStatus
+if (-not $publishedReceipt.published) {
+    Write-Error "[acceptance] fail-closed: final receipt was not published."
 }
-$writtenDigests = $writtenReceipt.scriptDigests
-foreach ($digestKey in $scriptDigests.Keys) {
-    # Key -> on-disk path: identical Join-Path to the $scriptDigests block above (same relative path).
-    $digestPath = Join-Path $PSScriptRoot $digestKey
-    $realDigest = Get-FileSha256 $digestPath
-    if ($null -eq $realDigest) {
-        Write-Error "[acceptance] fail-closed: scriptDigests key '$digestKey' has no file at '$digestPath'."
-        exit 1
-    }
-    if (-not ($writtenDigests.PSObject.Properties.Name -contains $digestKey)) {
-        Write-Error "[acceptance] fail-closed: written receipt scriptDigests missing key '$digestKey' (wiring gap)."
-        exit 1
-    }
-    $boundDigest = [string]$writtenDigests.$digestKey
-    if ($boundDigest -ne $realDigest) {
-        Write-Error "[acceptance] fail-closed: receipt scriptDigests['$digestKey']='$boundDigest' != current file real SHA256 '$realDigest' (hardcoded or stale digest)."
-        exit 1
-    }
-}
-Write-Host "[phase0-acceptance] scriptDigests reverse-lookup OK: $($scriptDigests.Keys.Count) script digests match disk"
+Write-Host "[phase0-acceptance] $($publishedReceipt.detail)"
 
 Write-Host ""
 Write-Host "========================================"

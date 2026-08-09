@@ -16,7 +16,7 @@ GPT Phase 0 PR #2 CI blocker 修复的回归测试（锁定行为不回退）。
 
 GPT round-16 二审强化（本文件）：
   - P1-1：wrapper non-Windows 分支必须在任何 D 盘引用之前可达——用去注释可执行代码做
-    位置断言（跨平台）+ 运行时强制非 Windows 分支产出合法 BLOCKED 回执且不触碰 D:（Windows）。
+    位置断言（跨平台）+ 真实 non-Windows/pwsh 的隔离仓库回执路径验证。
   - P1-2：wrapper AST 必须锁定**真实值流**——正确分支→正确 -Kind→赋值 $r→无中途覆盖→
     Write-Receipt $r；并对交换 Kind/覆盖 $r/错误赋值变量/退回旧回执逐一做 mutation 实证。
   - P1-3：CI 预热检测必须用 AST 确认存在**真实 CommandAst** 调用 dev.ps1（完整参数序列），
@@ -37,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -479,8 +480,30 @@ function Get-KindArg($cmd) {
     return $null
 }
 
+# P1-2：以下三个谓词把“出现过变量”收紧为具体 helper 赋值和精确 Write-Receipt $r。
+function Test-ExactVariableR($node) {
+    return ($node -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $node.VariablePath.UserPath -eq 'r')
+}
+
+function Test-RMutationTarget($node) {
+    if (Test-ExactVariableR $node) { return $true }
+    # 成员/索引改写（$r.reason / $r['reason']）同样会劫持即将落盘的回执。
+    return ($node.Extent.Text -match '^\s*\$r(?:\.|\[)')
+}
+
+function Test-ExactWriteReceiptR($cmd) {
+    $els = @($cmd.CommandElements)
+    return ($cmd.GetCommandName() -eq 'Write-Receipt' -and $els.Count -eq 2 -and
+        (Test-ExactVariableR $els[1]))
+}
+
 function Analyze-Branch($bodyStart, $bodyEnd) {
-    $res = [ordered]@{ kind = $null; lastRFromHelper = $false; writesR = $false }
+    $res = [ordered]@{
+        kind = $null; lastRFromHelper = $false; writesR = $false
+        helperEndBeforeWrite = $false; writeExactR = $false
+        noIntermediateRMutation = $false; valueFlowValid = $false
+    }
     $assigns = @($ast.FindAll(
         { $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
         Where-Object { $_.Extent.StartOffset -ge $bodyStart -and $_.Extent.EndOffset -le $bodyEnd })
@@ -488,32 +511,59 @@ function Analyze-Branch($bodyStart, $bodyEnd) {
         $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
         $_.Left.VariablePath.UserPath -eq 'r'
     } | Sort-Object { $_.Extent.StartOffset })
-    if ($rAssigns.Count -ge 1) {
-        $last = $rAssigns[$rAssigns.Count - 1]
-        $rhs = @($last.FindAll(
+    $helperAssigns = @()
+    foreach ($assign in $rAssigns) {
+        $rhs = @($assign.Right.FindAll(
             { $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
             Where-Object { $_.GetCommandName() -eq 'New-DurableIoBlockedReceipt' })
-        if ($rhs.Count -ge 1) {
-            $res.lastRFromHelper = $true
-            $res.kind = Get-KindArg $rhs[0]
+        if ($rhs.Count -eq 1) {
+            $helperAssigns += [pscustomobject]@{ assignment = $assign; command = $rhs[0] }
         }
     }
     $writes = @($cmds | Where-Object {
         $_.GetCommandName() -eq 'Write-Receipt' -and
         $_.Extent.StartOffset -ge $bodyStart -and $_.Extent.EndOffset -le $bodyEnd
     })
-    foreach ($w in $writes) {
-        $vars = @($w.FindAll(
-            { $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
-            Where-Object { $_.VariablePath.UserPath -eq 'r' })
-        if ($vars.Count -ge 1) { $res.writesR = $true }
+    $exactWrites = @($writes | Where-Object { Test-ExactWriteReceiptR $_ })
+    $res.writesR = ($exactWrites.Count -ge 1)
+    # 一个分支只能有一个落盘写；这样“先写后 helper”不会被后续的第二次写掩盖。
+    $res.writeExactR = ($writes.Count -eq 1 -and $exactWrites.Count -eq 1)
+    if ($helperAssigns.Count -eq 1) {
+        $helper = $helperAssigns[0]
+        $res.kind = Get-KindArg $helper.command
+        $res.lastRFromHelper = ($rAssigns.Count -ge 1 -and
+            $rAssigns[$rAssigns.Count - 1].Extent.StartOffset -eq $helper.assignment.Extent.StartOffset)
+        if ($res.writeExactR) {
+            $write = $exactWrites[0]
+            $res.helperEndBeforeWrite = ($helper.assignment.Extent.EndOffset -lt $write.Extent.StartOffset)
+            $res.noIntermediateRMutation = $true
+            $between = @($assigns | Where-Object {
+                $_.Extent.StartOffset -ge $helper.assignment.Extent.EndOffset -and
+                $_.Extent.EndOffset -le $write.Extent.StartOffset
+            })
+            foreach ($assign in $between) {
+                if (Test-RMutationTarget $assign.Left) {
+                    $res.noIntermediateRMutation = $false
+                }
+            }
+        }
     }
+    $res.valueFlowValid = ($helperAssigns.Count -eq 1 -and $res.lastRFromHelper -and
+        $res.writeExactR -and $res.helperEndBeforeWrite -and $res.noIntermediateRMutation)
     return $res
 }
 
 $ifs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] }, $true)
-$nonWin = [ordered]@{ found = $false; kind = $null; lastRFromHelper = $false; writesR = $false }
-$buildFail = [ordered]@{ found = $false; kind = $null; lastRFromHelper = $false; writesR = $false }
+$nonWin = [ordered]@{
+    found = $false; kind = $null; lastRFromHelper = $false; writesR = $false
+    conditionExact = $false; helperEndBeforeWrite = $false; writeExactR = $false
+    noIntermediateRMutation = $false; valueFlowValid = $false
+}
+$buildFail = [ordered]@{
+    found = $false; kind = $null; lastRFromHelper = $false; writesR = $false
+    conditionExact = $false; helperEndBeforeWrite = $false; writeExactR = $false
+    noIntermediateRMutation = $false; valueFlowValid = $false
+}
 foreach ($if in $ifs) {
     foreach ($clause in $if.Clauses) {
         $cond = $clause.Item1; $body = $clause.Item2
@@ -527,10 +577,20 @@ foreach ($if in $ifs) {
         if ($ct -match 'env:OS') {
             $nonWin.found = $true; $nonWin.kind = $a.kind
             $nonWin.lastRFromHelper = $a.lastRFromHelper; $nonWin.writesR = $a.writesR
+            $normalizedCondition = ($ct -replace '"', '' -replace "'", '' -replace '\s+', '')
+            $nonWin.conditionExact = ($normalizedCondition -eq '$env:OS-notmatchWindows')
+            $nonWin.helperEndBeforeWrite = $a.helperEndBeforeWrite; $nonWin.writeExactR = $a.writeExactR
+            $nonWin.noIntermediateRMutation = $a.noIntermediateRMutation
+            $nonWin.valueFlowValid = $a.valueFlowValid
         }
         if ($ct -match 'buildExit') {
             $buildFail.found = $true; $buildFail.kind = $a.kind
             $buildFail.lastRFromHelper = $a.lastRFromHelper; $buildFail.writesR = $a.writesR
+            $normalizedCondition = ($ct -replace '"', '' -replace "'", '' -replace '\s+', '')
+            $buildFail.conditionExact = ($normalizedCondition -eq '$buildExit-ne0-or-not(Test-Path$writerExe)')
+            $buildFail.helperEndBeforeWrite = $a.helperEndBeforeWrite; $buildFail.writeExactR = $a.writeExactR
+            $buildFail.noIntermediateRMutation = $a.noIntermediateRMutation
+            $buildFail.valueFlowValid = $a.valueFlowValid
         }
     }
 }
@@ -543,10 +603,20 @@ foreach ($if in $ifs) {
     nonWindowsKind            = $nonWin.kind
     nonWindowsLastRFromHelper = $nonWin.lastRFromHelper
     nonWindowsWritesR         = $nonWin.writesR
+    nonWindowsConditionExact   = $nonWin.conditionExact
+    nonWindowsHelperEndBeforeWrite = $nonWin.helperEndBeforeWrite
+    nonWindowsWriteExactR      = $nonWin.writeExactR
+    nonWindowsNoIntermediateRMutation = $nonWin.noIntermediateRMutation
+    nonWindowsValueFlowValid   = $nonWin.valueFlowValid
     buildFailFound            = $buildFail.found
     buildFailKind             = $buildFail.kind
     buildFailLastRFromHelper  = $buildFail.lastRFromHelper
     buildFailWritesR          = $buildFail.writesR
+    buildFailConditionExact   = $buildFail.conditionExact
+    buildFailHelperEndBeforeWrite = $buildFail.helperEndBeforeWrite
+    buildFailWriteExactR      = $buildFail.writeExactR
+    buildFailNoIntermediateRMutation = $buildFail.noIntermediateRMutation
+    buildFailValueFlowValid   = $buildFail.valueFlowValid
 } | ConvertTo-Json -Compress
 """
 
@@ -557,49 +627,104 @@ _CI_PREHEAT_AST_ANALYZER = r"""
 $ErrorActionPreference = 'Stop'
 $b64 = [Console]::In.ReadToEnd()
 $src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
-$required = $env:R16_REQUIRED_CMD
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
 $parseErrors = @($errors).Count
-$cmds = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
 
-function Norm($s) {
-    $t = $s -replace '"', ' ' -replace "'", ' ' -replace '\\', '/'
-    return ($t -replace '\s+', ' ').Trim()
-}
+# P1-3：逐项比较 CommandElements，禁止把多个参数塞回一个字符串后靠全文正则蒙混过关。
+$expectedElements = @(
+    '$PWD/scripts/dev.ps1', '--', '--', 'rustup', 'toolchain', 'install',
+    'stable-x86_64-pc-windows-gnu', '--profile', 'minimal'
+)
 
-$devInvokes = $false
-$devInvokeCount = 0
-foreach ($c in $cmds) {
-    $els = @($c.CommandElements)
-    if ($els.Count -lt 1) { continue }
-    $first = $els[0].Extent.Text
-    if ($first -match 'dev\.ps1') {
-        $devInvokeCount++
-        $norm = Norm($c.Extent.Text)
-        if ($norm -match [regex]::Escape($required)) { $devInvokes = $true }
+function Normalize-CommandElement($element) {
+    $value = $element.Extent.Text.Trim()
+    # CommandElement 的首项在 YAML 中带双引号；只去除完整包裹引号，保留参数边界。
+    if ($value.Length -ge 2 -and (
+        ($value.StartsWith([string][char]34) -and $value.EndsWith([string][char]34)) -or
+        ($value.StartsWith([string][char]39) -and $value.EndsWith([string][char]39)))) {
+        $value = $value.Substring(1, $value.Length - 2)
     }
+    return ($value -replace '\\', '/')
 }
 
-$ifs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.IfStatementAst] }, $true)
-$hasExitGuard = $false
-$exitGuardBodyText = ""
-foreach ($if in $ifs) {
-    foreach ($clause in $if.Clauses) {
-        $cond = $clause.Item1; $body = $clause.Item2
-        if ($cond.Extent.Text -match '\$LASTEXITCODE\s+-ne\s+0') {
-            $hasExitGuard = $true
-            $exitGuardBodyText = $body.Extent.Text
+function Test-ExactPreheatElements($cmd) {
+    $elements = @($cmd.CommandElements)
+    if ($elements.Count -ne $expectedElements.Count) { return $false }
+    for ($i = 0; $i -lt $expectedElements.Count; $i++) {
+        if ((Normalize-CommandElement $elements[$i]) -cne $expectedElements[$i]) {
+            return $false
         }
     }
+    return $true
 }
 
+function Get-ExitGuardDetails($statement) {
+    $result = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false; bodyText = '' }
+    if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $result }
+    $clauses = @($statement.Clauses)
+    if ($clauses.Count -ne 1) { return $result }
+    $result.isGuard = $true
+    $condition = $clauses[0].Item1
+    $body = $clauses[0].Item2
+    $normalizedCondition = ($condition.Extent.Text -replace '\s+', '')
+    $result.conditionExact = ($normalizedCondition -ceq '$LASTEXITCODE-ne0')
+    $result.bodyText = $body.Extent.Text
+    $result.exitsOne = ($result.bodyText -match '(?m)(^|\s)exit\s+1(\s|$)')
+    return $result
+}
+
+$topStatements = @($ast.EndBlock.Statements)
+$devInvokeCount = 0
+$devExactCount = 0
+$devIndex = -1
+for ($i = 0; $i -lt $topStatements.Count; $i++) {
+    $statement = $topStatements[$i]
+    if ($statement -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+    $pipelineElements = @($statement.PipelineElements)
+    if ($pipelineElements.Count -ne 1 -or
+        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) { continue }
+    $command = $pipelineElements[0]
+    $elements = @($command.CommandElements)
+    if ($elements.Count -lt 1 -or
+        (Normalize-CommandElement $elements[0]) -cne '$PWD/scripts/dev.ps1') { continue }
+    $devInvokeCount++
+    if (Test-ExactPreheatElements $command) {
+        $devExactCount++
+        $devIndex = $i
+    }
+}
+
+$commandElementsExact = ($devExactCount -eq 1)
+$devPreheatAtTopLevel = $commandElementsExact
+$nextTopLevelIsExitGuard = $false
+$guardConditionExact = $false
+$guardExitsOne = $false
+$exitGuardBodyText = ''
+if ($devPreheatAtTopLevel -and $devIndex + 1 -lt $topStatements.Count) {
+    $guard = Get-ExitGuardDetails $topStatements[$devIndex + 1]
+    $nextTopLevelIsExitGuard = $guard.isGuard
+    $guardConditionExact = $guard.conditionExact
+    $guardExitsOne = $guard.exitsOne
+    $exitGuardBodyText = $guard.bodyText
+}
+$devInvokes = $commandElementsExact
+$hasExitGuard = ($nextTopLevelIsExitGuard -and $guardConditionExact)
+$preheatValid = ($commandElementsExact -and $devPreheatAtTopLevel -and
+    $nextTopLevelIsExitGuard -and $guardConditionExact -and $guardExitsOne)
+
 [pscustomobject]@{
-    parseErrors       = $parseErrors
-    devInvokes        = $devInvokes
-    devInvokeCount    = $devInvokeCount
-    hasExitGuard      = $hasExitGuard
-    exitGuardBodyText = $exitGuardBodyText
+    parseErrors              = $parseErrors
+    devInvokes               = $devInvokes
+    devInvokeCount           = $devInvokeCount
+    hasExitGuard             = $hasExitGuard
+    exitGuardBodyText        = $exitGuardBodyText
+    commandElementsExact     = $commandElementsExact
+    devPreheatAtTopLevel     = $devPreheatAtTopLevel
+    nextTopLevelIsExitGuard  = $nextTopLevelIsExitGuard
+    guardConditionExact      = $guardConditionExact
+    guardExitsOne            = $guardExitsOne
+    preheatValid             = $preheatValid
 } | ConvertTo-Json -Compress
 """
 
@@ -687,7 +812,7 @@ Write-Output "ok=$($v.ok)|status=$($v.status)|detail=$($v.detail)"
             "detail": parts.get("detail", out),
         }
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _remove_tree_strict(tmp_dir)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="validator 需 Windows PowerShell")
@@ -734,7 +859,7 @@ Write-Output "ok=$($v.ok)|status=$($v.status)|detail=$($v.detail)"
         parts = {p.split("=", 1)[0]: p.split("=", 1)[1] for p in out.split("|") if "=" in p}
         ok = parts.get("ok", "").lower() == "true"
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _remove_tree_strict(tmp_dir)
     assert ok, (
         "证据结构合法性反证失败：BLOCKED 回执在 EnvCompat=$true + allowlist 命中时应被接受 "
         f"（说明结构完整）；实际 detail={parts.get('detail')}"
@@ -764,43 +889,88 @@ def test_wrapper_source_guards_non_windows_before_any_d_reference() -> None:
     assert not early, f"以下 D 盘引用出现在 non-Windows guard exit 之前（P1-1 回归）：{early}"
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="wrapper 运行时验证需 Windows PowerShell")
-def test_wrapper_non_windows_branch_reachable_without_touching_d() -> None:
-    """P1-1（运行时）：强制 $env:OS 为空（伪装非 Windows）+ 回执写唯一临时 override，
-    wrapper 必须 exit 0、产出合法 BLOCKED 回执（subcheckId + 非空 assertions + passed=false），
-    override 落 D 盘非 C 盘，且**不触碰**真实 receipt.json（字节级不变）。"""
-    d = _unique_tmp_dir("nonwin")
-    override = d / f"receipt_{uuid.uuid4().hex[:8]}.json"
-    real = DURABLE_IO_WRAPPER_RECEIPT
-    real_before = real.read_bytes() if real.exists() else None
-    env = dict(os.environ)
-    env["OS"] = ""  # 伪装非 Windows 宿主（"" -notmatch "Windows" -> true）
-    env["DURABLE_IO_RECEIPT_OVERRIDE"] = str(override)
+def test_wrapper_uses_cross_platform_default_receipt_path_without_override() -> None:
+    """默认回执路径必须由 Join-Path 逐段构造，且生产 wrapper 不得保留任意环境变量覆写。
+
+    这条静态锚点与后续真实 pwsh/non-Windows 执行测试配对：前者防止把测试隔离退化为
+    任意路径绕过，后者防止反斜杠在非 Windows 被当作普通文件名而导致回执落错位置。
+    """
+    code = _strip_ps_comments(DURABLE_IO_WRAPPER_PS1.read_text(encoding="utf-8-sig"))
+    assert re.search(
+        r"\$probeDir\s*=\s*Join-Path\s+\$scriptRoot\s+['\"]tools/compat-probes/windows_durable_io['\"]",
+        code,
+    ), "probeDir 必须用 Join-Path 从仓库根构造跨平台路径"
+    assert re.search(
+        r"\$receiptPath\s*=\s*Join-Path\s+\$probeDir\s+['\"]receipt\.json['\"]",
+        code,
+    ), "receiptPath 必须用 Join-Path 从 probeDir 构造"
+    assert "DURABLE_IO_RECEIPT_OVERRIDE" not in code, (
+        "生产 wrapper 不得保留 DURABLE_IO_RECEIPT_OVERRIDE；测试必须使用隔离仓库而非任意路径覆写"
+    )
+    assert re.search(
+        r'\.\s*\(Join-Path\s+\$scriptRoot\s+["\']scripts/spikes/_durable-io-receipt\.ps1["\']\)',
+        code,
+    ), "non-Windows 前置 helper 必须使用 / 子路径，不能把反斜杠当作文件名的一部分"
+
+
+def _copy_isolated_durable_wrapper(root: Path) -> tuple[Path, Path]:
+    """复制最小生产 wrapper/helper 到独立仓库根，默认回执只能落入该副本自己的 tools 目录。"""
+    fake_repo = root / "isolated-repo"
+    spike_dir = fake_repo / "scripts" / "spikes"
+    expected = fake_repo / "tools" / "compat-probes" / "windows_durable_io" / "receipt.json"
+    spike_dir.mkdir(parents=True, exist_ok=False)
+    expected.parent.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(DURABLE_IO_WRAPPER_PS1, spike_dir / DURABLE_IO_WRAPPER_PS1.name)
+    shutil.copy2(DURABLE_IO_RECEIPT_PS1, spike_dir / DURABLE_IO_RECEIPT_PS1.name)
+    return spike_dir / DURABLE_IO_WRAPPER_PS1.name, expected
+
+
+def _assert_valid_non_windows_durable_receipt(path: Path) -> None:
+    """校验真实 non-Windows 分支生成的最小合法 core-BLOCKED 回执。"""
+    assert path.exists(), f"默认回执必须落在隔离仓库的 tools 目录：{path}"
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "BLOCKED_UNCERTIFIED"
+    assert receipt["subcheckId"] == "spike:windows_durable_io/non_windows_host"
+    assertions = receipt.get("assertions")
+    assert isinstance(assertions, list) and assertions, "assertions 必须非空"
+    assert all(item.get("passed") is False for item in assertions), (
+        "每条 assertion passed 必须为 JSON boolean false"
+    )
+
+
+def test_wrapper_real_non_windows_pwsh_uses_default_repo_receipt_without_backslash_artifact() -> None:
+    """在真正 non-Windows + pwsh 宿主执行生产 wrapper，验证默认 receipt 的仓库位置。
+
+    Windows 上立即返回且不创建临时目录；Linux runner 必须真实执行 pwsh。
+    """
+    if sys.platform == "win32":
+        return
+    pwsh = shutil.which("pwsh")
+    assert pwsh is not None, "non-Windows CI 必须提供 pwsh 以执行跨平台路径回归"
+    isolated = Path(tempfile.mkdtemp(prefix="durable_non_windows_"))
+    real_before = DURABLE_IO_WRAPPER_RECEIPT.read_bytes() if DURABLE_IO_WRAPPER_RECEIPT.exists() else None
     try:
+        wrapper, expected = _copy_isolated_durable_wrapper(isolated)
+        env = dict(os.environ)
+        env["OS"] = ""
+        env.pop("DURABLE_IO_RECEIPT_OVERRIDE", None)
         result = subprocess.run(
-            [_ps_host(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(DURABLE_IO_WRAPPER_PS1)],
+            [pwsh, "-NoProfile", "-File", str(wrapper)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            cwd=str(REPO_ROOT), timeout=120, env=env,
+            cwd=str(wrapper.parents[2]), timeout=120, env=env,
         )
         assert result.returncode == 0, (
-            f"非 Windows 分支应 exit 0；rc={result.returncode} stderr={result.stderr!r}"
+            f"真实 non-Windows pwsh 分支应 exit 0；rc={result.returncode} stderr={result.stderr!r}"
         )
-        assert override.exists(), "非 Windows 分支必须把 BLOCKED 回执写到 override 路径"
-        r = json.loads(override.read_text(encoding="utf-8"))
-        assert r["status"] == "BLOCKED_UNCERTIFIED"
-        assert r["subcheckId"] == "spike:windows_durable_io/non_windows_host"
-        asserts = r.get("assertions")
-        assert isinstance(asserts, list) and len(asserts) >= 1, "assertions 必须非空"
-        for a in asserts:
-            assert a.get("passed") is False, "每条 assertion passed 必须为 JSON boolean false"
-        rp = str(override).replace("/", "\\")
-        assert not rp.lower().startswith("c:\\"), f"override 不得落 C 盘：{override}"
-        if real_before is not None:
-            assert real.exists() and real.read_bytes() == real_before, (
-                "非 Windows 分支不得改动真实 receipt.json"
-            )
+        _assert_valid_non_windows_durable_receipt(expected)
+        backslash_artifact = Path(str(wrapper.parents[2]) + r"\tools\compat-probes\windows_durable_io\receipt.json")
+        assert not backslash_artifact.exists(), f"不得产生含反斜杠的错误回执路径：{backslash_artifact}"
+        if real_before is None:
+            assert not DURABLE_IO_WRAPPER_RECEIPT.exists(), "真实持久 receipt 原先不存在时运行后仍必须不存在"
+        else:
+            assert DURABLE_IO_WRAPPER_RECEIPT.read_bytes() == real_before, "隔离运行不得改动真实持久 receipt"
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        _remove_tree_strict(isolated)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -825,6 +995,12 @@ def test_wrapper_ast_value_flow_locks_both_branches() -> None:
     )
     assert a["nonWindowsLastRFromHelper"] is True, "non-Windows 分支最后一次 $r 赋值必须来自 helper（无覆盖）"
     assert a["nonWindowsWritesR"] is True, "non-Windows 分支必须 Write-Receipt $r"
+    # 新增的顺序/精确参数锚点：不能只证明“某处出现过 helper 与 $r”。
+    assert a["nonWindowsConditionExact"] is True
+    assert a["nonWindowsHelperEndBeforeWrite"] is True
+    assert a["nonWindowsWriteExactR"] is True
+    assert a["nonWindowsNoIntermediateRMutation"] is True
+    assert a["nonWindowsValueFlowValid"] is True
     # build/linker 分支完整值流
     assert a["buildFailFound"] is True, "build/linker 分支必须调用 helper"
     assert a["buildFailKind"] == "toolchain", (
@@ -832,6 +1008,11 @@ def test_wrapper_ast_value_flow_locks_both_branches() -> None:
     )
     assert a["buildFailLastRFromHelper"] is True, "build/linker 分支最后一次 $r 赋值必须来自 helper（无覆盖）"
     assert a["buildFailWritesR"] is True, "build/linker 分支必须 Write-Receipt $r"
+    assert a["buildFailConditionExact"] is True
+    assert a["buildFailHelperEndBeforeWrite"] is True
+    assert a["buildFailWriteExactR"] is True
+    assert a["buildFailNoIntermediateRMutation"] is True
+    assert a["buildFailValueFlowValid"] is True
 
 
 # ── mutation 定义（每个把真实值流破坏一处，AST 必须捕获对应布尔翻转）────────────────
@@ -868,6 +1049,20 @@ def _mut_wrong_var_nonwin(src: str) -> str:
     )
 
 
+def _mut_write_before_helper_nonwin(src: str) -> str:
+    """把唯一的 non-Windows 落盘写移到 helper 赋值之前，验证 EndOffset 顺序约束。"""
+    return src.replace(
+        _NONWIN_CALL + "\n    Write-Receipt $r",
+        "Write-Receipt $r\n    " + _NONWIN_CALL,
+        1,
+    )
+
+
+def _mut_member_rewrite_nonwin(src: str) -> str:
+    """helper 与落盘写之间改写 $r 成员，不能让“最后赋值仍是 helper”掩盖劫持。"""
+    return src.replace(_NONWIN_CALL, _NONWIN_CALL + "\n    $r.reason = 'tampered'", 1)
+
+
 def _mut_legacy_nonwin(src: str) -> str:
     """non-Windows 分支整体退回手写旧回执（无 helper 调用）。"""
     return src.replace(_NONWIN_CALL, _LEGACY, 1)
@@ -876,6 +1071,41 @@ def _mut_legacy_nonwin(src: str) -> str:
 def _mut_legacy_buildfail(src: str) -> str:
     """build/linker 分支整体退回手写旧回执（无 helper 调用）。"""
     return _BUILDFAIL_CALL_RE.sub(_LEGACY, src, count=1)
+
+
+def _mut_write_before_helper_build(src: str) -> str:
+    """把 build/linker 分支唯一的 Write-Receipt $r 移到 helper 赋值之前。"""
+    match = _BUILDFAIL_CALL_RE.search(src)
+    if match is None:
+        return src
+    following = re.match(r"\r?\n\s*Write-Receipt \$r", src[match.end():])
+    if following is None:
+        return src
+    end = match.end() + following.end()
+    return src[:match.start()] + "Write-Receipt $r\n    " + match.group(0) + src[end:]
+
+
+def _mut_overwrite_r_build(src: str) -> str:
+    """build/linker helper 后以旧 hashtable 覆盖 $r，验证中间赋值检查。"""
+    return _BUILDFAIL_CALL_RE.sub(lambda m: m.group(0) + "\n    " + _LEGACY, src, count=1)
+
+
+def _mut_wrong_var_build(src: str) -> str:
+    """build/linker helper 的结果改赋给 $x，Write-Receipt $r 不再消费 helper 结果。"""
+    return src.replace(
+        "$r = New-DurableIoBlockedReceipt -Kind toolchain",
+        "$x = New-DurableIoBlockedReceipt -Kind toolchain",
+        1,
+    )
+
+
+def _mut_invert_build_condition(src: str) -> str:
+    """反转 build 失败条件的退出码判断，验证条件 AST 不只按变量名匹配。"""
+    return src.replace(
+        "$buildExit -ne 0 -or -not (Test-Path $writerExe)",
+        "$buildExit -eq 0 -or -not (Test-Path $writerExe)",
+        1,
+    )
 
 
 def _mut_comment_dotsource(src: str) -> str:
@@ -899,8 +1129,20 @@ def _chk_nonwin_broken(a: dict[str, Any]) -> bool:
     return a["nonWindowsLastRFromHelper"] is False
 
 
+def _chk_nonwin_value_flow_broken(a: dict[str, Any]) -> bool:
+    return a["nonWindowsValueFlowValid"] is False
+
+
 def _chk_buildfail_broken(a: dict[str, Any]) -> bool:
     return a["buildFailLastRFromHelper"] is False
+
+
+def _chk_build_value_flow_broken(a: dict[str, Any]) -> bool:
+    return a["buildFailValueFlowValid"] is False
+
+
+def _chk_build_condition_broken(a: dict[str, Any]) -> bool:
+    return a["buildFailConditionExact"] is False
 
 
 def _chk_no_dotsource(a: dict[str, Any]) -> bool:
@@ -911,8 +1153,14 @@ _VALUE_FLOW_MUTATIONS: list[tuple[str, Callable[[str], str], Callable[[dict[str,
     ("swap_kind", _mut_swap_kind, _chk_swap),
     ("overwrite_r_nonwin", _mut_overwrite_r_nonwin, _chk_nonwin_broken),
     ("wrong_var_nonwin", _mut_wrong_var_nonwin, _chk_nonwin_broken),
+    ("write_before_helper_nonwin", _mut_write_before_helper_nonwin, _chk_nonwin_value_flow_broken),
+    ("member_rewrite_nonwin", _mut_member_rewrite_nonwin, _chk_nonwin_value_flow_broken),
     ("legacy_nonwin", _mut_legacy_nonwin, _chk_nonwin_broken),
     ("legacy_buildfail", _mut_legacy_buildfail, _chk_buildfail_broken),
+    ("write_before_helper_build", _mut_write_before_helper_build, _chk_build_value_flow_broken),
+    ("overwrite_r_build", _mut_overwrite_r_build, _chk_build_value_flow_broken),
+    ("wrong_var_build", _mut_wrong_var_build, _chk_build_value_flow_broken),
+    ("invert_build_condition", _mut_invert_build_condition, _chk_build_condition_broken),
     ("comment_dotsource", _mut_comment_dotsource, _chk_no_dotsource),
 ]
 
@@ -954,6 +1202,13 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     )
     assert a["devInvokeCount"] >= 1
     assert a["hasExitGuard"] is True, "必须有 if ($LASTEXITCODE -ne 0) 守卫"
+    # 顺序及 token 级锚点：一个包含相同文本的命令或过早守卫都不能通过。
+    assert a["commandElementsExact"] is True
+    assert a["devPreheatAtTopLevel"] is True
+    assert a["nextTopLevelIsExitGuard"] is True
+    assert a["guardConditionExact"] is True
+    assert a["guardExitsOne"] is True
+    assert a["preheatValid"] is True
     body = _strip_ps_comments(str(a.get("exitGuardBodyText", "")))
     assert re.search(r"(?m)(^|\s)exit\s+1(\s|$)", body), (
         f"LASTEXITCODE 守卫体必须 exit 1（去注释后）；body={body!r}"
@@ -987,21 +1242,215 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     )
 
 
+_PREHEAT_COMMAND = (
+    '& "$PWD/scripts/dev.ps1" -- -- rustup toolchain install '
+    'stable-x86_64-pc-windows-gnu --profile minimal'
+)
+
+
+def _mut_preheat_single_string_argument(run: str) -> str:
+    """把独立参数合并成一个字符串，验证 CommandElements 必须逐项精确匹配。"""
+    return run.replace(
+        _PREHEAT_COMMAND,
+        '& "$PWD/scripts/dev.ps1" "-- -- rustup toolchain install '
+        'stable-x86_64-pc-windows-gnu --profile minimal"',
+        1,
+    )
+
+
+def _mut_preheat_guard_before_call(run: str) -> str:
+    """把守卫整体移动到调用之前，验证不能只在同一 run block 内搜到 guard。"""
+    lines = run.split("\n")
+    command_index = next((i for i, line in enumerate(lines) if _PREHEAT_COMMAND in line), None)
+    guard_index = next(
+        (i for i, line in enumerate(lines) if "if ($LASTEXITCODE -ne 0)" in line), None
+    )
+    if command_index is None or guard_index is None:
+        return run
+    guard_end = next(
+        (i for i in range(guard_index + 1, len(lines)) if lines[i].strip() == "}"), None
+    )
+    if guard_end is None:
+        return run
+    command = lines[command_index]
+    guard = lines[guard_index:guard_end + 1]
+    return "\n".join(
+        lines[:command_index] + guard + lines[command_index + 1:guard_index] + [command] + lines[guard_end + 1:]
+    )
+
+
+def _mut_preheat_intervening_native_command(run: str) -> str:
+    """在 dev 调用与守卫之间插入原生命令，模拟污染 $LASTEXITCODE 的回归。"""
+    return run.replace(_PREHEAT_COMMAND, _PREHEAT_COMMAND + "\n          & cmd /c exit 0", 1)
+
+
+def _chk_preheat_token_boundary(a: dict[str, Any]) -> bool:
+    return a["commandElementsExact"] is False and a["preheatValid"] is False
+
+
+def _chk_preheat_not_immediately_guarded(a: dict[str, Any]) -> bool:
+    return a["nextTopLevelIsExitGuard"] is False and a["preheatValid"] is False
+
+
+_PREHEAT_ORDER_MUTATIONS: list[tuple[str, Callable[[str], str], Callable[[dict[str, Any]], bool]]] = [
+    ("single_string_argument", _mut_preheat_single_string_argument, _chk_preheat_token_boundary),
+    ("guard_before_call", _mut_preheat_guard_before_call, _chk_preheat_not_immediately_guarded),
+    ("intervening_native_command", _mut_preheat_intervening_native_command, _chk_preheat_not_immediately_guarded),
+]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
+@pytest.mark.parametrize(
+    ("mut_id", "mutate", "check"), _PREHEAT_ORDER_MUTATIONS,
+    ids=[m[0] for m in _PREHEAT_ORDER_MUTATIONS],
+)
+def test_preheat_ast_rejects_token_and_order_mutations(
+    mut_id: str,
+    mutate: Callable[[str], str],
+    check: Callable[[dict[str, Any]], bool],
+) -> None:
+    """P1-3 mutation 实证：参数折叠、守卫提前、原生命令插队都必须让预热合同失效。"""
+    run = str(_preheat_step().get("run", ""))
+    mutated = mutate(run)
+    assert mutated != run, f"mutation '{mut_id}' 未改动预热 run block（锚点失配）"
+    a = _analyze_ci_run_block(mutated)
+    assert a["parseErrors"] == 0, f"mutation '{mut_id}' 后仍应可解析；parseErrors={a['parseErrors']}"
+    assert check(a), f"mutation '{mut_id}' 未被 AST 捕获（P1-3 回归）：{a}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 八、P1-4：唯一临时目录（D 盘 DataRoot、worktree/进程/随机唯一、绝不落 C 盘）
 # ─────────────────────────────────────────────────────────────────────────────
+_TEST_DATA_ROOT_ENV = "FACTORY_TEST_DATA_ROOT"
+_APPROVED_D_TEST_PREFIX = Path(r"D:\codex项目")
+
+
+def _validate_d_test_root(candidate: Path) -> Path:
+    """在任何 mkdir/写入前验证测试根：仅允许 D:\\codex项目 下的非 reparse 物理路径。"""
+    raw = os.fspath(candidate)
+    path = Path(raw)
+    if not path.is_absolute() or path.drive.casefold() != "d:":
+        raise RuntimeError(f"测试 DataRoot 必须是 D 盘绝对路径，实际为：{raw}")
+    if any(part == ".." for part in path.parts):
+        raise RuntimeError(f"测试 DataRoot 不得包含 '..'：{raw}")
+
+    # 先逐层检查已存在组件，拒绝 symlink/junction；未存在叶子仅在全部前置检查完成后创建。
+    current = Path(path.anchor)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    for part in path.parts[1:]:
+        current = current / part
+        if not current.exists():
+            break
+        attrs = getattr(os.lstat(current), "st_file_attributes", 0)
+        if current.is_symlink() or bool(attrs & reparse_flag):
+            raise RuntimeError(f"测试 DataRoot 不得穿越 reparse/junction：{current}")
+
+    resolved = path.resolve(strict=False)
+    approved = _APPROVED_D_TEST_PREFIX.resolve(strict=False)
+    resolved_text = str(resolved).rstrip("\\/").casefold()
+    approved_text = str(approved).rstrip("\\/").casefold()
+    if resolved_text != approved_text and not resolved_text.startswith(approved_text + "\\"):
+        raise RuntimeError(
+            f"测试 DataRoot 必须位于批准根 '{approved}' 内，实际为：{resolved}"
+        )
+    if resolved.drive.casefold() != "d:":
+        raise RuntimeError(f"测试 DataRoot 物理解析后离开 D 盘：{resolved}")
+    return resolved
+
+
 def _data_root() -> Path:
     """定位 <PROJECT_ROOT>\\AI-Coding-Factory-Data\\dev（向上找 AI-Coding-Factory-Data 祖先）。
-    找不到时回退系统临时目录（仅非 Windows / 无 DataRoot 环境；Windows 存储合同下必命中 D 盘）。"""
+    找不到时 fail-closed；绝不回退 ambient TEMP。需要隔离根时只能显式给出经验证的
+    FACTORY_TEST_DATA_ROOT，且物理路径必须位于批准的 D:\\codex项目 根内。"""
+    override = os.environ.get(_TEST_DATA_ROOT_ENV)
+    if override:
+        return _validate_d_test_root(Path(override))
+
     cur = REPO_ROOT
     for _ in range(8):
         cand = cur / "AI-Coding-Factory-Data"
         if cand.exists():
-            return cand / "dev"
+            return _validate_d_test_root(cand / "dev")
         if cur.parent == cur:
             break
         cur = cur.parent
-    return Path(tempfile.gettempdir())
+    raise RuntimeError(
+        "未找到批准的 D 盘 AI-Coding-Factory-Data；请显式设置经过校验的 FACTORY_TEST_DATA_ROOT"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘测试根校验是 Windows 存储合同")
+def test_windows_data_root_rejects_missing_approved_root_instead_of_ambient_temp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows 找不到项目批准 DataRoot 时必须失败，绝不能静默回退 ambient TEMP（可能是 C 盘）。"""
+    monkeypatch.delenv("FACTORY_TEST_DATA_ROOT", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", Path(r"D:\\__missing_factory_root__"))
+    with pytest.raises(RuntimeError, match="DataRoot|D 盘|D:"):
+        _data_root()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘测试根校验是 Windows 存储合同")
+def test_windows_data_root_rejects_unapproved_override_before_any_mkdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FACTORY_TEST_DATA_ROOT 若指向 C 盘必须在创建目录前拒绝，避免测试路径越界。"""
+    monkeypatch.setenv("FACTORY_TEST_DATA_ROOT", r"C:\\must-not-write")
+    with pytest.raises(RuntimeError, match="D 盘|C:"):
+        _data_root()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘测试根校验是 Windows 存储合同")
+@pytest.mark.parametrize(
+    "override",
+    [r"D:\outside-approved-root", r"D:\codex项目\candidate\..\escape"],
+    ids=["outside-approved-d-root", "parent-traversal"],
+)
+def test_windows_data_root_rejects_outside_or_parent_traversal_override(
+    monkeypatch: pytest.MonkeyPatch,
+    override: str,
+) -> None:
+    """显式测试根不能越过批准 D 根，也不能用 .. 在校验后绕回其他位置。"""
+    monkeypatch.setenv(_TEST_DATA_ROOT_ENV, override)
+    with pytest.raises(RuntimeError, match="批准根|不得包含"):
+        _data_root()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘测试根校验是 Windows 存储合同")
+def test_windows_data_root_rejects_reparse_component_before_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模拟文件系统的 reparse flag；无需创建需要特权的真实 junction 也要覆盖拒绝分支。"""
+    existing = {r"d:\codex项目", r"d:\codex项目\reparse"}
+
+    def fake_exists(path: Path) -> bool:
+        return str(path).replace("/", "\\").rstrip("\\").casefold() in existing
+
+    fake_stat = type("ReparseStat", (), {"st_file_attributes": 0x0400})()
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(os, "lstat", lambda _path: fake_stat)
+    with pytest.raises(RuntimeError, match="reparse/junction"):
+        _validate_d_test_root(Path(r"D:\codex项目\reparse\child"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘临时目录清理合同在 Windows 验证")
+def test_strict_temp_cleanup_propagates_failure_and_finally_removes_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """清理失败必须冒泡，不能用 ignore_errors 假绿；恢复后 finally 路径必须确认目录不存在。"""
+    owned = _unique_tmp_dir("cleanup-strict")
+    try:
+        def denied(_path: Path) -> None:
+            raise OSError("simulated cleanup denial")
+
+        monkeypatch.setattr(shutil, "rmtree", denied)
+        with pytest.raises(OSError, match="cleanup denial"):
+            _remove_tree_strict(owned)
+        assert owned.exists(), "模拟清理失败后目录应仍存在，不能误报已清理"
+    finally:
+        monkeypatch.undo()
+        _remove_tree_strict(owned)
 
 
 def _worktree_digest(root_str: str) -> str:
@@ -1012,12 +1461,25 @@ def _worktree_digest(root_str: str) -> str:
 
 def _unique_tmp_dir(tag: str) -> Path:
     """在 D 盘 DataRoot\\tmp 下创建 worktree/进程/uuid 唯一子目录（并发/xdist 不互撞）。
-    调用方 try/finally shutil.rmtree 清理，不残留、不覆盖他人预存文件。"""
-    root = _data_root() / "tmp"
+    调用方必须在 finally 调用 _remove_tree_strict；清理失败会失败，且 helper 断言目录不存在。"""
+    root = _data_root() / "phase0-contract-tests"
+    root = _validate_d_test_root(root)
+    if not root.exists():
+        # 先完成 D 盘/物理路径校验，再用 exist_ok=False 创建；并发撞名不得静默复用。
+        root.mkdir(parents=True, exist_ok=False)
+    root = _validate_d_test_root(root)
     uniq = f"_r16_{tag}_{_worktree_digest(str(REPO_ROOT))}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     d = root / uniq
-    d.mkdir(parents=True, exist_ok=True)
+    _validate_d_test_root(d)
+    d.mkdir(exist_ok=False)
     return d
+
+
+def _remove_tree_strict(path: Path) -> None:
+    """严格清理本测试自己创建的唯一目录；清理失败必须让测试失败，避免假绿残留。"""
+    if path.exists():
+        shutil.rmtree(path)
+    assert not path.exists(), f"临时目录清理后仍存在：{path}"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="D 盘 DataRoot 唯一性是 Windows 存储合同")
@@ -1028,8 +1490,9 @@ def test_temp_paths_are_unique_per_worktree_and_off_c_drive() -> None:
     d2 = _worktree_digest(r"D:\codex项目\.codex-worktrees\AI-Coding-Factory\wt-B")
     assert d1 != d2, "不同 worktree 必须派生不同临时目录 digest（不得共享临时路径）"
     a = _unique_tmp_dir("uniqtest")
-    b = _unique_tmp_dir("uniqtest")
+    b: Path | None = None
     try:
+        b = _unique_tmp_dir("uniqtest")
         assert a != b, "同一 worktree 两次分配必须得到不同目录（uuid 唯一）"
         data_root = str(_data_root()).replace("/", "\\").lower()
         for d in (a, b):
@@ -1038,7 +1501,8 @@ def test_temp_paths_are_unique_per_worktree_and_off_c_drive() -> None:
             assert rp.startswith(data_root), f"临时目录必须在 D 盘 DataRoot 下：{d}"
     finally:
         for d in (a, b):
-            shutil.rmtree(d, ignore_errors=True)
+            if d is not None:
+                _remove_tree_strict(d)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1052,6 +1516,11 @@ def test_durable_io_helper_wired_into_script_digests() -> None:
     m = re.search(r"\$scriptDigests\s*=\s*\[ordered\]@\{(.*?)\n\s*\}", code, re.S)
     assert m is not None, "phase0-acceptance.ps1 未找到 $scriptDigests [ordered]@{...} 块"
     block = m.group(1)
+    keys = re.findall(r'^\s*"([^"]+)"\s*=', block, re.M)
+    assert keys == [
+        "phase0-acceptance.ps1", "check.ps1", "dev.ps1", "_python-probe.ps1",
+        "_worktree-target.ps1", "spikes/_durable-io-receipt.ps1",
+    ], "scriptDigests 必须保持冻结的 6 个生产脚本，不能删减或无界扩大绑定范围"
     wired = re.search(
         r'"spikes/_durable-io-receipt\.ps1"\s*=\s*Get-FileSha256\s*\(\s*'
         r'Join-Path\s+\$PSScriptRoot\s+"spikes/_durable-io-receipt\.ps1"\s*\)',
@@ -1064,18 +1533,21 @@ def test_durable_io_helper_wired_into_script_digests() -> None:
 
 
 def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
-    """P2-1（动态门存在）：phase0-acceptance.ps1 必须在回执**写盘后回读**并对每个执行脚本
-    重算 SHA256 与回执绑定值逐一比对，缺键/不匹配 fail-closed exit 1。
-    这是权威动态反查（Python 侧因 CI 中回执尚未生成而空过的盲区在此堵死）。
-    用去注释可执行代码做结构断言（非注释子串）。"""
+    """动态反查必须先在 verified provisional 回执上完成，再作为正式 check 写入最终回执。
+
+    测试结构保证：缺字段/缺键/错摘要都先令 script-digests=false，随后才原子发布 FAIL；
+    发布失败还会删除旧 final，不能遗留历史 PASS。
+    """
     code = _strip_ps_comments(ACCEPTANCE_PS1.read_text(encoding="utf-8"))
-    # 回执写盘后回读（$outFull = 刚写出的总回执路径）。
-    assert re.search(r"\$writtenReceipt\s*=\s*Get-Content\s+-LiteralPath\s+\$outFull\s+-Raw", code), (
-        "动态门必须回读已写盘的回执文件 $outFull"
+    assert re.search(r"function\s+Publish-AcceptanceReceipt\b", code), (
+        "动态反查与发布必须收敛为 Publish-AcceptanceReceipt，避免先写 final PASS"
     )
-    # 逐脚本重算当前磁盘文件的真实 SHA256（遍历 $scriptDigests.Keys → Get-FileSha256 $digestPath）。
-    assert re.search(r"foreach\s*\(\s*\$digestKey\s+in\s+\$scriptDigests\.Keys\s*\)", code), (
-        "动态门必须遍历 $scriptDigests.Keys 逐脚本反查"
+    assert re.search(r"\$writtenReceipt\s*=\s*Get-Content\s+-LiteralPath\s+\$provisionalFull\s+-Raw", code), (
+        "动态门必须回读 verified provisional 回执，而不是先发布最终文件"
+    )
+    # 逐脚本重算当前磁盘文件的真实 SHA256（遍历 ScriptDigests.Keys → Get-FileSha256 digestPath）。
+    assert re.search(r"foreach\s*\(\s*\$digestKey\s+in\s+\$ScriptDigests\.Keys\s*\)", code), (
+        "动态门必须遍历 ScriptDigests.Keys 逐脚本反查"
     )
     assert re.search(r"\$realDigest\s*=\s*Get-FileSha256\s+\$digestPath", code), (
         "动态门必须对每个键重算当前磁盘文件真实 SHA256"
@@ -1084,10 +1556,119 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
     assert re.search(r"\$boundDigest\s+-ne\s+\$realDigest", code), (
         "动态门必须比对回执绑定值 != 当前文件真实 SHA256"
     )
-    # 缺 scriptDigests / 缺键 / 不匹配三路都要 fail-closed exit 1。
-    assert code.count("exit 1") >= 3, "动态门缺字段/缺键/不匹配三路都必须 exit 1（fail-closed）"
     # helper 键必须在动态反查名单内（即 $scriptDigests 含该键，遍历时会反查它）。
     assert '"spikes/_durable-io-receipt.ps1"' in code, "动态门反查名单必须含 durable-io helper 键"
+    # 反查不是写盘后的孤立 exit：必须被记录为正式 check，重算顶层状态后才发布最终回执。
+    assert re.search(r'Add-CheckResult\s+"script-digests"', code), (
+        "scriptDigests 反查必须作为正式 check 写入 results，不能只在最终回执写盘后直接 exit"
+    )
+    assert "Publish-AcceptanceReceipt" in code, (
+        "最终回执必须经受控 provisional 校验后原子发布，避免动态反查失败留下 PASS 文件"
+    )
+    assert "[System.IO.File]::Replace($provisionalFull, $OutFull, $null)" in code, (
+        "已有最终回执时必须以 File.Replace 原子发布 verified provisional"
+    )
+    assert "[System.IO.File]::Move($provisionalFull, $OutFull)" in code, (
+        "首次发布必须从 verified provisional 原子移动到最终路径"
+    )
+    assert "Remove-Item -LiteralPath $OutFull -Force -ErrorAction Stop" in code, (
+        "原子发布失败时必须移除旧 final，避免残留历史 PASS"
+    )
+
+
+def _run_script_digest_publish_failure(case: str) -> tuple[int, dict[str, Any]]:
+    """从生产脚本 AST 提取 Publish-AcceptanceReceipt，在 D 盘隔离目录复放最终回执失败语义。"""
+    d = _unique_tmp_dir(f"digest-{case}")
+    script_root = d / "scripts"
+    script_root.mkdir(exist_ok=False)
+    bound = script_root / "bound.ps1"
+    bound.write_text("# digest binding fixture\n", encoding="utf-8")
+    final = d / "final-receipt.json"
+    try:
+        ps = f"""
+$ErrorActionPreference = 'Stop'
+$source = Get-Content -LiteralPath '{ACCEPTANCE_PS1}' -Raw -Encoding utf8
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+if (@($errors).Count -ne 0) {{ throw 'phase0 source parse failed' }}
+$definitions = @($ast.FindAll(
+    {{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $args[0].Name -eq 'Publish-AcceptanceReceipt' }},
+    $true
+))
+$definition = $definitions[0]
+if ($null -eq $definition) {{ throw 'Publish-AcceptanceReceipt missing' }}
+. ([scriptblock]::Create($definition.Extent.Text))
+function Test-ReparsePointInChain {{ param([string]$Leaf, [string]$Root); return $null }}
+function Get-FileSha256 {{
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {{ return $null }}
+    return 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLower()
+}}
+$global:results = [System.Collections.Generic.List[object]]::new()
+function Add-CheckResult {{
+    param([string]$Id, [string]$Desc, [bool]$Passed, [string]$Detail)
+    $entry = [ordered]@{{
+        id=$Id; desc=$Desc; exitCode=$(if ($Passed) {{0}} else {{1}})
+        passed=$Passed; tail=$Detail
+    }}
+    $global:results.Add($entry)
+}}
+$scriptRoot = '{script_root}'
+$boundPath = Join-Path $scriptRoot 'bound.ps1'
+$actual = Get-FileSha256 $boundPath
+$digests = [ordered]@{{ 'bound.ps1' = $actual }}
+$receipt = [ordered]@{{ topStatus='PASS'; checks=@() }}
+switch ('{case}') {{
+    'missing_field' {{ }}
+    'missing_key' {{ $receipt['scriptDigests'] = [ordered]@{{}} }}
+    'wrong_digest' {{ $receipt['scriptDigests'] = [ordered]@{{ 'bound.ps1' = ('sha256:' + ('0' * 64)) }} }}
+    default {{ throw 'unknown case' }}
+}}
+$published = Publish-AcceptanceReceipt `
+    -Receipt $receipt -ScriptDigests $digests -ScriptRoot $scriptRoot `
+    -OutFull '{final}' -VerifiedProvisionalDir '{d}' -DataRoot '{d}'
+$payload = [ordered]@{{
+    topStatus = [string]$published.topStatus
+    published = [bool]$published.published
+    finalExists = (Test-Path -LiteralPath '{final}')
+}}
+if ($payload.finalExists) {{
+    $payload['finalReceipt'] = Get-Content -LiteralPath '{final}' -Raw -Encoding utf8 | ConvertFrom-Json
+}}
+$payload | ConvertTo-Json -Depth 12 -Compress
+if ($published.topStatus -eq 'PASS') {{ exit 0 }}
+exit 1
+"""
+        result = subprocess.run(
+            [_ps_host(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(REPO_ROOT),
+            timeout=120,
+        )
+        assert result.stdout.strip(), (
+            f"回执失败语义 harness 未输出 JSON；stderr={result.stderr!r}"
+        )
+        return result.returncode, json.loads(result.stdout)
+    finally:
+        _remove_tree_strict(d)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="D 盘原子回执发布语义需 Windows PowerShell")
+@pytest.mark.parametrize("case", ["missing_field", "missing_key", "wrong_digest"])
+def test_script_digest_failures_exit_nonzero_and_never_publish_pass(case: str) -> None:
+    """缺 scriptDigests、缺键、错摘要三路均须 exit 1，最终回执存在时 topStatus 必为 FAIL。"""
+    rc, payload = _run_script_digest_publish_failure(case)
+    assert rc == 1, f"{case} 动态 digest 失败必须 exit 1；实际 rc={rc} payload={payload}"
+    assert payload["topStatus"] == "FAIL", f"{case} 失败时发布器必须返回 FAIL：{payload}"
+    assert payload["finalExists"] is True, f"{case} 失败时应发布可审计 FAIL 回执，而非遗留旧 PASS"
+    final_receipt = payload["finalReceipt"]
+    assert final_receipt["topStatus"] == "FAIL", f"{case} 最终回执不得残留 PASS：{final_receipt}"
+    digest_check = next(item for item in final_receipt["checks"] if item["id"] == "script-digests")
+    assert digest_check["passed"] is False, f"{case} script-digests 正式 check 必须失败：{digest_check}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

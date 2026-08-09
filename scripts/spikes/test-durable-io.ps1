@@ -19,19 +19,18 @@ $ErrorActionPreference = "Stop"
 
 $spikeName    = "windows_durable_io"
 $scriptRoot   = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
-$probeDir     = "$scriptRoot\tools\compat-probes\windows_durable_io"
-# 回执路径：默认写探针目录下 receipt.json。DURABLE_IO_RECEIPT_OVERRIDE（仅供回归测试用）
-# 可把 BLOCKED 回执改写到唯一临时文件，使"非 Windows 分支可达性"测试不污染真实 receipt.json
-# 也不与其它 worktree/进程竞争。生产 CI 不设该变量，行为完全不变（仍 fail-closed）。
-if ($env:DURABLE_IO_RECEIPT_OVERRIDE) { $receiptPath = $env:DURABLE_IO_RECEIPT_OVERRIDE }
-else { $receiptPath = "$probeDir\receipt.json" }
+# 路径逐段用 Join-Path 构造：在 pwsh/non-Windows 上反斜杠不是目录分隔符，字符串拼接会把
+# "tools\\..." 当作一个错误文件名。生产回执只能写入本仓库的固定 probe 目录；回归测试通过
+# 隔离仓库副本验证，绝不提供任意环境变量覆写路径。
+$probeDir     = Join-Path $scriptRoot "tools/compat-probes/windows_durable_io"
+$receiptPath  = Join-Path $probeDir "receipt.json"
 
 # GPT Phase 0 PR #2：non-Windows 与 build/linker 失败两条 BLOCKED 回执改用共享
 # New-DurableIoBlockedReceipt（单一真源），补齐 validator 必需的 assertions/
 # observable_facts/subcheckId，使拒因从 INVALID 变为合法 core BLOCKED（仍 fail-closed）。
 # 该 helper 只依赖 $scriptRoot（本 worktree 根），绝不触碰 D 盘，故可在平台前置检查前加载，
 # 保证非 Windows 宿主也能构造并写出合法 BLOCKED 回执。
-. (Join-Path $scriptRoot "scripts\spikes\_durable-io-receipt.ps1")
+. (Join-Path $scriptRoot "scripts/spikes/_durable-io-receipt.ps1")
 
 # receipt 统一用无 BOM UTF-8 写:PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM,
 # 令下游 Python json.load 报 "Unexpected UTF-8 BOM"。
@@ -60,15 +59,15 @@ if ($env:OS -notmatch "Windows") {
 # GPT 第九轮 P0：target 已按 worktree 哈希隔离(dev.ps1 构建时用 Get-WorktreeTargetDir
 # 派生同一路径)。本 wrapper 用同一函数、同一 $scriptRoot(=worktree 根)算出相同 target,
 # 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 windows_durable_io.exe。
-$manifest     = "$probeDir\Cargo.toml"
-$devWrapper   = "$scriptRoot\scripts\dev.ps1"
-$tmpDir       = "$probeDir\probe_tmp"
-$childOut     = "$probeDir\_child_stdout.log"
-$childErr     = "$probeDir\_child_stderr.log"
-$dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
-. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+$manifest     = Join-Path $probeDir "Cargo.toml"
+$devWrapper   = Join-Path $scriptRoot "scripts/dev.ps1"
+$tmpDir       = Join-Path $probeDir "probe_tmp"
+$childOut     = Join-Path $probeDir "_child_stdout.log"
+$childErr     = Join-Path $probeDir "_child_stderr.log"
+$dataRoot     = Join-Path (Join-Path "D:\codex项目" "AI-Coding-Factory-Data") "dev"
+. (Join-Path $scriptRoot "scripts/_worktree-target.ps1")
 $targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
-$writerExe    = "$targetDir\debug\windows_durable_io.exe"
+$writerExe    = Join-Path (Join-Path $targetDir "debug") "windows_durable_io.exe"
 
 # ── 1. 经 dev.ps1 + cargo 预构建 Rust writer(双 -- 调用协议)──────────────────────
 # 第一个 -- 被 PowerShell & 当作"停止解析参数"标记吞掉,第二个 -- 才原样进入

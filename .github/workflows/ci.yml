@@ -154,6 +154,9 @@ jobs:
     #     才允许 BLOCKED_UNCERTIFIED；否则整体红。
     name: windows-probes
     runs-on: windows-latest
+    # 合同测试的隔离目录只能在批准 D 根内；测试代码会在 mkdir 前校验绝对路径、.. 与 reparse/junction。
+    env:
+      FACTORY_TEST_DATA_ROOT: D:\codex项目\AI-Coding-Factory-Data\dev
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
