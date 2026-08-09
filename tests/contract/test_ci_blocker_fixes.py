@@ -14,6 +14,13 @@ GPT Phase 0 PR #2 CI blocker 修复的回归测试（锁定行为不回退）。
   缺 validator 必需的证据结构（assertions/passed=false/observable_facts/subcheckId），
   被 validator 判 INVALID 而非合法 core BLOCKED。
 
+R6 平台分层：GitHub hosted Windows 的 dockerd 只能运行 Windows 容器，不能伪装成
+Windows 11 + WSL2 + Docker Desktop Linux backend 的 runner_identity 认证。故 hosted
+job 只跑它可真实认证的 Windows-native spike；runner_identity 只能由受信 self-hosted
+专用标签在本仓 ``codex/*`` 分支的 push 上执行，PR（包括同仓 PR）一律不调度。其在 pull
+前验证候选 SHA、WSL2 与 Linux Docker backend，receipt 还必须绑定实际
+runner_identity.exe SHA-256，不能只绑定源码候选 SHA。
+
 GPT round-16 二审强化（本文件）：
   - P1-1：wrapper non-Windows 分支必须在任何 D 盘引用之前可达——用去注释可执行代码做
     位置断言（跨平台）+ 真实 non-Windows/pwsh 的隔离仓库回执路径验证。
@@ -62,6 +69,10 @@ DURABLE_IO_WRAPPER_RECEIPT = (
     REPO_ROOT / "tools" / "compat-probes" / "windows_durable_io" / "receipt.json"
 )
 ACCEPTANCE_PS1 = REPO_ROOT / "scripts" / "phase0-acceptance.ps1"
+STAMP_RUN_BINDING_PY = REPO_ROOT / "scripts" / "spikes" / "stamp_run_binding.py"
+PLATFORM_HELPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "_runner-identity-platform.ps1"
+RUNNER_CERTIFIED_JOB = "runner-identity-certified"
+RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,8 +209,8 @@ def _parse_steps(job_lines: list[str]) -> list[dict[str, Any]]:
     return steps
 
 
-def _load_jobs(text: str) -> dict[str, list[dict[str, Any]]]:
-    """解析整个 workflow，返回 {job_name: [step, ...]}。自带 sanity 断言。"""
+def _load_job_blocks(text: str) -> dict[str, list[str]]:
+    """按 YAML 缩进取出每个 job 的原始结构块；注释行不参与后续语义解析。"""
     lines = text.split("\n")
     n = len(lines)
     i = 0
@@ -223,11 +234,34 @@ def _load_jobs(text: str) -> dict[str, list[dict[str, Any]]]:
         i += 1
     if cur_name is not None:
         jobs[cur_name] = lines[start:i]
+    return jobs
+
+
+def _load_jobs(text: str) -> dict[str, list[dict[str, Any]]]:
+    """解析整个 workflow，返回 {job_name: [step, ...]}。自带 sanity 断言。"""
+    jobs = _load_job_blocks(text)
     parsed = {name: _parse_steps(body) for name, body in jobs.items()}
     for required_job in ("desktop", "windows-probes", "contracts"):
         assert required_job in parsed, f"解析器未提取到 job '{required_job}'（解析器可能失效）"
         assert len(parsed[required_job]) >= 2, f"job '{required_job}' 解析出的 step 过少（解析器可能失效）"
     return parsed
+
+
+def _job_metadata(name: str, workflow_text: str | None = None) -> dict[str, Any]:
+    """读取 job 顶层结构字段与 permissions 子映射，避免把注释文本当成调度策略。"""
+    text = CI_YML.read_text(encoding="utf-8") if workflow_text is None else workflow_text
+    blocks = _load_job_blocks(text)
+    assert name in blocks, f"ci.yml 缺少 job '{name}'"
+    block = "\n".join(blocks[name])
+    def field(pattern: str) -> str:
+        match = re.search(pattern, block, re.M)
+        assert match is not None, f"认证 job 缺少结构字段：{pattern!r}"
+        return _scalar(match.group(1))
+    return {
+        "runs-on": field(r"^    runs-on:\s*(.+?)\s*$"),
+        "if": field(r"^    if:\s*(.+?)\s*$"),
+        "permissions": {"contents": field(r"^      contents:\s*(.+?)\s*$")},
+    }
 
 
 def _find_step(
@@ -334,12 +368,40 @@ def _windows_probes_steps() -> list[dict[str, Any]]:
     return _load_jobs(CI_YML.read_text(encoding="utf-8"))["windows-probes"]
 
 
+def _runner_identity_certified_steps() -> list[dict[str, Any]]:
+    """受信 self-hosted job 是 runner_identity 唯一可认证入口，缺失即 fail-closed。"""
+    jobs = _load_jobs(CI_YML.read_text(encoding="utf-8"))
+    assert RUNNER_CERTIFIED_JOB in jobs, (
+        "ci.yml 必须提供 runner-identity-certified；hosted Windows Docker 不能认证 WSL2 Linux 容器语义"
+    )
+    return jobs[RUNNER_CERTIFIED_JOB]
+
+
+def _required_named_step(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
+    step = _find_step(steps, lambda s: str(s.get("name", "")).strip() == name)
+    assert step is not None, f"缺少 CI 结构步骤 {name!r}"
+    return step
+
+
+def _parse_inline_labels(raw: str) -> tuple[str, ...]:
+    """解析 workflow 的 runs-on 内联列表；调度标签属于 YAML 结构字段而非注释文本。"""
+    assert raw.startswith("[") and raw.endswith("]"), f"runs-on 必须是标签列表，实际={raw!r}"
+    return tuple(part.strip() for part in raw[1:-1].split(",") if part.strip())
+
+
+def _normalize_expression(expr: str) -> str:
+    """仅折叠 job-level if 的空白；逻辑 token 保持逐字比较，避免把 fork guard 放宽。"""
+    return re.sub(r"\s+", "", expr)
+
+
 # 预热步骤必须**实际执行**的完整命令（按 token 序列匹配，非注释子串）。
 PREHEAT_REQUIRED_CMD = (
     "scripts/dev.ps1 -- -- rustup toolchain install "
     "stable-x86_64-pc-windows-gnu --profile minimal"
 )
-RUNNER_IDENTITY_IMAGE_STEP_NAME = "准备 runner-identity Python 容器镜像（fail-closed，spike loop 之前）"
+RUNNER_IDENTITY_PREFLIGHT_STEP_NAME = "认证前置：候选 SHA、WSL2 与 Docker Desktop Linux backend（fail-closed）"
+RUNNER_IDENTITY_IMAGE_STEP_NAME = "准备 self-hosted runner-identity Linux 容器镜像（fail-closed，认证前）"
+RUNNER_IDENTITY_EXECUTE_STEP_NAME = "执行并验证 runner_identity 真认证（Windows+WSL2+Linux Docker）"
 
 
 def _is_spike_loop_step(step: dict[str, Any]) -> bool:
@@ -368,46 +430,134 @@ def _preheat_step() -> dict[str, Any]:
 
 
 def _runner_identity_image_step() -> dict[str, Any]:
-    """按 YAML 的显式步骤名定位 runner_identity 镜像准备，避免把注释或未使用字符串当成 CI 行为。"""
-    step = _find_step(
-        _windows_probes_steps(),
-        lambda s: str(s.get("name", "")).strip() == RUNNER_IDENTITY_IMAGE_STEP_NAME,
-    )
-    assert step is not None, (
-        f"windows-probes 缺少显式镜像准备步骤 {RUNNER_IDENTITY_IMAGE_STEP_NAME!r}"
-    )
-    return step
+    """按 YAML 显式步骤名定位 self-hosted Linux 镜像准备，不接受 hosted 替代。"""
+    return _required_named_step(_runner_identity_certified_steps(), RUNNER_IDENTITY_IMAGE_STEP_NAME)
 
 
 def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
-    """windows-probes 必须在 spike loop **之前**有预热步骤，其**去注释可执行代码**完整包含
-    reviewer 指定命令，且 shell 为 pwsh。（结构 + 顺序断言；命令真实性见 AST 测试。）"""
+    """hosted/self-hosted 必须严格分层：hosted 只认证 Windows-native spike，Linux 容器
+    runner_identity 只能由受信专用 self-hosted runner 认证，且每个前置检查排在 pull 前。"""
     steps = _windows_probes_steps()
     preheat = _preheat_step()
-    image_prep = _runner_identity_image_step()
     spike = _find_step(steps, _is_spike_loop_step)
     assert spike is not None, "windows-probes 缺少 spike 执行步骤（解析器或 CI 结构异常）"
     assert preheat["_order"] < spike["_order"], (
         f"预热步骤（order={preheat['_order']}）必须在 spike loop（order={spike['_order']}）之前"
     )
-    assert preheat["_order"] < image_prep["_order"] < spike["_order"], (
-        "D-root GNU 工具链预热、runner_identity 镜像准备、真实 spike loop 必须严格按此顺序执行；"
-        f"实际 order=({preheat['_order']}, {image_prep['_order']}, {spike['_order']})"
-    )
     assert str(preheat.get("shell", "")).strip() == "pwsh", (
         f"预热步骤 shell 必须为 pwsh；实际 ={preheat.get('shell')!r}"
-    )
-    assert str(image_prep.get("shell", "")).strip() == "pwsh", (
-        f"镜像准备步骤 shell 必须为 pwsh；实际 ={image_prep.get('shell')!r}"
     )
     code_norm = _normalize_ws(_strip_ps_comments(str(preheat["run"])))
     assert PREHEAT_REQUIRED_CMD in code_norm, (
         f"预热**可执行代码**必须完整包含 '{PREHEAT_REQUIRED_CMD}'；实际归一化后 ={code_norm!r}"
     )
 
+    # hosted Windows 只能运行 Windows dockerd，出现 Linux 镜像 pull 或 runner_identity
+    # 都意味着把平台不匹配伪装成认证；这两个动作必须完全从 hosted loop 移除。
+    hosted_code = _strip_ps_comments(str(spike.get("run", "")))
+    assert "runner_identity" not in hosted_code, "windows-probes 不得执行 runner_identity"
+    assert "python:3.12-slim" not in hosted_code, "windows-probes 不得准备 Linux runner_identity 镜像"
+    assert all("python:3.12-slim" not in _strip_ps_comments(str(s.get("run", ""))) for s in steps), (
+        "hosted Windows 的任何 step 均不得 docker pull/inspect Linux runner_identity 镜像"
+    )
+
+    meta = _job_metadata(RUNNER_CERTIFIED_JOB)
+    assert _parse_inline_labels(str(meta.get("runs-on", ""))) == RUNNER_CERTIFIED_LABELS, (
+        "runner_identity 必须只投递到受信 Windows+WSL2 Linux-container 专用标签"
+    )
+    assert meta["permissions"].get("contents") == "read", "认证 job 必须最小权限 contents: read"
+    certified_block = "\n".join(_load_job_blocks(CI_YML.read_text(encoding="utf-8"))[RUNNER_CERTIFIED_JOB])
+    assert re.search(r"^    timeout-minutes:\s*[1-9]\d*\s*$", certified_block, re.M), (
+        "self-hosted 认证 job 必须设置正的 timeout-minutes，失控 Docker/WSL 命令不能无限占用专用 runner"
+    )
+    expected_if = (
+        "github.event_name == 'push' && "
+        "github.repository == 'geqian236/AI-Coding-Factory' && "
+        "startsWith(github.ref, 'refs/heads/codex/')"
+    )
+    assert _normalize_expression(str(meta.get("if", ""))) == _normalize_expression(expected_if), (
+        "认证 job 只能接受受信本仓 codex/* push；任何 PR（含同仓）与 fork PR 均不得调度 self-hosted runner"
+    )
+
+    # 这三项分别是公共仓库 self-hosted 认证的信任边界。直接对结构化 job 字段施加
+    # mutation，证明删除任一条件都会被当前测试拒绝，而不是只在注释里写了安全承诺。
+    workflow = CI_YML.read_text(encoding="utf-8")
+    policy = str(meta.get("if", ""))
+    for removed, replacement in (
+        ("github.event_name == 'push'", "github.event_name == 'pull_request'"),
+        ("github.repository == 'geqian236/AI-Coding-Factory'", "github.repository == 'attacker/fork'"),
+        ("startsWith(github.ref, 'refs/heads/codex/')", "startsWith(github.ref, 'refs/heads/main')"),
+    ):
+        mutated = workflow.replace(policy, policy.replace(removed, replacement), 1)
+        assert mutated != workflow, f"未能对认证 job trust guard 施加 mutation：{removed!r}"
+        altered = _job_metadata(RUNNER_CERTIFIED_JOB, mutated)
+        assert _normalize_expression(str(altered.get("if", ""))) != _normalize_expression(expected_if), (
+            f"删除/替换 trust guard {removed!r} 后仍与受信策略等价，测试无法防止 self-hosted 误调度"
+        )
+
+    certified = _runner_identity_certified_steps()
+    d_root_guard = _required_named_step(certified, "认证机 D 根路径前置（fail-closed）")
+    checkout = _find_step(certified, lambda s: "actions/checkout" in str(s.get("uses", "")))
+    expected_checkout = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+    assert checkout is not None and checkout.get("uses") == expected_checkout, (
+        "自托管认证 job 必须以经核验的不可变 actions/checkout commit 运行，不能使用可变 tag"
+    )
+    assert checkout.get("with", {}).get("persist-credentials") == "false", (
+        "self-hosted checkout 必须关闭 persist-credentials，避免把可写 token 暴露给认证机"
+    )
+    credential_mutant = workflow.replace("persist-credentials: false", "persist-credentials: true", 1)
+    altered_checkout = _find_step(
+        _load_jobs(credential_mutant)[RUNNER_CERTIFIED_JOB],
+        lambda step: "actions/checkout" in str(step.get("uses", "")),
+    )
+    assert altered_checkout is not None
+    assert altered_checkout.get("with", {}).get("persist-credentials") != "false", (
+        "将 checkout 的凭据持久化改为 true 后，结构化 CI 合同必须翻转为拒绝"
+    )
+    preflight = _required_named_step(certified, RUNNER_IDENTITY_PREFLIGHT_STEP_NAME)
+    toolchain_check = _required_named_step(certified, "验证受控 Python 3.12 与本机工具链入口（fail-closed）")
+    image_prep = _runner_identity_image_step()
+    execute = _required_named_step(certified, RUNNER_IDENTITY_EXECUTE_STEP_NAME)
+    assert d_root_guard["_order"] == 0 and d_root_guard["_order"] < checkout["_order"] < preflight["_order"], (
+        "D 根路径断言必须是认证 job 首个 step，并在 checkout/任何下载前 fail-closed"
+    )
+    d_root_code = _strip_ps_comments(str(d_root_guard.get("run", "")))
+    d_root_requirements = (
+        "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE", "CURRENT_WORKING_DIRECTORY",
+        "Get-CimInstance", "Get-PSDrive -Name D", "ReparsePoint", "StartsWith($approvedRoot", "exit 1",
+    )
+    for required in d_root_requirements:
+        assert required in d_root_code, f"认证机 D 根首步缺少可执行断言：{required!r}"
+    junction_mutant = d_root_code.replace("ReparsePoint", "NoJunctionFlag", 1)
+    assert all(required in d_root_code for required in d_root_requirements)
+    assert not all(required in junction_mutant for required in d_root_requirements), (
+        "移除真实 ReparsePoint 审计后，D 根路径合同必须失效，不能只保留 lexical StartsWith"
+    )
+    toolchain_code = _strip_ps_comments(str(toolchain_check.get("run", "")))
+    for required in ("sys.version_info[:2] == (3, 12)", '"rustup"', '"cargo"', "Get-Command", "exit 1"):
+        assert required in toolchain_code, f"认证机受控工具链检查缺少 fail-closed 规则：{required!r}"
+    assert preflight["_order"] < toolchain_check["_order"] < image_prep["_order"] < execute["_order"], (
+        "候选/WSL2/Linux-backend 前置检查、镜像准备、真实 wrapper+receipt 验证必须严格按此顺序执行"
+    )
+    assert all(str(step.get("shell", "")).strip() == "pwsh" for step in (preflight, image_prep, execute)), (
+        "runner_identity 认证步骤必须在 pwsh 下执行，与生产 wrapper 宿主保持一致"
+    )
+    execute_code = _strip_ps_comments(str(execute.get("run", "")))
+    for required in (
+        "test-runner-identity.ps1", "Get-FileHash -Algorithm SHA256", "runner_identity.exe",
+        "stamp_run_binding.py", "--probe-digest $probeDigest", "Test-SpikeReceiptEvidence",
+        "-ExpectCandidateSha $env:SPIKE_CANDIDATE_SHA", "-ExpectProbeDigest $probeDigest",
+        '$v.status -ne "PASS"',
+    ):
+        assert required in execute_code, f"认证执行步骤缺少真实 receipt/probe 绑定动作：{required!r}"
+    preflight_code = _strip_ps_comments(str(preflight.get("run", "")))
+    assert "_runner-identity-platform.ps1" in preflight_code and "Test-RunnerIdentityPlatform" in preflight_code, (
+        "CI 前置必须 dot-source 共享平台事实 helper，不能与 wrapper 复制 Docker/WSL 判定"
+    )
+
 
 def test_windows_probes_preheat_is_fail_closed() -> None:
-    """windows-probes 无 continue-on-error；预热**可执行代码**显式检查 $LASTEXITCODE 且非零退出。"""
+    """hosted 与 self-hosted job 均不得吞错；hosted 不将 runner_identity BLOCKED 降级为 PASS。"""
     steps = _windows_probes_steps()
     offenders = [
         s for s in steps
@@ -425,6 +575,15 @@ def test_windows_probes_preheat_is_fail_closed() -> None:
     assert re.search(r"(?m)^\s*exit\s+1\s*$", code) or "exit 1" in _normalize_ws(code), (
         f"预热可执行代码必须在安装失败时 exit 1（fail-closed）；实际去注释代码 ={code!r}"
     )
+    certified = _runner_identity_certified_steps()
+    certified_offenders = [
+        s for s in certified if str(s.get("continue-on-error", "")).strip().lower() == "true"
+    ]
+    assert not certified_offenders, "self-hosted runner_identity 认证不得 continue-on-error"
+    hosted_spike = _find_step(steps, _is_spike_loop_step)
+    assert hosted_spike is not None
+    hosted_code = _strip_ps_comments(str(hosted_spike.get("run", "")))
+    assert '"runner_identity"' not in hosted_code, "hosted job 不得把 core runner_identity 加入任何 allowlist/循环"
 
 
 def test_dev_ps1_does_not_implicitly_install_toolchain() -> None:
@@ -955,6 +1114,74 @@ def _analyze_runner_identity_image_run(run_text: str) -> dict[str, Any]:
     return _run_ps_analyzer(_CI_RUNNER_IMAGE_AST_ANALYZER, run_text)
 
 
+def _run_runner_platform_helper_mock(
+    helper_path: Path, *, ostype: str = "linux", operating_system: str = "Docker Desktop",
+    context: str = "desktop-linux", endpoint: str = "npipe:////./pipe/dockerDesktopLinuxEngine",
+    image_os: str = "linux", wsl_has_nul: bool = False,
+    candidate_sha: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+) -> dict[str, Any]:
+    """在不接触真实 Docker 的 Windows PowerShell 子进程中执行生产 helper。
+
+    Docker/git/WSL 均由同进程函数替身提供可控事实；这验证 helper 的真实 PS5 运行语义，
+    包括 WSL UTF-16 NUL 清理与 remote context named-pipe 拒绝，而非只断言源码片段。
+    """
+    ps = r"""
+$ErrorActionPreference = 'Stop'
+function git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    $global:LASTEXITCODE = 0
+    $env:FACTORY_MOCK_GIT_SHA
+}
+function docker {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    $joined = $CmdArgs -join ' '
+    if ($joined -like 'version *') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_VERSION; return }
+    if ($joined -like 'info *OSType*') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_OSTYPE; return }
+    if ($joined -like 'info *OperatingSystem*') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_OPERATING; return }
+    if ($joined -eq 'context show') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_CONTEXT; return }
+    if ($joined -like 'context inspect *') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_ENDPOINT; return }
+    if ($joined -like 'image inspect *') { $global:LASTEXITCODE = 0; $env:FACTORY_MOCK_IMAGE_OS; return }
+    $global:LASTEXITCODE = 1
+}
+function wsl.exe {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
+    $global:LASTEXITCODE = 0
+    if ($env:FACTORY_MOCK_WSL_NUL -eq '1') { "  docker-desktop`0 Running`0 2`0" }
+    else { '  docker-desktop Running 2' }
+}
+. $env:FACTORY_PLATFORM_HELPER
+$result = Test-RunnerIdentityPlatform `
+    -ExpectedCandidateSha 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -RequireImage $true
+[pscustomobject]@{
+    ok = [bool]$result.ok
+    failed = @($result.assertions | Where-Object { -not $_.passed } | ForEach-Object { $_.name })
+} | ConvertTo-Json -Compress
+"""
+    env = dict(os.environ)
+    env.update({
+        "FACTORY_PLATFORM_HELPER": str(helper_path),
+        "FACTORY_MOCK_VERSION": "27.5.1",
+        "FACTORY_MOCK_OSTYPE": ostype,
+        "FACTORY_MOCK_OPERATING": operating_system,
+        "FACTORY_MOCK_CONTEXT": context,
+        "FACTORY_MOCK_ENDPOINT": endpoint,
+        "FACTORY_MOCK_IMAGE_OS": image_os,
+        "FACTORY_MOCK_WSL_NUL": "1" if wsl_has_nul else "0",
+        "FACTORY_MOCK_GIT_SHA": candidate_sha,
+        "TEMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
+        "TMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
+    })
+    result = subprocess.run(
+        [_ps_host(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", _encoded_command(ps)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(REPO_ROOT),
+        timeout=60, env=env,
+    )
+    assert result.returncode == 0, (
+        f"共享 runner 平台 helper mock 执行失败 rc={result.returncode} stderr={result.stderr!r}"
+    )
+    return json.loads(result.stdout)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 四、durable-IO 两条 BLOCKED 回执证据结构 + validator 判定（直接调用生产实现）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1003,16 +1230,23 @@ def test_durable_io_blocked_receipt_has_valid_evidence(kind: str, expected_subch
     assert isinstance(facts, dict) and len(facts) >= 1, "observable_facts 必须非空"
 
 
-def _pwsh_validate_receipt(receipt: dict[str, Any], env_compat: bool) -> dict[str, Any]:
-    """把 receipt 写唯一临时文件，经生产 validator Test-SpikeReceiptEvidence 判定。"""
+def _pwsh_validate_receipt(
+    receipt: dict[str, Any], env_compat: bool, *, name: str = "windows_durable_io",
+    run_id: str = "", run_nonce: str = "", candidate_sha: str = "", probe_digest: str = "",
+) -> dict[str, Any]:
+    """把 receipt 写唯一临时文件，经生产 validator 判定；可传运行/候选/probe 三重绑定。"""
     tmp_dir = _unique_tmp_dir("validate")
     tmp = tmp_dir / f"receipt_{uuid.uuid4().hex[:8]}.json"
     try:
         tmp.write_text(json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
         env_flag = "$true" if env_compat else "$false"
+        bindings = (
+            f"-ExpectRunId '{run_id}' -ExpectRunNonce '{run_nonce}' "
+            f"-ExpectCandidateSha '{candidate_sha}' -ExpectProbeDigest '{probe_digest}'"
+        )
         ps = f"""
 . '{VALIDATOR_PS1}'
-$v = Test-SpikeReceiptEvidence -Name 'windows_durable_io' -Path '{tmp}' -EnvCompat {env_flag} -Allowlist @()
+$v = Test-SpikeReceiptEvidence -Name '{name}' -Path '{tmp}' -EnvCompat {env_flag} -Allowlist @() {bindings}
 Write-Output "ok=$($v.ok)|status=$($v.status)|detail=$($v.detail)"
 """
         result = subprocess.run(
@@ -1443,6 +1677,158 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     assert image_a["sequenceExact"] is True
     assert image_a["imagePreparationValid"] is True
 
+    # 认证机必须在任何 Linux image 拉取前调用共享 helper；helper 的真实 CommandAst
+    # 覆盖候选 SHA、Linux OSType、Docker Desktop backend/context 与 WSL2 v2，注释或
+    # 未使用字符串不能充数。
+    ci_preflight_run = str(
+        _required_named_step(_runner_identity_certified_steps(), RUNNER_IDENTITY_PREFLIGHT_STEP_NAME).get("run", "")
+    )
+    ci_preflight_code = _strip_ps_comments(ci_preflight_run)
+    assert "_runner-identity-platform.ps1" in ci_preflight_code
+    expected_preflight_call = (
+        "Test-RunnerIdentityPlatform -ExpectedCandidateSha $env:EXPECTED_CANDIDATE_SHA -RequireImage $false"
+    )
+    assert expected_preflight_call in ci_preflight_code
+    assert re.search(r"if\s*\(\s*-not\s+\$platform\.ok\s*\).*?exit\s+1", ci_preflight_code, re.S), (
+        "共享平台 helper 返回失败时，CI preflight 必须在 pull 前 exit 1"
+    )
+    helper_run = PLATFORM_HELPER_PS1.read_text(encoding="utf-8-sig")
+    helper_code = _strip_ps_comments(helper_run)
+    for required in (
+        "git rev-parse HEAD 2>$null",
+        'docker info --format "{{.OSType}}" 2>$null',
+        'docker context inspect --format "{{.Endpoints.docker.Host}}" $facts.docker_context 2>$null',
+        "wsl.exe --list --verbose 2>$null",
+        '$facts.docker_ostype -ceq "linux"',
+        '$facts.docker_operating_system -match "Docker Desktop"',
+        '$facts.docker_context -in @("desktop-linux", "docker-desktop")',
+        'docker_desktop_local_endpoint',
+        'docker-desktop\\s+\\S+\\s+2',
+        '$facts.image_os -ceq "linux"',
+        'candidate_sha_exact',
+    ):
+        assert required in helper_code, f"共享 helper 缺少平台事实/断言：{required!r}"
+
+    # 真实执行生产 helper：WSL 的 UTF-16/NUL 输出仍须识别 docker-desktop v2；Windows
+    # containers、同名但远端 TCP context、候选 SHA 漂移均必须 fail-closed。最后一项用
+    # 删除 NUL 清理的临时 mutant 复现 PS5 漏判，确保该兼容代码不是无牙注释。
+    helper_tmp = _unique_tmp_dir("runner-platform-helper")
+    try:
+        happy = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, wsl_has_nul=True)
+        assert happy["ok"] is True, f"NUL 清理后的本机 Docker Desktop 事实应通过：{happy}"
+        windows_engine = _run_runner_platform_helper_mock(
+            PLATFORM_HELPER_PS1, ostype="windows", image_os="windows",
+        )
+        assert windows_engine["ok"] is False and "docker_linux_backend" in windows_engine["failed"]
+        remote_context = _run_runner_platform_helper_mock(
+            PLATFORM_HELPER_PS1, endpoint="tcp://remote.example:2376",
+        )
+        assert remote_context["ok"] is False and "docker_desktop_local_endpoint" in remote_context["failed"]
+        wrong_candidate = _run_runner_platform_helper_mock(
+            PLATFORM_HELPER_PS1, candidate_sha="b" * 40,
+        )
+        assert wrong_candidate["ok"] is False and "candidate_sha_exact" in wrong_candidate["failed"]
+
+        nul_mutant = helper_run.replace(' -replace "`0", ""', "", 1)
+        assert nul_mutant != helper_run, "未能定位生产 helper 的 WSL NUL 清理以施加 mutation"
+        mutant_path = helper_tmp / "runner-identity-platform-no-nul.ps1"
+        mutant_path.write_text(nul_mutant, encoding="utf-8-sig")
+        nul_regression = _run_runner_platform_helper_mock(mutant_path, wsl_has_nul=True)
+        assert nul_regression["ok"] is False and "docker_desktop_wsl2" in nul_regression["failed"], (
+            "移除 NUL 清理后必须复现 PS5 WSL2 假阴性，证明生产兼容修复有回归牙齿"
+        )
+    finally:
+        shutil.rmtree(helper_tmp, ignore_errors=True)
+
+    image_code = _strip_ps_comments(str(_runner_identity_image_step().get("run", "")))
+    expected_image_call = (
+        "Test-RunnerIdentityPlatform -ExpectedCandidateSha $env:EXPECTED_CANDIDATE_SHA -RequireImage $true"
+    )
+    assert expected_image_call in image_code, (
+        "pull 后必须用同一 helper 复核 Linux image OS，不能只检查镜像名称存在"
+    )
+
+    # runner_identity 是非 sqlite receipt，过去仅校验 run/candidate，真实 exe 被替换时
+    # 仍可能放行。上方已结构化断言 workflow 以 Get-FileHash 取 exe；这里用格式合法的
+    # 摘要直接让生产盖章器/validator 对缺失、全零、错值逐一拒绝，避免重复构建 Rust probe。
+    tmp_dir = _unique_tmp_dir("runner-identity-probe-binding")
+    try:
+        probe_digest = "sha256:" + "a" * 64
+        receipt_path = tmp_dir / "runner_identity_receipt.json"
+        receipt_path.write_text(
+            json.dumps(
+                {
+                    "spike": "runner_identity",
+                    "status": "PASS",
+                    "assertions": [{"id": "runner_identity_fixture", "passed": True}],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        run_id = "r6-" + uuid.uuid4().hex
+        run_nonce = uuid.uuid4().hex
+        candidate_sha = "a" * 40
+        stamp_env = os.environ.copy()
+        stamp_env.update(
+            {
+                "SPIKE_RUN_ID": run_id,
+                "SPIKE_RUN_NONCE": run_nonce,
+                "SPIKE_CANDIDATE_SHA": candidate_sha,
+            }
+        )
+        stamped = subprocess.run(
+            [
+                sys.executable,
+                str(STAMP_RUN_BINDING_PY),
+                str(receipt_path),
+                "runner_identity",
+                "--probe-digest",
+                probe_digest,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(REPO_ROOT),
+            env=stamp_env,
+            timeout=60,
+        )
+        assert stamped.returncode == 0, (
+            "生产盖章器必须接受真实 exe digest："
+            f"stdout={stamped.stdout!r} stderr={stamped.stderr!r}"
+        )
+        good = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert good["runBinding"]["probeDigest"] == probe_digest
+        verdict = _pwsh_validate_receipt(
+            good, False, name="runner_identity", run_id=run_id, run_nonce=run_nonce,
+            candidate_sha=candidate_sha, probe_digest=probe_digest,
+        )
+        assert verdict["ok"] is True, f"真实绑定必须通过：{verdict}"
+
+        for label, bad_digest in (
+            ("missing", None),
+            ("zero", "sha256:" + "0" * 64),
+            ("wrong", "sha256:" + "f" * 64),
+        ):
+            mutated = json.loads(json.dumps(good))
+            if bad_digest is None:
+                del mutated["runBinding"]["probeDigest"]
+            else:
+                mutated["runBinding"]["probeDigest"] = bad_digest
+            verdict = _pwsh_validate_receipt(
+                mutated, False, name="runner_identity", run_id=run_id, run_nonce=run_nonce,
+                candidate_sha=candidate_sha, probe_digest=probe_digest,
+            )
+            assert verdict["ok"] is False, (
+                f"probeDigest={label} 必须被生产 validator 拒绝：{verdict}"
+            )
+            assert verdict["status"] == "BINDING_MISMATCH", (
+                f"probeDigest={label} 必须报 BINDING_MISMATCH，而非被静默跳过：{verdict}"
+            )
+    finally:
+        _remove_tree_strict(tmp_dir)
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
 def test_preheat_ast_immune_to_unused_string_mutation() -> None:
@@ -1578,7 +1964,6 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     image_a = _analyze_runner_identity_image_run(image_nested_exit_zero)
     assert image_a["parseErrors"] == 0
     assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
-
 
 _PREHEAT_COMMAND = (
     '& "$PWD/scripts/dev.ps1" -- -- rustup toolchain install '
@@ -1942,7 +2327,8 @@ def test_durable_io_helper_wired_into_script_digests() -> None:
     assert keys == [
         "phase0-acceptance.ps1", "check.ps1", "dev.ps1", "_python-probe.ps1",
         "_worktree-target.ps1", "spikes/_durable-io-receipt.ps1",
-    ], "scriptDigests 必须保持冻结的 6 个生产脚本，不能删减或无界扩大绑定范围"
+        "spikes/_runner-identity-platform.ps1",
+    ], "scriptDigests 必须绑定冻结的 7 个生产脚本；新增共享平台 helper 不得成为未留痕依赖"
     wired = re.search(
         r'"spikes/_durable-io-receipt\.ps1"\s*=\s*Get-FileSha256\s*\(\s*'
         r'Join-Path\s+\$PSScriptRoot\s+"spikes/_durable-io-receipt\.ps1"\s*\)',
@@ -1952,6 +2338,12 @@ def test_durable_io_helper_wired_into_script_digests() -> None:
         "scriptDigests 必须把 'spikes/_durable-io-receipt.ps1' 接到 "
         "Get-FileSha256(Join-Path $PSScriptRoot \"spikes/_durable-io-receipt.ps1\")（去注释代码解析）"
     )
+    platform_wired = re.search(
+        r'"spikes/_runner-identity-platform\.ps1"\s*=\s*Get-FileSha256\s*\(\s*'
+        r'Join-Path\s+\$PSScriptRoot\s+"spikes/_runner-identity-platform\.ps1"\s*\)',
+        block,
+    )
+    assert platform_wired is not None, "共享 runner_identity 平台 helper 必须进入动态 scriptDigests"
 
 
 def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
@@ -1978,6 +2370,17 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
         "UTF-8 BOM 脚本不得残留 pure-ASCII/ASCII-only 与 BOM-less 组合的过期说明"
     )
     code = _strip_ps_comments(source)
+    assert re.search(r"function\s+Test-RunnerIdentityCiContract\b", code), (
+        "C-1 必须有独立的 runner_identity CI split 机械合同，不能只靠 A-1 静态测试"
+    )
+    assert re.search(r"Test-RunnerIdentityCiContract\s+-CiText\s+\$ci", code), (
+        "C-1 必须实际调用 runner_identity CI split 合同，不能定义后不执行"
+    )
+    for required in (
+        'if ($name -eq "runner_identity")', "Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT",
+        "runner_identity.exe", '"--probe-digest", $expectProbeDigest', "ExpectProbeDigest  = $expectProbeDigest",
+    ):
+        assert required in code, f"本地验收 runner_identity 缺少实际 exe probeDigest 绑定：{required!r}"
     assert re.search(r"function\s+Publish-AcceptanceReceipt\b", code), (
         "动态反查与发布必须收敛为 Publish-AcceptanceReceipt，避免先写 final PASS"
     )

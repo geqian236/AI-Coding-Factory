@@ -29,16 +29,6 @@ $manifest     = "$probeDir\Cargo.toml"
 $devWrapper   = "$scriptRoot\scripts\dev.ps1"
 $brokerOut    = "$probeDir\_broker_stdout.log"
 $brokerErr    = "$probeDir\_broker_stderr.log"
-# dev.ps1 将 CARGO_TARGET_DIR 绑定到项目根下 DATA_ROOT 内的 per-worktree target。
-# broker 是自足 exe,运行期不依赖 dev.ps1 环境(仅**构建**需要 ld.lld 链接器),
-# 故构建后直接 Start-Process 该 exe 以取真实 PID 做定点硬杀。
-# GPT 第九轮 P0：target 已按 worktree 哈希隔离(dev.ps1 构建时用 Get-WorktreeTargetDir
-# 派生同一路径)。本 wrapper 用同一函数、同一 $scriptRoot(=worktree 根)算出相同 target,
-# 从本 worktree 自己的产物取 exe,绝不误取另一 checkout 编译的 runner_identity.exe。
-$dataRoot     = "D:\codex项目\AI-Coding-Factory-Data\dev"
-. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
-$targetDir    = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
-$brokerExe    = "$targetDir\debug\runner_identity.exe"
 
 # receipt 统一用无 BOM UTF-8 写:PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM,
 # 令下游 Python json.load 报 "Unexpected UTF-8 BOM"。
@@ -47,55 +37,36 @@ function Write-Receipt($obj) {
     [System.IO.File]::WriteAllText($receiptPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# ── 0. 平台前置检查 ─────────────────────────────────────────────────────────────
-if ($env:OS -notmatch "Windows") {
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     reason="WSL/Windows runner identity semantics require Windows host"
-                     timestamp=(Get-Date -Format "o") }
+# ── 0. 共享平台前置检查 ─────────────────────────────────────────────────────────
+# 平台身份是 runner_identity 语义的一部分，不能只由 CI 预检查；本地验收也必须通过
+# 同一 helper 得到 Windows host、Docker Desktop Linux backend、WSL2 与 Linux image 证据。
+. (Join-Path $scriptRoot "scripts\spikes\_runner-identity-platform.ps1")
+$platform = Test-RunnerIdentityPlatform
+if (-not $platform.ok) {
+    $failedPlatformNames = @($platform.assertions | Where-Object { -not $_.passed } | ForEach-Object { $_.name })
+    $subcheckId = if ($failedPlatformNames -contains "docker_daemon_available") {
+        "spike:runner_identity/docker_daemon"
+    } elseif ($failedPlatformNames -contains "linux_container_image") {
+        "spike:runner_identity/container_image"
+    } else {
+        "spike:runner_identity/platform_identity"
+    }
+    $r = [ordered]@{
+        spike = $spikeName; status = "BLOCKED_UNCERTIFIED"; subcheckId = $subcheckId
+        reason = $platform.detail; observable_facts = $platform.facts
+        assertions = @($platform.assertions); timestamp = (Get-Date -Format "o")
+    }
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
+$dockerVersion = [string]$platform.facts["docker_server_version"]
 
-# ── 1. 检查 docker 可用性(缺失如实 BLOCKED,不伪造)──────────────────────────────
-$dockerVersion = $null
-$verExit = -1  # P1 crash fix: initialize before try so the catch path can reference it safely
-try {
-    # 原生命令管道给 Select-Object -First 1 会因上游被提前中断(StopUpstreamCommandsException)
-    # 把 $LASTEXITCODE 污染成 -1,令 daemon 明明可用却误判不可用(假 BLOCKED)。
-    # 故先落变量、立即取 $LASTEXITCODE,再切片。
-    $verRaw  = docker version --format "{{.Server.Version}}" 2>$null
-    $verExit = $LASTEXITCODE
-    if ($verExit -eq 0) { $dockerVersion = ($verRaw | Select-Object -First 1) }
-} catch { $dockerVersion = $null }
-
-if (-not $dockerVersion) {
-    # Round-7 fix: BLOCKED receipt MUST carry at least one assertion (observable
-    # evidence) and a subcheckId so the allowlist check can admit it. The empty
-    # assertions=@() caused the validator to reject with "assertions empty".
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     subcheckId="spike:runner_identity/docker_daemon"
-                     reason="Docker CLI/daemon 不可用 —— 安装 Docker Desktop(WSL2 后端)并启动 daemon 后方可认证"
-                     observable_facts=@{ docker_available=$false }
-                     assertions=@(@{name="docker_daemon_available"; passed=$false;
-                                    detail="docker version returned exit=$verExit or empty output (daemon not running)"})
-                     timestamp=(Get-Date -Format "o") }
-    Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
-}
-
-# ── 2. 确认 python:3.12-slim 镜像本地可用(本地已缓存;缺失 -> BLOCKED,区分基建问题)──
-Write-Host "检查 python:3.12-slim 本地镜像 ..."
-docker image inspect "python:3.12-slim" 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     subcheckId="spike:runner_identity/container_image"
-                     reason="本地无 python:3.12-slim 镜像 —— 基建问题,非能力缺陷;请先 docker pull python:3.12-slim"
-                     observable_facts=@{ docker_available=$true; image_available=$false }
-                     assertions=@(@{name="docker_image_available"; passed=$false;
-                                    detail="docker image inspect python:3.12-slim returned exit != 0 (image not cached locally)"})
-                     timestamp=(Get-Date -Format "o") }
-    Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
-}
-
-# ── 3. 经 dev.ps1 + cargo 预构建 Rust broker(双 -- 调用协议)────────────────────────
+# ── 1. 经 dev.ps1 + cargo 预构建 Rust broker(双 -- 调用协议)────────────────────────
+# dev.ps1 将 CARGO_TARGET_DIR 绑定到项目根下 DATA_ROOT 内的 per-worktree target；本
+# wrapper 用同一 helper 取当前 worktree 的 exe，绝不复用另一 checkout 的编译产物。
+$dataRoot = "D:\codex项目\AI-Coding-Factory-Data\dev"
+. (Join-Path $scriptRoot "scripts\_worktree-target.ps1")
+$targetDir = Get-WorktreeTargetDir -WorktreeRoot $scriptRoot -DataRoot $dataRoot
+$brokerExe = "$targetDir\debug\runner_identity.exe"
 Push-Location $scriptRoot
 try {
     & $devWrapper -- -- cargo build --manifest-path $manifest --quiet
@@ -104,9 +75,30 @@ try {
     Pop-Location
 }
 if ($buildExit -ne 0 -or -not (Test-Path $brokerExe)) {
-    $r = [ordered]@{ spike=$spikeName; status="BLOCKED_UNCERTIFIED"
-                     reason="Rust broker build failed or exe missing (toolchain/linker unavailable)"
-                     build_exit=$buildExit; broker_exe=$brokerExe; timestamp=(Get-Date -Format "o") }
+    # 平台已经通过而 broker 无法构建时，这是可复核的 toolchain BLOCKED；必须保留平台
+    # facts 与一条明确失败断言，避免 validator 将其误判为证据结构无效的 INVALID。
+    $r = [ordered]@{
+        spike = $spikeName; status = "BLOCKED_UNCERTIFIED"
+        subcheckId = "spike:runner_identity/toolchain_unavailable"
+        reason = "Rust broker build failed or exe missing (toolchain/linker unavailable)"
+        observable_facts = [ordered]@{
+            windows_host = $platform.facts["windows_host"]
+            docker_server_version = $platform.facts["docker_server_version"]
+            docker_ostype = $platform.facts["docker_ostype"]
+            docker_operating_system = $platform.facts["docker_operating_system"]
+            docker_context = $platform.facts["docker_context"]
+            docker_context_endpoint = $platform.facts["docker_context_endpoint"]
+            wsl_docker_desktop_v2 = $platform.facts["wsl_docker_desktop_v2"]
+            image_os = $platform.facts["image_os"]
+            broker_exe = $brokerExe; build_exit = $buildExit
+        }
+        assertions = @($platform.assertions) + @(@{
+            name = "runner_identity_broker_build"
+            passed = $false
+            detail = "cargo build exit=$buildExit broker_exe_exists=$(Test-Path $brokerExe)"
+        })
+        timestamp = (Get-Date -Format "o")
+    }
     Write-Receipt $r; Write-Host ($r | ConvertTo-Json); exit 0
 }
 
@@ -211,7 +203,9 @@ try {
     Invoke-Cleanup
 
     # ── 11. 组装 gating 断言(全部来自真实观测)─────────────────────────────────────
-    $assertions = @()
+    # 先保留共享 helper 的平台身份断言；只有 Windows+Docker Desktop Linux+WSL2+Linux
+    # image 本身已通过，后续 broker 孤儿存活证据才具有本 spike 所声明的语义。
+    $assertions = @($platform.assertions)
     $assertions += @{ name="broker_is_separate_process"
                       passed=($brokerPid -ne $PID) -and ($spawnPid -eq $brokerPid) -and ($brokerPid -ne 0)
                       detail="driver_pid=$PID spawn_pid=$spawnPid broker_self_reported_pid=$brokerPid" }
@@ -263,9 +257,16 @@ try {
             "独立进程 docker inspect:确认容器仍 Running(孤儿存活)+ 因果核对 container_id",
             "docker rm -f 清理容器"
         )
-        observable_facts = @{
-            docker_available     = $true
-            image_available       = $true
+        observable_facts = [ordered]@{
+            windows_host          = $platform.facts["windows_host"]
+            docker_server_version = $platform.facts["docker_server_version"]
+            docker_ostype         = $platform.facts["docker_ostype"]
+            docker_operating_system = $platform.facts["docker_operating_system"]
+            docker_context        = $platform.facts["docker_context"]
+            docker_context_endpoint = $platform.facts["docker_context_endpoint"]
+            wsl_docker_desktop_v2 = $platform.facts["wsl_docker_desktop_v2"]
+            image_available       = $platform.facts["image_available"]
+            image_os              = $platform.facts["image_os"]
             driver_pid           = $PID
             broker_pid           = $brokerPid
             broker_spawn_pid     = $spawnPid

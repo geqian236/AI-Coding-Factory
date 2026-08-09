@@ -130,6 +130,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -- `
     python contracts/codegen/generate.py --check
 ```
 
+### 4.5 `runner_identity` 的 CI 认证边界
+
+- GitHub hosted Windows 只执行可在 Windows dockerd 上真实验证的 Windows-native spike；它**不得**
+  拉取 Linux `python:3.12-slim`，也不得把 `runner_identity` 的 `BLOCKED_UNCERTIFIED` 降级为 PASS。
+- `runner_identity` 只能由 `runner-identity-certified` job 在受信自托管
+  `[self-hosted, Windows, X64, acf-wsl2-linux, ephemeral]` runner 上认证。该 job 仅接受本仓
+  `codex/*` 分支的 push；任何 PR（包括同仓 PR 和 fork PR）都不会调度认证机。缺少该 runner 时
+  check 保持 pending，不能用 Ubuntu、Windows 容器或 allowlist 替代。
+- 认证机须由运维在 D 盘安装并设置 `--work`；首个 CI step 会 fail-closed 验证
+  `RUNNER_TEMP`、`RUNNER_TOOL_CACHE`、`GITHUB_WORKSPACE` 和实际工作目录均在
+  `D:\codex项目\` 下，并拒绝非固定 D 盘或任意祖先 reparse point。Python 3.12、`rustup`、
+  `cargo` 是外部受控预装工具，job 不通过 setup action 或包管理器隐式下载这些基础工具，
+  只会显式预热 D 根 GNU target toolchain；也不会把保留 `RUNNER_*` 变量伪造为 D 盘路径。
+- 认证前后使用共享平台 helper 核验 Windows 主机、精确候选 SHA、Docker Desktop Linux backend、
+  本机 Linux engine named pipe、`docker-desktop` WSL2 v2 与 Linux image OS；最终 receipt 绑定
+  实际执行的 `runner_identity.exe` SHA-256，并由共享 validator 强制要求 core PASS。
+
 ---
 
 ## 5. 分支与提交规则

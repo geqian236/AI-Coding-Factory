@@ -28,7 +28,9 @@
 #       exit in {0,2}; exit==1 (the wrappers' FAIL code) is always rejected.
 #   (d) Run binding: when the caller passes the round's run identity, the receipt
 #       must carry a matching runBinding (six probes, stamped by the runner) OR a
-#       matching run_nonce (sqlite, which owns its nonce end-to-end).
+#       matching run_nonce (sqlite, which owns its nonce end-to-end). When the
+#       caller requires probeDigest, non-sqlite runBinding must match the real
+#       executed probe byte-for-byte as well.
 # ---------------------------------------------------------------------------
 
 Set-StrictMode -Version Latest
@@ -133,6 +135,15 @@ function Test-SpikeReceiptEvidence {
             }
             if ($ExpectCandidateSha -ne "" -and [string]$rb.candidateSha -ne $ExpectCandidateSha) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.candidateSha='$($rb.candidateSha)' != '$ExpectCandidateSha'" }
+            }
+            # Non-sqlite receipts historically bound only run/candidate, so a
+            # replaced executable could still pass. When a caller supplies the
+            # real probe digest, missing, zero, and wrong values must fail closed.
+            if ($ExpectProbeDigest -ne "") {
+                $rbProbe = if ($rb.PSObject.Properties.Name -contains "probeDigest") { [string]$rb.probeDigest } else { "" }
+                if ($rbProbe -ne $ExpectProbeDigest) {
+                    return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.probeDigest='$rbProbe' != expected '$ExpectProbeDigest' (executed probe mismatch/forgery)" }
+                }
             }
             if ([string]$rb.spike -ne $Name) {
                 return @{ ok = $false; status = "BINDING_MISMATCH"; detail = "runBinding.spike='$($rb.spike)' != '$Name'" }

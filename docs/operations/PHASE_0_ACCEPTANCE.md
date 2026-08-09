@@ -109,7 +109,7 @@
 
 | 编号 | 检查 | 判定 |
 |------|------|------|
-| C-1 | `.github/workflows/ci.yml` 无 `echo OK/neutral` 占位 | 每个 job 调真实命令 |
+| C-1 | `.github/workflows/ci.yml` 无 `echo OK/neutral` 占位，且 runner_identity 平台分层不可降级 | hosted Windows 不得执行该 Linux 容器 spike/拉取镜像；唯一认证 job 必须是受信 self-hosted 专用标签、仅本仓 `codex/*` push、精确 SHA/WSL2/Docker Desktop Linux backend/probe digest/共享 validator 均 fail-closed |
 | C-2 | 无重复 workflow | plan-validation.yml 已删 |
 
 ---
@@ -122,7 +122,7 @@
 | windows_durable_io | PASS | 跨进程硬杀 + 独立进程读回 |
 | named_pipe | PASS | 双进程 nonce + 重放拒绝 |
 | git_object_bridge | PASS | 双进程 pack roundtrip + 零污染 |
-| runner_identity | **PASS**（Docker 可用时，broker 硬杀后容器孤儿存活全部断言通过）；Docker daemon 不可用 → BLOCKED_UNCERTIFIED，但**不在 allowlist，topStatus 不 PASS** |
+| runner_identity | **PASS**（仅 Windows 11 + WSL2 + Docker Desktop Linux-container 的受信 self-hosted 认证机；broker 硬杀后容器孤儿存活全部断言通过）；本地 Docker daemon/平台身份/镜像任一不可用 → BLOCKED_UNCERTIFIED，但**不在 allowlist，topStatus 不 PASS** |
 | sqlite_wal_full | **BLOCKED_UNCERTIFIED** | 核心（process-kill 恢复 / group-commit 原子 / events/bytes/age 三阈值 / PRAGMA 读回）全 PASS；必选 disk-full ENOSPC 子项无 admin VHD 无法认证 → 按优先级顶层 = BLOCKED_UNCERTIFIED（allowlist ID `spike:sqlite_wal_full/disk_full_enospc`） |
 | tauri_e2e | **BLOCKED_UNCERTIFIED**（Phase 0 spike ownership 保留） | Phase 0 拥有该 spike；本机无 WebView2/Tauri 运行时 → 正式 BLOCKED（allowlist ID `spike:tauri_e2e/webview_runtime`），非"待 Phase 2"移交 |
 
@@ -199,7 +199,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 - **A-3b** `cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked`
 - **B-1** `pnpm install --frozen-lockfile`
 - **B-2** Python 3.12 锁定校验（`UV_PYTHON=3.12` 固定 uv 环境，`uv run --locked python` 内断言 `sys.version_info[:2]==(3,12)`；receipt 的 `pythonVersion` 亦取自该 uv 环境，与 A-1/GATES 同源）
-- **C-1** ci.yml 无 `echo OK/neutral` 占位（机器判定）
+- **C-1** ci.yml 无 `echo OK/neutral` 占位；机械拒绝 hosted Windows 认证 runner_identity 或拉取 Linux image，机械要求 self-hosted 专用标签、仅本仓 `codex/*` push、共享平台 helper 与 PASS/probe 绑定 validator（机器判定）
 - **C-2** 无重复 workflow（plan-validation.yml 已删）
 - **GATES** `check.ps1` 15 项门禁
 - **spike:** 7 个 spike receipt 状态按 §3 allowlist 判定
@@ -207,12 +207,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0-acceptance.ps
 完成后写出**唯一总回执** `.phase0-acceptance-receipt.json`，绑定：
 `testedCandidateSha`（40 位）、`acceptanceSetVersion`、`cleanTree` + `dirtyFiles`、
 每条 check 的 `id/exitCode/passed/tail`、`spikeStatuses`、`blockedAllowlist`、
-`acceptanceSetDigest`（验收文档单独绑定）、`scriptDigests`（6 个执行脚本：
+`acceptanceSetDigest`（验收文档单独绑定）、`scriptDigests`（7 个执行脚本：
 phase0-acceptance.ps1 / check.ps1 / dev.ps1 / _python-probe.ps1 / _worktree-target.ps1 /
-spikes/_durable-io-receipt.ps1）、`schemaDigests`（全 schema）、环境版本。
+spikes/_durable-io-receipt.ps1 / spikes/_runner-identity-platform.ps1）、`schemaDigests`（全 schema）、环境版本。
 （`spikes/_durable-io-receipt.ps1` 是 PR #2 新增的 durable-IO BLOCKED 回执共享
 真源，被 test-durable-io.ps1 dot-source；作为验收依赖的生产代码，其 SHA256 必须
 进入 scriptDigests，篡改即在证据链留痕。）
+`spikes/_runner-identity-platform.ps1` 同时供本地 wrapper 和认证 CI 前置使用；其 SHA256 也进入
+scriptDigests，防止 Docker/WSL2 平台判定被静默替换。
 
 **顶层 PASS 判定**：所有 check `passed=true`（spike 按 allowlist：核心必 PASS，
 仅 allowlist ID 允许 BLOCKED_UNCERTIFIED）→ `topStatus=PASS` = Phase 0 达成。

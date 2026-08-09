@@ -647,15 +647,30 @@ foreach ($name in ($spikeReceipts.Keys)) {
     # zeroed candidateSha/probeDigest passed. Compute the expected bench.py digest here
     # so the validator can bind sqlite to the real on-disk probe + this candidate.
     $expectProbeDigest = ""
+    $runnerProbeMissing = $false
     if ($name -eq "sqlite_wal_full") {
         $benchPy = Join-Path $REPO_ROOT "tools/compat-probes/sqlite_wal_full/bench.py"
         $expectProbeDigest = Get-FileSha256 $benchPy
+    } elseif ($name -eq "runner_identity") {
+        # runner_identity 的 receipt 必须绑定本 worktree 实际构建/执行的 exe，而不是只
+        # 绑定源码候选 SHA；不存在即显式失败，禁止空 ExpectProbeDigest 静默跳过校验。
+        $runnerTarget = Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT -DataRoot $DATA_ROOT
+        $runnerExe = Join-Path $runnerTarget "debug\runner_identity.exe"
+        if (Test-Path -LiteralPath $runnerExe) {
+            $expectProbeDigest = Get-FileSha256 $runnerExe
+        } else {
+            $runnerProbeMissing = $true
+            $expectProbeDigest = "sha256:missing-runner-identity-exe"
+            Add-CheckResult "probe:runner_identity" "runner_identity executed exe exists before stamp" $false "missing '$runnerExe'"
+        }
     }
-    # Stamp runBinding into the six non-sqlite receipts (item 2d). sqlite binds via
+    # Stamp runBinding into non-sqlite receipts (item 2d). sqlite binds via
     # run_nonce + candidateSha + probeDigest (all written by bench.py); stamping sqlite
     # would round-trip a receipt whose digests emit_manifest recomputes.
-    if ($name -ne "sqlite_wal_full" -and (Test-Path -LiteralPath $receiptPath)) {
-        python $stampScript $receiptPath $name | Write-Host
+    if ($name -ne "sqlite_wal_full" -and (Test-Path -LiteralPath $receiptPath) -and -not $runnerProbeMissing) {
+        $stampArgs = @($receiptPath, $name)
+        if ($name -eq "runner_identity") { $stampArgs += @("--probe-digest", $expectProbeDigest) }
+        python $stampScript @stampArgs | Write-Host
         if ($LASTEXITCODE -ne 0) {
             # Fail-closed: stamp failure means runBinding is absent, so the validator
             # will see BINDING_MISSING and reject. Make the runner consistent with CI
@@ -683,6 +698,7 @@ foreach ($name in ($spikeReceipts.Keys)) {
     $spikeBindings[$name] = [ordered]@{
         status        = $v.status
         ok            = $v.ok
+        probeDigest   = $expectProbeDigest
         receiptDigest = (Get-FileSha256 $receiptPath)
     }
     Add-CheckResult "spike:$name" "spike executed + receipt evidence" $v.ok "status=$($v.status); $($v.detail)"
@@ -794,6 +810,88 @@ Invoke-AcceptanceCheck "B-2" "Python 3.12 pinned (uv-locked env)" {
     }
 } | Out-Null
 
+# 从顶层 jobs 提取一个 YAML 块。C-1 只做冻结 CI 合同的机械审计，不尝试充当完整
+# YAML 解释器；未知结构、缺 job 或缺关键字段一律返回问题并使验收失败。
+function Get-CiJobBlock {
+    param([string]$CiText, [string]$JobName)
+    $escaped = [regex]::Escape($JobName)
+    $match = [regex]::Match($CiText, "(?ms)^  ${escaped}:\s*$.*?(?=^  [A-Za-z0-9_-]+:\s*$|\z)")
+    if (-not $match.Success) { return "" }
+    return $match.Value
+}
+
+function Get-CiExecutableText {
+    param([string]$JobBlock)
+    # 只检查实际 YAML 字段/run 文本；整行注释不得替代可执行认证动作。
+    return (($JobBlock -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n")
+}
+
+function Test-RunnerIdentityCiContract {
+    param([string]$CiText)
+    # runner_identity 是 Windows+WSL2+Docker Desktop Linux backend 的核心 spike。
+    # C-1 必须独立拒绝 hosted 误跑/假绿、认证机丢失或 receipt 验证降级，不能只寄望 A-1。
+    $issues = [System.Collections.Generic.List[string]]::new()
+    $hosted = Get-CiJobBlock -CiText $CiText -JobName "windows-probes"
+    $certified = Get-CiJobBlock -CiText $CiText -JobName "runner-identity-certified"
+    if ([string]::IsNullOrWhiteSpace($hosted)) { $issues.Add("windows-probes job missing") }
+    if ([string]::IsNullOrWhiteSpace($certified)) { $issues.Add("runner-identity-certified job missing") }
+    if ($issues.Count -gt 0) { return @($issues) }
+
+    $hostedCode = Get-CiExecutableText $hosted
+    if ($hostedCode -match 'runner_identity') { $issues.Add("hosted windows-probes executes runner_identity") }
+    if ($hostedCode -match 'python:3\.12-slim') { $issues.Add("hosted windows-probes pulls/inspects Linux image") }
+
+    $certifiedCode = Get-CiExecutableText $certified
+    if ($certified -notmatch '(?m)^    runs-on:\s*\[self-hosted,\s*Windows,\s*X64,\s*acf-wsl2-linux,\s*ephemeral\]\s*$') {
+        $issues.Add("certified job lacks exact dedicated self-hosted labels")
+    }
+    $ifMatch = [regex]::Match($certified, '(?m)^    if:\s*(.+?)\s*$')
+    $expectedIf = "github.event_name == 'push' && github.repository == 'geqian236/AI-Coding-Factory' && startsWith(github.ref, 'refs/heads/codex/')"
+    if (-not $ifMatch.Success -or (($ifMatch.Groups[1].Value -replace '\s', '') -cne ($expectedIf -replace '\s', ''))) {
+        $issues.Add("certified job is not push-only trusted codex branch")
+    }
+    if ($certifiedCode -match 'pull_request') { $issues.Add("certified job permits PR-triggered self-hosted execution") }
+    $firstStep = [regex]::Match($certified, '(?m)^      - name:\s*(.+?)\s*$')
+    if (-not $firstStep.Success -or $firstStep.Groups[1].Value -cne "认证机 D 根路径前置（fail-closed）") {
+        $issues.Add("certified job does not make D-root runner path verification its first step")
+    }
+    if ($certified -notmatch '(?m)^      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\s*$') {
+        $issues.Add("certified checkout is not pinned to the approved immutable SHA")
+    }
+    if ($certified -notmatch '(?m)^          persist-credentials:\s*false\s*$') { $issues.Add("certified checkout persists credentials") }
+    if ($certified -notmatch '(?m)^    permissions:[ \t]*\r?$\r?\n^      contents:[ \t]*read[ \t]*$') { $issues.Add("certified job lacks contents: read") }
+    if ($certified -notmatch '(?m)^      EXPECTED_CANDIDATE_SHA:\s*\$\{\{\s*github\.sha\s*\}\}\s*$' -or
+        $certified -notmatch '(?m)^          ref:\s*\$\{\{\s*github\.sha\s*\}\}\s*$') {
+        $issues.Add("certified job does not bind checkout and expected candidate to github.sha")
+    }
+    if ($certified -notmatch '(?m)^    timeout-minutes:\s*[1-9]\d*\s*$') { $issues.Add("certified job lacks timeout") }
+    foreach ($cacheVar in @("TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME")) {
+        $expectedCache = [regex]::Escape("      ${cacheVar}: D:\codex项目\")
+        if ($certified -notmatch "(?m)^$expectedCache") { $issues.Add("certified $cacheVar is not bound to D root") }
+    }
+    if ($certifiedCode -notmatch 'RUNNER_TEMP' -or $certifiedCode -notmatch 'RUNNER_TOOL_CACHE' -or $certifiedCode -notmatch 'StartsWith\(\$approvedRoot') {
+        $issues.Add("certified runner temp/tool cache lacks runtime D-root assertion")
+    }
+    if ($certifiedCode -notmatch 'GITHUB_WORKSPACE' -or $certifiedCode -notmatch 'CURRENT_WORKING_DIRECTORY' -or
+        $certifiedCode -notmatch 'Get-CimInstance' -or $certifiedCode -notmatch 'Get-PSDrive\s+-Name\s+D' -or
+        $certifiedCode -notmatch 'ReparsePoint' -or
+        $certifiedCode -notmatch 'sys\.version_info\[:2\]\s*==\s*\(3,\s*12\)' -or
+        $certifiedCode -notmatch 'Get-Command\s+-Name\s+\$tool') {
+        $issues.Add("certified first-step D-root or externally managed toolchain verification is incomplete")
+    }
+    if ($certifiedCode -notmatch '_runner-identity-platform\.ps1' -or
+        $certifiedCode -notmatch 'Test-RunnerIdentityPlatform\s+-ExpectedCandidateSha\s+\$env:EXPECTED_CANDIDATE_SHA\s+-RequireImage\s+\$false') {
+        $issues.Add("certified preflight does not use shared platform helper before pull")
+    }
+    if ($certifiedCode -notmatch 'Test-RunnerIdentityPlatform\s+-ExpectedCandidateSha\s+\$env:EXPECTED_CANDIDATE_SHA\s+-RequireImage\s+\$true') {
+        $issues.Add("certified pull path does not recheck Linux image through shared helper")
+    }
+    foreach ($required in @('Get-FileHash -Algorithm SHA256', 'runner_identity.exe', 'python scripts/spikes/stamp_run_binding.py', 'Test-SpikeReceiptEvidence', '-EnvCompat \$false', '-ExpectRunId \$env:SPIKE_RUN_ID', '-ExpectRunNonce \$env:SPIKE_RUN_NONCE', '-ExpectCandidateSha \$env:SPIKE_CANDIDATE_SHA', '-ExpectProbeDigest \$probeDigest', '\$v\.status\s+-ne\s+"PASS"')) {
+        if ($certifiedCode -notmatch $required) { $issues.Add("certified receipt validation missing $required") }
+    }
+    return @($issues)
+}
+
 # --- C-1 CI fail-closed (V6/C-1 strengthened) ------------------------------
 Invoke-AcceptanceCheck "C-1" "ci.yml has no fail-open patterns" {
     $ci = Get-Content ".github/workflows/ci.yml" -Raw -Encoding utf8
@@ -813,6 +911,7 @@ Invoke-AcceptanceCheck "C-1" "ci.yml has no fail-open patterns" {
             $bad += "windows-probes runs no spike"
         }
     }
+    $bad += @(Test-RunnerIdentityCiContract -CiText $ci)
     if ($bad.Count -gt 0) { Write-Host ("fail-open: " + ($bad -join "; ")); $global:LASTEXITCODE = 1 }
     else { $global:LASTEXITCODE = 0 }
 } | Out-Null
@@ -853,6 +952,8 @@ $acceptanceSetDigest = Get-FileSha256 $ACCEPTANCE_SET_DOC
 # real production code the durable-io spike depends on; bind it so a tamper there
 # leaves a digest trace. Key carries the "spikes/" prefix to disambiguate from the
 # top-level helpers (it lives under scripts/spikes/, not scripts/).
+# R6：runner_identity 的本地 wrapper 与 self-hosted CI 共用平台事实 helper；该 helper
+# 若未纳入 scriptDigests，篡改 Docker/WSL2 身份判定不会进入本地总回执，故冻结绑定。
 $scriptDigests = [ordered]@{
     "phase0-acceptance.ps1"          = Get-FileSha256 (Join-Path $PSScriptRoot "phase0-acceptance.ps1")
     "check.ps1"                      = Get-FileSha256 (Join-Path $PSScriptRoot "check.ps1")
@@ -860,6 +961,7 @@ $scriptDigests = [ordered]@{
     "_python-probe.ps1"              = Get-FileSha256 (Join-Path $PSScriptRoot "_python-probe.ps1")
     "_worktree-target.ps1"           = Get-FileSha256 (Join-Path $PSScriptRoot "_worktree-target.ps1")
     "spikes/_durable-io-receipt.ps1" = Get-FileSha256 (Join-Path $PSScriptRoot "spikes/_durable-io-receipt.ps1")
+    "spikes/_runner-identity-platform.ps1" = Get-FileSha256 (Join-Path $PSScriptRoot "spikes/_runner-identity-platform.ps1")
 }
 $schemaDigests = [ordered]@{}
 Get-ChildItem (Join-Path $REPO_ROOT "contracts/schemas") -Filter *.json | Sort-Object Name | ForEach-Object {

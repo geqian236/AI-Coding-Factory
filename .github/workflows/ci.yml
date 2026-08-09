@@ -147,8 +147,12 @@ jobs:
     # 判定按 receipt 的 status + subcheckId，绝不只看退出码（GPT 第五轮 REVISE
     # item 4：核心 wrapper 如 named_pipe/runner_identity 在 BLOCKED 时也 exit 0，
     # 只看退出码会让核心能力受阻仍绿）。规则：
-    #   - 核心 spike（clock/durable-io/named-pipe/git-bridge/runner-identity）：
+    #   - hosted Windows 核心 spike（clock/durable-io/named-pipe/git-bridge）：
     #     receipt.status 必须 == PASS，任何 BLOCKED/FAIL 即整体红。
+    #   - runner_identity 是 Windows 11 + WSL2 + Docker Desktop Linux-container
+    #     的组合认证，GitHub hosted Windows 的 Windows dockerd 不能冒充该能力；它只在
+    #     下方受信 self-hosted `runner-identity-certified` job 认证，hosted 不执行也不
+    #     将 BLOCKED 降级成 PASS。
     #   - env-compat spike（sqlite_wal_full/tauri_e2e）：只有 receipt 的
     #     subcheckId（或 required 阻断 subResult 的 id）在冻结 allowlist 内时
     #     才允许 BLOCKED_UNCERTIFIED；否则整体红。
@@ -195,22 +199,6 @@ jobs:
             Write-Error "[preheat] D-root GNU 工具链安装失败 exit=$LASTEXITCODE，fail-closed"
             exit 1
           }
-      - name: 准备 runner-identity Python 容器镜像（fail-closed，spike loop 之前）
-        # GitHub hosted Windows runner 虽提供 Docker daemon，却不保证预置 runner_identity
-        # 核心 spike 所需的 python:3.12-slim；拉取和本地存在性验证均必须独立 fail-closed，
-        # 防止 wrapper 仅因冷镜像返回 BLOCKED_UNCERTIFIED 而使核心能力检查失败。
-        shell: pwsh
-        run: |
-          docker pull python:3.12-slim
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "[runner_identity] 拉取 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
-            exit 1
-          }
-          docker image inspect python:3.12-slim
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "[runner_identity] 验证本地 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
-            exit 1
-          }
       - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
         shell: pwsh
         run: |
@@ -227,7 +215,6 @@ jobs:
             "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
             "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
             "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
-            "runner_identity"    = "scripts/spikes/test-runner-identity.ps1"
             "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
             "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
           }
@@ -236,7 +223,6 @@ jobs:
             "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
             "named_pipe"         = "tools/compat-probes/named_pipe/receipt.json"
             "git_object_bridge"  = "tools/compat-probes/git_object_bridge/receipt.json"
-            "runner_identity"    = "tools/compat-probes/runner_identity/receipt.json"
             "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
             "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
           }
@@ -320,3 +306,192 @@ jobs:
       - name: 合同测试（Windows runner）
         # GPT round-9 P1: --locked 使 uv run 前也校验锁未漂移（不因 run 阶段刷新锁）。
         run: uv run --locked python -m pytest tests/contract/ -q
+
+  runner-identity-certified:
+    # 这是唯一可以认证 Windows 11 + WSL2 + Docker Desktop Linux-container 语义的入口。
+    # 公共仓库的 PR（即使来自同仓）都可能在 head 中改 workflow/脚本，故认证机只接受本仓
+    # codex/* 分支 push；没有带专用标签的 runner 时 GitHub 保持 pending，绝不以 hosted
+    # Windows、Ubuntu 或 allowlist 代替该认证。
+    name: runner-identity-certified
+    if: github.event_name == 'push' && github.repository == 'geqian236/AI-Coding-Factory' && startsWith(github.ref, 'refs/heads/codex/')
+    runs-on: [self-hosted, Windows, X64, acf-wsl2-linux, ephemeral]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      FACTORY_TEST_DATA_ROOT: D:\codex项目\AI-Coding-Factory-Data\dev
+      TEMP: D:\codex项目\AI-Coding-Factory-Data\dev\tmp
+      TMP: D:\codex项目\AI-Coding-Factory-Data\dev\tmp
+      CARGO_HOME: D:\codex项目\AI-Coding-Factory-Data\dev\cargo-home
+      RUSTUP_HOME: D:\codex项目\AI-Coding-Factory-Data\dev\rustup-home
+      EXPECTED_CANDIDATE_SHA: ${{ github.sha }}
+    steps:
+      - name: 认证机 D 根路径前置（fail-closed）
+        # 这是首个 step：runner 若错误安装在 C 盘，不能先 checkout/下载工具链再事后拒绝。
+        # RUNNER_* 的真实位置只能由外部 runner 安装目录与 --work 配置保证，workflow 不伪造覆盖。
+        shell: pwsh
+        run: |
+          $approvedRoot = "D:\codex项目"
+          # 仅前缀匹配会被 junction/symlink 逃逸；沿已有祖先逐级检查 ReparsePoint，并要求
+          # D: 是固定 FileSystem 卷。不存在的末级路径先回退到最近存在祖先再审计。
+          $dVolume = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
+          $dDrive = Get-PSDrive -Name D -PSProvider FileSystem -ErrorAction SilentlyContinue
+          if ($null -eq $dVolume -or $dVolume.DriveType -ne 3 -or $null -eq $dDrive) {
+            Write-Error "[runner_identity] D: 不是可验证的固定卷，拒绝认证"
+            exit 1
+          }
+          function Assert-ApprovedRunnerPath([string]$Name, [string]$Value) {
+            if ([string]::IsNullOrWhiteSpace($Value)) { throw "$Name is empty" }
+            $full = [System.IO.Path]::GetFullPath($Value).TrimEnd('\')
+            if ($full -cne $approvedRoot -and -not $full.StartsWith($approvedRoot + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "$Name='$Value' is outside $approvedRoot"
+            }
+            $existing = $full
+            while (-not (Test-Path -LiteralPath $existing)) {
+              $parent = Split-Path -LiteralPath $existing -Parent
+              if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $existing) { throw "$Name has no existing ancestor" }
+              $existing = $parent
+            }
+            while ($true) {
+              if (((Get-Item -LiteralPath $existing -Force -ErrorAction Stop).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Name reparse point detected at '$existing'"
+              }
+              if ($existing -ceq $approvedRoot) { break }
+              $existing = Split-Path -LiteralPath $existing -Parent
+              if ([string]::IsNullOrWhiteSpace($existing)) { throw "$Name path escaped approved root" }
+            }
+          }
+          $paths = [ordered]@{
+            RUNNER_TEMP = [string][Environment]::GetEnvironmentVariable("RUNNER_TEMP")
+            RUNNER_TOOL_CACHE = [string][Environment]::GetEnvironmentVariable("RUNNER_TOOL_CACHE")
+            GITHUB_WORKSPACE = [string][Environment]::GetEnvironmentVariable("GITHUB_WORKSPACE")
+            CURRENT_WORKING_DIRECTORY = (Get-Location).Path
+          }
+          foreach ($entry in $paths.GetEnumerator()) {
+            try {
+              Assert-ApprovedRunnerPath -Name $entry.Key -Value $entry.Value
+            } catch {
+              Write-Error "[runner_identity] $($entry.Key)='$($entry.Value)' 不在批准 D 根，拒绝认证"
+              exit 1
+            }
+          }
+      # GitHub API 已将 actions/checkout v4 解析为该不可变 commit；避免标签被重定向。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # 只 checkout event 的精确 SHA；后续前置检查再次从 Git 对比，双层拒绝漂移。
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: 认证前置：候选 SHA、WSL2 与 Docker Desktop Linux backend（fail-closed）
+        # 在 setup action、工具链下载和 docker pull 前先验证认证机自身受控数据根与平台身份；
+        # 只存在 docker CLI、Windows containers、非 Docker Desktop context 或 WSL1 均不能冒充。
+        shell: pwsh
+        run: |
+          . "$PWD/scripts/spikes/_runner-identity-platform.ps1"
+          $platform = Test-RunnerIdentityPlatform -ExpectedCandidateSha $env:EXPECTED_CANDIDATE_SHA -RequireImage $false
+          if (-not $platform.ok) {
+            Write-Error "[runner_identity] 平台前置失败：$($platform.detail)"
+            exit 1
+          }
+      - name: 验证受控 Python 3.12 与本机工具链入口（fail-closed）
+        # 认证机由运维预装并锁定工具，不在 job 内隐式下载；盖章器只依赖 Python 标准库。
+        shell: pwsh
+        run: |
+          & python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 3)"
+          $pythonExit = $LASTEXITCODE
+          if ($pythonExit -ne 0) {
+            Write-Error "[runner_identity] 受控 python 不是 3.12.x 或不可用 exit=$pythonExit"
+            exit 1
+          }
+          foreach ($tool in @("rustup", "cargo")) {
+            $command = Get-Command -Name $tool -CommandType Application -ErrorAction SilentlyContinue
+            if ($null -eq $command) {
+              Write-Error "[runner_identity] 缺少受控工具 '$tool'，拒绝认证"
+              exit 1
+            }
+          }
+      - name: 预热 D-root GNU 工具链（认证前置，fail-closed）
+        shell: pwsh
+        run: |
+          & "$PWD/scripts/dev.ps1" -- -- rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] D-root GNU 工具链安装失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
+      - name: 准备 self-hosted runner-identity Linux 容器镜像（fail-closed，认证前）
+        shell: pwsh
+        run: |
+          docker pull python:3.12-slim
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] 拉取 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
+          docker image inspect python:3.12-slim
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] 验证本地 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
+          . "$PWD/scripts/spikes/_runner-identity-platform.ps1"
+          $platform = Test-RunnerIdentityPlatform -ExpectedCandidateSha $env:EXPECTED_CANDIDATE_SHA -RequireImage $true
+          if (-not $platform.ok) {
+            Write-Error "[runner_identity] pull 后平台/image 身份验证失败：$($platform.detail)"
+            exit 1
+          }
+      - name: 执行并验证 runner_identity 真认证（Windows+WSL2+Linux Docker）
+        shell: pwsh
+        run: |
+          $receiptPath = "tools/compat-probes/runner_identity/receipt.json"
+          # 先 purge 再运行，禁止历史 PASS receipt 被本轮盖章或 validator 复用。
+          if (Test-Path -LiteralPath $receiptPath) {
+            Remove-Item -LiteralPath $receiptPath -Force -ErrorAction Stop
+          }
+          if (Test-Path -LiteralPath $receiptPath) {
+            Write-Error "[runner_identity] 历史 receipt 无法清除，拒绝复用"
+            exit 1
+          }
+          $env:SPIKE_RUN_ID = [guid]::NewGuid().ToString()
+          $env:SPIKE_RUN_NONCE = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+          $env:SPIKE_CANDIDATE_SHA = $env:EXPECTED_CANDIDATE_SHA
+          $runStart = Get-Date
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File "scripts/spikes/test-runner-identity.ps1"
+          $wrapperExit = $LASTEXITCODE
+          if ($null -eq $wrapperExit) { $wrapperExit = 0 }
+          if (-not (Test-Path -LiteralPath $receiptPath)) {
+            Write-Error "[runner_identity] wrapper 未写 receipt，fail-closed"
+            exit 1
+          }
+          $preStampMtime = (Get-Item -LiteralPath $receiptPath).LastWriteTime
+
+          # 用 wrapper 的同一 per-worktree target 推导真实 exe，digest 绑定的是已执行的
+          # probe 二进制而非仓库源码；exe 缺失或摘要计算失败均拒绝继续。
+          $worktreeRoot = (Get-Location).Path
+          $dataRoot = "D:\codex项目\AI-Coding-Factory-Data\dev"
+          . "$PWD/scripts/_worktree-target.ps1"
+          $targetDir = Get-WorktreeTargetDir -WorktreeRoot $worktreeRoot -DataRoot $dataRoot
+          $probePath = Join-Path $targetDir "debug\runner_identity.exe"
+          if (-not (Test-Path -LiteralPath $probePath)) {
+            Write-Error "[runner_identity] 已执行 probe 二进制缺失 '$probePath'，拒绝盖章"
+            exit 1
+          }
+          $probeDigest = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $probePath).Hash.ToLowerInvariant()
+          if ($wrapperExit -ne 0) {
+            Write-Error "[runner_identity] wrapper exit=$wrapperExit，拒绝认证"
+            exit 1
+          }
+          # stamp_run_binding.py 仅依赖标准库；使用已在前置锁定为 3.12 的受控 Python，避免
+          # 认证 job 为盖章器临时创建 venv 或联网安装依赖。
+          python scripts/spikes/stamp_run_binding.py $receiptPath runner_identity --probe-digest $probeDigest
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] receipt 盖章失败，拒绝认证"
+            exit 1
+          }
+          . "$PWD/scripts/spikes/_receipt-validator.ps1"
+          $v = Test-SpikeReceiptEvidence -Name "runner_identity" -Path $receiptPath -EnvCompat $false `
+            -Allowlist @() -RunStart $runStart -ReceiptMtime $preStampMtime -WrapperExitCode $wrapperExit `
+            -ExpectRunId $env:SPIKE_RUN_ID -ExpectRunNonce $env:SPIKE_RUN_NONCE `
+            -ExpectCandidateSha $env:SPIKE_CANDIDATE_SHA -ExpectProbeDigest $probeDigest
+          if (-not $v.ok -or $v.status -ne "PASS") {
+            Write-Error "[runner_identity] receipt/probe 绑定失败 status=$($v.status): $($v.detail)"
+            exit 1
+          }
+          Write-Host "[runner_identity] CERTIFIED PASS: run=$env:SPIKE_RUN_ID probe=$probeDigest"
