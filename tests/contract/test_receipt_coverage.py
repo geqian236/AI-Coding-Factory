@@ -365,13 +365,90 @@ def _run_verify_cli(catalog: Path, receipts: Path) -> subprocess.CompletedProces
     )
 
 
-def test_cli_valid_fixture_exits_zero() -> None:
-    """CLI --receipts valid.json 必须退出码为 0。"""
+def _run_verify_cli_cp1252(catalog: Path, receipts: Path) -> subprocess.CompletedProcess[bytes]:
+    """以 cp1252:strict 启动真实 CLI，并保留原始字节供 UTF-8 严格解码验收。"""
+    agent_src = str(REPO_ROOT / "apps" / "agent" / "src")
+    env_with_path = {
+        **os.environ,
+        "PYTHONPATH": agent_src,
+        "PYTHONIOENCODING": "cp1252:strict",
+        # 显式关闭 UTF-8 mode，避免宿主默认值掩盖 CLI 自身的 stdout/stderr 配置责任。
+        "PYTHONUTF8": "0",
+    }
+    return subprocess.run(
+        [
+            sys.executable, "-m", "factory_agent.testing.verify_receipts",
+            "--catalog", str(catalog),
+            "--receipts", str(receipts),
+        ],
+        capture_output=True,
+        text=False,
+        cwd=str(REPO_ROOT),
+        env=env_with_path,
+        check=False,
+    )
+
+
+def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI 对有效回执在默认和 cp1252:strict 宿主均须输出完整 UTF-8，并在配置失败时 fail-closed。"""
     proc = _run_verify_cli(CATALOG_PATH, VALID_FIXTURE)
     assert proc.returncode == 0, (
         f"CLI 对 valid.json 应退出码 0，实际 {proc.returncode}\n"
         f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
     )
+    assert "所有回执验证通过" in proc.stdout
+
+    hostile_proc = _run_verify_cli_cp1252(CATALOG_PATH, VALID_FIXTURE)
+    hostile_stdout = hostile_proc.stdout.decode("utf-8", errors="strict")
+    hostile_stderr = hostile_proc.stderr.decode("utf-8", errors="strict")
+    assert hostile_proc.returncode == 0, (
+        "cp1252:strict 宿主中的 CLI 仍必须由入口自行改为 UTF-8："
+        f"rc={hostile_proc.returncode}\nstdout={hostile_stdout}\nstderr={hostile_stderr}"
+    )
+    assert "所有回执验证通过" in hostile_stdout, "中文 PASS 报告不得丢失或被转义"
+    assert hostile_stderr == "", "有效回执不应把诊断正文写入 stderr"
+
+    from factory_agent.testing import verify_receipts
+
+    class _FailingReconfigureStream:
+        """模拟宿主拒绝 reconfigure；若 CLI 提前写正文，测试立即失败。"""
+
+        encoding = "cp1252"
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            raise OSError("secret reconfigure detail")
+
+        def write(self, text: str) -> int:
+            self.writes.append(text)
+            raise AssertionError(f"UTF-8 配置失败后不得输出回执正文：{text!r}")
+
+        def flush(self) -> None:
+            return None
+
+    class _AsciiErrorSink:
+        """收集 fail-closed 分类，验证不泄露路径、回执或底层异常。"""
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    failing_stdout = _FailingReconfigureStream()
+    error_sink = _AsciiErrorSink()
+    monkeypatch.setattr(verify_receipts.sys, "stdout", failing_stdout)
+    monkeypatch.setattr(verify_receipts.sys, "stderr", error_sink)
+    assert verify_receipts.main(["--catalog", str(CATALOG_PATH), "--receipts", str(VALID_FIXTURE)]) == 2
+    assert failing_stdout.writes == [], "配置失败前不得写出半份报告"
+    assert error_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+    assert error_sink.text.isascii(), "配置失败分类必须保持 ASCII，适配未知 stderr 编码"
 
 
 def test_cli_missing_fixture_exits_nonzero() -> None:

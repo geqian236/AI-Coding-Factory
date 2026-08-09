@@ -5,7 +5,9 @@ Task 2 合同层测试：验证 schema、策略目录和测试目录的完整性
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -387,7 +389,7 @@ def test_codegen_generated_files_exist() -> None:
 
 
 def test_codegen_no_drift() -> None:
-    """generate.py --check 必须通过（三语言生成树无漂移）
+    """generate.py --check 必须通过，并在 cp1252:strict 与配置失败时保持 UTF-8/fail-closed。
 
     使用 sys.executable 而非裸 "python"：后者经 PATH 解析，
     可能命中与运行 pytest 不同的解释器，导致漂移检测结果不可信。
@@ -406,6 +408,79 @@ def test_codegen_no_drift() -> None:
         f"stdout: {result.stdout}\n"
         f"stderr: {result.stderr}"
     )
+
+    hostile_env = {
+        **os.environ,
+        "PYTHONIOENCODING": "cp1252:strict",
+        # 显式关闭 UTF-8 mode，验证入口不依赖 workflow 或用户环境掩盖问题。
+        "PYTHONUTF8": "0",
+    }
+    hostile = subprocess.run(
+        [sys.executable, str(CODEGEN_DIR / "generate.py"), "--check"],
+        capture_output=True,
+        text=False,
+        cwd=str(REPO_ROOT),
+        env=hostile_env,
+        check=False,
+    )
+    hostile_stdout = hostile.stdout.decode("utf-8", errors="strict")
+    hostile_stderr = hostile.stderr.decode("utf-8", errors="strict")
+    assert hostile.returncode == 0, (
+        "cp1252:strict 宿主中的 generate.py 必须由入口自行建立 UTF-8："
+        f"rc={hostile.returncode}\nstdout={hostile_stdout}\nstderr={hostile_stderr}"
+    )
+    assert "三语言生成树无漂移" in hostile_stdout, "中文 check 成功消息不得丢失或被转义"
+    assert hostile_stderr == "", "无漂移时不应把诊断正文写入 stderr"
+
+    spec = importlib.util.spec_from_file_location("codegen_utf8_failure_probe", CODEGEN_DIR / "generate.py")
+    assert spec is not None and spec.loader is not None
+    codegen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(codegen)
+
+    class _FailingReconfigureStream:
+        """模拟 stdout 拒绝 UTF-8 重配置，禁止入口继续输出生成或路径正文。"""
+
+        encoding = "cp1252"
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            raise OSError("secret reconfigure detail")
+
+        def write(self, text: str) -> int:
+            self.writes.append(text)
+            raise AssertionError(f"UTF-8 配置失败后不得输出生成正文：{text!r}")
+
+        def flush(self) -> None:
+            return None
+
+    class _AsciiErrorSink:
+        """收集稳定失败分类，避免将底层异常或文件路径带到 stderr。"""
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    failing_stdout = _FailingReconfigureStream()
+    error_sink = _AsciiErrorSink()
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(codegen.sys, "stdout", failing_stdout)
+        monkeypatch.setattr(codegen.sys, "stderr", error_sink)
+        monkeypatch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
+        assert codegen.main() == 2
+    finally:
+        monkeypatch.undo()
+    assert failing_stdout.writes == [], "配置失败前不得写出半份生成结果"
+    assert error_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+    assert error_sink.text.isascii(), "配置失败分类必须保持 ASCII，适配未知 stderr 编码"
 
 
 def test_runtime_only_schemas_not_in_codegen(codegen_catalog: dict) -> None:

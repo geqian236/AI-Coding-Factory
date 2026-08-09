@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,50 @@ RS_TYPE_MAP: dict[str, str] = {
     "array": "Vec<serde_json::Value>",
     "null": "()",
 }
+
+
+def _is_utf8_encoding(encoding: object) -> bool:
+    """仅接受无 BOM 的 UTF-8 编码标识，防止代码生成 CLI 在 ANSI 代码页截断中文。"""
+    if not isinstance(encoding, str):
+        return False
+    return encoding.replace("_", "").replace("-", "").casefold() == "utf8"
+
+
+def _configure_cli_text_stream_utf8(stream: object) -> None:
+    """将一个 CLI 文本流固定为严格 UTF-8；未知流形态必须 fail-closed。
+
+    生成器的成功、漂移和加载错误都可能包含中文或路径。必须在 argparse 与任何输出前
+    配置 stdout/stderr；若宿主流不能明确确认 UTF-8，就停止，不能留下半份生成报告。
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except Exception as exc:  # noqa: BLE001 - 只暴露稳定分类，禁止泄露宿主异常正文。
+            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED") from exc
+        if not _is_utf8_encoding(getattr(stream, "encoding", None)):
+            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
+        return
+
+    if isinstance(stream, io.StringIO) or _is_utf8_encoding(getattr(stream, "encoding", None)):
+        return
+    raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
+
+
+def _configure_cli_text_output_utf8() -> None:
+    """在解析参数和输出生成结果前同时固定 stdout/stderr，保证证据编码一致。"""
+    _configure_cli_text_stream_utf8(sys.stdout)
+    _configure_cli_text_stream_utf8(sys.stderr)
+
+
+def _emit_cli_text_encoding_failure() -> bool:
+    """尝试输出稳定 ASCII 失败分类；返回值显式记录 stderr 是否仍可写。"""
+    try:
+        sys.stderr.write("CLI_TEXT_UTF8_CONFIGURATION_FAILED\n")
+        sys.stderr.flush()
+        return True
+    except Exception:  # noqa: BLE001 - 失败路径不允许 traceback 覆盖稳定分类。
+        return False
 
 
 def load_catalog() -> dict[str, Any]:
@@ -252,7 +296,7 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
     """生成单个 Python TypedDict 类定义。"""
     lines = [
         f"class {name}(TypedDict, total=False):",
-        f'    """由 generate.py 自动生成，禁止手动修改。"""',
+        '    """由 generate.py 自动生成，禁止手动修改。"""',
     ]
     if not props:
         lines.append("    pass")
@@ -393,6 +437,13 @@ def write_or_check(path: Path, content: str, check_mode: bool) -> bool:
 
 def main() -> int:
     """主入口。返回 0 表示成功，非零表示失败。"""
+    try:
+        # --help、成功与漂移路径都会输出中文；先由入口独立建立严格 UTF-8。
+        _configure_cli_text_output_utf8()
+    except RuntimeError:
+        _emit_cli_text_encoding_failure()
+        return 2
+
     parser = argparse.ArgumentParser(
         description="确定性代码生成器：从 catalog.v1.json 生成三语言类型定义。"
     )

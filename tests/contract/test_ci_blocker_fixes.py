@@ -908,40 +908,105 @@ def _invoke_d_root_path_guard(run: str, target: Path) -> dict[str, Any]:
 # preflight 记住平台条件。这里从生产 PowerShell AST 取两类 receipt 的 observable_facts：
 # toolchain BLOCKED 必须克隆完整 platform facts，最终 PASS/FAIL receipt 必须逐项写入。
 _RUNNER_IDENTITY_FACTS_AST_ANALYZER = r"""
+using namespace System.Management.Automation.Language
+
 $ErrorActionPreference = 'Stop'
 $b64 = [Console]::In.ReadToEnd()
 $src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
 
+function Get-AstExtentText($node) {
+    # PowerShell 5.1/pwsh 7 在错误恢复或候选 AST 差异下都可能给出 null/非 AST 节点；
+    # 统一在读取 Extent/Text 前拒绝，避免 StrictMode 把审计器自身变成 false-positive。
+    if ($null -eq $node -or $node -isnot [Ast]) { return $null }
+    $extent = $node.Extent
+    if ($null -eq $extent -or $extent -isnot [IScriptExtent]) { return $null }
+    $text = $extent.Text
+    if ($text -isnot [string]) { return $null }
+    return $text
+}
+
+function Get-TrimmedAstExtentText($node) {
+    $text = Get-AstExtentText $node
+    if ($null -eq $text) { return $null }
+    return $text.Trim()
+}
+
+function Get-AstStartOffset($node) {
+    if ($null -eq $node -or $node -isnot [Ast]) { return [int]::MaxValue }
+    $extent = $node.Extent
+    if ($null -eq $extent -or $extent -isnot [IScriptExtent]) {
+        return [int]::MaxValue
+    }
+    $offset = $extent.StartOffset
+    if ($offset -isnot [int]) { return [int]::MaxValue }
+    return $offset
+}
+
 function Get-Pair($htable, [string]$Name) {
-    return @($htable.KeyValuePairs | Where-Object { $_.Item1.Extent.Text -eq $Name } | Select-Object -First 1)
+    if ($null -eq $htable -or $htable -isnot [HashtableAst]) { return }
+    $candidates = $htable.KeyValuePairs
+    if ($null -eq $candidates) { return }
+    foreach ($candidate in @($candidates)) {
+        # 每个 candidate、Item1、Item2 都先验证 concrete AST 类型，再读取 Extent/Text。
+        if ($null -eq $candidate -or $candidate -isnot [System.Tuple[ExpressionAst, StatementAst]]) {
+            continue
+        }
+        $keyNode = $candidate.Item1
+        $valueNode = $candidate.Item2
+        $keyText = Get-AstExtentText $keyNode
+        $valueText = Get-AstExtentText $valueNode
+        if ($null -eq $keyText -or $null -eq $valueText) { continue }
+        if ($keyText -eq $Name) { Write-Output $candidate }
+    }
 }
 
 function Get-InnerFacts($htable) {
-    $pair = Get-Pair $htable 'observable_facts'
+    $pair = @(Get-Pair $htable 'observable_facts')
     if ($pair.Count -ne 1) { return $null }
-    $inner = @($pair[0].Item2.FindAll({
-        $args[0] -is [System.Management.Automation.Language.HashtableAst]
-    }, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
-    if ($inner.Count -ne 1) { return $null }
+    $valueNode = $pair[0].Item2
+    $valueText = Get-AstExtentText $valueNode
+    if ($null -eq $valueText -or $valueNode -isnot [Ast]) { return $null }
+    $inner = @($valueNode.FindAll({
+        $args[0] -is [HashtableAst]
+    }, $true) | Sort-Object { Get-AstStartOffset $_ } | Select-Object -First 1)
+    if ($inner.Count -ne 1 -or $inner[0] -isnot [HashtableAst]) { return $null }
     $values = [ordered]@{}
-    foreach ($entry in $inner[0].KeyValuePairs) {
-        $values[$entry.Item1.Extent.Text] = $entry.Item2.Extent.Text.Trim()
+    foreach ($entry in @($inner[0].KeyValuePairs)) {
+        if ($null -eq $entry -or $entry -isnot [System.Tuple[ExpressionAst, StatementAst]]) {
+            return $null
+        }
+        $keyText = Get-AstExtentText $entry.Item1
+        $valueText = Get-TrimmedAstExtentText $entry.Item2
+        if ($null -eq $keyText -or $null -eq $valueText) { return $null }
+        $values[$keyText] = $valueText
     }
     return $values
 }
 
-$tables = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.HashtableAst] }, $true))
-$toolchain = @($tables | Where-Object {
-    $pair = Get-Pair $_ 'subcheckId'
-    $pair.Count -eq 1 -and $pair[0].Item2.Extent.Text -match 'toolchain_unavailable'
-} | Select-Object -First 1)
-$final = @($tables | Where-Object {
-    $status = Get-Pair $_ 'status'
-    $facts = Get-Pair $_ 'observable_facts'
-    $status.Count -eq 1 -and $status[0].Item2.Extent.Text.Trim() -eq '$status' -and $facts.Count -eq 1
-} | Select-Object -First 1)
+$tables = @($ast.FindAll({ $args[0] -is [HashtableAst] }, $true))
+$toolchainCandidates = @()
+$finalCandidates = @()
+foreach ($table in $tables) {
+    $subcheckPair = @(Get-Pair $table 'subcheckId')
+    if ($subcheckPair.Count -eq 1) {
+        $subcheckText = Get-AstExtentText $subcheckPair[0].Item2
+        if ($null -ne $subcheckText -and $subcheckText -match 'toolchain_unavailable') {
+            $toolchainCandidates += $table
+        }
+    }
+    $statusPair = @(Get-Pair $table 'status')
+    $factsPair = @(Get-Pair $table 'observable_facts')
+    if ($statusPair.Count -eq 1 -and $factsPair.Count -eq 1) {
+        $statusText = Get-TrimmedAstExtentText $statusPair[0].Item2
+        if ($null -ne $statusText -and $statusText -eq '$status') {
+            $finalCandidates += $table
+        }
+    }
+}
+$toolchain = @($toolchainCandidates | Select-Object -First 1)
+$final = @($finalCandidates | Select-Object -First 1)
 
 $expected = @(
     'windows_host', 'windows_nt', 'windows_product_type', 'windows_build', 'candidate_sha',
@@ -958,17 +1023,27 @@ if ($finalMappingsExact) {
     }
 }
 
-$toolchainFactsPair = if ($toolchain.Count -eq 1) { Get-Pair $toolchain[0] 'observable_facts' } else { @() }
-$toolchainUsesClone = ($toolchainFactsPair.Count -eq 1 -and
-    $toolchainFactsPair[0].Item2.Extent.Text.Trim() -eq '$blockedFacts')
+$toolchainFactsPair = @()
+if ($toolchain.Count -eq 1) {
+    # if 语句本身会枚举单元素数组；先建立数组容器再直接赋值，StrictMode 下始终可读取 Count。
+    $toolchainFactsPair = @(Get-Pair $toolchain[0] 'observable_facts')
+}
+$toolchainFactsText = $null
+if ($toolchainFactsPair.Count -eq 1) {
+    $toolchainFactsText = Get-TrimmedAstExtentText $toolchainFactsPair[0].Item2
+}
+$toolchainUsesClone = ($null -ne $toolchainFactsText -and $toolchainFactsText -eq '$blockedFacts')
 $cloneLoops = @($ast.FindAll({
-    $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] -and
-    $args[0].Extent.Text -match '\$platform\.facts\.GetEnumerator\(\)'
+    if ($args[0] -isnot [ForEachStatementAst]) { return $false }
+    $loopText = Get-AstExtentText $args[0]
+    return $null -ne $loopText -and $loopText -match '\$platform\.facts\.GetEnumerator\(\)'
 }, $true))
 $cloneAssignments = @($ast.FindAll({
-    $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-    $args[0].Left.Extent.Text -match '^\$blockedFacts\[\$fact\.Key\]$' -and
-    $args[0].Right.Extent.Text.Trim() -eq '$fact.Value'
+    if ($args[0] -isnot [AssignmentStatementAst]) { return $false }
+    $leftText = Get-AstExtentText $args[0].Left
+    $rightText = Get-TrimmedAstExtentText $args[0].Right
+    return $null -ne $leftText -and $null -ne $rightText -and
+        $leftText -match '^\$blockedFacts\[\$fact\.Key\]$' -and $rightText -eq '$fact.Value'
 }, $true))
 $toolchainCloneExact = ($toolchainUsesClone -and $cloneLoops.Count -eq 1 -and $cloneAssignments.Count -eq 1)
 
@@ -2513,6 +2588,22 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     assert wrapper_facts["valid"] is True, (
         "runner wrapper 的 toolchain BLOCKED 必须克隆完整 platform facts，最终 receipt 必须逐项留存；"
         f"实际={wrapper_facts}"
+    )
+    # GitHub Windows runner 用 pwsh 7 执行合同测试；强制开启 StrictMode 后必须仍能解析真实
+    # wrapper，避免 PowerShell 5.1 的宽松属性访问掩盖候选 AST 的 null/类型缺陷。
+    strict_facts_analyzer = _RUNNER_IDENTITY_FACTS_AST_ANALYZER.replace(
+        "$ErrorActionPreference = 'Stop'",
+        "$ErrorActionPreference = 'Stop'\nSet-StrictMode -Version Latest",
+        1,
+    )
+    strict_wrapper_facts = _run_ps_analyzer(strict_facts_analyzer, wrapper_source)
+    assert strict_wrapper_facts["parseErrors"] == 0, (
+        "StrictMode 下 runner wrapper 必须仍可由事实 AST 分析器解析："
+        f"{strict_wrapper_facts}"
+    )
+    assert strict_wrapper_facts["valid"] is True, (
+        "StrictMode 下 runner wrapper 的 toolchain clone 和最终事实映射必须完整："
+        f"{strict_wrapper_facts}"
     )
     final_endpoint_mutant = wrapper_source.rsplit(
         'docker_context_endpoint = $platform.facts["docker_context_endpoint"]', 1,

@@ -31,6 +31,7 @@ CLI 和可编程 API：验证测试回执是否满足 required-test-catalog 覆�
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 from pathlib import Path
@@ -61,6 +62,51 @@ _AUTHORIZED_OWNERS: frozenset[str] = frozenset({
     "codex-implementer",
     "release-engineer",
 })
+
+
+def _is_utf8_encoding(encoding: object) -> bool:
+    """仅接受无 BOM 的 UTF-8 编码标识，避免 CLI 在 ANSI 代码页输出中文证据。"""
+    if not isinstance(encoding, str):
+        return False
+    return encoding.replace("_", "").replace("-", "").casefold() == "utf8"
+
+
+def _configure_cli_text_stream_utf8(stream: object) -> None:
+    """将一个 CLI 文本流固定为严格 UTF-8；未知流形态一律拒绝而非猜测编码。
+
+    回执报告和参数错误均可能包含中文，必须在任何正文输出前完成此配置。若宿主替换了
+    `sys.stdout`/`sys.stderr`，仅接受明确的 Unicode StringIO 或已标记 UTF-8 的流，避免
+    cp1252 等代码页写出半份回执后才失败。
+    """
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except Exception as exc:  # noqa: BLE001 - 失败分类不能泄露宿主异常正文。
+            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED") from exc
+        if not _is_utf8_encoding(getattr(stream, "encoding", None)):
+            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
+        return
+
+    if isinstance(stream, io.StringIO) or _is_utf8_encoding(getattr(stream, "encoding", None)):
+        return
+    raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
+
+
+def _configure_cli_text_output_utf8() -> None:
+    """在解析参数和输出回执前同时固定 stdout/stderr，保证两条证据面编码一致。"""
+    _configure_cli_text_stream_utf8(sys.stdout)
+    _configure_cli_text_stream_utf8(sys.stderr)
+
+
+def _emit_cli_text_encoding_failure() -> bool:
+    """尝试输出稳定 ASCII 失败分类；返回值显式记录 stderr 是否仍可写。"""
+    try:
+        sys.stderr.write("CLI_TEXT_UTF8_CONFIGURATION_FAILED\n")
+        sys.stderr.flush()
+        return True
+    except Exception:  # noqa: BLE001 - 失败路径不允许再以 traceback 泄露详情。
+        return False
 
 
 # ─── 验证结果 ─────────────────────────────────────────────────────────────────
@@ -319,6 +365,13 @@ def main(argv: list[str] | None = None) -> int:
 
     返回退出码：0=全部通过，1=有错误，2=参数/加载失败。
     """
+    try:
+        # argparse/help、JSON 和人可读报告均可能写中文；先固定两条文本输出通道。
+        _configure_cli_text_output_utf8()
+    except RuntimeError:
+        _emit_cli_text_encoding_failure()
+        return 2
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
