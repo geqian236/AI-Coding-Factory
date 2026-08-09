@@ -19,6 +19,7 @@ Task 6 合同层测试：测试回执覆盖率验证与 fail-closed 规则。
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -443,12 +444,146 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
 
     failing_stdout = _FailingReconfigureStream()
     error_sink = _AsciiErrorSink()
-    monkeypatch.setattr(verify_receipts.sys, "stdout", failing_stdout)
-    monkeypatch.setattr(verify_receipts.sys, "stderr", error_sink)
-    assert verify_receipts.main(["--catalog", str(CATALOG_PATH), "--receipts", str(VALID_FIXTURE)]) == 2
+    with monkeypatch.context() as stream_patch:
+        stream_patch.setattr(verify_receipts.sys, "stdout", failing_stdout)
+        stream_patch.setattr(verify_receipts.sys, "stderr", error_sink)
+        assert verify_receipts.main(["--catalog", str(CATALOG_PATH), "--receipts", str(VALID_FIXTURE)]) == 2
     assert failing_stdout.writes == [], "配置失败前不得写出半份报告"
     assert error_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
     assert error_sink.text.isascii(), "配置失败分类必须保持 ASCII，适配未知 stderr 编码"
+
+    class _ReconfigurableStrictStream:
+        """模拟可重配置文本流，只有回读到 UTF-8/strict 后才允许 CLI 输出正文。"""
+
+        def __init__(self) -> None:
+            self.encoding = "cp1252"
+            self.errors = "replace"
+            self.text = ""
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.encoding = encoding
+            self.errors = errors
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    class _PlainUtf8StrictStream:
+        """模拟无 reconfigure 的普通流；声明 UTF-8/strict 时才是可接受的证据通道。"""
+
+        encoding = "UTF_8"
+        errors = "strict"
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    class _PlainUtf8MissingErrorsStream:
+        """模拟缺少 errors 状态的普通流，防止仅凭 UTF-8 名称被错误放行。"""
+
+        encoding = "utf-8"
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.writes.append(value)
+            raise AssertionError(f"缺少 strict 状态时不得输出回执正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
+    class _RejectedOutputStream:
+        """模拟假成功重配置和属性访问异常，任何一类都不得继续输出回执正文。"""
+
+        def __init__(self, *, errors: str = "strict", failure: str | None = None) -> None:
+            self._errors = errors
+            self._failure = failure
+            self.reconfigure_calls: list[tuple[str, str]] = []
+            self.writes: list[str] = []
+
+        @property
+        def reconfigure(self) -> object:
+            if self._failure == "reconfigure_getter":
+                raise OSError("SECRET_PATH: reconfigure getter")
+            return self._reconfigure
+
+        def _reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.reconfigure_calls.append((encoding, errors))
+
+        @property
+        def encoding(self) -> str:
+            if self._failure == "encoding_getter":
+                raise OSError("SECRET_PATH: encoding getter")
+            return "utf-8"
+
+        @property
+        def errors(self) -> str:
+            if self._failure == "errors_getter":
+                raise OSError("SECRET_PATH: errors getter")
+            return self._errors
+
+        def write(self, value: str) -> int:
+            self.writes.append(value)
+            raise AssertionError(f"UTF-8 配置未被严格确认时不得输出回执正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
+    def _run_with_streams(stdout: object, stderr: object) -> int:
+        """在隔离的 sys 流替身下调用既有 CLI 节点，避免新增 pytest 节点。"""
+        with monkeypatch.context() as stream_patch:
+            stream_patch.setattr(verify_receipts.sys, "stdout", stdout)
+            stream_patch.setattr(verify_receipts.sys, "stderr", stderr)
+            return verify_receipts.main(["--catalog", str(CATALOG_PATH), "--receipts", str(VALID_FIXTURE)])
+
+    def _assert_fail_closed(stream: _RejectedOutputStream) -> None:
+        """统一验收属性异常或非 strict 状态只返回 ASCII 分类，且不泄露正文。"""
+        sink = _AsciiErrorSink()
+        assert _run_with_streams(stream, sink) == 2
+        assert stream.writes == [], "配置失败前不得写出半份回执"
+        assert sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+        assert sink.text.isascii()
+
+    # 可重配置流必须回读到 UTF-8/strict；这是正常 TextIOWrapper 的等价合同。
+    configured_stdout = _ReconfigurableStrictStream()
+    configured_stderr = _ReconfigurableStrictStream()
+    assert _run_with_streams(configured_stdout, configured_stderr) == 0
+    assert configured_stdout.encoding == "utf-8" and configured_stdout.errors == "strict"
+    assert "所有回执验证通过" in configured_stdout.text
+
+    # StringIO 是纯 Unicode 内存流，可安全作为没有 encoding/errors 的唯一例外。
+    unicode_stdout = io.StringIO()
+    assert _run_with_streams(unicode_stdout, io.StringIO()) == 0
+    assert "所有回执验证通过" in unicode_stdout.getvalue()
+
+    # 无 reconfigure 的普通流不能靠 UTF-8 名称猜测，必须同时声明 strict。
+    plain_stdout = _PlainUtf8StrictStream()
+    assert _run_with_streams(plain_stdout, _PlainUtf8StrictStream()) == 0
+    assert "所有回执验证通过" in plain_stdout.text
+
+    missing_errors_stdout = _PlainUtf8MissingErrorsStream()
+    missing_errors_sink = _AsciiErrorSink()
+    assert _run_with_streams(missing_errors_stdout, missing_errors_sink) == 2
+    assert missing_errors_stdout.writes == []
+    assert missing_errors_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+
+    for non_strict_errors in ("replace", "ignore"):
+        non_strict_stream = _RejectedOutputStream(errors=non_strict_errors)
+        _assert_fail_closed(non_strict_stream)
+        assert non_strict_stream.reconfigure_calls == [("utf-8", "strict")]
+
+    for getter_failure in ("reconfigure_getter", "encoding_getter", "errors_getter"):
+        _assert_fail_closed(_RejectedOutputStream(failure=getter_failure))
 
 
 def test_cli_missing_fixture_exits_nonzero() -> None:

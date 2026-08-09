@@ -6,6 +6,7 @@ Task 2 合同层测试：验证 schema、策略目录和测试目录的完整性
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -388,7 +389,7 @@ def test_codegen_generated_files_exist() -> None:
     assert rs_path.exists(), f"Rust 生成文件不存在: {rs_path}"
 
 
-def test_codegen_no_drift() -> None:
+def test_codegen_no_drift(monkeypatch: pytest.MonkeyPatch) -> None:
     """generate.py --check 必须通过，并在 cp1252:strict 与配置失败时保持 UTF-8/fail-closed。
 
     使用 sys.executable 而非裸 "python"：后者经 PATH 解析，
@@ -470,17 +471,148 @@ def test_codegen_no_drift() -> None:
 
     failing_stdout = _FailingReconfigureStream()
     error_sink = _AsciiErrorSink()
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        monkeypatch.setattr(codegen.sys, "stdout", failing_stdout)
-        monkeypatch.setattr(codegen.sys, "stderr", error_sink)
-        monkeypatch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
+    with monkeypatch.context() as stream_patch:
+        stream_patch.setattr(codegen.sys, "stdout", failing_stdout)
+        stream_patch.setattr(codegen.sys, "stderr", error_sink)
+        stream_patch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
         assert codegen.main() == 2
-    finally:
-        monkeypatch.undo()
     assert failing_stdout.writes == [], "配置失败前不得写出半份生成结果"
     assert error_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
     assert error_sink.text.isascii(), "配置失败分类必须保持 ASCII，适配未知 stderr 编码"
+
+    class _ReconfigurableStrictStream:
+        """模拟可重配置文本流，只有回读到 UTF-8/strict 后才允许生成器输出正文。"""
+
+        def __init__(self) -> None:
+            self.encoding = "cp1252"
+            self.errors = "replace"
+            self.text = ""
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.encoding = encoding
+            self.errors = errors
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    class _PlainUtf8StrictStream:
+        """模拟无 reconfigure 的普通流；仅 UTF-8/strict 声明可作为生成证据通道。"""
+
+        encoding = "UTF_8"
+        errors = "strict"
+
+        def __init__(self) -> None:
+            self.text = ""
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    class _PlainUtf8MissingErrorsStream:
+        """模拟缺少 errors 状态的普通流，防止仅凭 UTF-8 名称被错误放行。"""
+
+        encoding = "utf-8"
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.writes.append(value)
+            raise AssertionError(f"缺少 strict 状态时不得输出生成正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
+    class _RejectedOutputStream:
+        """模拟假成功重配置和属性读取异常，验证入口不会泄露生成正文或异常路径。"""
+
+        def __init__(self, *, errors: str = "strict", failure: str | None = None) -> None:
+            self._errors = errors
+            self._failure = failure
+            self.reconfigure_calls: list[tuple[str, str]] = []
+            self.writes: list[str] = []
+
+        @property
+        def reconfigure(self) -> object:
+            if self._failure == "reconfigure_getter":
+                raise OSError("SECRET_PATH: reconfigure getter")
+            return self._reconfigure
+
+        def _reconfigure(self, *, encoding: str, errors: str) -> None:
+            self.reconfigure_calls.append((encoding, errors))
+
+        @property
+        def encoding(self) -> str:
+            if self._failure == "encoding_getter":
+                raise OSError("SECRET_PATH: encoding getter")
+            return "utf-8"
+
+        @property
+        def errors(self) -> str:
+            if self._failure == "errors_getter":
+                raise OSError("SECRET_PATH: errors getter")
+            return self._errors
+
+        def write(self, value: str) -> int:
+            self.writes.append(value)
+            raise AssertionError(f"UTF-8 配置未被严格确认时不得输出生成正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
+    def _run_with_streams(stdout: object, stderr: object) -> int:
+        """在隔离的 sys 流替身下调用既有 --check 节点，避免新增 pytest 节点。"""
+        with monkeypatch.context() as stream_patch:
+            stream_patch.setattr(codegen.sys, "stdout", stdout)
+            stream_patch.setattr(codegen.sys, "stderr", stderr)
+            stream_patch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
+            return codegen.main()
+
+    def _assert_fail_closed(stream: _RejectedOutputStream) -> None:
+        """统一验收不严格状态和属性异常只能返回 ASCII 分类，且不泄露生成正文。"""
+        sink = _AsciiErrorSink()
+        assert _run_with_streams(stream, sink) == 2
+        assert stream.writes == [], "配置失败前不得写出半份生成结果"
+        assert sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+        assert sink.text.isascii()
+
+    # 可重配置流要回读 UTF-8/strict，防止宿主伪称配置成功却保留 replace/ignore。
+    configured_stdout = _ReconfigurableStrictStream()
+    configured_stderr = _ReconfigurableStrictStream()
+    assert _run_with_streams(configured_stdout, configured_stderr) == 0
+    assert configured_stdout.encoding == "utf-8" and configured_stdout.errors == "strict"
+    assert "三语言生成树无漂移" in configured_stdout.text
+
+    # StringIO 是纯 Unicode 内存流，可安全作为没有 encoding/errors 的唯一例外。
+    unicode_stdout = io.StringIO()
+    assert _run_with_streams(unicode_stdout, io.StringIO()) == 0
+    assert "三语言生成树无漂移" in unicode_stdout.getvalue()
+
+    # 无 reconfigure 的普通流只有同时声明 UTF-8/strict 才能继续。
+    plain_stdout = _PlainUtf8StrictStream()
+    assert _run_with_streams(plain_stdout, _PlainUtf8StrictStream()) == 0
+    assert "三语言生成树无漂移" in plain_stdout.text
+
+    missing_errors_stdout = _PlainUtf8MissingErrorsStream()
+    missing_errors_sink = _AsciiErrorSink()
+    assert _run_with_streams(missing_errors_stdout, missing_errors_sink) == 2
+    assert missing_errors_stdout.writes == []
+    assert missing_errors_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+
+    for non_strict_errors in ("replace", "ignore"):
+        non_strict_stream = _RejectedOutputStream(errors=non_strict_errors)
+        _assert_fail_closed(non_strict_stream)
+        assert non_strict_stream.reconfigure_calls == [("utf-8", "strict")]
+
+    for getter_failure in ("reconfigure_getter", "encoding_getter", "errors_getter"):
+        _assert_fail_closed(_RejectedOutputStream(failure=getter_failure))
 
 
 def test_runtime_only_schemas_not_in_codegen(codegen_catalog: dict) -> None:

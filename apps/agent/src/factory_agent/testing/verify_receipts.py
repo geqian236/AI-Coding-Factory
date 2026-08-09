@@ -76,20 +76,26 @@ def _configure_cli_text_stream_utf8(stream: object) -> None:
 
     回执报告和参数错误均可能包含中文，必须在任何正文输出前完成此配置。若宿主替换了
     `sys.stdout`/`sys.stderr`，仅接受明确的 Unicode StringIO 或已标记 UTF-8 的流，避免
-    cp1252 等代码页写出半份回执后才失败。
+    cp1252 等代码页写出半份回执后才失败。普通流还必须回读 `errors == "strict"`；所有
+    属性读取、重配置和状态回读异常都归一化为稳定分类，不能把宿主异常正文带到 CLI。
     """
-    reconfigure = getattr(stream, "reconfigure", None)
-    if callable(reconfigure):
-        try:
-            reconfigure(encoding="utf-8", errors="strict")
-        except Exception as exc:  # noqa: BLE001 - 失败分类不能泄露宿主异常正文。
-            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED") from exc
-        if not _is_utf8_encoding(getattr(stream, "encoding", None)):
-            raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
-        return
+    try:
+        # StringIO 只保存 Unicode 字符串，不经过外部编码器，是唯一可安全省略状态属性的流。
+        if isinstance(stream, io.StringIO):
+            return
 
-    if isinstance(stream, io.StringIO) or _is_utf8_encoding(getattr(stream, "encoding", None)):
-        return
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+        # 即使 reconfigure 未抛错，也必须回读两项状态，拒绝 replace/ignore 等伪成功实现。
+        encoding = getattr(stream, "encoding", None)
+        errors = getattr(stream, "errors", None)
+        if _is_utf8_encoding(encoding) and isinstance(errors, str) and errors == "strict":
+            return
+    except Exception as exc:  # noqa: BLE001 - 失败分类不能泄露宿主异常正文。
+        raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED") from exc
+
     raise RuntimeError("CLI_TEXT_UTF8_CONFIGURATION_FAILED")
 
 
