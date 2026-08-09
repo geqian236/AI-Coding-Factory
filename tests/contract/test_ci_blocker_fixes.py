@@ -339,6 +339,7 @@ PREHEAT_REQUIRED_CMD = (
     "scripts/dev.ps1 -- -- rustup toolchain install "
     "stable-x86_64-pc-windows-gnu --profile minimal"
 )
+RUNNER_IDENTITY_IMAGE_STEP_NAME = "准备 runner-identity Python 容器镜像（fail-closed，spike loop 之前）"
 
 
 def _is_spike_loop_step(step: dict[str, Any]) -> bool:
@@ -366,18 +367,38 @@ def _preheat_step() -> dict[str, Any]:
     return tok
 
 
+def _runner_identity_image_step() -> dict[str, Any]:
+    """按 YAML 的显式步骤名定位 runner_identity 镜像准备，避免把注释或未使用字符串当成 CI 行为。"""
+    step = _find_step(
+        _windows_probes_steps(),
+        lambda s: str(s.get("name", "")).strip() == RUNNER_IDENTITY_IMAGE_STEP_NAME,
+    )
+    assert step is not None, (
+        f"windows-probes 缺少显式镜像准备步骤 {RUNNER_IDENTITY_IMAGE_STEP_NAME!r}"
+    )
+    return step
+
+
 def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     """windows-probes 必须在 spike loop **之前**有预热步骤，其**去注释可执行代码**完整包含
     reviewer 指定命令，且 shell 为 pwsh。（结构 + 顺序断言；命令真实性见 AST 测试。）"""
     steps = _windows_probes_steps()
     preheat = _preheat_step()
+    image_prep = _runner_identity_image_step()
     spike = _find_step(steps, _is_spike_loop_step)
     assert spike is not None, "windows-probes 缺少 spike 执行步骤（解析器或 CI 结构异常）"
     assert preheat["_order"] < spike["_order"], (
         f"预热步骤（order={preheat['_order']}）必须在 spike loop（order={spike['_order']}）之前"
     )
+    assert preheat["_order"] < image_prep["_order"] < spike["_order"], (
+        "D-root GNU 工具链预热、runner_identity 镜像准备、真实 spike loop 必须严格按此顺序执行；"
+        f"实际 order=({preheat['_order']}, {image_prep['_order']}, {spike['_order']})"
+    )
     assert str(preheat.get("shell", "")).strip() == "pwsh", (
         f"预热步骤 shell 必须为 pwsh；实际 ={preheat.get('shell')!r}"
+    )
+    assert str(image_prep.get("shell", "")).strip() == "pwsh", (
+        f"镜像准备步骤 shell 必须为 pwsh；实际 ={image_prep.get('shell')!r}"
     )
     code_norm = _normalize_ws(_strip_ps_comments(str(preheat["run"])))
     assert PREHEAT_REQUIRED_CMD in code_norm, (
@@ -407,13 +428,15 @@ def test_windows_probes_preheat_is_fail_closed() -> None:
 
 
 def test_dev_ps1_does_not_implicitly_install_toolchain() -> None:
-    """不得把安装逻辑塞进 dev.ps1（否则每次运行隐式联网）。dev.ps1 正文不得出现
-    rustup toolchain install。"""
+    """不得把工具链或 runner_identity 镜像准备塞进 dev.ps1（否则每次运行都可能隐式联网）。"""
     dev = (REPO_ROOT / "scripts" / "dev.ps1").read_text(encoding="utf-8")
     code_lines = [ln for ln in dev.split("\n") if not ln.lstrip().startswith("#")]
     code = "\n".join(code_lines)
     assert not re.search(r"rustup\s+toolchain\s+install", code), (
         "dev.ps1 不得隐式安装工具链（安装应是 CI 显式预热步骤）"
+    )
+    assert not re.search(r"docker\s+pull\s+python:3\.12-slim", code), (
+        "dev.ps1 不得隐式拉取 runner_identity 镜像（拉取应是 CI 显式 fail-closed 步骤）"
     )
 
 
@@ -741,6 +764,119 @@ $preheatValid = ($commandElementsExact -and $devPreheatAtTopLevel -and
 """
 
 
+# runner_identity 镜像准备 AST：命令必须是独立的 CommandElements，且每次原生命令的下一个
+# 顶层语句就是 $LASTEXITCODE -ne 0 → 直接 exit 1。这样注释、未使用字符串、守卫提前
+# 或插入其他原生命令都不能把失败路径伪装成已覆盖。
+_CI_RUNNER_IMAGE_AST_ANALYZER = r"""
+$ErrorActionPreference = 'Stop'
+$b64 = [Console]::In.ReadToEnd()
+$src = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errors)
+$parseErrors = @($errors).Count
+
+function Normalize-CommandElement($element) {
+    $value = $element.Extent.Text.Trim()
+    if ($value.Length -ge 2 -and (
+        ($value.StartsWith([string][char]34) -and $value.EndsWith([string][char]34)) -or
+        ($value.StartsWith([string][char]39) -and $value.EndsWith([string][char]39)))) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+    return ($value -replace '\\', '/')
+}
+
+function Test-ExactElements($command, [string[]]$expected) {
+    $elements = @($command.CommandElements)
+    if ($elements.Count -ne $expected.Count) { return $false }
+    for ($i = 0; $i -lt $expected.Count; $i++) {
+        if ((Normalize-CommandElement $elements[$i]) -cne $expected[$i]) { return $false }
+    }
+    return $true
+}
+
+function Test-ExactPull($command) {
+    return (Test-ExactElements -command $command -expected @('docker', 'pull', 'python:3.12-slim'))
+}
+
+function Test-ExactInspect($command) {
+    return (Test-ExactElements -command $command -expected @('docker', 'image', 'inspect', 'python:3.12-slim'))
+}
+
+function Get-ExitGuardDetails($statement) {
+    $result = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
+    if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $result }
+    $clauses = @($statement.Clauses)
+    if ($clauses.Count -ne 1 -or $null -ne $statement.ElseClause) { return $result }
+    $result.isGuard = $true
+    $condition = $clauses[0].Item1
+    $body = $clauses[0].Item2
+    $normalizedCondition = ($condition.Extent.Text -replace '\s+', '')
+    $result.conditionExact = ($normalizedCondition -ceq '$LASTEXITCODE-ne0')
+
+    # 只接受 guard 块最后一个直接顶层语句的 exit 1；嵌套分支、字符串或别的退出码不能
+    # 表示当前 docker 调用已 fail-closed。
+    $directStatements = @($body.Statements)
+    if ($directStatements.Count -eq 0) { return $result }
+    $lastStatement = $directStatements[$directStatements.Count - 1]
+    if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
+    $pipeline = $lastStatement.Pipeline
+    $pipelineElements = @($pipeline.PipelineElements)
+    if ($pipelineElements.Count -ne 1 -or
+        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $result }
+    $expression = $pipelineElements[0].Expression
+    if ($expression -isnot [System.Management.Automation.Language.ConstantExpressionAst]) { return $result }
+    $result.exitsOne = ($expression.Value -is [int] -and $expression.Value -eq 1 -and
+        $expression.Extent.Text -ceq '1')
+    return $result
+}
+
+$topStatements = @($ast.EndBlock.Statements)
+$pullCount = 0; $pullIndex = -1
+$inspectCount = 0; $inspectIndex = -1
+for ($i = 0; $i -lt $topStatements.Count; $i++) {
+    $statement = $topStatements[$i]
+    if ($statement -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+    $pipelineElements = @($statement.PipelineElements)
+    if ($pipelineElements.Count -ne 1 -or
+        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandAst]) { continue }
+    $command = $pipelineElements[0]
+    if (Test-ExactPull $command) {
+        $pullCount++
+        $pullIndex = $i
+    }
+    if (Test-ExactInspect $command) {
+        $inspectCount++
+        $inspectIndex = $i
+    }
+}
+
+$pullGuard = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
+$inspectGuard = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
+if ($pullCount -eq 1 -and $pullIndex + 1 -lt $topStatements.Count) {
+    $pullGuard = Get-ExitGuardDetails $topStatements[$pullIndex + 1]
+}
+if ($inspectCount -eq 1 -and $inspectIndex + 1 -lt $topStatements.Count) {
+    $inspectGuard = Get-ExitGuardDetails $topStatements[$inspectIndex + 1]
+}
+
+$pullImmediatelyGuarded = ($pullGuard.isGuard -and $pullGuard.conditionExact -and $pullGuard.exitsOne)
+$inspectImmediatelyGuarded = ($inspectGuard.isGuard -and $inspectGuard.conditionExact -and $inspectGuard.exitsOne)
+$sequenceExact = ($pullCount -eq 1 -and $inspectCount -eq 1 -and
+    $inspectIndex -eq ($pullIndex + 2))
+$imagePreparationValid = ($sequenceExact -and $pullImmediatelyGuarded -and $inspectImmediatelyGuarded)
+
+[pscustomobject]@{
+    parseErrors               = $parseErrors
+    pullCommandCount          = $pullCount
+    inspectCommandCount       = $inspectCount
+    pullImmediatelyGuarded    = $pullImmediatelyGuarded
+    inspectImmediatelyGuarded = $inspectImmediatelyGuarded
+    sequenceExact             = $sequenceExact
+    imagePreparationValid     = $imagePreparationValid
+} | ConvertTo-Json -Compress
+"""
+
+
 def _analyze_wrapper_source(source_text: str) -> dict[str, Any]:
     return _run_ps_analyzer(_WRAPPER_AST_ANALYZER, source_text)
 
@@ -749,6 +885,11 @@ def _analyze_ci_run_block(run_text: str) -> dict[str, Any]:
     return _run_ps_analyzer(
         _CI_PREHEAT_AST_ANALYZER, run_text, {"R16_REQUIRED_CMD": PREHEAT_REQUIRED_CMD}
     )
+
+
+def _analyze_runner_identity_image_run(run_text: str) -> dict[str, Any]:
+    """用真实 PowerShell AST 验证 Docker 准备步骤，不把注释、字符串或文本检索当作执行证据。"""
+    return _run_ps_analyzer(_CI_RUNNER_IMAGE_AST_ANALYZER, run_text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1222,6 +1363,23 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     assert a["guardExitsOne"] is True
     assert a["preheatValid"] is True
 
+    # runner_identity 依赖的容器镜像必须由独立步骤显式准备；两条 Docker 原生命令均需
+    # 使用独立 CommandElements，并分别紧邻自身的 $LASTEXITCODE fail-closed 守卫。
+    image_a = _analyze_runner_identity_image_run(
+        str(_runner_identity_image_step().get("run", ""))
+    )
+    assert image_a["parseErrors"] == 0, (
+        f"镜像准备 run block 应可解析；parseErrors={image_a['parseErrors']}"
+    )
+    assert image_a["pullCommandCount"] == 1, "必须恰有一条真实 docker pull python:3.12-slim"
+    assert image_a["inspectCommandCount"] == 1, (
+        "必须恰有一条真实 docker image inspect python:3.12-slim"
+    )
+    assert image_a["pullImmediatelyGuarded"] is True
+    assert image_a["inspectImmediatelyGuarded"] is True
+    assert image_a["sequenceExact"] is True
+    assert image_a["imagePreparationValid"] is True
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
 def test_preheat_ast_immune_to_unused_string_mutation() -> None:
@@ -1267,11 +1425,107 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
         "未使用字符串中的 exit 1 不能作为 guard 的直接失败退出——AST 未锁定常量 ExitStatementAst"
     )
 
+    # 新镜像准备规则的 mutation 也放在既有节点中，保持冻结测试节点数量不变。注释整行或
+    # 仅保留未使用字符串都不能算作 Docker 命令；守卫提前、参数折叠、原生命令插队均必须红。
+    image_run = str(_runner_identity_image_step().get("run", ""))
+    commented_pull = _mut_comment_exact_command(
+        image_run, _RUNNER_IMAGE_PULL_COMMAND, add_unused_string=False
+    )
+    assert commented_pull != image_run, "未能定位真实 docker pull 行以施加整行注释 mutation"
+    image_a = _analyze_runner_identity_image_run(commented_pull)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullCommandCount"] == 0 and image_a["imagePreparationValid"] is False
+
+    unused_pull = _mut_comment_exact_command(
+        image_run, _RUNNER_IMAGE_PULL_COMMAND, add_unused_string=True
+    )
+    assert unused_pull != image_run, "未能定位真实 docker pull 行以施加未使用字符串 mutation"
+    image_a = _analyze_runner_identity_image_run(unused_pull)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullCommandCount"] == 0 and image_a["imagePreparationValid"] is False
+
+    folded_pull = image_run.replace(
+        _RUNNER_IMAGE_PULL_COMMAND, 'docker "pull python:3.12-slim"', 1
+    )
+    assert folded_pull != image_run, "未能定位真实 docker pull 行以施加参数折叠 mutation"
+    image_a = _analyze_runner_identity_image_run(folded_pull)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullCommandCount"] == 0 and image_a["imagePreparationValid"] is False
+
+    early_pull_guard = _mut_move_guard_before_command(image_run, _RUNNER_IMAGE_PULL_COMMAND)
+    assert early_pull_guard != image_run, "未能定位 docker pull 守卫以施加守卫提前 mutation"
+    image_a = _analyze_runner_identity_image_run(early_pull_guard)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
+    inspect_interleaved = _mut_insert_native_between_command_and_guard(
+        image_run, _RUNNER_IMAGE_INSPECT_COMMAND
+    )
+    assert inspect_interleaved != image_run, "未能定位 docker inspect 行以施加原生命令插队 mutation"
+    image_a = _analyze_runner_identity_image_run(inspect_interleaved)
+    assert image_a["parseErrors"] == 0
+    assert image_a["inspectImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
 
 _PREHEAT_COMMAND = (
     '& "$PWD/scripts/dev.ps1" -- -- rustup toolchain install '
     'stable-x86_64-pc-windows-gnu --profile minimal'
 )
+_RUNNER_IMAGE_PULL_COMMAND = "docker pull python:3.12-slim"
+_RUNNER_IMAGE_INSPECT_COMMAND = "docker image inspect python:3.12-slim"
+
+
+def _mut_comment_exact_command(run: str, command: str, *, add_unused_string: bool) -> str:
+    """注释完整原生命令行；可选未使用字符串用于证明 AST 不把文本当成实际执行。"""
+    out: list[str] = []
+    changed = False
+    for line in run.split("\n"):
+        if not changed and line.strip() == command:
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(indent + "# " + line.lstrip())
+            if add_unused_string:
+                out.append(indent + f'$unusedDockerCommand = "{command}"')
+            changed = True
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _mut_move_guard_before_command(run: str, command: str) -> str:
+    """把指定命令的紧邻守卫提前，验证 $LASTEXITCODE 守卫不能只在同一 run block 出现即可。"""
+    lines = run.split("\n")
+    command_index = next((i for i, line in enumerate(lines) if line.strip() == command), None)
+    if command_index is None:
+        return run
+    guard_index = next(
+        (
+            i
+            for i in range(command_index + 1, len(lines))
+            if lines[i].strip() == "if ($LASTEXITCODE -ne 0) {"
+        ),
+        None,
+    )
+    if guard_index is None:
+        return run
+    guard_end = next(
+        (i for i in range(guard_index + 1, len(lines)) if lines[i].strip() == "}"),
+        None,
+    )
+    if guard_end is None:
+        return run
+    guard = lines[guard_index : guard_end + 1]
+    return "\n".join(
+        lines[:command_index]
+        + guard
+        + [lines[command_index]]
+        + lines[command_index + 1 : guard_index]
+        + lines[guard_end + 1 :]
+    )
+
+
+def _mut_insert_native_between_command_and_guard(run: str, command: str) -> str:
+    """在命令与守卫之间插入原生命令，模拟 $LASTEXITCODE 被覆盖的回归。"""
+    return run.replace(command, command + "\n          & cmd /c exit 0", 1)
 
 
 def _mut_preheat_single_string_argument(run: str) -> str:

@@ -195,6 +195,22 @@ jobs:
             Write-Error "[preheat] D-root GNU 工具链安装失败 exit=$LASTEXITCODE，fail-closed"
             exit 1
           }
+      - name: 准备 runner-identity Python 容器镜像（fail-closed，spike loop 之前）
+        # GitHub hosted Windows runner 虽提供 Docker daemon，却不保证预置 runner_identity
+        # 核心 spike 所需的 python:3.12-slim；拉取和本地存在性验证均必须独立 fail-closed，
+        # 防止 wrapper 仅因冷镜像返回 BLOCKED_UNCERTIFIED 而使核心能力检查失败。
+        shell: pwsh
+        run: |
+          docker pull python:3.12-slim
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] 拉取 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
+          docker image inspect python:3.12-slim
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[runner_identity] 验证本地 python:3.12-slim 失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
       - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
         shell: pwsh
         run: |
