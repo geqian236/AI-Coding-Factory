@@ -41,8 +41,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -622,7 +624,7 @@ foreach ($if in $ifs) {
 
 
 # CI 预热 run block AST 分析器（P1-3）：确认存在真实 CommandAst 调用 dev.ps1（完整参数序列），
-# 而非仅在未使用字符串/注释里出现命令文本；并定位 $LASTEXITCODE -ne 0 守卫体（供 Python 校验 exit 1）。
+# 而非仅在未使用字符串/注释里出现命令文本；守卫末尾必须是直接的 `exit 1` AST，不能用正文正则。
 _CI_PREHEAT_AST_ANALYZER = r"""
 $ErrorActionPreference = 'Stop'
 $b64 = [Console]::In.ReadToEnd()
@@ -660,17 +662,30 @@ function Test-ExactPreheatElements($cmd) {
 }
 
 function Get-ExitGuardDetails($statement) {
-    $result = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false; bodyText = '' }
+    $result = [ordered]@{ isGuard = $false; conditionExact = $false; exitsOne = $false }
     if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $result }
     $clauses = @($statement.Clauses)
-    if ($clauses.Count -ne 1) { return $result }
+    if ($clauses.Count -ne 1 -or $null -ne $statement.ElseClause) { return $result }
     $result.isGuard = $true
     $condition = $clauses[0].Item1
     $body = $clauses[0].Item2
     $normalizedCondition = ($condition.Extent.Text -replace '\s+', '')
     $result.conditionExact = ($normalizedCondition -ceq '$LASTEXITCODE-ne0')
-    $result.bodyText = $body.Extent.Text
-    $result.exitsOne = ($result.bodyText -match '(?m)(^|\s)exit\s+1(\s|$)')
+
+    # 只能接受 guard 代码块最后一个**直接顶层**语句的 ExitStatementAst。嵌套 if、字符串
+    # 或前置 exit 都不代表失败分支一定退出；参数还必须是文本和 AST 值均精确为常量 1。
+    $directStatements = @($body.Statements)
+    if ($directStatements.Count -eq 0) { return $result }
+    $lastStatement = $directStatements[$directStatements.Count - 1]
+    if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
+    $pipeline = $lastStatement.Pipeline
+    $pipelineElements = @($pipeline.PipelineElements)
+    if ($pipelineElements.Count -ne 1 -or
+        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $result }
+    $expression = $pipelineElements[0].Expression
+    if ($expression -isnot [System.Management.Automation.Language.ConstantExpressionAst]) { return $result }
+    $result.exitsOne = ($expression.Value -is [int] -and $expression.Value -eq 1 -and
+        $expression.Extent.Text -ceq '1')
     return $result
 }
 
@@ -700,13 +715,11 @@ $devPreheatAtTopLevel = $commandElementsExact
 $nextTopLevelIsExitGuard = $false
 $guardConditionExact = $false
 $guardExitsOne = $false
-$exitGuardBodyText = ''
 if ($devPreheatAtTopLevel -and $devIndex + 1 -lt $topStatements.Count) {
     $guard = Get-ExitGuardDetails $topStatements[$devIndex + 1]
     $nextTopLevelIsExitGuard = $guard.isGuard
     $guardConditionExact = $guard.conditionExact
     $guardExitsOne = $guard.exitsOne
-    $exitGuardBodyText = $guard.bodyText
 }
 $devInvokes = $commandElementsExact
 $hasExitGuard = ($nextTopLevelIsExitGuard -and $guardConditionExact)
@@ -718,7 +731,6 @@ $preheatValid = ($commandElementsExact -and $devPreheatAtTopLevel -and
     devInvokes               = $devInvokes
     devInvokeCount           = $devInvokeCount
     hasExitGuard             = $hasExitGuard
-    exitGuardBodyText        = $exitGuardBodyText
     commandElementsExact     = $commandElementsExact
     devPreheatAtTopLevel     = $devPreheatAtTopLevel
     nextTopLevelIsExitGuard  = $nextTopLevelIsExitGuard
@@ -1209,16 +1221,12 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     assert a["guardConditionExact"] is True
     assert a["guardExitsOne"] is True
     assert a["preheatValid"] is True
-    body = _strip_ps_comments(str(a.get("exitGuardBodyText", "")))
-    assert re.search(r"(?m)(^|\s)exit\s+1(\s|$)", body), (
-        f"LASTEXITCODE 守卫体必须 exit 1（去注释后）；body={body!r}"
-    )
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="AST 分析需 Windows PowerShell")
 def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     """P1-3 mutation 实证：把真实 dev.ps1 调用行注释掉 + 追加含完整命令的**未使用字符串**后，
-    AST 必须报 devInvokes=False（证明验证的是真实 CommandAst，而非命令文本出现在字符串/注释里）。"""
+    AST 必须报 devInvokes=False；同时 guard 中嵌套/字符串形式的 ``exit 1`` 也不得冒充直接失败退出。"""
     step = _preheat_step()
     run = str(step.get("run", ""))
     unused = (
@@ -1239,6 +1247,24 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     assert a["parseErrors"] == 0, f"mutation 后仍应可解析；parseErrors={a['parseErrors']}"
     assert a["devInvokes"] is False, (
         "注释真实调用后仅剩未使用字符串仍判 devInvokes=True——AST 未验证真实 CommandAst（P1-3 回归）"
+    )
+
+    # 守卫体中嵌套的 exit 即使文本匹配，也不是 $LASTEXITCODE 失败时的直接顶层退出。
+    nested_exit = run.replace("exit 1", "if ($false) { exit 1 }", 1)
+    assert nested_exit != run, "未能定位 CI 预热 guard 的直接 exit 1 以施加嵌套 mutation"
+    nested = _analyze_ci_run_block(nested_exit)
+    assert nested["parseErrors"] == 0, f"嵌套 exit mutation 后仍应可解析；结果={nested}"
+    assert nested["guardExitsOne"] is False and nested["preheatValid"] is False, (
+        "if ($false) { exit 1 } 不能作为 guard 的直接失败退出——AST 未锁定顶层 ExitStatementAst"
+    )
+
+    # 未使用字符串中的 exit 1 也必须被 AST 排除，不能再靠守卫正文正则放行。
+    string_exit = run.replace("exit 1", '$unusedExitText = "exit 1"', 1)
+    assert string_exit != run, "未能定位 CI 预热 guard 的直接 exit 1 以施加字符串 mutation"
+    string_only = _analyze_ci_run_block(string_exit)
+    assert string_only["parseErrors"] == 0, f"字符串 exit mutation 后仍应可解析；结果={string_only}"
+    assert string_only["guardExitsOne"] is False and string_only["preheatValid"] is False, (
+        "未使用字符串中的 exit 1 不能作为 guard 的直接失败退出——AST 未锁定常量 ExitStatementAst"
     )
 
 
@@ -1464,10 +1490,11 @@ def _unique_tmp_dir(tag: str) -> Path:
     调用方必须在 finally 调用 _remove_tree_strict；清理失败会失败，且 helper 断言目录不存在。"""
     root = _data_root() / "phase0-contract-tests"
     root = _validate_d_test_root(root)
-    if not root.exists():
-        # 先完成 D 盘/物理路径校验，再用 exist_ok=False 创建；并发撞名不得静默复用。
-        root.mkdir(parents=True, exist_ok=False)
+    # 共享父目录允许并发调用共同创建；预验证后以 exist_ok=True 消除 exists()+mkdir 的 TOCTOU，
+    # 并立即再次验证真实链路，防止创建窗口被 junction/reparse 偷换。
+    root.mkdir(parents=True, exist_ok=True)
     root = _validate_d_test_root(root)
+    # 只有本调用拥有的 UUID 叶目录必须拒绝复用，避免不同测试/xdist 互相覆盖。
     uniq = f"_r16_{tag}_{_worktree_digest(str(REPO_ROOT))}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     d = root / uniq
     _validate_d_test_root(d)
@@ -1483,7 +1510,9 @@ def _remove_tree_strict(path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="D 盘 DataRoot 唯一性是 Windows 存储合同")
-def test_temp_paths_are_unique_per_worktree_and_off_c_drive() -> None:
+def test_temp_paths_are_unique_per_worktree_and_off_c_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """P1-4：不同 worktree 派生不同临时目录 digest（不共享）；同一 worktree 两次分配也不撞
     （uuid/pid）；所有临时目录落在 D 盘 DataRoot 下、绝不落 C 盘。"""
     d1 = _worktree_digest(r"D:\codex项目\.codex-worktrees\AI-Coding-Factory\wt-A")
@@ -1503,6 +1532,32 @@ def test_temp_paths_are_unique_per_worktree_and_off_c_drive() -> None:
         for d in (a, b):
             if d is not None:
                 _remove_tree_strict(d)
+
+    # 首次创建共享父目录时，8 个并发调用都必须成功；只有 UUID 叶目录允许 exist_ok=False。
+    # 使用独占 D 盘测试根保证 shared parent 起初不存在，避免已有目录掩盖 TOCTOU。
+    parallel_root = _data_root() / f"_r16_parallel_root_{uuid.uuid4().hex[:8]}"
+    allocated: list[Path] = []
+    _validate_d_test_root(parallel_root)
+    parallel_root.mkdir(exist_ok=False)
+    monkeypatch.setenv(_TEST_DATA_ROOT_ENV, str(parallel_root))
+    barrier = threading.Barrier(8)
+
+    def allocate_after_barrier() -> Path:
+        barrier.wait(timeout=15)
+        return _unique_tmp_dir("parallel")
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(allocate_after_barrier) for _ in range(8)]
+            allocated = [future.result(timeout=30) for future in futures]
+        assert len(allocated) == 8 and len(set(allocated)) == 8, (
+            f"8 线程首次分配必须全成功且路径唯一：{allocated}"
+        )
+        assert all(path.exists() for path in allocated), "每个并发分配目录都必须真实创建"
+    finally:
+        for path in allocated:
+            _remove_tree_strict(path)
+        _remove_tree_strict(parallel_root)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1593,20 +1648,67 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
     )
 
 
+def _create_windows_junction(link: Path, target: Path) -> None:
+    """创建真实 D 盘 junction，供发布器验证已存在 reparse 链而非 mock 检查器。"""
+    assert link.parent.exists() and target.exists(), "junction 的父目录和目标必须先真实存在"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"真实 junction 创建失败；rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    attrs = getattr(os.lstat(link), "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    assert link.exists() and bool(attrs & reparse_flag), "测试夹具必须是实际 reparse/junction"
+
+
+def _remove_junction_strict(link: Path) -> None:
+    """只移除测试拥有的 junction 本身，绝不递归删除其指向的外部目标。"""
+    if os.path.lexists(link):
+        os.rmdir(link)
+    assert not os.path.lexists(link), f"junction 清理后仍存在：{link}"
+
+
 def _run_script_digest_publish_case(
     case: str,
     *,
     existing_final: bool = False,
     missing_final_parent: bool = False,
+    junction_escape: bool = False,
 ) -> tuple[int, dict[str, Any]]:
-    """从生产脚本 AST 提取发布函数，在 D 盘隔离目录复放无 final、已有 final 和发布失败路径。"""
+    """从生产脚本 AST 提取发布函数，在 D 盘隔离目录复放发布和真实 junction 拒绝路径。"""
     d = _unique_tmp_dir(f"digest-{case}")
-    script_root = d / "scripts"
+    project_root = d / "project"
+    script_root = project_root / "scripts"
+    data_root = d / "data-root"
+    provisional_dir = data_root / "tmp"
+    project_root.mkdir(exist_ok=False)
     script_root.mkdir(exist_ok=False)
+    provisional_dir.mkdir(parents=True, exist_ok=False)
     bound = script_root / "bound.ps1"
     bound.write_text("# digest binding fixture\n", encoding="utf-8")
-    final = (d / "missing-final-parent" / "final-receipt.json") if missing_final_parent else d / "final-receipt.json"
+    escape_link: Path | None = None
+    if junction_escape:
+        # lexical 路径仍在 project 内，但真实目标位于 project 外；两侧仍受 D 测试根约束。
+        escape_target = d / "outside"
+        escape_target.mkdir(exist_ok=False)
+        escape_link = project_root / "escape"
+        _create_windows_junction(escape_link, escape_target)
+        final = escape_link / "final-receipt.json"
+    else:
+        final = (
+            project_root / "missing-final-parent" / "final-receipt.json"
+            if missing_final_parent
+            else project_root / "final-receipt.json"
+        )
     existing_final_ps = "$true" if existing_final else "$false"
+    watch_source = "$true" if junction_escape else "$false"
+    event_source = f"phase0-provisional-{uuid.uuid4().hex}"
     try:
         ps = f"""
 $ErrorActionPreference = 'Stop'
@@ -1621,14 +1723,23 @@ $definitions = @($ast.FindAll(
 ))
 $definition = $definitions[0]
 if ($null -eq $definition) {{ throw 'Publish-AcceptanceReceipt missing' }}
+$reparseDefinitions = @($ast.FindAll(
+    {{ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $args[0].Name -eq 'Test-ReparsePointInChain' }},
+    $true
+))
+$reparseDefinition = $reparseDefinitions[0]
+if ($null -eq $reparseDefinition) {{ throw 'Test-ReparsePointInChain missing' }}
+. ([scriptblock]::Create($reparseDefinition.Extent.Text))
 . ([scriptblock]::Create($definition.Extent.Text))
-function Test-ReparsePointInChain {{ param([string]$Leaf, [string]$Root); return $null }}
 function Get-FileSha256 {{
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {{ return $null }}
     return 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLower()
 }}
 $global:results = [System.Collections.Generic.List[object]]::new()
+$global:PROJECT_ROOT = '{d}'
+$global:REPO_ROOT = '{project_root}'
 function Add-CheckResult {{
     param([string]$Id, [string]$Desc, [bool]$Passed, [string]$Detail)
     $entry = [ordered]@{{
@@ -1655,20 +1766,48 @@ if ($existingFinal) {{
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText('{final}', $oldReceipt, $utf8NoBom)
 }}
+$watcher = $null
+$eventSource = '{event_source}'
+if ({watch_source}) {{
+    $watcher = New-Object System.IO.FileSystemWatcher '{provisional_dir}', '*.provisional.json'
+    $watcher.EnableRaisingEvents = $true
+    $null = Register-ObjectEvent -InputObject $watcher -EventName Created -SourceIdentifier $eventSource
+}}
 $priorErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-$published = Publish-AcceptanceReceipt `
-    -Receipt $receipt -ScriptDigests $digests -ScriptRoot $scriptRoot `
-    -OutFull '{final}' -VerifiedProvisionalDir '{d}' -DataRoot '{d}'
+$publishException = ''
+try {{
+    $published = Publish-AcceptanceReceipt `
+        -Receipt $receipt -ScriptDigests $digests -ScriptRoot $scriptRoot `
+        -OutFull '{final}' -VerifiedProvisionalDir '{provisional_dir}' -DataRoot '{data_root}'
+}} catch {{
+    $publishException = $_.Exception.Message
+    $published = [ordered]@{{ topStatus='FAIL'; published=$false }}
+}}
 $ErrorActionPreference = $priorErrorActionPreference
-$provisionalFiles = @(Get-ChildItem -LiteralPath '{d}' -Filter '*.provisional.json' -File -ErrorAction SilentlyContinue)
-$backupFiles = @(Get-ChildItem -LiteralPath '{d}' -Filter '*.replace-backup.json' -File -ErrorAction SilentlyContinue)
+if ($null -ne $watcher) {{
+    Start-Sleep -Milliseconds 250
+    $provisionalEvents = @(Get-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue).Count
+    Unregister-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue
+    Get-Event -SourceIdentifier $eventSource -ErrorAction SilentlyContinue | Remove-Event -ErrorAction SilentlyContinue
+    $watcher.Dispose()
+}} else {{
+    $provisionalEvents = 0
+}}
+$provisionalFiles = @(
+    Get-ChildItem -LiteralPath '{provisional_dir}' -Filter '*.provisional.json' -File -ErrorAction SilentlyContinue
+)
+$backupFiles = @(
+    Get-ChildItem -LiteralPath '{provisional_dir}' -Filter '*.replace-backup.json' -File -ErrorAction SilentlyContinue
+)
 $payload = [ordered]@{{
     topStatus = [string]$published.topStatus
     published = [bool]$published.published
     finalExists = (Test-Path -LiteralPath '{final}')
     provisionalLeft = $provisionalFiles.Count
     backupLeft = $backupFiles.Count
+    provisionalEvents = $provisionalEvents
+    publishException = $publishException
 }}
 if ($payload.finalExists) {{
     $payload['finalReceipt'] = Get-Content -LiteralPath '{final}' -Raw -Encoding utf8 | ConvertFrom-Json
@@ -1691,6 +1830,8 @@ exit 1
         )
         return result.returncode, json.loads(result.stdout)
     finally:
+        if escape_link is not None:
+            _remove_junction_strict(escape_link)
         _remove_tree_strict(d)
 
 
@@ -1700,7 +1841,7 @@ exit 1
     [("missing_field", True), ("missing_key", False), ("wrong_digest", False)],
 )
 def test_script_digest_publish_contract(case: str, covers_publish_paths: bool) -> None:
-    """动态摘要失败不得发布 PASS；同一合同还覆盖无 final、已有 final 与发布失败清理。"""
+    """动态摘要失败不得发布 PASS；同一合同还覆盖原子发布、真实 junction 拒绝与严格清理。"""
     rc, payload = _run_script_digest_publish_case(case)
     assert rc == 1, f"{case} 动态 digest 失败必须 exit 1；实际 rc={rc} payload={payload}"
     assert payload["topStatus"] == "FAIL", f"{case} 失败时发布器必须返回 FAIL：{payload}"
@@ -1741,6 +1882,23 @@ def test_script_digest_publish_contract(case: str, covers_publish_paths: bool) -
         assert publish_failure["finalExists"] is False, f"发布异常不得遗留最终 PASS：{publish_failure}"
         assert publish_failure["provisionalLeft"] == 0 and publish_failure["backupLeft"] == 0, (
             f"发布异常后临时文件必须清理：{publish_failure}"
+        )
+
+        rc, junction_escape = _run_script_digest_publish_case("valid", junction_escape=True)
+        assert rc == 1 and junction_escape["published"] is False, (
+            f"OutFull 经真实 D 盘 junction 逃逸时必须在发布前 fail-closed：{junction_escape}"
+        )
+        assert junction_escape["topStatus"] == "FAIL", (
+            f"junction 拒绝必须返回 FAIL，不能把 PASS 作为本次验收结果：{junction_escape}"
+        )
+        assert junction_escape["finalExists"] is False, (
+            f"junction 拒绝前不得写出目标 final（尤其不能留下 PASS）：{junction_escape}"
+        )
+        assert junction_escape["provisionalEvents"] == 0, (
+            f"junction 必须在首次 provisional 写入前被拒绝：{junction_escape}"
+        )
+        assert junction_escape["provisionalLeft"] == 0 and junction_escape["backupLeft"] == 0, (
+            f"junction 拒绝后不得残留受控临时文件：{junction_escape}"
         )
 
 

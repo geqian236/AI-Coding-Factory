@@ -313,8 +313,70 @@ function Publish-AcceptanceReceipt {
         [string]$DataRoot
     )
 
+    # 目标回执预检必须先于任何 provisional 写入：$PROJECT_ROOT 是批准的 D 盘项目根，
+    # $REPO_ROOT 是本次验收回执允许落盘的仓库根。仅 GetFullPath 的词法前缀不足以
+    # 防御 junction，因此后续还会对实际存在的链路逐层检查 ReparsePoint。
+    $approvedRootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
+    $receiptProjectRootFull = [System.IO.Path]::GetFullPath($REPO_ROOT).TrimEnd('\')
     $provisionalRoot = [System.IO.Path]::GetFullPath($VerifiedProvisionalDir).TrimEnd('\')
     $dataRootFull = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\')
+    $outFullNormalized = [System.IO.Path]::GetFullPath($OutFull)
+    # 后续 File API 只能消费已规范化的目标，不能重新使用包含 .. 的原始输入绕过本次预检。
+    $OutFull = $outFullNormalized
+    $finalParentRaw = Split-Path -Path $outFullNormalized -Parent
+    if (-not $finalParentRaw) {
+        throw "final receipt has no parent directory: '$outFullNormalized'"
+    }
+    $finalParentFull = [System.IO.Path]::GetFullPath($finalParentRaw).TrimEnd('\')
+    $approvedDriveRoot = [System.IO.Path]::GetPathRoot($approvedRootFull)
+    $approvedVolume = $approvedDriveRoot.TrimEnd('\')
+    $provisionalVolume = ([System.IO.Path]::GetPathRoot($provisionalRoot)).TrimEnd('\')
+    $targetVolume = ([System.IO.Path]::GetPathRoot($finalParentFull)).TrimEnd('\')
+
+    # 批准根必须是实际存在的 D 盘目录；DataRoot、provisional 与最终父目录都要在其内。
+    # 这是后续同卷原子 Move/Replace 的前置条件，拒绝 C 盘、D 根外及跨卷目标。
+    if ($approvedVolume -ine 'D:' -or -not (Test-Path -LiteralPath $approvedRootFull -PathType Container)) {
+        throw "approved receipt root must be an existing D: directory: '$approvedRootFull'"
+    }
+    if ($receiptProjectRootFull -ne $approvedRootFull -and -not $receiptProjectRootFull.StartsWith($approvedRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "receipt project root escaped approved D: root: '$receiptProjectRootFull'"
+    }
+    if ($dataRootFull -ne $approvedRootFull -and -not $dataRootFull.StartsWith($approvedRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "receipt data root escaped approved D: root: '$dataRootFull'"
+    }
+    if ($outFullNormalized -ne $receiptProjectRootFull -and -not $outFullNormalized.StartsWith($receiptProjectRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "final receipt path escaped receipt project root: '$outFullNormalized'"
+    }
+    if ($finalParentFull -ne $receiptProjectRootFull -and -not $finalParentFull.StartsWith($receiptProjectRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "final receipt parent escaped receipt project root: '$finalParentFull'"
+    }
+    if (-not (Test-Path -LiteralPath $finalParentFull -PathType Container)) {
+        throw "final receipt parent directory does not exist: '$finalParentFull'"
+    }
+    if ($provisionalVolume -ine $approvedVolume -or $targetVolume -ine $approvedVolume -or $provisionalVolume -ine $targetVolume) {
+        throw "receipt provisional and final target must share approved D: volume: '$provisionalVolume' -> '$targetVolume'"
+    }
+
+    # 真实 reparse 链检查：先检查批准根到盘符，再检查 data/provisional 和 OutFull（存在时含文件，
+    # 不存在时检查已存在父链）。所有链均无 reparse 后，上述规范化路径才代表可验证的物理边界。
+    $approvedReparse = Test-ReparsePointInChain -Leaf $approvedRootFull -Root $approvedDriveRoot
+    if ($approvedReparse) {
+        throw "approved receipt root contains reparse point: '$approvedReparse'"
+    }
+    $dataRootReparse = Test-ReparsePointInChain -Leaf $dataRootFull -Root $approvedRootFull
+    if ($dataRootReparse) {
+        throw "receipt data root contains reparse point: '$dataRootReparse'"
+    }
+    $projectRootReparse = Test-ReparsePointInChain -Leaf $receiptProjectRootFull -Root $approvedRootFull
+    if ($projectRootReparse) {
+        throw "receipt project root contains reparse point: '$projectRootReparse'"
+    }
+    $finalProbe = if (Test-Path -LiteralPath $outFullNormalized) { $outFullNormalized } else { $finalParentFull }
+    $finalReparse = Test-ReparsePointInChain -Leaf $finalProbe -Root $receiptProjectRootFull
+    if ($finalReparse) {
+        throw "final receipt path contains reparse point: '$finalReparse'"
+    }
+
     $publicationId = [guid]::NewGuid().ToString("N")
     $provisional = Join-Path $provisionalRoot ("phase0-acceptance-" + $publicationId + ".provisional.json")
     $provisionalFull = [System.IO.Path]::GetFullPath($provisional)
@@ -332,7 +394,7 @@ function Publish-AcceptanceReceipt {
     if (-not (Test-Path -LiteralPath $provisionalRoot)) {
         throw "verified provisional receipt directory does not exist: '$provisionalRoot'"
     }
-    $provisionalReparse = Test-ReparsePointInChain -Leaf $provisionalRoot -Root $DataRoot
+    $provisionalReparse = Test-ReparsePointInChain -Leaf $provisionalRoot -Root $dataRootFull
     if ($provisionalReparse) {
         throw "provisional receipt directory contains reparse point: '$provisionalReparse'"
     }
@@ -842,11 +904,11 @@ $receipt = [ordered]@{
 }
 
 if (-not $OutFile) { $OutFile = Join-Path $REPO_ROOT ".phase0-acceptance-receipt.json" }
-# V7: OutFile fail-closed under the project root.
+# OutFile 先按仓库根做词法拒绝；发布函数还会在写 provisional 前复核真实 reparse 链和物理边界。
 $outFull = [System.IO.Path]::GetFullPath($OutFile)
-$rootFull = [System.IO.Path]::GetFullPath($PROJECT_ROOT).TrimEnd('\')
+$rootFull = [System.IO.Path]::GetFullPath($REPO_ROOT).TrimEnd('\')
 if ($outFull -ne $rootFull -and -not $outFull.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-    Write-Error "[acceptance] fail-closed: OutFile '$outFull' is not under project root '$PROJECT_ROOT'."
+    Write-Error "[acceptance] fail-closed: OutFile '$outFull' is not under receipt project root '$REPO_ROOT'."
     exit 1
 }
 $publishedReceipt = Publish-AcceptanceReceipt `
