@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import io
 import json
 import os
 import platform
@@ -60,6 +61,38 @@ EVENT_BATCH_PARAMETERS = {
 _BENCHMARK_PROFILE_REL = os.path.join(
     "contracts", "benchmarks", "benchmark-profile.v1.json"
 )
+
+
+def _is_utf8_encoding(encoding: object) -> bool:
+    """只接受无 BOM 的 UTF-8，确保 stdout 可被下游按单一 JSON 编码解析。"""
+    if not isinstance(encoding, str):
+        return False
+    return encoding.replace("_", "").replace("-", "").casefold() == "utf8"
+
+
+def _configure_stdout_utf8() -> None:
+    """将 CLI stdout 固定为严格 UTF-8，避免 Windows ANSI 代码页截断中文回执。
+
+    bench 的回执刻意保留中文（ensure_ascii=False），下游 wrapper 也把 stdout 当作完整
+    JSON 证据。真实 TextIOWrapper 必须成功重配置并回读为 UTF-8；如果宿主替换 stdout，
+    仅接受已知安全的 Unicode StringIO 或已标记 UTF-8 的流。任何配置异常都抛出稳定错误，
+    由入口 fail-closed，禁止在 cp1252 等未知编码上继续写半份 receipt。
+    """
+    stdout = sys.stdout
+    reconfigure = getattr(stdout, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except Exception as exc:
+            raise RuntimeError("STDOUT_UTF8_CONFIG_FAILED") from exc
+        if not _is_utf8_encoding(getattr(stdout, "encoding", None)):
+            raise RuntimeError("STDOUT_UTF8_CONFIG_FAILED")
+        return
+
+    # pytest 等捕获器可能用 StringIO 替换 stdout；它保存 Unicode 字符，不走终端代码页。
+    if isinstance(stdout, io.StringIO) or _is_utf8_encoding(getattr(stdout, "encoding", None)):
+        return
+    raise RuntimeError("STDOUT_UTF8_UNAVAILABLE")
 
 
 def _sha256(data: bytes) -> str:
@@ -541,6 +574,18 @@ def run_probe(tmp_dir: str) -> dict:
 
 if __name__ == "__main__":
     import argparse
+
+    try:
+        # 先固定编码再解析参数，保证 --help 与正式 receipt 都不会落回 Windows ANSI stdout。
+        _configure_stdout_utf8()
+    except RuntimeError:
+        # 只报告稳定 ASCII 分类，不输出 receipt、路径细节或环境正文，避免失败路径泄漏内容。
+        try:
+            sys.stderr.write("STDOUT_UTF8_CONFIGURATION_FAILED\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        sys.exit(1)
 
     parser = argparse.ArgumentParser(description="SQLite WAL+FULL probe")
     parser.add_argument(
