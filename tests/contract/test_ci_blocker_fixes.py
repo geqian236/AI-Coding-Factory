@@ -695,11 +695,43 @@ function Get-ExitGuardDetails($statement) {
     $normalizedCondition = ($condition.Extent.Text -replace '\s+', '')
     $result.conditionExact = ($normalizedCondition -ceq '$LASTEXITCODE-ne0')
 
-    # 只能接受 guard 代码块最后一个**直接顶层**语句的 ExitStatementAst。嵌套 if、字符串
-    # 或前置 exit 都不代表失败分支一定退出；参数还必须是文本和 AST 值均精确为常量 1。
+    # 当前 CI 的 fail-closed guard 仅允许两个**直接顶层**语句：直接调用 Write-Error，
+    # 再以常量 exit 1 结束。任何前置 return、exit 0、嵌套分支或其他短路控制流都会使
+    # 末尾 exit 1 不可达，不能被误判为已可靠失败退出。
     $directStatements = @($body.Statements)
-    if ($directStatements.Count -eq 0) { return $result }
-    $lastStatement = $directStatements[$directStatements.Count - 1]
+    if ($directStatements.Count -ne 2) { return $result }
+    $writeErrorStatement = $directStatements[0]
+    if ($writeErrorStatement -isnot [System.Management.Automation.Language.PipelineAst]) { return $result }
+    $writeErrorPipeline = @($writeErrorStatement.PipelineElements)
+    if ($writeErrorPipeline.Count -ne 1 -or
+        $writeErrorPipeline[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $result }
+    $writeError = $writeErrorPipeline[0]
+    $writeErrorElements = @($writeError.CommandElements)
+    if ($writeError.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+        $writeErrorElements.Count -lt 2 -or
+        (Normalize-CommandElement $writeErrorElements[0]) -cne 'Write-Error') { return $result }
+    # 即使顶层只剩 Write-Error，也要递归拒绝消息子表达式里的短路或控制流；例如
+    # `Write-Error "$(exit 0) ..."` 会在记录错误前提前退出，不能借块尾 exit 1 假绿。
+    $nestedControlFlow = @($writeErrorStatement.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ReturnStatementAst] -or
+        $node -is [System.Management.Automation.Language.ExitStatementAst] -or
+        $node -is [System.Management.Automation.Language.ThrowStatementAst] -or
+        $node -is [System.Management.Automation.Language.BreakStatementAst] -or
+        $node -is [System.Management.Automation.Language.ContinueStatementAst] -or
+        $node -is [System.Management.Automation.Language.TrapStatementAst] -or
+        $node -is [System.Management.Automation.Language.IfStatementAst] -or
+        $node -is [System.Management.Automation.Language.SwitchStatementAst] -or
+        $node -is [System.Management.Automation.Language.TryStatementAst] -or
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -or
+        $node -is [System.Management.Automation.Language.ForStatementAst] -or
+        $node -is [System.Management.Automation.Language.WhileStatementAst] -or
+        $node -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+        $node -is [System.Management.Automation.Language.DoUntilStatementAst]
+    }, $true))
+    if ($nestedControlFlow.Count -ne 0) { return $result }
+
+    $lastStatement = $directStatements[1]
     if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
     $pipeline = $lastStatement.Pipeline
     $pipelineElements = @($pipeline.PipelineElements)
@@ -813,11 +845,42 @@ function Get-ExitGuardDetails($statement) {
     $normalizedCondition = ($condition.Extent.Text -replace '\s+', '')
     $result.conditionExact = ($normalizedCondition -ceq '$LASTEXITCODE-ne0')
 
-    # 只接受 guard 块最后一个直接顶层语句的 exit 1；嵌套分支、字符串或别的退出码不能
-    # 表示当前 docker 调用已 fail-closed。
+    # 镜像准备的 guard 同样只能是直接 Write-Error 后紧接常量 exit 1。前置 return、
+    # exit 0、嵌套分支或其他短路控制流会让块尾 exit 1 不可达，必须 fail-closed 拒绝。
     $directStatements = @($body.Statements)
-    if ($directStatements.Count -eq 0) { return $result }
-    $lastStatement = $directStatements[$directStatements.Count - 1]
+    if ($directStatements.Count -ne 2) { return $result }
+    $writeErrorStatement = $directStatements[0]
+    if ($writeErrorStatement -isnot [System.Management.Automation.Language.PipelineAst]) { return $result }
+    $writeErrorPipeline = @($writeErrorStatement.PipelineElements)
+    if ($writeErrorPipeline.Count -ne 1 -or
+        $writeErrorPipeline[0] -isnot [System.Management.Automation.Language.CommandAst]) { return $result }
+    $writeError = $writeErrorPipeline[0]
+    $writeErrorElements = @($writeError.CommandElements)
+    if ($writeError.InvocationOperator -ne [System.Management.Automation.Language.TokenKind]::Unknown -or
+        $writeErrorElements.Count -lt 2 -or
+        (Normalize-CommandElement $writeErrorElements[0]) -cne 'Write-Error') { return $result }
+    # Docker guard 的日志参数同样不得暗藏 return/exit/throw 等控制流；否则命令文本末尾
+    # 虽有 exit 1，实际却可能在 Write-Error 构造消息时提前短路并绕过 fail-closed。
+    $nestedControlFlow = @($writeErrorStatement.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ReturnStatementAst] -or
+        $node -is [System.Management.Automation.Language.ExitStatementAst] -or
+        $node -is [System.Management.Automation.Language.ThrowStatementAst] -or
+        $node -is [System.Management.Automation.Language.BreakStatementAst] -or
+        $node -is [System.Management.Automation.Language.ContinueStatementAst] -or
+        $node -is [System.Management.Automation.Language.TrapStatementAst] -or
+        $node -is [System.Management.Automation.Language.IfStatementAst] -or
+        $node -is [System.Management.Automation.Language.SwitchStatementAst] -or
+        $node -is [System.Management.Automation.Language.TryStatementAst] -or
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -or
+        $node -is [System.Management.Automation.Language.ForStatementAst] -or
+        $node -is [System.Management.Automation.Language.WhileStatementAst] -or
+        $node -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+        $node -is [System.Management.Automation.Language.DoUntilStatementAst]
+    }, $true))
+    if ($nestedControlFlow.Count -ne 0) { return $result }
+
+    $lastStatement = $directStatements[1]
     if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
     $pipeline = $lastStatement.Pipeline
     $pipelineElements = @($pipeline.PipelineElements)
@@ -1425,6 +1488,34 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
         "未使用字符串中的 exit 1 不能作为 guard 的直接失败退出——AST 未锁定常量 ExitStatementAst"
     )
 
+    # guard 即使末尾仍留有 exit 1，前置 return 或 exit 0 也会让失败路径提前成功返回；
+    # 必须拒绝这两种短路，锁定当前唯一允许的 Write-Error → exit 1 形状。
+    early_return = run.replace("Write-Error ", "return\n            Write-Error ", 1)
+    assert early_return != run, "未能定位预热 guard 的 Write-Error 以施加 early-return mutation"
+    returned = _analyze_ci_run_block(early_return)
+    assert returned["parseErrors"] == 0, f"early-return mutation 后仍应可解析；结果={returned}"
+    assert returned["guardExitsOne"] is False and returned["preheatValid"] is False, (
+        "guard 中前置 return 后末尾 exit 1 不可达，AST 必须拒绝该假 fail-closed 形状"
+    )
+
+    early_exit_zero = run.replace("Write-Error ", "exit 0\n            Write-Error ", 1)
+    assert early_exit_zero != run, "未能定位预热 guard 的 Write-Error 以施加 early-exit0 mutation"
+    exited_zero = _analyze_ci_run_block(early_exit_zero)
+    assert exited_zero["parseErrors"] == 0, f"early-exit0 mutation 后仍应可解析；结果={exited_zero}"
+    assert exited_zero["guardExitsOne"] is False and exited_zero["preheatValid"] is False, (
+        "guard 中前置 exit 0 后末尾 exit 1 不可达，AST 必须拒绝该假 fail-closed 形状"
+    )
+
+    # 短路也不能藏在 Write-Error 的可展开字符串子表达式中：执行消息构造时会先执行 exit 0，
+    # 因而后续的错误日志和 exit 1 都不可达，必须由深层 AST 检查拒绝。
+    nested_exit_zero = run.replace('Write-Error "', 'Write-Error "$(exit 0) ', 1)
+    assert nested_exit_zero != run, "未能定位预热 guard 的 Write-Error 以施加嵌套 exit0 mutation"
+    nested_zero = _analyze_ci_run_block(nested_exit_zero)
+    assert nested_zero["parseErrors"] == 0, f"嵌套 exit0 mutation 后仍应可解析；结果={nested_zero}"
+    assert nested_zero["guardExitsOne"] is False and nested_zero["preheatValid"] is False, (
+        "Write-Error 子表达式中的 exit 0 也会短路，AST 必须拒绝该假 fail-closed 形状"
+    )
+
     # 新镜像准备规则的 mutation 也放在既有节点中，保持冻结测试节点数量不变。注释整行或
     # 仅保留未使用字符串都不能算作 Docker 命令；守卫提前、参数折叠、原生命令插队均必须红。
     image_run = str(_runner_identity_image_step().get("run", ""))
@@ -1465,6 +1556,28 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     image_a = _analyze_runner_identity_image_run(inspect_interleaved)
     assert image_a["parseErrors"] == 0
     assert image_a["inspectImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
+    # 镜像步骤与工具链预热共用同一 fail-closed 合同：首个 guard 发生早期 return / exit 0
+    # 时，不能仅因块末尾还留有 exit 1 就被误判为安全。
+    image_early_return = image_run.replace("Write-Error ", "return\n            Write-Error ", 1)
+    assert image_early_return != image_run, "未能定位镜像 guard 的 Write-Error 以施加 early-return mutation"
+    image_a = _analyze_runner_identity_image_run(image_early_return)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
+    image_early_exit_zero = image_run.replace("Write-Error ", "exit 0\n            Write-Error ", 1)
+    assert image_early_exit_zero != image_run, "未能定位镜像 guard 的 Write-Error 以施加 early-exit0 mutation"
+    image_a = _analyze_runner_identity_image_run(image_early_exit_zero)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
+
+    image_nested_exit_zero = image_run.replace(
+        'Write-Error "', 'Write-Error "$(exit 0) ', 1
+    )
+    assert image_nested_exit_zero != image_run, "未能定位镜像 guard 的 Write-Error 以施加嵌套 exit0 mutation"
+    image_a = _analyze_runner_identity_image_run(image_nested_exit_zero)
+    assert image_a["parseErrors"] == 0
+    assert image_a["pullImmediatelyGuarded"] is False and image_a["imagePreparationValid"] is False
 
 
 _PREHEAT_COMMAND = (
