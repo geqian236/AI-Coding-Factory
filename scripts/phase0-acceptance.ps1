@@ -316,10 +316,16 @@ function Publish-AcceptanceReceipt {
 
     $provisionalRoot = [System.IO.Path]::GetFullPath($VerifiedProvisionalDir).TrimEnd('\')
     $dataRootFull = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\')
-    $provisional = Join-Path $provisionalRoot ("phase0-acceptance-" + [guid]::NewGuid().ToString("N") + ".provisional.json")
+    $publicationId = [guid]::NewGuid().ToString("N")
+    $provisional = Join-Path $provisionalRoot ("phase0-acceptance-" + $publicationId + ".provisional.json")
     $provisionalFull = [System.IO.Path]::GetFullPath($provisional)
+    $backup = Join-Path $provisionalRoot ("phase0-acceptance-" + $publicationId + ".replace-backup.json")
+    $backupFull = [System.IO.Path]::GetFullPath($backup)
     if ($provisionalFull -ne $provisionalRoot -and -not $provisionalFull.StartsWith($provisionalRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "provisional receipt path escaped verified directory: '$provisionalFull'"
+    }
+    if ($backupFull -ne $provisionalRoot -and -not $backupFull.StartsWith($provisionalRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "provisional receipt backup path escaped verified directory: '$backupFull'"
     }
     if ($provisionalRoot -ne $dataRootFull -and -not $provisionalRoot.StartsWith($dataRootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "provisional receipt directory escaped data root: '$provisionalRoot'"
@@ -385,9 +391,17 @@ function Publish-AcceptanceReceipt {
     try {
         $finalJson = $Receipt | ConvertTo-Json -Depth 12
         [System.IO.File]::WriteAllText($provisionalFull, $finalJson, (New-Object System.Text.UTF8Encoding($false)))
-        # 同卷原子替换：已有最终文件使用 File.Replace 发布已验证 provisional；首次发布使用 Move。
+        # 同卷原子替换：PS5 的 File.Replace 不能把 $null 绑定为第三参数；使用受控唯一备份，
+        # 成功后立即严格删除备份。首次发布仍以 Move 发布已验证 provisional。
         if (Test-Path -LiteralPath $OutFull) {
-            [System.IO.File]::Replace($provisionalFull, $OutFull, $null)
+            [System.IO.File]::Replace($provisionalFull, $OutFull, $backupFull)
+            if (-not (Test-Path -LiteralPath $backupFull)) {
+                throw "atomic receipt replacement did not create controlled backup: '$backupFull'"
+            }
+            Remove-Item -LiteralPath $backupFull -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $backupFull) {
+                throw "atomic receipt replacement backup remains after cleanup: '$backupFull'"
+            }
         } else {
             [System.IO.File]::Move($provisionalFull, $OutFull)
         }
@@ -404,9 +418,12 @@ function Publish-AcceptanceReceipt {
         Write-Error "[acceptance] fail-closed: could not publish receipt '$OutFull': $_"
         $topStatusNow = "FAIL"
     } finally {
-        # 无论发布成功或失败，都严格清理未移动的 provisional，避免下次运行误用残留验证文件。
+        # 无论发布成功或失败，都严格清理残留 provisional/backup，避免下次运行误用验证文件。
         if (Test-Path -LiteralPath $provisionalFull) {
             Remove-Item -LiteralPath $provisionalFull -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $backupFull) {
+            Remove-Item -LiteralPath $backupFull -Force -ErrorAction Stop
         }
     }
 

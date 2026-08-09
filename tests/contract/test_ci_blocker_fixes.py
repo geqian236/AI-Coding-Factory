@@ -1579,8 +1579,8 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
     assert "Publish-AcceptanceReceipt" in code, (
         "最终回执必须经受控 provisional 校验后原子发布，避免动态反查失败留下 PASS 文件"
     )
-    assert "[System.IO.File]::Replace($provisionalFull, $OutFull, $null)" in code, (
-        "已有最终回执时必须以 File.Replace 原子发布 verified provisional"
+    assert "[System.IO.File]::Replace($provisionalFull, $OutFull, $backupFull)" in code, (
+        "已有最终回执时必须以具名受控备份调用 File.Replace 原子发布 verified provisional"
     )
     assert "[System.IO.File]::Move($provisionalFull, $OutFull)" in code, (
         "首次发布必须从 verified provisional 原子移动到最终路径"
@@ -1590,14 +1590,20 @@ def test_acceptance_has_dynamic_receipt_digest_gate() -> None:
     )
 
 
-def _run_script_digest_publish_failure(case: str) -> tuple[int, dict[str, Any]]:
-    """从生产脚本 AST 提取 Publish-AcceptanceReceipt，在 D 盘隔离目录复放最终回执失败语义。"""
+def _run_script_digest_publish_case(
+    case: str,
+    *,
+    existing_final: bool = False,
+    missing_final_parent: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """从生产脚本 AST 提取发布函数，在 D 盘隔离目录复放无 final、已有 final 和发布失败路径。"""
     d = _unique_tmp_dir(f"digest-{case}")
     script_root = d / "scripts"
     script_root.mkdir(exist_ok=False)
     bound = script_root / "bound.ps1"
     bound.write_text("# digest binding fixture\n", encoding="utf-8")
-    final = d / "final-receipt.json"
+    final = (d / "missing-final-parent" / "final-receipt.json") if missing_final_parent else d / "final-receipt.json"
+    existing_final_ps = "$true" if existing_final else "$false"
     try:
         ps = f"""
 $ErrorActionPreference = 'Stop'
@@ -1637,15 +1643,29 @@ switch ('{case}') {{
     'missing_field' {{ }}
     'missing_key' {{ $receipt['scriptDigests'] = [ordered]@{{}} }}
     'wrong_digest' {{ $receipt['scriptDigests'] = [ordered]@{{ 'bound.ps1' = ('sha256:' + ('0' * 64)) }} }}
+    'valid' {{ $receipt['scriptDigests'] = [ordered]@{{ 'bound.ps1' = $actual }} }}
     default {{ throw 'unknown case' }}
 }}
+$existingFinal = {existing_final_ps}
+if ($existingFinal) {{
+    $oldReceipt = '{{"topStatus":"PASS","origin":"old"}}'
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText('{final}', $oldReceipt, $utf8NoBom)
+}}
+$priorErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $published = Publish-AcceptanceReceipt `
     -Receipt $receipt -ScriptDigests $digests -ScriptRoot $scriptRoot `
     -OutFull '{final}' -VerifiedProvisionalDir '{d}' -DataRoot '{d}'
+$ErrorActionPreference = $priorErrorActionPreference
+$provisionalFiles = @(Get-ChildItem -LiteralPath '{d}' -Filter '*.provisional.json' -File -ErrorAction SilentlyContinue)
+$backupFiles = @(Get-ChildItem -LiteralPath '{d}' -Filter '*.replace-backup.json' -File -ErrorAction SilentlyContinue)
 $payload = [ordered]@{{
     topStatus = [string]$published.topStatus
     published = [bool]$published.published
     finalExists = (Test-Path -LiteralPath '{final}')
+    provisionalLeft = $provisionalFiles.Count
+    backupLeft = $backupFiles.Count
 }}
 if ($payload.finalExists) {{
     $payload['finalReceipt'] = Get-Content -LiteralPath '{final}' -Raw -Encoding utf8 | ConvertFrom-Json
@@ -1672,10 +1692,13 @@ exit 1
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="D 盘原子回执发布语义需 Windows PowerShell")
-@pytest.mark.parametrize("case", ["missing_field", "missing_key", "wrong_digest"])
-def test_script_digest_failures_exit_nonzero_and_never_publish_pass(case: str) -> None:
-    """缺 scriptDigests、缺键、错摘要三路均须 exit 1，最终回执存在时 topStatus 必为 FAIL。"""
-    rc, payload = _run_script_digest_publish_failure(case)
+@pytest.mark.parametrize(
+    ("case", "covers_publish_paths"),
+    [("missing_field", True), ("missing_key", False), ("wrong_digest", False)],
+)
+def test_script_digest_publish_contract(case: str, covers_publish_paths: bool) -> None:
+    """动态摘要失败不得发布 PASS；同一合同还覆盖无 final、已有 final 与发布失败清理。"""
+    rc, payload = _run_script_digest_publish_case(case)
     assert rc == 1, f"{case} 动态 digest 失败必须 exit 1；实际 rc={rc} payload={payload}"
     assert payload["topStatus"] == "FAIL", f"{case} 失败时发布器必须返回 FAIL：{payload}"
     assert payload["finalExists"] is True, f"{case} 失败时应发布可审计 FAIL 回执，而非遗留旧 PASS"
@@ -1683,6 +1706,39 @@ def test_script_digest_failures_exit_nonzero_and_never_publish_pass(case: str) -
     assert final_receipt["topStatus"] == "FAIL", f"{case} 最终回执不得残留 PASS：{final_receipt}"
     digest_check = next(item for item in final_receipt["checks"] if item["id"] == "script-digests")
     assert digest_check["passed"] is False, f"{case} script-digests 正式 check 必须失败：{digest_check}"
+    assert payload["provisionalLeft"] == 0, f"{case} 完成后不得残留 provisional：{payload}"
+    assert payload["backupLeft"] == 0, f"{case} 完成后不得残留 replace backup：{payload}"
+
+    if covers_publish_paths:
+        rc, no_final = _run_script_digest_publish_case("valid")
+        assert rc == 0 and no_final["published"] is True, f"首次发布必须成功：{no_final}"
+        assert no_final["finalExists"] is True, f"首次发布必须产生最终回执：{no_final}"
+        assert no_final["finalReceipt"]["topStatus"] == "PASS", f"首次发布回执必须为 PASS：{no_final}"
+
+        rc, existing_final = _run_script_digest_publish_case("valid", existing_final=True)
+        assert rc == 0 and existing_final["published"] is True, (
+            f"已有 final 时必须同卷原子替换并成功：{existing_final}"
+        )
+        assert existing_final["finalExists"] is True, f"替换后最终回执不得丢失：{existing_final}"
+        assert existing_final["finalReceipt"]["topStatus"] == "PASS", (
+            f"替换后最终回执必须为本次 PASS：{existing_final}"
+        )
+        assert "origin" not in existing_final["finalReceipt"], (
+            f"替换后不得继续读取预存 final 内容：{existing_final}"
+        )
+        assert existing_final["provisionalLeft"] == 0 and existing_final["backupLeft"] == 0, (
+            f"原子替换成功后临时文件必须清理：{existing_final}"
+        )
+
+        rc, publish_failure = _run_script_digest_publish_case("valid", missing_final_parent=True)
+        assert rc == 1 and publish_failure["published"] is False, (
+            f"发布目标目录缺失时必须 fail-closed：{publish_failure}"
+        )
+        assert publish_failure["topStatus"] == "FAIL", f"发布异常必须返回 FAIL：{publish_failure}"
+        assert publish_failure["finalExists"] is False, f"发布异常不得遗留最终 PASS：{publish_failure}"
+        assert publish_failure["provisionalLeft"] == 0 and publish_failure["backupLeft"] == 0, (
+            f"发布异常后临时文件必须清理：{publish_failure}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
