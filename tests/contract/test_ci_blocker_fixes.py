@@ -611,6 +611,23 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         assert analysis.get("unsafeTerminalInAuditChain") is True and analysis["dRootValid"] is False, (
             f"首次 audit 后的 {terminal!r} 必须在 post-create 复核完成前被拒绝：{analysis}"
         )
+
+    # post-create audit 本身位于 foreach；在命令后成功终止会跳过后续
+    # TEMP/TMP/缓存路径项。保护边界必须覆盖整个 ForEachStatementAst，
+    # 不能停在首轮实际执行的 audit CommandAst 文本末尾。
+    post_create_audit = (
+        '[void](Assert-ApprovedRunnerPath -Name $name -Value $paths[$name] -Stage "post-create")'
+    )
+    assert post_create_audit in d_root_code
+    for terminal in ("exit 0", "exit", "return"):
+        loop_shortcut = d_root_code.replace(
+            post_create_audit, post_create_audit + "\n              " + terminal, 1,
+        )
+        analysis = _analyze_d_root_guard_run(loop_shortcut)
+        assert analysis["parseErrors"] == 0
+        assert analysis.get("unsafeTerminalInAuditChain") is True and analysis["dRootValid"] is False, (
+            f"post-create foreach 首轮 audit 后的 {terminal!r} 必须被拒绝：{analysis}"
+        )
     d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
     junction = d_root_tmp / "reparse-link"
     junction_target = d_root_tmp / "target"
@@ -761,9 +778,19 @@ $newItems = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.CommandAst] -and
     $args[0].GetCommandName() -eq 'New-Item'
 }, $true) | Sort-Object { $_.Extent.StartOffset })
-$lastAuditEndOffset = if ($auditCommands.Count -gt 0) {
-    $auditCommands[$auditCommands.Count - 1].Extent.EndOffset
-} else { -1 }
+$lastAudit = if ($auditCommands.Count -gt 0) { $auditCommands[$auditCommands.Count - 1] } else { $null }
+$postCreateLoop = $null
+if ($null -ne $lastAudit) {
+    $cursor = $lastAudit.Parent
+    while ($null -ne $cursor) {
+        if ($cursor -is [System.Management.Automation.Language.ForEachStatementAst]) {
+            $postCreateLoop = $cursor
+            break
+        }
+        $cursor = $cursor.Parent
+    }
+}
+$auditChainEndOffset = if ($null -ne $postCreateLoop) { $postCreateLoop.Extent.EndOffset } else { -1 }
 
 function Test-InFunctionScope($node) {
     $cursor = $node.Parent
@@ -799,8 +826,8 @@ $terminals = @($ast.FindAll({
 foreach ($terminal in $terminals) {
     # 只忽略函数定义内的终止语句；顶层保护区间必须延伸到最后一次
     # post-create 审计结束，否则首次 audit 后仍能成功短路。
-    if ((Test-InFunctionScope $terminal) -or $lastAuditEndOffset -lt 0 -or
-        $terminal.Extent.StartOffset -ge $lastAuditEndOffset) { continue }
+    if ((Test-InFunctionScope $terminal) -or $auditChainEndOffset -lt 0 -or
+        $terminal.Extent.StartOffset -ge $auditChainEndOffset) { continue }
     # 只有 ExitStatementAst 中的整数常量 1 是合法 fail-closed；不依赖源码大小写。
     if (-not (Test-ConstantExitOne $terminal)) { $unsafeTerminalInAuditChain = $true }
 }
@@ -813,10 +840,11 @@ $pathAuditBeforeCreate = ($pathsOffset -ge 0 -and $auditCommands.Count -ge 2 -an
     approvedPathFunctionCount = $fn.Count
     pathsAssignmentFound = ($pathsOffset -ge 0)
     pathAuditBeforeCreate = $pathAuditBeforeCreate
+    postCreateLoopFound = ($null -ne $postCreateLoop)
     unsafeTerminalBeforeAudit = $unsafeTerminalInAuditChain
     unsafeTerminalInAuditChain = $unsafeTerminalInAuditChain
     dRootValid = (
-        @($errors).Count -eq 0 -and $fn.Count -eq 1 -and
+        @($errors).Count -eq 0 -and $fn.Count -eq 1 -and $null -ne $postCreateLoop -and
         $pathAuditBeforeCreate -and -not $unsafeTerminalInAuditChain
     )
 } | ConvertTo-Json -Compress
@@ -1171,6 +1199,21 @@ function Test-ExactPreheatElements($cmd) {
     return $true
 }
 
+function Test-ConstantExitOne($node) {
+    if ($node -isnot [System.Management.Automation.Language.ExitStatementAst] -or
+        $null -eq $node.Pipeline) { return $false }
+    $elements = @($node.Pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or
+        $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $false
+    }
+    $expression = $elements[0].Expression
+    return (
+        $expression -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        $expression.Value -is [int] -and $expression.Value -eq 1
+    )
+}
+
 function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
     # 只审计首个必需顶层动作之前真正会执行的终止语句；函数定义内部的 return/exit
     # 只是未来调用体，不能与 run block 首行 exit 0 混为一谈。
@@ -1191,11 +1234,9 @@ function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitInd
                 $cursor = $cursor.Parent
             }
             if (-not $inFunction) {
-                # 认证前已有 `exit 1` 的失败 guard 是允许的；其余 exit（bare/0/变量）
-                # 可能以成功状态跳过 preheat，和 return/break/continue 一样必须拒绝。
-                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
-                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
-                } else { return $true }
+                # 只有 ExitStatementAst 中的整数常量 1 是合法 fail-closed；
+                # bare/0/变量 exit 及 return/break/continue 都可能成功短路。
+                if (-not (Test-ConstantExitOne $terminal)) { return $true }
             }
         }
     }
@@ -1250,15 +1291,7 @@ function Get-ExitGuardDetails($statement) {
     if ($nestedControlFlow.Count -ne 0) { return $result }
 
     $lastStatement = $directStatements[1]
-    if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
-    $pipeline = $lastStatement.Pipeline
-    $pipelineElements = @($pipeline.PipelineElements)
-    if ($pipelineElements.Count -ne 1 -or
-        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $result }
-    $expression = $pipelineElements[0].Expression
-    if ($expression -isnot [System.Management.Automation.Language.ConstantExpressionAst]) { return $result }
-    $result.exitsOne = ($expression.Value -is [int] -and $expression.Value -eq 1 -and
-        $expression.Extent.Text -ceq '1')
+    $result.exitsOne = (Test-ConstantExitOne $lastStatement)
     return $result
 }
 
@@ -1357,6 +1390,21 @@ function Test-ExactInspect($command) {
     return (Test-ExactElements -command $command -expected @('docker', 'image', 'inspect', 'python:3.12-slim'))
 }
 
+function Test-ConstantExitOne($node) {
+    if ($node -isnot [System.Management.Automation.Language.ExitStatementAst] -or
+        $null -eq $node.Pipeline) { return $false }
+    $elements = @($node.Pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or
+        $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $false
+    }
+    $expression = $elements[0].Expression
+    return (
+        $expression -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        $expression.Value -is [int] -and $expression.Value -eq 1
+    )
+}
+
 function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
     # docker pull 前的成功终止会令后续 pull/inspect 文本永远不可达；只忽略函数定义
     # 内的终止语句，避免把未来调用体误判为当前 workflow 的执行短路。
@@ -1377,11 +1425,9 @@ function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitInd
                 $cursor = $cursor.Parent
             }
             if (-not $inFunction) {
-                # 镜像准备之前只允许标准 fail-closed `exit 1` guard；任何可成功退出或
-                # 不透明退出码都会令后续 Linux image 认证不可达。
-                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
-                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
-                } else { return $true }
+                # 镜像准备前仅允许 ExitStatementAst 中的整数常量 1；
+                # 任何可成功退出或不透明退出码都会令 Linux image 认证不可达。
+                if (-not (Test-ConstantExitOne $terminal)) { return $true }
             }
         }
     }
@@ -1435,15 +1481,7 @@ function Get-ExitGuardDetails($statement) {
     if ($nestedControlFlow.Count -ne 0) { return $result }
 
     $lastStatement = $directStatements[1]
-    if ($lastStatement -isnot [System.Management.Automation.Language.ExitStatementAst]) { return $result }
-    $pipeline = $lastStatement.Pipeline
-    $pipelineElements = @($pipeline.PipelineElements)
-    if ($pipelineElements.Count -ne 1 -or
-        $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $result }
-    $expression = $pipelineElements[0].Expression
-    if ($expression -isnot [System.Management.Automation.Language.ConstantExpressionAst]) { return $result }
-    $result.exitsOne = ($expression.Value -is [int] -and $expression.Value -eq 1 -and
-        $expression.Extent.Text -ceq '1')
+    $result.exitsOne = (Test-ConstantExitOne $lastStatement)
     return $result
 }
 
@@ -2683,10 +2721,17 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     assert first_line_exit_preheat["preheatValid"] is False, (
         f"预热 run block 第一行 exit 0 必须被拒绝：{first_line_exit_preheat}"
     )
-    for terminal in ("exit", "return"):
+    for terminal in ("exit", "exit $code", "return"):
         shorted = _analyze_ci_run_block(terminal + "\n" + run)
         assert shorted["parseErrors"] == 0 and shorted["preheatValid"] is False, (
             f"预热 run block 首行 {terminal!r} 必须被拒绝：{shorted}"
+        )
+    # 在必需动作前的失败退出只按 ExitStatementAst 整数常量 1 判定；
+    # PowerShell 关键字大小写不敏感，`exit 1` 与 `Exit 1` 必须同样合法。
+    for terminal in ("exit 1", "Exit 1"):
+        fail_closed = _analyze_ci_run_block(terminal + "\n" + run)
+        assert fail_closed["parseErrors"] == 0 and fail_closed["preheatValid"] is True, (
+            f"预热分析器必须按 AST 常量 1 识别 {terminal!r}：{fail_closed}"
         )
     unused = (
         '$unused = "& $PWD/scripts/dev.ps1 -- -- rustup toolchain install '
@@ -2763,10 +2808,15 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     assert first_line_exit_image["imagePreparationValid"] is False, (
         f"镜像准备 run block 第一行 exit 0 必须被拒绝：{first_line_exit_image}"
     )
-    for terminal in ("exit", "return"):
+    for terminal in ("exit", "exit $code", "return"):
         shorted = _analyze_runner_identity_image_run(terminal + "\n" + image_run)
         assert shorted["parseErrors"] == 0 and shorted["imagePreparationValid"] is False, (
             f"镜像准备 run block 首行 {terminal!r} 必须被拒绝：{shorted}"
+        )
+    for terminal in ("exit 1", "Exit 1"):
+        fail_closed = _analyze_runner_identity_image_run(terminal + "\n" + image_run)
+        assert fail_closed["parseErrors"] == 0 and fail_closed["imagePreparationValid"] is True, (
+            f"镜像分析器必须按 AST 常量 1 识别 {terminal!r}：{fail_closed}"
         )
     commented_pull = _mut_comment_exact_command(
         image_run, _RUNNER_IMAGE_PULL_COMMAND, add_unused_string=False
