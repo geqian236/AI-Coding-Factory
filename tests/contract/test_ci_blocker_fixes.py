@@ -587,6 +587,30 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         assert shorted["dRootValid"] is False and shorted["unsafeTerminalBeforeAudit"] is True, (
             f"D 根 run block 首行 {terminal!r} 必须被视为成功短路：{shorted}"
         )
+    # `exit 1` 的安全性来自 ExitStatementAst 的整数常量值，而不是源码大小写；
+    # Windows PowerShell 对关键字大小写不敏感，`Exit 1` 必须仍是合法 fail-closed。
+    casefolded_exit_one = d_root_code.replace("exit 1", "Exit 1")
+    assert casefolded_exit_one != d_root_code
+    casefolded_d_root = _analyze_d_root_guard_run(casefolded_exit_one)
+    assert casefolded_d_root["parseErrors"] == 0 and casefolded_d_root["dRootValid"] is True, (
+        f"D 根分析器必须按 AST 常量 1 识别 fail-closed，而非匹配源码文本：{casefolded_d_root}"
+    )
+
+    # 只检查首次 audit 之前仍可在第一轮 pre-create audit 后成功退出，使余下路径及全部
+    # post-create 复核不可达。三种成功终止共用同一真实 AST 插入点，测试节点数不变。
+    first_pre_create_audit = (
+        '[void](Assert-ApprovedRunnerPath -Name $entry.Key -Value $entry.Value -Stage "pre-create")'
+    )
+    assert first_pre_create_audit in d_root_code
+    for terminal in ("exit 0", "exit", "return"):
+        mid_chain = d_root_code.replace(
+            first_pre_create_audit, first_pre_create_audit + "\n              " + terminal, 1,
+        )
+        analysis = _analyze_d_root_guard_run(mid_chain)
+        assert analysis["parseErrors"] == 0
+        assert analysis.get("unsafeTerminalInAuditChain") is True and analysis["dRootValid"] is False, (
+            f"首次 audit 后的 {terminal!r} 必须在 post-create 复核完成前被拒绝：{analysis}"
+        )
     d_root_tmp = _unique_tmp_dir("runner-d-root-guard")
     junction = d_root_tmp / "reparse-link"
     junction_target = d_root_tmp / "target"
@@ -737,8 +761,9 @@ $newItems = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.CommandAst] -and
     $args[0].GetCommandName() -eq 'New-Item'
 }, $true) | Sort-Object { $_.Extent.StartOffset })
-$firstAuditOffset = if ($auditCommands.Count -gt 0) { $auditCommands[0].Extent.StartOffset } else { [int]::MaxValue }
-$firstNewItemOffset = if ($newItems.Count -gt 0) { $newItems[0].Extent.StartOffset } else { [int]::MaxValue }
+$lastAuditEndOffset = if ($auditCommands.Count -gt 0) {
+    $auditCommands[$auditCommands.Count - 1].Extent.EndOffset
+} else { -1 }
 
 function Test-InFunctionScope($node) {
     $cursor = $node.Parent
@@ -749,7 +774,22 @@ function Test-InFunctionScope($node) {
     return $false
 }
 
-$unsafeTerminalBeforeAudit = $false
+function Test-ConstantExitOne($node) {
+    if ($node -isnot [System.Management.Automation.Language.ExitStatementAst] -or
+        $null -eq $node.Pipeline) { return $false }
+    $elements = @($node.Pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or
+        $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $false
+    }
+    $expression = $elements[0].Expression
+    return (
+        $expression -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        $expression.Value -is [int] -and $expression.Value -eq 1
+    )
+}
+
+$unsafeTerminalInAuditChain = $false
 $terminals = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
     $args[0] -is [System.Management.Automation.Language.ReturnStatementAst] -or
@@ -757,16 +797,12 @@ $terminals = @($ast.FindAll({
     $args[0] -is [System.Management.Automation.Language.ContinueStatementAst]
 }, $true))
 foreach ($terminal in $terminals) {
-    # 只能以 AST 父链判断终止语句是否位于函数定义内；原先按 functionEnd 的源码
-    # offset 跳过会把整个首段 workflow 误当函数体，从而放行 run block 首行 exit 0。
-    if ((Test-InFunctionScope $terminal) -or $terminal.Extent.StartOffset -ge $firstAuditOffset) { continue }
-    # D 根路径检查前已有的 `exit 1` 是明确 fail-closed guard；而 bare exit、exit 0、
-    # 变量退出码以及 return/break/continue 都可能成功短路，令后续路径审计不可达。
-    if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
-        if ($terminal.Extent.Text.Trim() -cne 'exit 1') { $unsafeTerminalBeforeAudit = $true }
-    } else {
-        $unsafeTerminalBeforeAudit = $true
-    }
+    # 只忽略函数定义内的终止语句；顶层保护区间必须延伸到最后一次
+    # post-create 审计结束，否则首次 audit 后仍能成功短路。
+    if ((Test-InFunctionScope $terminal) -or $lastAuditEndOffset -lt 0 -or
+        $terminal.Extent.StartOffset -ge $lastAuditEndOffset) { continue }
+    # 只有 ExitStatementAst 中的整数常量 1 是合法 fail-closed；不依赖源码大小写。
+    if (-not (Test-ConstantExitOne $terminal)) { $unsafeTerminalInAuditChain = $true }
 }
 
 $pathAuditBeforeCreate = ($pathsOffset -ge 0 -and $auditCommands.Count -ge 2 -and
@@ -777,10 +813,11 @@ $pathAuditBeforeCreate = ($pathsOffset -ge 0 -and $auditCommands.Count -ge 2 -an
     approvedPathFunctionCount = $fn.Count
     pathsAssignmentFound = ($pathsOffset -ge 0)
     pathAuditBeforeCreate = $pathAuditBeforeCreate
-    unsafeTerminalBeforeAudit = $unsafeTerminalBeforeAudit
+    unsafeTerminalBeforeAudit = $unsafeTerminalInAuditChain
+    unsafeTerminalInAuditChain = $unsafeTerminalInAuditChain
     dRootValid = (
         @($errors).Count -eq 0 -and $fn.Count -eq 1 -and
-        $pathAuditBeforeCreate -and -not $unsafeTerminalBeforeAudit
+        $pathAuditBeforeCreate -and -not $unsafeTerminalInAuditChain
     )
 } | ConvertTo-Json -Compress
 """
@@ -1533,6 +1570,20 @@ function Test-LastExitCapture($statement) {
         $right -is [System.Management.Automation.Language.VariableExpressionAst] -and
         $right.VariablePath.UserPath -eq 'LASTEXITCODE')
 }
+function Test-ConstantExitOne($node) {
+    if ($node -isnot [System.Management.Automation.Language.ExitStatementAst] -or
+        $null -eq $node.Pipeline) { return $false }
+    $elements = @($node.Pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or
+        $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $false
+    }
+    $expression = $elements[0].Expression
+    return (
+        $expression -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        $expression.Value -is [int] -and $expression.Value -eq 1
+    )
+}
 function Test-RejectGuard($statement, [string]$requiredCondition) {
     if ($statement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
     $clauses = @($statement.Clauses)
@@ -1553,13 +1604,13 @@ function Test-RejectGuard($statement, [string]$requiredCondition) {
         ($node -is [System.Management.Automation.Language.BreakStatementAst]) -or
         ($node -is [System.Management.Automation.Language.ContinueStatementAst]) -or
         ($node -is [System.Management.Automation.Language.ExitStatementAst] -and
-            $node.Extent.Text -notmatch '^\s*exit\s+1\s*$')
+            -not (Test-ConstantExitOne $node))
     }, $true))
     return ($unsafe.Count -eq 0)
 }
 function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitIndex) {
-    # 真正 wrapper 调用前的 exit 0、bare exit、return 等都会让后续 receipt 盖章和
-    # validator 文本不可达；仅函数定义内的终止语句可忽略。
+    # 保护区间内的 exit 0、bare exit、return 等都会让后续盖章或校验不可达；
+    # 仅函数定义内的终止语句可忽略。
     for ($i = 0; $i -lt $limitIndex; $i++) {
         $terminals = @($statements[$i].FindAll({
             $args[0] -is [System.Management.Automation.Language.ExitStatementAst] -or
@@ -1577,11 +1628,8 @@ function Test-UnsafeTopLevelTerminalBefore([object[]]$statements, [int]$limitInd
                 $cursor = $cursor.Parent
             }
             if (-not $inFunction) {
-                # wrapper 前的历史 receipt purge guard 可标准化失败 exit 1；bare exit、
-                # exit 0、变量退出码以及 return/break/continue 都可能产生成功短路。
-                if ($terminal -is [System.Management.Automation.Language.ExitStatementAst]) {
-                    if ($terminal.Extent.Text.Trim() -cne 'exit 1') { return $true }
-                } else { return $true }
+                # 只有 ExitStatementAst 中的整数常量 1 是合法 fail-closed，不依赖源码文本。
+                if (-not (Test-ConstantExitOne $terminal)) { return $true }
             }
         }
     }
@@ -1606,9 +1654,6 @@ $wrapperExpected = @(
     'scripts/spikes/test-runner-identity.ps1'
 )
 $wrapperIndex = Find-StatementIndex $top 0 { param($s) Test-ExactCommand $s $wrapperExpected $true }
-$unsafeTerminalBeforeWrapper = if ($wrapperIndex -ge 0) {
-    Test-UnsafeTopLevelTerminalBefore -statements $top -limitIndex $wrapperIndex
-} else { $true }
 $captureIndex = if ($wrapperIndex -ge 0) { $wrapperIndex + 1 } else { -1 }
 $captureValid = ($captureIndex -ge 0 -and $captureIndex -lt $top.Count -and (Test-LastExitCapture $top[$captureIndex]))
 $wrapperGuardIndex = if ($captureValid) { $captureIndex + 1 } else { -1 }
@@ -1643,6 +1688,11 @@ $validatorGuardValid = (
     $validatorGuardIndex -ge 0 -and $validatorGuardIndex -lt $top.Count -and
     (Test-RejectGuard $top[$validatorGuardIndex] '-not$v.ok-or$v.status-ne"PASS"')
 )
+$executeChainLimitIndex = if ($validatorGuardIndex -ge 0) { $validatorGuardIndex + 1 } else { -1 }
+$unsafeTerminalInExecuteChain = if ($executeChainLimitIndex -ge 0) {
+    # 从 run block 起点一直扫描到 validator 拒绝 guard，覆盖 wrapper→hash→stamp→validator 全链。
+    Test-UnsafeTopLevelTerminalBefore -statements $top -limitIndex $executeChainLimitIndex
+} else { $true }
 
 [pscustomobject]@{
     parseErrors = @($errors).Count
@@ -1654,9 +1704,10 @@ $validatorGuardValid = (
     stampGuardValid = $stampGuardValid
     validatorIndex = $validatorIndex
     validatorGuardValid = $validatorGuardValid
-    unsafeTerminalBeforeWrapper = $unsafeTerminalBeforeWrapper
+    unsafeTerminalBeforeWrapper = $unsafeTerminalInExecuteChain
+    unsafeTerminalInExecuteChain = $unsafeTerminalInExecuteChain
     executeValid = (
-        $wrapperIndex -ge 0 -and -not $unsafeTerminalBeforeWrapper -and
+        $wrapperIndex -ge 0 -and -not $unsafeTerminalInExecuteChain -and
         $captureValid -and $wrapperGuardValid -and
         $hashIndex -gt $wrapperGuardIndex -and $stampIndex -gt $hashIndex -and
         $stampGuardValid -and $validatorIndex -gt $stampGuardIndex -and $validatorGuardValid
@@ -2796,6 +2847,39 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
         assert shorted["parseErrors"] == 0 and shorted["executeValid"] is False, (
             f"最终 execute run block 首行 {terminal!r} 必须被拒绝：{shorted}"
         )
+
+    # fail-closed exit 的合法性必须来自 AST 常量整数 1；仅把关键字改成 `Exit 1`
+    # 不应使认证链失效，否则分析器实际上仍依赖源码文本大小写。
+    execute_casefolded_exit_one = execute_run.replace("exit 1", "Exit 1")
+    assert execute_casefolded_exit_one != execute_run
+    casefolded_execute = _analyze_runner_identity_execute_run(execute_casefolded_exit_one)
+    assert casefolded_execute["parseErrors"] == 0 and casefolded_execute["executeValid"] is True, (
+        f"execute 分析器必须按 ExitStatementAst 常量值识别 exit 1：{casefolded_execute}"
+    )
+
+    # Find-StatementIndex 会越过普通顶层语句；因此必须在完整 wrapper→hash→stamp→validator
+    # 保护区间扫描成功终止，而不是仅靠各锚点仍按相对顺序出现。每个真实间隙均覆盖
+    # exit 0，并在同一位置覆盖 bare exit/return，保持既有 pytest 节点数量不变。
+    execute_gaps = (
+        ("wrapper_to_hash", "after", '$preStampMtime = (Get-Item -LiteralPath $receiptPath).LastWriteTime'),
+        (
+            "hash_to_stamp", "after",
+            '$probeDigest = "sha256:" + '
+            '(Get-FileHash -Algorithm SHA256 -LiteralPath $probePath).Hash.ToLowerInvariant()',
+        ),
+        ("stamp_to_validator", "before", '. "$PWD/scripts/spikes/_receipt-validator.ps1"'),
+        ("validator_to_guard", "before", 'if (-not $v.ok -or $v.status -ne "PASS") {'),
+    )
+    for gap, placement, anchor in execute_gaps:
+        assert anchor in execute_run, f"未能定位 execute 间隙 {gap} 的真实锚点"
+        for terminal in ("exit 0", "exit", "return"):
+            replacement = anchor + "\n" + terminal if placement == "after" else terminal + "\n" + anchor
+            mutated = execute_run.replace(anchor, replacement, 1)
+            analysis = _analyze_runner_identity_execute_run(mutated)
+            assert analysis["parseErrors"] == 0
+            assert analysis.get("unsafeTerminalInExecuteChain") is True and analysis["executeValid"] is False, (
+                f"execute {gap} 插入 {terminal!r} 必须被全链 AST 扫描拒绝：{analysis}"
+            )
 
     # 注释真实 wrapper 再塞未使用字符串、把参数折叠、捕获后插入另一原生命令，或在拒绝
     # guard 内提前 exit 0，均不得被任何文字匹配误当为完整认证链。
