@@ -502,10 +502,33 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
         def flush(self) -> None:
             return None
 
+    class _PlainCp1252StrictStream:
+        """模拟无 reconfigure 的 ANSI 流；即使 errors=strict 也不能把中文回执写入。"""
+
+        encoding = "cp1252"
+        errors = "strict"
+
+        def __init__(self) -> None:
+            self.writes: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.writes.append(value)
+            raise AssertionError(f"cp1252 流不得输出回执正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
     class _RejectedOutputStream:
         """模拟假成功重配置和属性访问异常，任何一类都不得继续输出回执正文。"""
 
-        def __init__(self, *, errors: str = "strict", failure: str | None = None) -> None:
+        def __init__(
+            self,
+            *,
+            encoding: str = "utf-8",
+            errors: str = "strict",
+            failure: str | None = None,
+        ) -> None:
+            self._encoding = encoding
             self._errors = errors
             self._failure = failure
             self.reconfigure_calls: list[tuple[str, str]] = []
@@ -524,7 +547,7 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
         def encoding(self) -> str:
             if self._failure == "encoding_getter":
                 raise OSError("SECRET_PATH: encoding getter")
-            return "utf-8"
+            return self._encoding
 
         @property
         def errors(self) -> str:
@@ -535,6 +558,27 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
         def write(self, value: str) -> int:
             self.writes.append(value)
             raise AssertionError(f"UTF-8 配置未被严格确认时不得输出回执正文：{value!r}")
+
+        def flush(self) -> None:
+            return None
+
+    class _RejectedStderr:
+        """模拟 stderr 重配置失败或伪成功后仍为 cp1252，收集唯一允许的 ASCII 分类。"""
+
+        encoding = "cp1252"
+        errors = "strict"
+
+        def __init__(self, *, failure: str) -> None:
+            self.failure = failure
+            self.text = ""
+
+        def reconfigure(self, *, encoding: str, errors: str) -> None:
+            if self.failure == "call":
+                raise OSError("SECRET_PATH: stderr reconfigure")
+
+        def write(self, value: str) -> int:
+            self.text += value
+            return len(value)
 
         def flush(self) -> None:
             return None
@@ -576,6 +620,27 @@ def test_cli_valid_fixture_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _run_with_streams(missing_errors_stdout, missing_errors_sink) == 2
     assert missing_errors_stdout.writes == []
     assert missing_errors_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+
+    # 无 reconfigure 的 cp1252+strict 仍不可作为中文回执通道，必须 fail-closed。
+    plain_cp1252_stdout = _PlainCp1252StrictStream()
+    plain_cp1252_sink = _AsciiErrorSink()
+    assert _run_with_streams(plain_cp1252_stdout, plain_cp1252_sink) == 2
+    assert plain_cp1252_stdout.writes == []
+    assert plain_cp1252_sink.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+
+    # reconfigure 即使返回成功，只要回读仍为 cp1252+strict，也必须停止而非输出半份正文。
+    fake_success_cp1252 = _RejectedOutputStream(encoding="cp1252")
+    _assert_fail_closed(fake_success_cp1252)
+    assert fake_success_cp1252.reconfigure_calls == [("utf-8", "strict")]
+
+    # stdout 已严格 UTF-8 时，stderr 失败或仍是 cp1252 也必须阻止业务正文，只留 ASCII 分类。
+    for stderr_failure in ("call", "invalid"):
+        valid_stdout = _ReconfigurableStrictStream()
+        rejected_stderr = _RejectedStderr(failure=stderr_failure)
+        assert _run_with_streams(valid_stdout, rejected_stderr) == 2
+        assert valid_stdout.text == "", "stderr 配置失败前 stdout 不得写出回执正文"
+        assert rejected_stderr.text == "CLI_TEXT_UTF8_CONFIGURATION_FAILED\n"
+        assert rejected_stderr.text.isascii()
 
     for non_strict_errors in ("replace", "ignore"):
         non_strict_stream = _RejectedOutputStream(errors=non_strict_errors)
