@@ -25,14 +25,26 @@ function Invoke-RunnerIdentityNativeProbe {
     )
 
     try {
-        $command = Get-Command -Name $Name -CommandType Application -ErrorAction Stop
-        if ($null -eq $command -or [string]::IsNullOrWhiteSpace([string]$command.Path)) {
+        # Get-Command 在 Windows PATH 上可能同时返回 docker.exe 与无扩展名包装项；不能
+        # 直接读取数组 .Path（会拼接成一个不存在的命令）。选择第一个具备路径的 Application，
+        # 真正启动失败仍由下方 catch 归为可复核的 stable failure。
+        $commands = @(Get-Command -Name $Name -CommandType Application -ErrorAction Stop)
+        $command = $null
+        foreach ($candidate in $commands) {
+            if ($null -ne $candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate.Path)) {
+                $command = $candidate
+                break
+            }
+        }
+        if ($null -eq $command) {
             return [pscustomobject]@{ ok = $false; text = ""; exitCode = -1; detail = "command missing: $Name" }
         }
         # 先保存原生命令退出码，再处理输出；管道/Select-Object 可能覆盖 $LASTEXITCODE。
         $raw = @(& $command.Path @Arguments 2>$null)
         $exitCode = $LASTEXITCODE
-        $text = ((@($raw | ForEach-Object { [string]$_ }) -join "\`n").Trim())
+        # 原生命令的多段 stdout 必须只用真实换行拼接；PowerShell 里的 `\` 不是转义前缀，
+        # 写成 "\`n" 会在每段末尾留下反斜杠，进而让 WSL2 表格行的严格正则误判失败。
+        $text = ((@($raw | ForEach-Object { [string]$_ }) -join "`n").Trim())
         if ($exitCode -ne 0) {
             return [pscustomobject]@{ ok = $false; text = $text; exitCode = $exitCode; detail = "command nonzero: $Name exit=$exitCode" }
         }

@@ -1551,10 +1551,11 @@ def _analyze_runner_identity_execute_run(run_text: str) -> dict[str, Any]:
 def _run_runner_platform_helper_mock(
     helper_path: Path, *, ostype: str = "linux", operating_system: str = "Docker Desktop",
     context: str = "desktop-linux", endpoint: str = "npipe:////./pipe/dockerDesktopLinuxEngine",
-    image_os: str = "linux", wsl_has_nul: bool = False,
+    image_os: str = "linux", wsl_has_nul: bool = False, wsl_multiline: bool = False,
     candidate_sha: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     product_type: int = 1, build_number: str = "22631", os_value: str = "Windows_NT",
-    missing_command: str = "", throwing_command: str = "", docker_override: tuple[str, str] | None = None,
+    missing_command: str = "", throwing_command: str = "", duplicate_command: str = "",
+    docker_override: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """在不接触真实 Docker 的 Windows PowerShell 子进程中执行生产 helper。
 
@@ -1580,6 +1581,15 @@ function Get-CimInstance {
 function Get-Command {
     param([string]$Name, [Parameter(ValueFromRemainingArguments = $true)][object[]]$Args)
     if ($Name -eq $env:FACTORY_MOCK_MISSING_COMMAND) { return $null }
+    # Windows PATH 可能同时解析 docker.exe 与无扩展名包装项；生产 helper 必须选择一个
+    # 可执行 command，而不能把数组 Path 拼成无法执行的单个字符串。
+    if ($Name -eq $env:FACTORY_MOCK_DUPLICATE_COMMAND) {
+        @(
+            [pscustomobject]@{ Name = $Name; CommandType = 'Application'; Path = $Name }
+            [pscustomobject]@{ Name = $Name; CommandType = 'Application'; Path = $Name }
+        )
+        return
+    }
     [pscustomobject]@{ Name = $Name; CommandType = 'Application'; Path = $Name }
 }
 function docker {
@@ -1598,7 +1608,21 @@ function wsl.exe {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdArgs)
     if ($env:FACTORY_MOCK_THROWING_COMMAND -eq 'wsl.exe') { throw 'mock wsl exception' }
     $global:LASTEXITCODE = 0
-    if ($env:FACTORY_MOCK_WSL_NUL -eq '1') { "  docker-desktop`0 Running`0 2`0" }
+    # 真实 PS 5.1 的 wsl.exe 可能输出表头、空行和多条对象；保留多对象形态，
+    # 才能覆盖 native probe 在连接 stdout 片段时不能把分隔符写进数据行尾的回归。
+    if ($env:FACTORY_MOCK_WSL_MULTILINE -eq '1') {
+        if ($env:FACTORY_MOCK_WSL_NUL -eq '1') {
+            # UTF-16 经 PS5 stdout 传输时，空行也会成为仅含 NUL 的对象，不能用空字符串代替。
+            "  NAME              STATE           VERSION`0"
+            "`0"
+            "`0* docker-desktop`0 Running`0 2`0"
+            "`0"
+        } else {
+            '  NAME              STATE           VERSION'
+            'sentinel-empty-row'
+            '* docker-desktop Running 2'
+        }
+    } elseif ($env:FACTORY_MOCK_WSL_NUL -eq '1') { "  docker-desktop`0 Running`0 2`0" }
     else { '  docker-desktop Running 2' }
 }
 . $env:FACTORY_PLATFORM_HELPER
@@ -1619,11 +1643,13 @@ $result = Test-RunnerIdentityPlatform `
         "FACTORY_MOCK_ENDPOINT": endpoint,
         "FACTORY_MOCK_IMAGE_OS": image_os,
         "FACTORY_MOCK_WSL_NUL": "1" if wsl_has_nul else "0",
+        "FACTORY_MOCK_WSL_MULTILINE": "1" if wsl_multiline else "0",
         "FACTORY_MOCK_GIT_SHA": candidate_sha,
         "FACTORY_MOCK_PRODUCT_TYPE": str(product_type),
         "FACTORY_MOCK_BUILD_NUMBER": build_number,
         "FACTORY_MOCK_MISSING_COMMAND": missing_command,
         "FACTORY_MOCK_THROWING_COMMAND": throwing_command,
+        "FACTORY_MOCK_DUPLICATE_COMMAND": duplicate_command,
         "OS": os_value,
         "TEMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
         "TMP": r"D:\codex项目\AI-Coding-Factory-Data\dev\tmp",
@@ -2185,6 +2211,20 @@ def test_windows_probes_preheat_ast_requires_real_command() -> None:
     try:
         happy = _run_runner_platform_helper_mock(PLATFORM_HELPER_PS1, wsl_has_nul=True)
         assert happy["ok"] is True, f"NUL 清理后的本机 Docker Desktop 事实应通过：{happy}"
+        multiline_wsl = _run_runner_platform_helper_mock(
+            PLATFORM_HELPER_PS1, wsl_has_nul=True, wsl_multiline=True,
+        )
+        assert multiline_wsl["ok"] is True, (
+            "WSL 表头/空行拆成多个 stdout 对象时，native probe 必须仅以换行连接，"
+            f"不能把反斜杠等分隔符残留到 docker-desktop v2 数据行尾：{multiline_wsl}"
+        )
+        duplicate_docker = _run_runner_platform_helper_mock(
+            PLATFORM_HELPER_PS1, duplicate_command="docker",
+        )
+        assert duplicate_docker["ok"] is True, (
+            "Get-Command 返回 docker.exe/包装项等多个 Application 时，helper 必须选择一个可执行项；"
+            f"实际={duplicate_docker}"
+        )
         windows_engine = _run_runner_platform_helper_mock(
             PLATFORM_HELPER_PS1, ostype="windows", image_os="windows",
         )
