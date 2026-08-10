@@ -80,7 +80,7 @@ RUNNER_IDENTITY_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-runner-id
 RUNNER_CERTIFIED_JOB = "runner-identity-certified"
 RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
 RUNNER_CERTIFIED_TRIGGER = {"push": {"branches": ["codex/**"]}}
-RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS = {"contents": "read"}
+RUNNER_CERTIFIED_PERMISSIONS = {"contents": "read"}
 RUNNER_APPROVED_ROOT_ENV = "RUNNER_APPROVED_ROOT"
 FACTORY_TEST_DATA_ROOT_ENV = "FACTORY_TEST_DATA_ROOT"
 RUNNER_PS51_ROOT_CAUSE_COMMENT = (
@@ -523,7 +523,7 @@ def _runner_identity_workflow_document_violations(document: dict[str, Any]) -> l
         violations.append("workflow name must be exactly runner-identity-certified")
     if document.get("on") != RUNNER_CERTIFIED_TRIGGER:
         violations.append("workflow trigger must be exactly push on codex/**")
-    if document.get("permissions") != RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS:
+    if document.get("permissions") != RUNNER_CERTIFIED_PERMISSIONS:
         violations.append("workflow top-level permissions must be exactly contents: read")
     return violations
 
@@ -573,6 +573,8 @@ def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[st
     if job_violations:
         return [*violations, *job_violations]
     assert job is not None
+    if job.get("permissions") != RUNNER_CERTIFIED_PERMISSIONS:
+        violations.append("runner-identity-certified job permissions must be exactly contents: read")
     steps = _runner_identity_steps_from_job(job)
     run_steps = [step for step in steps if "run" in step]
     if len(run_steps) != 6:
@@ -703,7 +705,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     )
     assert runner_document.get("name") == RUNNER_CERTIFIED_JOB, "独立 workflow 名必须精确为 runner-identity-certified"
     assert runner_document.get("on") == RUNNER_CERTIFIED_TRIGGER, "独立 workflow 只能监听 codex/** 的 push"
-    assert runner_document.get("permissions") == RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS, (
+    assert runner_document.get("permissions") == RUNNER_CERTIFIED_PERMISSIONS, (
         "独立 workflow 顶层 permissions 必须精确为 contents: read"
     )
     meta, runner_job_violations = _runner_identity_yaml_job_from_document(runner_document)
@@ -715,8 +717,9 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     assert isinstance(runs_on, list) and tuple(runs_on) == RUNNER_CERTIFIED_LABELS, (
         "runner_identity 必须只投递到受信 Windows+WSL2 Linux-container 专用标签"
     )
-    assert isinstance(meta.get("permissions"), dict), "认证 job permissions 必须是 YAML 映射"
-    assert meta["permissions"].get("contents") == "read", "认证 job 必须最小权限 contents: read"
+    assert meta.get("permissions") == RUNNER_CERTIFIED_PERMISSIONS, (
+        "认证 job permissions 必须精确为最小权限 contents: read"
+    )
 
     # 变异 0：YAML 语义允许不同书写形式落到同一键；认证合同必须拒绝所有重复映射，
     # 不能只扫描首个 jobs 或裸 job-id 后静默漏掉后续的 PowerShell run。
@@ -771,6 +774,21 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "认证 workflow 的全部可执行 run 必须显式 shell: powershell、ASCII-only，并以 YAML env "
         f"传递 Unicode 数据根；实际违规={ps51_contract_violations}"
     )
+
+    # 变异 0a：job 权限只要额外开启 id-token，就不能再视为最小只读认证机。
+    job_permissions_expansion_mutant = runner_workflow.replace(
+        "    permissions:\n      contents: read\n",
+        "    permissions:\n      contents: read\n      id-token: write\n",
+        1,
+    )
+    assert job_permissions_expansion_mutant != runner_workflow
+    job_permissions_expansion_violations = _runner_identity_ps51_run_contract_violations(
+        job_permissions_expansion_mutant
+    )
+    assert (
+        "runner-identity-certified job permissions must be exactly contents: read"
+        in job_permissions_expansion_violations
+    ), "expanding job permissions with id-token: write must fail closed"
 
     # 变异 0b：合法 run-name 标量可伪装 raw 文本中的 push/branches，触发器只能按 YAML 对象值验证。
     trigger_decoy_mutant = runner_workflow.replace(
