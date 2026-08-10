@@ -1168,6 +1168,24 @@ def _complete_plan_revision_for_snapshot() -> dict[str, Any]:
     }
 
 
+def _run_spec_for_new_repository_bootstrap() -> dict[str, Any]:
+    """构造 bootstrap 前的 RunSpec：new 模式只能冻结 null baseCommit。
+
+    BOOTSTRAP_REPOSITORY 尚未产生可信 Git 提交时，不能以空串、占位 SHA 或原位回填
+    绕过不可变计划边界；后续可信 SHA 只能写入新的子修订。
+    """
+    run_spec = _complete_run_spec_for_semantic_snapshot()
+    run_spec["specRevision"] = 1
+    run_spec["parentRevisionId"] = None
+    run_spec["repository"] = {
+        "mode": "new",
+        "root": "D:/codex项目/new-factory",
+        "baseBranch": "main",
+        "baseCommit": None,
+    }
+    return run_spec
+
+
 def _mutate_schema_valid_value(value: object, schema: dict[str, object]) -> object:
     """在不改变字段类型/枚举约束的前提下构造不同值，验证每个字段均进入摘要。"""
     enum_values = schema.get("enum")
@@ -1469,9 +1487,17 @@ def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_fie
         assert list(validator.iter_errors(missing)), f"缺失语义字段 {field} 不得通过"
 
         changed_run_spec = copy.deepcopy(run_spec)
-        changed_run_spec[field] = _mutate_schema_valid_value(
-            changed_run_spec[field], run_spec_schema["properties"][field]
-        )
+        if field == "repository":
+            # repository.mode 与 baseCommit 是成对状态；不能把 existing/SHA 撕裂成 new/SHA。
+            changed_run_spec[field] = {
+                **changed_run_spec[field],
+                "mode": "new",
+                "baseCommit": None,
+            }
+        else:
+            changed_run_spec[field] = _mutate_schema_valid_value(
+                changed_run_spec[field], run_spec_schema["properties"][field]
+            )
         _assert_accepted(run_spec_schema, changed_run_spec)
         changed_projection = plan_hash.build_semantic_projection(changed_run_spec)
         assert not list(validator.iter_errors(changed_projection)), f"变更后的 {field} 仍应是合法 projection"
@@ -1482,6 +1508,120 @@ def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_fie
     nested_extra = copy.deepcopy(projection)
     nested_extra["repository"]["unapproved"] = "blocked"
     assert list(validator.iter_errors(nested_extra))
+
+
+def test_repository_base_commit_wire_is_mode_conditioned_and_registry_is_same_source() -> None:
+    """RunSpec、运行时投影与 registry 必须一致区分 existing SHA 和 bootstrap 前 new/null。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    payload_schema = _registry_payload_schema(registry, binding)
+    registry_validator = _registry_payload_validator(registry, binding)
+
+    existing = _complete_run_spec_for_semantic_snapshot()
+    bootstrap = _run_spec_for_new_repository_bootstrap()
+
+    # 两种合法时态必须同时被 RunSpec、真实 projection 和 registry 接受。
+    for valid_run_spec in (existing, bootstrap):
+        _assert_accepted(run_spec_schema, valid_run_spec)
+        projection = plan_hash.build_semantic_projection(valid_run_spec)
+        assert not list(registry_validator.iter_errors(projection))
+
+    # registry 不能复制一份近似字段表；repository 子合同必须和 RunSpec 精确同源。
+    assert payload_schema["properties"]["repository"] == run_spec_schema["properties"]["repository"]
+
+    missing_base_commit = copy.deepcopy(bootstrap)
+    missing_base_commit["repository"].pop("baseCommit")
+    existing_null = copy.deepcopy(existing)
+    existing_null["repository"]["baseCommit"] = None
+    existing_short_sha = copy.deepcopy(existing)
+    existing_short_sha["repository"]["baseCommit"] = "a" * 7
+    new_with_sha = copy.deepcopy(bootstrap)
+    new_with_sha["repository"]["baseCommit"] = "a" * 40
+
+    for invalid_run_spec in (
+        missing_base_commit,
+        existing_null,
+        existing_short_sha,
+        new_with_sha,
+    ):
+        _assert_rejected(run_spec_schema, invalid_run_spec)
+
+
+def test_bootstrap_repository_uses_immutable_child_revision_with_changed_hash_and_snapshot_ref() -> None:
+    """bootstrap 后必须复制 new/null 计划为 existing/full-SHA 子修订，不能原位回填。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    semantic_binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    semantic_validator = _registry_payload_validator(registry, semantic_binding)
+
+    bootstrap_run_spec = _run_spec_for_new_repository_bootstrap()
+    frozen_bootstrap_run_spec = copy.deepcopy(bootstrap_run_spec)
+    _assert_accepted(run_spec_schema, bootstrap_run_spec)
+    bootstrap_projection = plan_hash.build_semantic_projection(bootstrap_run_spec)
+    assert not list(semantic_validator.iter_errors(bootstrap_projection))
+    bootstrap_semantic_hash = plan_hash.semantic_plan_hash(bootstrap_run_spec)
+
+    bootstrap_revision = _complete_plan_revision_for_snapshot()
+    bootstrap_revision.update(
+        {
+            "planRevisionId": "plan-bootstrap-001",
+            "specRevision": 1,
+            "semanticPlanHash": bootstrap_semantic_hash,
+        }
+    )
+    bootstrap_revision.pop("parentRevisionId")
+    bootstrap_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(bootstrap_revision)
+    frozen_bootstrap_revision = copy.deepcopy(bootstrap_revision)
+    _assert_accepted(plan_revision_schema, bootstrap_revision)
+
+    # 可信提交产生后复制新对象：旧 RunSpec/PlanRevision 保持字节语义不变。
+    child_run_spec = copy.deepcopy(bootstrap_run_spec)
+    child_run_spec["specRevision"] = 2
+    child_run_spec["parentRevisionId"] = bootstrap_revision["planRevisionId"]
+    child_run_spec["repository"] = {
+        **child_run_spec["repository"],
+        "mode": "existing",
+        "baseCommit": "b" * 40,
+    }
+    _assert_accepted(run_spec_schema, child_run_spec)
+    child_projection = plan_hash.build_semantic_projection(child_run_spec)
+    assert not list(semantic_validator.iter_errors(child_projection))
+    child_semantic_hash = plan_hash.semantic_plan_hash(child_run_spec)
+
+    child_revision = copy.deepcopy(bootstrap_revision)
+    child_revision.update(
+        {
+            "planRevisionId": "plan-bootstrap-002",
+            "parentRevisionId": bootstrap_revision["planRevisionId"],
+            "specRevision": 2,
+            "semanticPlanHash": child_semantic_hash,
+        }
+    )
+    child_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(child_revision)
+    _assert_accepted(plan_revision_schema, child_revision)
+
+    assert bootstrap_run_spec == frozen_bootstrap_run_spec
+    assert bootstrap_revision == frozen_bootstrap_revision
+    assert child_run_spec is not bootstrap_run_spec
+    assert child_revision is not bootstrap_revision
+    assert child_run_spec["specRevision"] == bootstrap_run_spec["specRevision"] + 1
+    assert child_run_spec["parentRevisionId"] == bootstrap_revision["planRevisionId"]
+    assert child_revision["specRevision"] == bootstrap_revision["specRevision"] + 1
+    assert child_revision["parentRevisionId"] == bootstrap_revision["planRevisionId"]
+    assert child_semantic_hash != bootstrap_semantic_hash
+    assert child_revision["planRevisionDigest"] != bootstrap_revision["planRevisionDigest"]
+
+    bootstrap_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "bootstrap-001")
+    bootstrap_ref["digest"] = _snapshot_payload_digest(
+        semantic_binding["schemaId"], semantic_binding["schemaVersion"], bootstrap_projection
+    )
+    child_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "bootstrap-002")
+    child_ref["digest"] = _snapshot_payload_digest(
+        semantic_binding["schemaId"], semantic_binding["schemaVersion"], child_projection
+    )
+    assert child_ref["digest"] != bootstrap_ref["digest"]
 
 
 def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_field() -> None:

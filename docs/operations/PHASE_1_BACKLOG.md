@@ -85,7 +85,10 @@
   的关联字符串误称为早期 `$ref`，也不实现授权运行时。
   `semanticPlanHash` 快照现在直接承接运行时 `build_semantic_projection` 的完整 RunSpec 语义字段，
   不再使用缩小样本（`schemaVersion` 为整数、`constraints` 为数组，assumptions/scope/acceptanceCriteria/
-  repository/workPlan/riskProfile 全部冻结）；`planRevisionDigest` 快照逐项承接
+  repository/workPlan/riskProfile 全部冻结）。其中 `repository.baseCommit` 键始终存在：existing
+   只能使用 40 位小写完整 SHA，bootstrap 前的 new 只能使用 `null`；bootstrap 成功后必须以新的
+   existing/SHA 子 RunSpec/PlanRevision 继承，而不是回填旧对象，新的 semantic hash 与闭合 snapshot ref
+   均须变化。`planRevisionDigest` 快照逐项承接
   `plan-revision.v1.schema.json`，仅排除自身 digest 与签名，仍包含 DAG、map 版本、nodes、barriers、
   stageMaps 与 createdAt。合同测试从权威投影/schema 派生 exact-set 断言，并对每个纳入字段的变更
   重算摘要，防止静态 registry 与后续运行时实现分叉。

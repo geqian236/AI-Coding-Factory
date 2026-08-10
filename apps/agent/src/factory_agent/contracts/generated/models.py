@@ -57,7 +57,7 @@ class RunSpec(TypedDict, total=False):
     acceptanceCriteria: Required[list[str]]
     # 目标终点阶段（Master Spec §6.1 权威 6 阶段）
     targetStage: Required[Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]]
-    # 仓库绑定（§8：mode/root/baseBranch/baseCommit）
+    # 仓库绑定（§8：mode/root/baseBranch/baseCommit；baseCommit 键始终存在，bootstrap 前仅允许 new/null）
     repository: Required[dict[str, Any]]
     # 工作计划 DAG（§8：dagVersion/nodes/barriers）
     workPlan: Required[dict[str, Any]]

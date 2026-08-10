@@ -95,8 +95,8 @@
     "repository": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "root", "baseBranch"],
-      "description": "仓库绑定（§8：mode/root/baseBranch/baseCommit）",
+      "required": ["mode", "root", "baseBranch", "baseCommit"],
+      "description": "仓库绑定（§8：mode/root/baseBranch/baseCommit；baseCommit 键始终存在，bootstrap 前仅允许 new/null）",
       "properties": {
         "mode": {
           "type": "string",
@@ -114,11 +114,34 @@
           "description": "基础分支名"
         },
         "baseCommit": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{7,40}$",
-          "description": "existing 模式的可信 base commit SHA（new 模式 bootstrap 后填入）"
+          "type": ["string", "null"],
+          "description": "可信 base commit：existing 必须为 40 位小写 SHA；bootstrap 前的 new 必须为 null"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"mode": {"const": "existing"}},
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "baseCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"mode": {"const": "new"}},
+            "required": ["mode"]
+          },
+          "then": {
+            "properties": {
+              "baseCommit": {"type": "null"}
+            }
+          }
+        }
+      ]
     },
     "workPlan": {
       "type": "object",
