@@ -1,0 +1,39 @@
+{
+  "version": "plan-hash-v1",
+  "domainTag": "factory-barrier-v1",
+  "description": "barrierId 跨语言 golden vectors（域分离数组）。",
+  "cases": [
+    {
+      "name": "run-0001-IMPLEMENTING-1",
+      "runId": "run-0001",
+      "planRevisionDigest": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e",
+      "businessPhase": "IMPLEMENTING",
+      "barrierOrdinal": 1,
+      "expected": "bar_aedd03a3c4f7dbd1a5a980e0ba71b04d7c5db64448ab0c78d1bb31f62fab1050"
+    },
+    {
+      "name": "run-0001-IMPLEMENTING-2",
+      "runId": "run-0001",
+      "planRevisionDigest": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e",
+      "businessPhase": "IMPLEMENTING",
+      "barrierOrdinal": 2,
+      "expected": "bar_6c102ef7dbb89ea251e56561fd631ef9fa14dff16a3186af8883b9a305856928"
+    },
+    {
+      "name": "run-0001-VERIFYING-1",
+      "runId": "run-0001",
+      "planRevisionDigest": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e",
+      "businessPhase": "VERIFYING",
+      "barrierOrdinal": 1,
+      "expected": "bar_726c9c93aa7724338efd90cea666f1bc9d302e4b75cae76642b01bbb4794cece"
+    },
+    {
+      "name": "run-0002-IMPLEMENTING-1",
+      "runId": "run-0002",
+      "planRevisionDigest": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e",
+      "businessPhase": "IMPLEMENTING",
+      "barrierOrdinal": 1,
+      "expected": "bar_e9ee0089196f01a8b65c7379e6804ca79b79118da943e1931436e1ed90e45313"
+    }
+  ]
+}

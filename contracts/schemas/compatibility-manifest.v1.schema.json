@@ -1,0 +1,117 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/compatibility-manifest.v1.schema.json",
+  "title": "CompatibilityManifest",
+  "description": "兼容性 Manifest，冻结单一路径 eventBatchParameters。synchronous 字段只能为 FULL。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifestId", "manifestSchemaDigest", "eventBatchParameters",
+    "benchmarkProfileDigest", "sqliteSpikeReceiptDigest",
+    "stageCapeabilityMapDigest", "nodeCapabilityMapDigest",
+    "createdAt"
+  ],
+  "properties": {
+    "manifestId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Manifest 唯一 ID"
+    },
+    "manifestSchemaDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本 schema 自身内容摘要"
+    },
+    "eventBatchParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxBatchEvents", "maxBatchBytes", "maxBatchAgeMs",
+        "synchronous", "parameterTupleDigest", "sqliteSpikeReceiptDigest"
+      ],
+      "description": "事件批处理参数（emitter、Phase 1 consumer 与 Phase 6 validator 都重算 tuple digest 并核对 receipt 输入）",
+      "properties": {
+        "maxBatchEvents": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "批次最大事件数"
+        },
+        "maxBatchBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "批次最大字节数"
+        },
+        "maxBatchAgeMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "批次最大年龄（毫秒）"
+        },
+        "synchronous": {
+          "type": "string",
+          "const": "FULL",
+          "description": "同步模式：只允许 FULL"
+        },
+        "parameterTupleDigest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "参数 tuple 摘要（maxBatchEvents+maxBatchBytes+maxBatchAgeMs+synchronous 的确定性哈希）"
+        },
+        "sqliteSpikeReceiptDigest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SQLite spike receipt 摘要（必须绑定同一参数 tuple、manifest schema digest、benchmarkProfileDigest 和环境 digest）"
+        }
+      }
+    },
+    "benchmarkProfileDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "benchmark-profile.v1 内容摘要"
+    },
+    "sqliteSpikeReceiptDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "顶级 SQLite spike receipt 摘要（与 eventBatchParameters 内的摘要一致）"
+    },
+    "stageCapeabilityMapDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "stage-capability-map.v1 内容摘要"
+    },
+    "nodeCapabilityMapDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "node-capability-map.v1 内容摘要"
+    },
+    "windowsBuild": {
+      "type": "string",
+      "description": "Windows build 版本"
+    },
+    "wslKernel": {
+      "type": "string",
+      "description": "WSL2 kernel 版本"
+    },
+    "dockerVersion": {
+      "type": "string",
+      "description": "Docker Engine 版本"
+    },
+    "claudeCliDigest": {
+      "type": "string",
+      "description": "Claude CLI 可执行文件 digest"
+    },
+    "codexCliDigest": {
+      "type": "string",
+      "description": "Codex CLI 可执行文件 digest"
+    },
+    "environmentDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "完整环境摘要（用于 SQLite spike receipt 绑定验证）"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Manifest 创建时间"
+    }
+  }
+}

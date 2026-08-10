@@ -1,0 +1,21 @@
+{
+  "name": "ai-coding-factory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Coding Factory — 多语言 monorepo 根配置",
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 --",
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1",
+    "test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "tools/compat-probes/tauri_e2e"
+
+# esbuild build-script policy（R4，GPT 第三轮 item 6）：
+# pnpm 10+ 默认拒绝未 allowlist 的依赖 build script 并硬报错
+# ERR_PNPM_IGNORED_BUILDS。esbuild 的 postinstall（下载平台二进制）是合法的，
+# 显式 allowlist 使 frozen install 跨 pnpm 9/10 确定性 exit 0；其余依赖 build
+# script 仍默认拒绝（fail-closed）。package.json 的 pnpm.onlyBuiltDependencies
+# 同步声明，兼容 pnpm 9 读取路径。
+onlyBuiltDependencies:
+  - esbuild

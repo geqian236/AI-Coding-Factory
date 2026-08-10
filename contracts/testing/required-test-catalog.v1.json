@@ -1,0 +1,497 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/testing/required-test-catalog.v1.json",
+  "title": "RequiredTestCatalogV1",
+  "description": "Master Spec §20.2 展开的 47 个必须通过的测试 ID。每行包含 implementationContributors/finalPassOwner/requiredReplays/scenarioContractDigest。",
+  "version": "1",
+  "specRef": "Master Design Spec §20.2",
+  "totalCount": 47,
+  "tests": [
+    {
+      "testId": "STAGE-001",
+      "scenario": "选择 target_stage=DESIGN_APPROVED，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:ddd06396e6051fa4b64313e3343cd17e9a6f9fa3cc15469c5b11a30790df3ce8"
+    },
+    {
+      "testId": "STAGE-002",
+      "scenario": "选择 target_stage=CODEX_APPROVED，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:b89422c80fdf03e4954046e4a8bc19192212026ac3bf95bcf346101fcc5dec7b"
+    },
+    {
+      "testId": "STAGE-003",
+      "scenario": "选择 target_stage=PR_READY，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:ebf2a2883990e10a9859430b8675921baf4164884c70d570ddd154d9a57dbb99"
+    },
+    {
+      "testId": "STAGE-004",
+      "scenario": "选择 target_stage=MERGED，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:34c59a9ba612545c8a59229c8f17c15cb6e6ec326f1986a0c117e1ad97a19a6e"
+    },
+    {
+      "testId": "STAGE-005",
+      "scenario": "选择 target_stage=STAGING_ACCEPTED，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:5a5754cf91e02448e7a201e4a2825180e7edcd7b102fed23e725b587e2a4f15e"
+    },
+    {
+      "testId": "STAGE-006",
+      "scenario": "选择 target_stage=PRODUCTION_ACCEPTED，枚举全部 required node",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:cc9452a014ddcccbed100016b288f4edd865afcf97da68fdfe983e92e623dbca"
+    },
+    {
+      "testId": "AUTH-001",
+      "scenario": "finding 触发范围内重规划，新 PlanRevision 自动继续",
+      "implementationContributors": [
+        "control-plane",
+        "policy-engine"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:10431e742e8536c9736dbf1789ede03762e23e03d0052d1a813f5ac6c32c7796"
+    },
+    {
+      "testId": "AUTH-002",
+      "scenario": "服务器/数据库/不可逆风险或权限越界；授权过期/撤销",
+      "implementationContributors": [
+        "control-plane",
+        "policy-engine"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:4d033f97b7bb7450b6ba45e92cd439f2a4adf16c2da79b850c2e5240b59bf22d"
+    },
+    {
+      "testId": "PLAN-001",
+      "scenario": "PM/Architect 双角色规划与 capability 派生",
+      "implementationContributors": [
+        "control-plane",
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:d1fdd1d16792adaa709d8671a91375f1c6b6ce5076baabe38007c6f284466c34"
+    },
+    {
+      "testId": "PLAN-HASH-001",
+      "scenario": "Rust/Python/TypeScript 对含完整 nodes/barriers/stage map 的 JCS/NFC golden vectors 计算双 hash/barrier ID",
+      "implementationContributors": [
+        "factory-contracts"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 3,
+      "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3"
+    },
+    {
+      "testId": "BOOT-001",
+      "scenario": "新项目目录非空、已有 .git、路径归属不明",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:90d600204beabef0ef1542bd1dbbfbc13ba2f9dd7a1ae88f4de96f9e4836c023"
+    },
+    {
+      "testId": "MCP-001",
+      "scenario": "注册无限制 shell、缺 capability/脱敏/副作用声明的 MCP",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:35634bc5d23586653f3152d0a44c318718ee2110e5807ae49c57a42411416cb7"
+    },
+    {
+      "testId": "STATE-001",
+      "scenario": "枚举合法/非法转换、同一 PlanRevision 多 Run、重规划复用 logical node、barrier settled/passed、UNKNOWN settle timeout 与 CAS 冲突",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:1e13c80a4032d2d6cc823e36db10bd1ee83f49a823dd9e888f0ca2ef8a7d3685"
+    },
+    {
+      "testId": "LEASE-001",
+      "scenario": "stale worker、双派发、旧 fencing token、继任者尝试消费前任授权",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:57b9154bd77cc05f4eaa026eaebe0d167d251dab347700a72cc043621c8df14f"
+    },
+    {
+      "testId": "PROC-001",
+      "scenario": "Claude 运行时只杀死并重启 UI",
+      "implementationContributors": [
+        "ai-harness",
+        "desktop-shell"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:8909bc0e1dce2f1d2dfa822a0186db55d66acecffc7a3adecf68582c6e15a740"
+    },
+    {
+      "testId": "CTRL-001",
+      "scenario": "各 Step 类型软暂停、立即停止、取消和恢复",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:42f370d652ea7e4006e3e7a4a7e42233338e94d6f91daf0d7c27c8a0ee5fe3ce"
+    },
+    {
+      "testId": "CTRL-002",
+      "scenario": "快速 PAUSE→RESUME、旧 executor 仍活；checkpoint 含未跟踪文件",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:851ba2ecc9676a2cb6731af96d698c85cbe2127e180b937b042415a153d562ff"
+    },
+    {
+      "testId": "EVENT-HASH-001",
+      "scenario": "Rust/Python/TypeScript 物化同一 PreparedBatchV2：同 Task 同批至少两事件、多 Task 交错、两个批次竞争同一旧 head",
+      "implementationContributors": [
+        "factory-contracts"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 3,
+      "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173"
+    },
+    {
+      "testId": "STREAM-001",
+      "scenario": "JSONL 断行、重复、乱序、跨 chunk 秘密、重连",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:eb43ecff0ba7599726c42dc85b3ecbaa8714b38721e168945538392ca7be6f58"
+    },
+    {
+      "testId": "STREAM-002",
+      "scenario": "CLI exit 0 但终止 frame、sourceSeq/transport span 或必需 Artifact 缺失",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:d1c0bc29c09bbf4990c2b6bb362326a9ada93bb628e1c53bd75b9a059c644d6d"
+    },
+    {
+      "testId": "STREAM-DUR-001",
+      "scenario": "逐点杀 Agent：record write 包含稳定切点 record_prefix_mid_batch 和 record_torn_next，覆盖 WSL VM/主机硬重启",
+      "crashPointIds": [
+        "record_prefix_mid_batch",
+        "record_torn_next"
+      ],
+      "implementationContributors": [
+        "ai-harness",
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 2,
+      "scenarioContractDigest": "sha256:84d71a57a25560a83e2e937aa9732a8877c0607e1e69c55223a32216acc080a0"
+    },
+    {
+      "testId": "STREAM-BP-001",
+      "scenario": "注入 slow disk/flush stall 直到摄取队列跨过高水位和硬上限",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:3eb0d26f4c31196a8583c3886768697fa430f5d90e4d69ea38948d39ab302f0f"
+    },
+    {
+      "testId": "STREAM-PERF-BURST",
+      "scenario": "签名 load generator 按固定三任务/事件/大小分布在 100 ms 内输入 12,000 events",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:8b2ec54a71fc9bb58dc38291b69b03019f77db3dee0933598e6742cb5e813b71"
+    },
+    {
+      "testId": "STREAM-PERF-SUSTAINED",
+      "scenario": "同一固定分布以三任务聚合 2,000 events/s（±0.5%）持续 60 秒",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:563057c8f7b92d2d4c357f5408eceba0f8367d8a210e1ece3d1963382fba0957"
+    },
+    {
+      "testId": "STREAM-PERF-SPARSE",
+      "scenario": "1–10 events/s、跨 chunk 不确定后缀和低流量 batch",
+      "implementationContributors": [
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:d54989016d0d60815968eeb7570274f0836b7d82ac733d0e98a476f381cb43c0"
+    },
+    {
+      "testId": "REVIEW-001",
+      "scenario": "Claude 实现后自审并自修复，Verifier 通过后 Codex reject 再返工；审核后 SHA 漂移",
+      "implementationContributors": [
+        "ai-harness",
+        "verification"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:60bd6658f00cc20dfc43d27e705ec7be5fed682e5b0428d707f032d890f58059"
+    },
+    {
+      "testId": "GIT-001",
+      "scenario": "含本地未 push base commit 的 Windows 仓库，经 Git Object Bridge 由 Codex 创建 PR、等待 CI/check 并合并",
+      "implementationContributors": [
+        "ai-harness",
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:5ae4b6c6fdf2bb93a7782deb6bebcc25a514ddca3c50502421865fad8539f078"
+    },
+    {
+      "testId": "SIDEFX-001",
+      "scenario": "push/PR/registry 已成功但响应丢失",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:23854bd34c5de74f044c15e574f7f21b95a3bd3dff0252a8a0c7e8a5df90499d"
+    },
+    {
+      "testId": "DEPLOY-001",
+      "scenario": "可销毁 Linux 上生产等价成功发布",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:2d77a972e8ab4003731136bf1d807dcf55ea74abe9ca6da3de11c822f5b7b867"
+    },
+    {
+      "testId": "DEPLOY-002",
+      "scenario": "切流前/后故障，按 RollbackPlan 恢复旧版本",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:04a531f40dfa7d7a0878ea9c31ceb3fa08ce06b920852c5c1f05f6dae604e5ce"
+    },
+    {
+      "testId": "DEPLOY-003",
+      "scenario": "回滚再次失败后，以新 Task 再次请求相同目标",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:4eb5f894be64b76580ed8304a0d14a64f1e4f13db668bd82a486685a058157a0"
+    },
+    {
+      "testId": "GUARD-001",
+      "scenario": "ServerProfile、数据库、registry 分别进入 INTERVENTION_REQUIRED 后创建新 Profile revision/Task",
+      "implementationContributors": [
+        "deployment",
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:d3d5f08699bdead6396d5a1c0643dcc81048bd6cd38a919268fa39feac63b68d"
+    },
+    {
+      "testId": "DEPLOY-FENCE-001",
+      "scenario": "只读预检后制造双 Release Runner，并在各点令旧 token 继续写",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:1f8fcae66cf0ddc216d0e28cc1b5bf0b3466dac81ea858f1f824cf8c9c2e6a6e"
+    },
+    {
+      "testId": "STORE-001",
+      "scenario": "SQLite/WAL 损坏、D 盘满、Artifact 原子 rename 失败",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:5566af2ed0c3c45aa1d4d75242d7ef0aedf965ed9709ea1f182b0687629518c3"
+    },
+    {
+      "testId": "BUDGET-001",
+      "scenario": "修复、重规划、重启、合法长时间关机、系统睡眠、用户暂停、Provider 重试和同 boot 时钟前跳/回拨",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:65f524b4a7b1b2b8b49c9f78c0dd5a2b384d7ce2dc8d78d61eaa2383351be742"
+    },
+    {
+      "testId": "RETRY-001",
+      "scenario": "短 Retry-After、订阅额度耗尽、请求发送后 SSH 断线",
+      "implementationContributors": [
+        "control-plane",
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:acac1655cea364dc14dabf258d83218cb11ece395022eff7bc5c99260bd57c28"
+    },
+    {
+      "testId": "NOTIFY-001",
+      "scenario": "自动修复、完成、BLOCKED、已知发送失败、调用后结果未知和 Agent 重启",
+      "implementationContributors": [
+        "desktop-shell",
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:f7378185d4cae6400fb31b94806aa88f6434512611f833ae372f3486421d2c18"
+    },
+    {
+      "testId": "PATH-001",
+      "scenario": "干净 Windows 安装与全流程文件系统快照",
+      "implementationContributors": [
+        "hardening"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:ceb85a27368da3ad3ff6eef0d39994b6c5d41ae581605a9ff1f075465c1b9537"
+    },
+    {
+      "testId": "PATH-002",
+      "scenario": "D 缺失、E/F 回退、junction/SUBST/网络卷伪装",
+      "implementationContributors": [
+        "hardening"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:5ca3a45e5a8f23cd0d4c043492a9cd1a2dd6c7d4ea081ef948efcb08119474d8"
+    },
+    {
+      "testId": "CLI-PROFILE-001",
+      "scenario": "C 盘默认 profile 存在、Factory profile 为空",
+      "implementationContributors": [
+        "hardening",
+        "ai-harness"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:e6edba5b5967aa121fc9f511446c82e55a65f0c25d8be94a64d94964293a3357"
+    },
+    {
+      "testId": "RUNTIME-001",
+      "scenario": "WSL2 simplified 单 distro、legacy 双 distro、Factory distro integration 未启用、Hyper-V 等布局",
+      "implementationContributors": [
+        "hardening"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:83a5851324f7abeb28f3fc228eec432be61892603aad674ff5901dec386ae9d5"
+    },
+    {
+      "testId": "WSL-IO-001",
+      "scenario": "执行依赖安装、Verifier 和构建",
+      "implementationContributors": [
+        "hardening",
+        "verification"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:a9acb1c7b6a0eca651fd0bfbf12b161487af5b02804b24768ab08d10de0e019a"
+    },
+    {
+      "testId": "NGINX-001",
+      "scenario": "第三方在 nginx -t/reload 前后修改配置",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:0777b503d62b178997dc809ed01454e49a72016a2f9f74aee098454d8c08b7a7"
+    },
+    {
+      "testId": "BACKUP-001",
+      "scenario": "每次发布轻量验证、drill receipt 过期、restore_required",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:30f8c5e559da64958777267a2664adc94077de6627ae3bcf4a2e2aa311229caf"
+    },
+    {
+      "testId": "DEPLOY-RAM-001",
+      "scenario": "候选栈会耗尽内存余量",
+      "implementationContributors": [
+        "deployment"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:205606c1076832d7e7ecd67008234a69f1ec8486829f69bec566a3deb8d1d454"
+    },
+    {
+      "testId": "SCHED-PERF-001",
+      "scenario": "单 Claude/Codex 槽位下并发执行三个代表任务",
+      "implementationContributors": [
+        "control-plane"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:f339a665a8ed80d48dbe5e89a866d531ed6bf8368283d108ec6098d58c89c804"
+    },
+    {
+      "testId": "COMPAT-001",
+      "scenario": "CLI/Docker/WSL 自动更新造成 executable digest/schema/layout 漂移",
+      "implementationContributors": [
+        "hardening"
+      ],
+      "finalPassOwner": "codex-reviewer",
+      "requiredReplays": 1,
+      "scenarioContractDigest": "sha256:b58e743f85190a37f42f6efb594bb856c76448182fc24849298e38270fd77f4c"
+    }
+  ]
+}

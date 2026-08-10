@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/claude-self-review.v1.schema.json",
+  "title": "ClaudeSelfReview",
+  "description": "Claude 对自身实现的结构化自审回执。actor 是候选源码作者，只能作为 IMPLEMENT 阶段的作者质量 Artifact，不能满足 CODE_REVIEW/ATTEST_REVIEW，不能关闭 Codex finding，也不能授权 PUBLISH_PR/MERGE。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "selfReviewId",
+    "reviewedBaseSha",
+    "reviewedCandidateSha",
+    "rubricVersion",
+    "result",
+    "findings",
+    "evidenceDigests",
+    "createdAt"
+  ],
+  "properties": {
+    "selfReviewId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "自审回执唯一 ID"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联任务 ID"
+    },
+    "stepId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "关联 Step ID"
+    },
+    "reviewedBaseSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "被审核的 base commit SHA；漂移后本回执失效"
+    },
+    "reviewedCandidateSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "被审核的候选 commit SHA；漂移后本回执失效"
+    },
+    "rubricVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所用审核规则集版本"
+    },
+    "result": {
+      "type": "string",
+      "enum": ["pass", "needs_fix"],
+      "description": "自审结论：pass 表示通过，needs_fix 表示需要修复"
+    },
+    "findings": {
+      "type": "array",
+      "description": "发现问题列表（result=pass 时可为空数组）",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["findingId", "severity", "status"],
+        "properties": {
+          "findingId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "稳定 finding 唯一 ID"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "high", "medium", "low", "info"],
+            "description": "问题严重度"
+          },
+          "file": {
+            "type": "string",
+            "description": "相关文件路径"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "相关符号（函数/类/变量名）"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "支撑证据描述（禁止隐藏思维链或自由文本冒充证据）"
+          },
+          "passCondition": {
+            "type": "string",
+            "description": "通过条件描述"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["open", "fixed", "acknowledged"],
+            "description": "finding 状态"
+          }
+        }
+      }
+    },
+    "evidenceDigests": {
+      "type": "array",
+      "description": "证据摘要列表（每个证据的内容寻址摘要）",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "自审完成时间"
+    }
+  }
+}

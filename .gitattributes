@@ -1,0 +1,18 @@
+# 统一行尾为 LF，防止跨平台提交时行尾混乱。
+* text=auto eol=lf
+
+# 二进制文件不转换行尾。
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.eot  binary
+*.pdf  binary
+*.zip  binary
+*.tar.gz binary
+*.lock linguist-generated=true

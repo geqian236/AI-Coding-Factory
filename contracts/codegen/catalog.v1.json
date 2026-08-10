@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/codegen/catalog.v1.json",
+  "title": "CodegenCatalogV1",
+  "description": "Codegen 输入目录：逐项冻结 codegen 输入、生成目标和 generated/runtime-only 分类。",
+  "version": "1",
+  "outputTargets": {
+    "typescript": "packages/factory-contracts/src/generated/contracts.ts",
+    "python": "apps/agent/src/factory_agent/contracts/generated/models.py",
+    "rust": "crates/factory-contracts/src/generated/contracts.rs"
+  },
+  "schemas": [
+    {
+      "name": "CredentialRef",
+      "schemaPath": "contracts/schemas/credential-ref.v1.schema.json",
+      "schemaId": "credential-ref.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "凭据引用类型，所有 Profile 必须 $ref 此类型"
+    },
+    {
+      "name": "RunSpec",
+      "schemaPath": "contracts/schemas/run-spec.v1.schema.json",
+      "schemaId": "run-spec.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "任务 RunSpec（不可变需求+授权）"
+    },
+    {
+      "name": "PlanRevision",
+      "schemaPath": "contracts/schemas/plan-revision.v1.schema.json",
+      "schemaId": "plan-revision.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "计划修订版本（DAG 节点+barrier+stage 映射）"
+    },
+    {
+      "name": "ControlCommand",
+      "schemaPath": "contracts/schemas/control-command.v1.schema.json",
+      "schemaId": "control-command.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "控制命令（PAUSE/STOP/CANCEL/RESUME）"
+    },
+    {
+      "name": "TaskIntakeRequest",
+      "schemaPath": "contracts/schemas/task-intake.v1.schema.json",
+      "schemaId": "task-intake.v1",
+      "definitionKey": "TaskIntakeRequest",
+      "codegen": true,
+      "category": "generated",
+      "description": "任务接入请求（用户输入）"
+    },
+    {
+      "name": "TaskIntakeAccepted",
+      "schemaPath": "contracts/schemas/task-intake.v1.schema.json",
+      "schemaId": "task-intake.v1",
+      "definitionKey": "TaskIntakeAccepted",
+      "codegen": true,
+      "category": "generated",
+      "description": "任务接入接受（Agent 生成）"
+    },
+    {
+      "name": "ClaudeSelfReview",
+      "schemaPath": "contracts/schemas/claude-self-review.v1.schema.json",
+      "schemaId": "claude-self-review.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "Claude 自审回执（IMPLEMENT 阶段作者质量 Artifact）"
+    },
+    {
+      "name": "PreparedEventV2",
+      "schemaPath": "contracts/schemas/prepared-event.v2.schema.json",
+      "schemaId": "prepared-event.v2",
+      "codegen": true,
+      "category": "generated",
+      "description": "耐久化前预备事件"
+    },
+    {
+      "name": "PreparedBatchV2",
+      "schemaPath": "contracts/schemas/prepared-batch.v2.schema.json",
+      "schemaId": "prepared-batch.v2",
+      "codegen": true,
+      "category": "generated",
+      "description": "预备事件批次"
+    },
+    {
+      "name": "DurableEventV2",
+      "schemaPath": "contracts/schemas/durable-event.v2.schema.json",
+      "schemaId": "durable-event.v2",
+      "codegen": true,
+      "category": "generated",
+      "description": "耐久化后事件（含 taskSeq/eventId/eventDigest/head）"
+    },
+    {
+      "name": "IpcEnvelope",
+      "schemaPath": "contracts/schemas/ipc-envelope.v1.schema.json",
+      "schemaId": "ipc-envelope.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "IPC 消息信封"
+    },
+    {
+      "name": "RunnerProtocol",
+      "schemaPath": "contracts/schemas/runner-protocol.v1.schema.json",
+      "schemaId": "runner-protocol.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "Runner 协议消息"
+    },
+    {
+      "name": "TestReceipt",
+      "schemaPath": "contracts/schemas/test-receipt.v1.schema.json",
+      "schemaId": "test-receipt.v1",
+      "codegen": false,
+      "category": "runtime-only",
+      "description": "机器可读测试回执。单一真源 = schema + 手写 dataclass（含 validate()/from_dict() 行为，codegen 无法生成）；由 test_receipt_schema_conformance 机械绑定 dataclass 字段↔schema，杜绝双源漂移。"
+    },
+    {
+      "name": "CompatibilityManifest",
+      "schemaPath": "contracts/schemas/compatibility-manifest.v1.schema.json",
+      "schemaId": "compatibility-manifest.v1",
+      "codegen": false,
+      "category": "runtime-only",
+      "description": "兼容性 Manifest（运行时动态验证，Adapter 验证边界）"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+[
+  {
+    "receiptId": "rcpt-conflict-event-hash-001a",
+    "testId": "EVENT-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-run-vectors-001",
+        "description": "首次执行 Python/Rust/TypeScript 跨语言 event hash vector 对比",
+        "executedAt": "2026-08-04T00:00:00Z",
+        "inputDigest": "sha256:aaa111bbb222ccc333ddd444eee555fff666aaa111bbb222ccc333ddd444eee5"
+      }
+    ],
+    "expected": {
+      "allHashesMatch": true
+    },
+    "actual": {
+      "allHashesMatch": true
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:aaa111bbb222ccc333ddd444eee555fff666aaa111bbb222ccc333ddd444eee5"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-04T00:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "FINAL",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  },
+  {
+    "receiptId": "rcpt-conflict-event-hash-001b",
+    "testId": "EVENT-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-rerun-vectors-002",
+        "description": "二次执行 event hash vector — Rust hash 与 Python baseline 不匹配，触发 CONFLICTING_RESULTS",
+        "executedAt": "2026-08-04T01:00:00Z",
+        "inputDigest": "sha256:aaa111bbb222ccc333ddd444eee555fff666aaa111bbb222ccc333ddd444eee5"
+      }
+    ],
+    "expected": {
+      "allHashesMatch": true
+    },
+    "actual": {
+      "allHashesMatch": false,
+      "mismatchDetail": "Rust hash differs from Python baseline"
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [],
+    "result": "FAIL",
+    "failureReason": "Rust DurableEventV2 hash 与 Python baseline 不一致；此 fixture 预期被 verify_receipts 以 CONFLICTING_RESULTS 拒绝",
+    "createdAt": "2026-08-04T01:00:00Z",
+    "scenarioContractDigest": "sha256:46ddca2b95068e58dbe84e6635c80455e951f1f858b51f5e637d84695475b173",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "FINAL",
+    "requiredReplays": 3,
+    "runtimeId": "rust-1.80"
+  }
+]

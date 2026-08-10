@@ -1,0 +1,18 @@
+﻿{
+  "name": "@factory/tauri-e2e-spike",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tauri E2E spike framework — BLOCKED_UNCERTIFIED until Tauri + WebView available",
+  "scripts": {
+    "test": "vitest run specs/",
+    "test:e2e": "echo BLOCKED_UNCERTIFIED: Tauri runtime not available && exit 1"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "2.0.0",
+    "vitest": "1.6.0",
+    "@playwright/test": "1.44.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

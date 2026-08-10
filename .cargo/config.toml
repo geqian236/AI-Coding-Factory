@@ -1,0 +1,18 @@
+# AI Coding Factory — Cargo 构建配置
+#
+# 项目根 D:\codex项目 含 CJK 字符。中文 Windows（GBK ANSI 代码页）下 MinGW
+# binutils 的 `ld` 用窄字符 API 打开文件，无法解析含 CJK 的路径，导致 std rlib
+# 与 self-contained 系统库在链接阶段全部 "cannot find"，任何 Rust 构建失败。
+# 实测：即便 `-fuse-ld=lld`，gcc 驱动仍回退到 GNU ld，无法绕过。
+#
+# 解法：绕过 gcc 驱动，直接把 Rust 自带、Unicode 安全的 lld（ld flavor）当链接器。
+# rustc 在 self-contained 模式下会显式传入全部 object/rlib/系统库路径与 -L 目录，
+# 故无需 gcc 补默认库，ld.lld 用宽字符 Win32 API 可正确打开含 CJK 的全部路径。
+#
+# linker-flavor 在此冻结（可移植）；linker 的绝对路径随工具链位置而变，由
+# scripts/dev.ps1 通过 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER 环境变量按
+# `rustc --print sysroot` 计算注入，不写死在此文件。
+#
+# 影响构建输出字节的链接器选择已冻结于此；改动须同步验证三语言 golden vectors。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "linker-flavor=ld"]

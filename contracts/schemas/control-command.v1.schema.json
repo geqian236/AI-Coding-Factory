@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/control-command.v1.schema.json",
+  "title": "ControlCommand",
+  "description": "控制命令，用于暂停、停止、取消或恢复任务执行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commandId", "commandType", "taskId", "issuedAt", "controlEpoch"],
+  "properties": {
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "命令唯一 ID"
+    },
+    "commandType": {
+      "type": "string",
+      "enum": ["PAUSE", "IMMEDIATE_STOP", "CANCEL", "RESUME"],
+      "description": "命令类型：软暂停、立即停止、取消（不可逆）、恢复"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "目标任务 ID"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "目标 Run ID（可选，指定具体 Run）"
+    },
+    "issuedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "命令签发时间"
+    },
+    "controlEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "控制 epoch，用于防重放和顺序保证"
+    },
+    "issuedBy": {
+      "type": "string",
+      "minLength": 1,
+      "description": "命令签发者标识"
+    },
+    "reason": {
+      "type": "string",
+      "description": "命令原因说明（可选）"
+    }
+  }
+}

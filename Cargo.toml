@@ -1,0 +1,23 @@
+[workspace]
+# AI Coding Factory — Rust workspace 根配置
+# 业务 crate 在各自子目录中维护，此处只声明 workspace 成员。
+members = [
+    # 合同层（Task 3 启用 canonical/plan 模块）
+    "crates/factory-contracts",
+    # Task 7 compat probe crates
+    "tools/compat-probes/windows_durable_io",
+    "tools/compat-probes/clock_source",
+    "tools/compat-probes/named_pipe",
+    "tools/compat-probes/runner_identity",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors  = ["AI Coding Factory"]
+license  = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"

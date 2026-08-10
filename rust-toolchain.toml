@@ -1,0 +1,8 @@
+[toolchain]
+# AI Coding Factory 固定 Rust 工具链版本，确保跨环境构建一致性。
+# host/target 使用 x86_64-pc-windows-gnu：项目根 D:\codex项目 含 CJK 字符，
+# GNU binutils `ld` 在 GBK 代码页下无法打开含 CJK 的路径，故经 .cargo/config.toml
+# 用 Rust 自带、Unicode 安全的 rust-lld（linker-flavor=ld）链接。详见 scripts/dev.ps1。
+channel  = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+targets  = ["x86_64-pc-windows-gnu"]

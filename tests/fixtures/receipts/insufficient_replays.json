@@ -1,0 +1,35 @@
+[
+  {
+    "receiptId": "rcpt-insufficient-replays-001-a",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-insufficient-replays-001-a",
+        "description": "PLAN-HASH-001 catalog.requiredReplays=3，此 fixture 只提供 1 条 PASS 触发 INSUFFICIENT_REPLAYS",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {
+      "allHashesMatch": true
+    },
+    "actual": {
+      "allHashesMatch": true
+    },
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "FINAL",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  }
+]

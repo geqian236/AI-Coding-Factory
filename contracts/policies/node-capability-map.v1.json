@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/policies/node-capability-map.v1.json",
+  "title": "NodeCapabilityMapV1",
+  "description": "首版冻结的 node→requiredCapabilities 映射。共 17 种 nodeType，Policy Engine 不接受模型自由填写 capability。",
+  "version": "1",
+  "specRef": "Master Design Spec §6.3",
+  "nodeTypes": {
+    "PLAN": {
+      "requiredCapabilities": ["repo.read"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "read-only",
+      "description": "规划节点：只读仓库，生成 RunSpec 和 PlanRevision Artifact"
+    },
+    "DESIGN_REVIEW": {
+      "requiredCapabilities": ["repo.read"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "read-only",
+      "description": "设计审核节点：只读仓库，产出设计审核 Artifact"
+    },
+    "BOOTSTRAP_REPOSITORY": {
+      "requiredCapabilities": ["repo.bootstrap", "git.local_commit"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "local-write",
+      "description": "新建仓库节点：仅限 D 盘空目录，本地提交"
+    },
+    "IMPLEMENT": {
+      "requiredCapabilities": ["repo.read", "worktree.write", "git.local_commit"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "local-write",
+      "description": "实现节点：独立 worktree 写入，本地提交，不含 push/部署权限"
+    },
+    "VERIFY": {
+      "requiredCapabilities": ["repo.read", "test.exec.isolated"],
+      "optionalCapabilities": ["network.egress.scoped"],
+      "sideEffectClass": "isolated-exec",
+      "description": "验证节点：隔离容器运行测试，无 Git/部署写权限"
+    },
+    "CODE_REVIEW": {
+      "requiredCapabilities": ["repo.read"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "read-only",
+      "description": "代码审核节点：只读仓库，产出代码审核 Artifact（不能被 self-review 替代）"
+    },
+    "ATTEST_REVIEW": {
+      "requiredCapabilities": ["repo.read", "check.publish"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "external-write-limited",
+      "description": "Codex 独立审核认证节点：只读仓库 + 发布固定 check name"
+    },
+    "PUBLISH_PR": {
+      "requiredCapabilities": ["git.push", "pr.create", "pr.update", "forge.observe.scoped"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "external-write",
+      "description": "发布 PR 节点：push+创建/更新 PR+只读观察"
+    },
+    "MERGE": {
+      "requiredCapabilities": ["forge.observe.scoped", "repo.merge"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "external-write",
+      "description": "合并节点：观察 Forge 状态后执行受保护合并"
+    },
+    "BUILD_ARTIFACT": {
+      "requiredCapabilities": ["build.exec.isolated"],
+      "optionalCapabilities": ["registry.push", "registry.observe.scoped"],
+      "sideEffectClass": "isolated-exec",
+      "description": "构建 Artifact 节点：隔离构建，推送时另需 registry 权限"
+    },
+    "DEPLOY_STAGING": {
+      "requiredCapabilities": ["ssh.exec.scoped", "remote.write.scoped"],
+      "optionalCapabilities": ["db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"],
+      "sideEffectClass": "remote-write",
+      "description": "测试环境部署节点：SSH+远端写，按计划附加 DB/Nginx 操作"
+    },
+    "ACCEPT_STAGING": {
+      "requiredCapabilities": [
+        "http.check.scoped", "network.egress.scoped",
+        "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"
+      ],
+      "optionalCapabilities": ["db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"],
+      "sideEffectClass": "remote-observe",
+      "description": "测试环境验收节点：观察+检查，按计划附加 DB 读/fixture"
+    },
+    "DEPLOY_PRODUCTION": {
+      "requiredCapabilities": ["ssh.exec.scoped", "remote.write.scoped"],
+      "optionalCapabilities": ["db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"],
+      "sideEffectClass": "remote-write",
+      "description": "生产环境部署节点：同 DEPLOY_STAGING 但指向生产目标"
+    },
+    "ACCEPT_PRODUCTION": {
+      "requiredCapabilities": [
+        "http.check.scoped", "network.egress.scoped",
+        "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"
+      ],
+      "optionalCapabilities": ["db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"],
+      "sideEffectClass": "remote-observe",
+      "description": "生产环境验收节点：同 ACCEPT_STAGING 但指向生产目标"
+    },
+    "ROLLBACK": {
+      "requiredCapabilities": ["rollback", "ssh.exec.scoped", "remote.write.scoped"],
+      "optionalCapabilities": ["db.restore", "nginx.switch", "traffic.switch.scoped"],
+      "sideEffectClass": "remote-write",
+      "description": "回滚节点：仅在预声明路径可附加 db.restore/nginx.switch/traffic.switch.scoped"
+    },
+    "RESTORE_DRILL": {
+      "requiredCapabilities": ["db.restore", "restore.validation.instance", "db.check"],
+      "optionalCapabilities": [],
+      "sideEffectClass": "isolated-restore",
+      "description": "恢复演练节点：必须绑定 resource fingerprint 证明目标不是生产实例，禁止指向生产实例"
+    },
+    "RECONCILE_TARGET": {
+      "requiredCapabilities": [],
+      "optionalCapabilities": [
+        "remote.observe.scoped", "container.inspect.scoped",
+        "log.read.scoped", "db.read", "db.check",
+        "registry.observe.scoped", "target.guard.clear"
+      ],
+      "sideEffectClass": "remote-observe",
+      "description": "Reconcile 节点：按目标附加观察权限；target.guard.clear 只有证据齐全且专用用户授权后才附加"
+    }
+  }
+}

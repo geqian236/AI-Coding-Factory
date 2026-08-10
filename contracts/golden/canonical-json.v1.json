@@ -1,0 +1,183 @@
+{
+  "version": "canonical-json-v1",
+  "description": "RFC 8785 JCS + Unicode NFC 规范化跨语言 golden vectors（完整 ES6 数字序列化）。",
+  "accept": [
+    {
+      "name": "key-sort-basic",
+      "inputJsonText": "{\"b\":1,\"a\":2}",
+      "expectedCanonical": "{\"a\":2,\"b\":1}"
+    },
+    {
+      "name": "int-one",
+      "inputJsonText": "1",
+      "expectedCanonical": "1"
+    },
+    {
+      "name": "float-one-point-zero",
+      "inputJsonText": "1.0",
+      "expectedCanonical": "1"
+    },
+    {
+      "name": "negative-zero",
+      "inputJsonText": "-0",
+      "expectedCanonical": "0"
+    },
+    {
+      "name": "exponent",
+      "inputJsonText": "1e2",
+      "expectedCanonical": "100"
+    },
+    {
+      "name": "max-safe-int",
+      "inputJsonText": "9007199254740991",
+      "expectedCanonical": "9007199254740991"
+    },
+    {
+      "name": "decimal-simple",
+      "inputJsonText": "1.5",
+      "expectedCanonical": "1.5"
+    },
+    {
+      "name": "decimal-negative",
+      "inputJsonText": "-2.5",
+      "expectedCanonical": "-2.5"
+    },
+    {
+      "name": "decimal-thousandths",
+      "inputJsonText": "0.001",
+      "expectedCanonical": "0.001"
+    },
+    {
+      "name": "decimal-mixed",
+      "inputJsonText": "1234.5",
+      "expectedCanonical": "1234.5"
+    },
+    {
+      "name": "exp-to-decimal",
+      "inputJsonText": "1e-6",
+      "expectedCanonical": "0.000001"
+    },
+    {
+      "name": "exp-stays-exp-neg7",
+      "inputJsonText": "1e-7",
+      "expectedCanonical": "1e-7"
+    },
+    {
+      "name": "exp-stays-exp-5e-8",
+      "inputJsonText": "5e-8",
+      "expectedCanonical": "5e-8"
+    },
+    {
+      "name": "exp-positive-collapses",
+      "inputJsonText": "1.25e2",
+      "expectedCanonical": "125"
+    },
+    {
+      "name": "float-integer-valued",
+      "inputJsonText": "3.0",
+      "expectedCanonical": "3"
+    },
+    {
+      "name": "null-value",
+      "inputJsonText": "{\"x\":null}",
+      "expectedCanonical": "{\"x\":null}"
+    },
+    {
+      "name": "bool-values",
+      "inputJsonText": "{\"t\":true,\"f\":false}",
+      "expectedCanonical": "{\"f\":false,\"t\":true}"
+    },
+    {
+      "name": "nested-array",
+      "inputJsonText": "[3,{\"z\":1,\"a\":2},[]]",
+      "expectedCanonical": "[3,{\"a\":2,\"z\":1},[]]"
+    },
+    {
+      "name": "nfc-combining",
+      "inputJsonText": "{\"k\": \"e\\u0301\"}",
+      "expectedCanonical": "{\"k\":\"é\"}"
+    },
+    {
+      "name": "escape-quote-backslash",
+      "inputJsonText": "{\"s\": \"a\\\"b\\\\c\"}",
+      "expectedCanonical": "{\"s\":\"a\\\"b\\\\c\"}"
+    },
+    {
+      "name": "escape-control-tab-newline",
+      "inputJsonText": "{\"s\": \"\\t\\n\\r\\b\\f\"}",
+      "expectedCanonical": "{\"s\":\"\\t\\n\\r\\b\\f\"}"
+    },
+    {
+      "name": "escape-unit-separator",
+      "inputJsonText": "{\"s\": \"\\u001f\"}",
+      "expectedCanonical": "{\"s\":\"\\u001f\"}"
+    },
+    {
+      "name": "utf16-vs-z",
+      "inputJsonText": "{\"z\": 1, \"😀\": 2}",
+      "expectedCanonical": "{\"z\":1,\"😀\":2}"
+    },
+    {
+      "name": "utf16-surrogate-before-ffff",
+      "inputJsonText": "{\"￿\": 1, \"😀\": 2}",
+      "expectedCanonical": "{\"😀\":2,\"￿\":1}"
+    }
+  ],
+  "reject": [
+    {
+      "name": "duplicate-key",
+      "inputJsonText": "{\"a\":1,\"a\":2}",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "nan",
+      "inputJsonText": "NaN",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "infinity",
+      "inputJsonText": "Infinity",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "neg-infinity",
+      "inputJsonText": "-Infinity",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "over-max-safe-int",
+      "inputJsonText": "9007199254740993",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "over-range-float-exp",
+      "inputJsonText": "1e20",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "leading-zero",
+      "inputJsonText": "01",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "trailing-dot",
+      "inputJsonText": "1.",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "dot-then-exp",
+      "inputJsonText": "1.e5",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "no-int-part",
+      "inputJsonText": ".5",
+      "expectedErrorCode": "canonical-json-error"
+    },
+    {
+      "name": "exp-no-digits",
+      "inputJsonText": "1e",
+      "expectedErrorCode": "canonical-json-error"
+    }
+  ]
+}

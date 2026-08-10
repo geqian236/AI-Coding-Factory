@@ -1,0 +1,31 @@
+[
+  {
+    "receiptId": "rcpt-forged-empty-pass-001",
+    "testId": "PLAN-HASH-001",
+    "environmentManifestDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "actions": [
+      {
+        "actionId": "act-forged-empty-pass-001",
+        "description": "动作有，但 expected/actual 故意留空以触发 EMPTY_EXPECTED/EMPTY_ACTUAL 拒绝",
+        "executedAt": "2026-08-05T00:00:00Z",
+        "inputDigest": "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+      }
+    ],
+    "expected": {},
+    "actual": {},
+    "sideEffectCount": 0,
+    "artifactDigests": [
+      "sha256:abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+    ],
+    "result": "PASS",
+    "createdAt": "2026-08-05T00:00:00Z",
+    "scenarioContractDigest": "sha256:97d9df5ddffa514c7e10b9a1153de57faebfac92903916f85a7a543f6294a5e3",
+    "implementationContributors": [
+      "factory-contracts"
+    ],
+    "finalPassOwner": "codex-reviewer",
+    "qualification": "FINAL",
+    "requiredReplays": 3,
+    "runtimeId": "python-3.12"
+  }
+]

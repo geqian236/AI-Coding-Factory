@@ -1,0 +1,118 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/test-receipt.v1.schema.json",
+  "title": "TestReceipt",
+  "description": "机器可读测试回执，至少包含测试 ID、环境 manifest 摘要、动作、期望、实际状态、外部副作用计数、Artifact 摘要和最终 receipt。禁止手工文字改为成功。P0-6 fail-closed 强化：expected/actual 必须非空、actions 至少 1 条、finalPassOwner/requiredReplays/scenarioContractDigest/qualification 为必填以防伪造 FINAL PASS。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receiptId", "testId", "environmentManifestDigest",
+    "actions", "expected", "actual", "sideEffectCount",
+    "artifactDigests", "result", "createdAt",
+    "finalPassOwner", "requiredReplays", "scenarioContractDigest",
+    "qualification"
+  ],
+  "properties": {
+    "receiptId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "回执唯一 ID（全局唯一，verify_receipts 强制 DUPLICATE_RECEIPT_ID 检查）"
+    },
+    "testId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "测试 ID（来自 required-test-catalog.v1.json）"
+    },
+    "environmentManifestDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "环境 Compatibility Manifest 摘要"
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "description": "执行动作列表（P0-6：至少 1 条，杜绝手工文字 PASS）",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["actionId", "description", "executedAt"],
+        "properties": {
+          "actionId": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "inputDigest": {"type": "string", "minLength": 1},
+          "executedAt": {"type": "string", "format": "date-time"}
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "期望结果描述（机器可读；P0-6：至少 1 个属性以防伪造 PASS）"
+    },
+    "actual": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "实际观察结果（机器可读；P0-6：至少 1 个属性以防伪造 PASS）"
+    },
+    "sideEffectCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "外部副作用计数"
+    },
+    "artifactDigests": {
+      "type": "array",
+      "description": "相关 Artifact 摘要列表",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "result": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "BLOCKED_UNCERTIFIED"],
+      "description": "测试结论（不能通过手工文字改为 PASS）"
+    },
+    "failureReason": {
+      "type": "string",
+      "description": "失败原因（result=FAIL 时必填）"
+    },
+    "scenarioContractDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "场景合同内容摘要（来自 required-test-catalog；P0-6：必填以防伪造 PASS）"
+    },
+    "implementationContributors": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "实现贡献者列表"
+    },
+    "finalPassOwner": {
+      "type": "string",
+      "minLength": 1,
+      "description": "最终通过责任人（P0-6：必填；verify_receipts 强制匹配 catalog.owner + 白名单）"
+    },
+    "qualification": {
+      "type": "string",
+      "enum": ["PARTIAL", "FINAL"],
+      "description": "执行资质等级（GPT 第二轮审核限定）：PARTIAL=阶段/中间通过；FINAL=最终/收口通过。verify_receipts 强制 PARTIAL 不能冒充 FINAL 用于收口。"
+    },
+    "requiredReplays": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "要求重放次数（P0-6：>= 1，verify_receipts 按 catalog.requiredReplays 强制覆盖门禁）"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "回执创建时间"
+    },
+    "runtimeId": {
+      "type": "string",
+      "enum": [
+        "python-3.12", "python-3.11", "rust-1.80", "rust-stable",
+        "typescript-node-20", "typescript-node-22", "factory-agent-v0"
+      ],
+      "description": "运行时标识（可选；若存在则必须是已知 runtimeId。此 enum 是 receipts.py KNOWN_RUNTIME_IDS 的单一真源，由 test_receipt_schema_conformance 机械绑定）"
+    }
+  }
+}

@@ -1,0 +1,308 @@
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [codex/**]
+
+# AI Coding Factory — CI 真源（fail-closed）。
+# 历史版本曾含 `echo OK` / `echo neutral` 的占位步骤；GPT 审核指出该 CI 是 fail-open，
+# 现已全部替换为真实 fail-closed 命令。修改本文件需同步更新 scripts/check.ps1
+# 与 docs/operations/development-environment.md 中的 CI 描述。
+#
+# 本机开发流程见 scripts/check.ps1（9 项门禁）；本 CI 是其镜像 + 跨平台扩展
+# （ubuntu-latest 无法跑 Windows-only probe，因此 probe 在本机/Windows runner 上跑）。
+
+jobs:
+  plan-consistency:
+    name: plan-consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装 uv + 同步锁定依赖
+        # GPT round-9 P1: 固定 uv 版本 + uv sync --locked（不是 --frozen）。--locked
+        # 要求 uv.lock 与 pyproject.toml 完全一致，锁文件漂移即整体红；随后所有 uv run
+        # 均加 --locked，确保运行期也做漂移检查（--frozen 允许陈旧锁通过）。
+        run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: 计划一致性门禁
+        # 真实 fail-closed：跑 plan_hash 与 event_hash 跨语言向量；
+        # PLAN-HASH-001/EVENT-HASH-001 是 required-test-catalog 强制 ID，
+        # fail 即整体红。
+        run: |
+          uv run --locked python -m pytest tests/contract/test_plan_hash_vectors.py tests/contract/test_event_hash_vectors.py -q --tb=short
+
+  contracts:
+    name: contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装 uv + 同步锁定依赖
+        # GPT round-9 P1: 固定 uv 版本 + uv sync --locked（不再 --frozen）。--frozen
+        # 只保证不改锁但仍可能用陈旧锁；--locked 强制 uv.lock 与 pyproject.toml 一致，
+        # 漂移即整体红。jsonschema 及全部依赖锁定在 uv.lock（uv lock 生成）。
+        run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: Codegen drift 检测
+        # 三语言生成树必须无漂移；漂移即整体红（fail-closed）。经 uv run --locked 在锁定
+        # 环境执行，并顺带做锁漂移检查。
+        run: uv run --locked python contracts/codegen/generate.py --check
+      - name: 合同测试
+        # uv run --locked python -m pytest: -m ensures cwd is on sys.path so tests
+        # that do 'from tests.conftest import REPO_ROOT' can resolve the 'tests'
+        # package; --locked 在每次 run 复核锁文件未漂移。
+        run: uv run --locked python -m pytest tests/contract/ -q
+
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装 uv + 同步锁定依赖
+        # GPT round-9 P1: ruff/mypy/pytest 全部锁定在 uv.lock（dependency-groups），
+        # 用固定 uv + uv sync --locked 复现，不再裸 pip install 未锁版本（漂移源）。
+        run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: Ruff lint
+        # pyproject.toml 已配 ruff；未跑过即视为 fail-closed 漏检。经 uv run --locked
+        # 用锁定版 ruff，并顺带复核锁未漂移。
+        run: uv run --locked ruff check apps/agent/src scripts tests/contract tests/security
+      - name: MyPy 类型检查
+        # apps/agent 是受代码，必须 mypy 严格通过（fail-closed）。
+        # 历史版本曾用 `strict || lax` 短路：严格失败仍走宽松分支通过，属 fail-open
+        # 假绿（GPT 第四轮审核 item 6 指出）。现只跑严格模式，失败即整体红。
+        run: uv run --locked mypy --config-file pyproject.toml apps/agent/src
+
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (workspace)
+        # 含 factory-contracts + 5 个 compat-probe；编译失败即整体红。
+        run: cargo check --workspace --all-targets
+      - name: cargo test (factory-contracts)
+        # 跨语言向量测试：Rust event_vectors + plan_vectors 必须与
+        # contracts/golden/*.json 冻结值字节级一致。
+        run: cargo test -p factory-contracts
+
+  desktop:
+    name: desktop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # GPT round-16 desktop blocker: 读取唯一真源 .node-version（仓库声明 Node 22），
+          # 不再硬编码 '20'。硬编码 20 与 .node-version/package engines 不一致，fresh
+          # frozen install 后 tsc 环境与本地/预期漂移；node-version-file 使 CI 与真源同步。
+          node-version-file: '.node-version'
+      - name: 启用 corepack + pnpm
+        # corepack 自带 pnpm；pnpm 必须能离线/在线解析 package.json。
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+      - name: 安装 frozen 依赖
+        # fail-closed：frozen-lockfile 必须成功，否则依赖锁与 package.json 不一致。
+        run: corepack pnpm install --frozen-lockfile
+      - name: TypeScript 类型检查
+        # tsc --noEmit 跑 .ts 类型一致性。
+        run: corepack pnpm --filter @factory/contracts run lint
+      - name: vitest 合同向量测试
+        # event.test.ts + plan.test.ts 与 Rust/Python 共享同一 golden JSON，
+        # 字节级一致 cross-language。
+        run: corepack pnpm --filter @factory/contracts test
+
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装 uv + 同步锁定依赖
+        # GPT round-9 P1: 固定 uv 版本 + uv sync --locked，令整个 CI 在锁定环境下运行，
+        # 不再用未锁定的 pip install（否则声称"CI 锁定"名不副实）。
+        run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: 秘密扫描
+        # _gate_checks.py secret-scan 已在本地 check.ps1 用过；CI 必须真跑
+        # （不能再 echo OK）。任何命中即整体红。uv run --locked 复核锁文件无漂移。
+        run: uv run --locked python scripts/_gate_checks.py secret-scan
+      - name: C 盘路径检查
+        # 防止源代码硬编码 C:\ 路径或 %APPDATA%；命中即整体红。
+        run: uv run --locked python scripts/_gate_checks.py c-drive-paths
+
+  windows-probes:
+    # Windows-only compat-probes 必须在 windows-latest 上真实执行 spike wrapper，
+    # 判定按 receipt 的 status + subcheckId，绝不只看退出码（GPT 第五轮 REVISE
+    # item 4：核心 wrapper 如 named_pipe/runner_identity 在 BLOCKED 时也 exit 0，
+    # 只看退出码会让核心能力受阻仍绿）。规则：
+    #   - hosted Windows 核心 spike（clock/durable-io/named-pipe/git-bridge）：
+    #     receipt.status 必须 == PASS，任何 BLOCKED/FAIL 即整体红。
+    #   - runner_identity 是 Windows 11 + WSL2 + Docker Desktop Linux-container
+    #     的组合认证，GitHub hosted Windows 的 Windows dockerd 不能冒充该能力；它只在
+    #     下方受信 self-hosted `runner-identity-certified` job 认证，hosted 不执行也不
+    #     将 BLOCKED 降级成 PASS。
+    #   - env-compat spike（sqlite_wal_full/tauri_e2e）：只有 receipt 的
+    #     subcheckId（或 required 阻断 subResult 的 id）在冻结 allowlist 内时
+    #     才允许 BLOCKED_UNCERTIFIED；否则整体红。
+    name: windows-probes
+    runs-on: windows-latest
+    # 合同测试的隔离目录只能在批准 D 根内；测试代码会在 mkdir 前校验绝对路径、.. 与 reparse/junction。
+    env:
+      FACTORY_TEST_DATA_ROOT: D:\codex项目\AI-Coding-Factory-Data\dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GPT 第十轮 P1：本 CI 的"全量锁定"合同范围 = **验收 harness**（合同/门禁测试、
+      # codegen 检查、ruff/mypy、stamp_run_binding 盖章脚本）全部经 uv==0.11.7 +
+      # uv sync --locked + uv run --locked 在锁定 .venv 内跑。**compatibility spike
+      # wrapper 本身不在此范围**：它们的职责就是探测**平台上实际存在**的 python/cargo/
+      # docker（例如 clock_source 的 python fallback、各 wrapper 经 dev.ps1 cargo build），
+      # 能力由 receipt 证据（assertions/绑定/exit code）判定，与依赖锁无关。若强行让
+      # wrapper 也走锁定 .venv，反而掩盖它要探测的真实平台差异。此边界即"锁定"合同。
+      - name: 安装 pytest + uv（windows-probes 合同测试）
+        # GPT round-8: 通过 uv 消费 uv.lock，锁定环境与本地 runner 一致。
+        # GPT round-9 P1: 固定 uv 版本 + --locked（不是 --frozen）。--locked 在 sync 时
+        # 断言 uv.lock 与 pyproject.toml 一致，锁漂移即整体红；--frozen 只是不改锁，
+        # 无法发现锁与声明依赖漂移。固定 uv==0.11.7（生成本 uv.lock 的版本）消除
+        # uv 自身版本差异导致的解析漂移。
+        run: pip install uv==0.11.7 && uv sync --locked --all-groups
+      - name: 预热 D-root GNU 工具链（fail-closed，spike loop 之前）
+        # GPT Phase 0 PR #2 修复（windows-probes toolchain blocker）：
+        # 根因——dev.ps1 把 RUSTUP_HOME 改到 D 盘后，在**首次** D-root GNU 工具链尚未
+        # 下载完成前就检查 ld.lld；第一次 cargo build 无 lld、回退 GNU ld，含 CJK 的
+        # 项目根路径变成 'D:\codex??\...' 链接 exit 101。故必须在 spike loop **之前**，
+        # 经 scripts/dev.ps1（令 RUSTUP_HOME 指向与 spike 查 ld.lld 完全相同的 D-root）
+        # 显式安装 stable-x86_64-pc-windows-gnu --profile minimal，使 gcc-ld/ld.lld 就位。
+        # fail-closed：安装失败即 exit 1（禁止 continue-on-error）。安装逻辑只在此 CI 步骤，
+        # 不塞进 dev.ps1（否则 dev.ps1 每次运行都隐式联网）。双 -- 调用协议同 durable-io wrapper：
+        # 第一个 -- 被 & 当"停止解析"吞掉，第二个 -- 原样进 dev.ps1 $args 作子命令分隔符。
+        shell: pwsh
+        run: |
+          & "$PWD/scripts/dev.ps1" -- -- rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "[preheat] D-root GNU 工具链安装失败 exit=$LASTEXITCODE，fail-closed"
+            exit 1
+          }
+      - name: 真实执行 compatibility spikes（dot-source 共享校验器，fail-closed）
+        shell: pwsh
+        run: |
+          # GPT 第六轮 item 4：CI 曾自带一份 receipt 判定逻辑，与 runner 各自演化出
+          # 不同的 fail-open 洞（不查 wrapper 退出码、PASS 不核 assertions、BLOCKED 只
+          # 要求命中一个 allowlist、无 candidate/run/probe 绑定）。现改为 dot-source
+          # scripts/spikes/_receipt-validator.ps1——与 phase0-acceptance.ps1 同一个
+          # Test-SpikeReceiptEvidence，一处修补处处生效：strict-bool（拒 "false" 字符串）、
+          # 全 blocker 必须 allowlisted、wrapper 退出码参与判定、runBinding/run_nonce 绑定。
+          . "$PWD/scripts/spikes/_receipt-validator.ps1"
+
+          $spikes = [ordered]@{
+            "clock_source"       = "scripts/spikes/test-clock-source.ps1"
+            "windows_durable_io" = "scripts/spikes/test-durable-io.ps1"
+            "named_pipe"         = "scripts/spikes/test-named-pipe.ps1"
+            "git_object_bridge"  = "scripts/spikes/test-git-bridge.ps1"
+            "sqlite_wal_full"    = "scripts/spikes/test-sqlite-wal.ps1"
+            "tauri_e2e"          = "scripts/spikes/test-tauri-e2e.ps1"
+          }
+          $receipts = [ordered]@{
+            "clock_source"       = "tools/compat-probes/clock_source/receipt.json"
+            "windows_durable_io" = "tools/compat-probes/windows_durable_io/receipt.json"
+            "named_pipe"         = "tools/compat-probes/named_pipe/receipt.json"
+            "git_object_bridge"  = "tools/compat-probes/git_object_bridge/receipt.json"
+            "sqlite_wal_full"    = "tools/compat-probes/sqlite_wal_full/receipt.json"
+            "tauri_e2e"          = "tools/compat-probes/tauri_e2e/receipt.json"
+          }
+          $envCompat = @("sqlite_wal_full", "tauri_e2e")
+          # 冻结 BLOCKED allowlist（与 PHASE_0_ACCEPTANCE.md §1 + phase0-acceptance.ps1 一致）。
+          # runner_identity 不在此列：它是核心 spike，必须 PASS；Docker 不可用时 topStatus=FAIL。
+          $allowlist = @(
+            "spike:sqlite_wal_full/disk_full_enospc",
+            "spike:tauri_e2e/webview_runtime"
+          )
+
+          # 本轮运行身份：绑定 candidate/run/probe（item 4 缺失项）。
+          $env:SPIKE_RUN_ID        = [guid]::NewGuid().ToString()
+          $env:SPIKE_RUN_NONCE     = -join ((1..16) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) })
+          $env:SPIKE_CANDIDATE_SHA = "$env:GITHUB_SHA"
+          $runStart = Get-Date
+
+          # Purge 全部 receipt，fail-closed（GPT 第七轮 item 1，与 runner 一致）：删除用
+          # -ErrorAction Stop 并断言文件已消失。锁定文件删除失败后若被后续 stamp/wrapper
+          # 写入刷新 mtime，freshness 会假通过——故残留即整体红。
+          foreach ($name in $receipts.Keys) {
+            $rp = $receipts[$name]
+            if (Test-Path $rp) {
+              try { Remove-Item $rp -Force -ErrorAction Stop }
+              catch { Write-Error "[$name] 无法 purge 陈旧 receipt '$rp': $_，fail-closed"; exit 1 }
+            }
+            if (Test-Path $rp) { Write-Error "[$name] purge 后 receipt '$rp' 仍在（锁定?），fail-closed"; exit 1 }
+          }
+
+          $hardFail = $false
+          foreach ($name in $spikes.Keys) {
+            $script  = $spikes[$name]
+            $receipt = $receipts[$name]
+            if (-not (Test-Path $script)) {
+              Write-Error "[$name] wrapper 缺失，fail-closed"; $hardFail = $true; continue
+            }
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String | Write-Host
+            $wrapperExit = $LASTEXITCODE
+            if ($null -eq $wrapperExit) { $wrapperExit = 0 }
+            # GPT 第七轮 item 1：盖章前捕获 mtime（stamp 会刷新它），freshness 用盖章前值。
+            $preStampMtime = [datetime]::MinValue
+            if (Test-Path $receipt) { $preStampMtime = (Get-Item $receipt).LastWriteTime }
+            # GPT 第七轮 item 2：sqlite 的 probe 是 bench.py（自报 probeDigest+candidateSha）。
+            # 计算期望 bench.py digest，validator 的 run_nonce 分支据此绑定真实探针+候选。
+            $expectProbeDigest = ""
+            if ($name -eq "sqlite_wal_full") {
+              $benchPy = "tools/compat-probes/sqlite_wal_full/bench.py"
+              $expectProbeDigest = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $benchPy).Hash.ToLower()
+            }
+            # 六份非 sqlite receipt 盖 runBinding（sqlite 走 run_nonce，避免扰动
+            # emit_manifest 对 eventBatchParameters 的 digest 重算）。
+            if ($name -ne "sqlite_wal_full" -and (Test-Path $receipt)) {
+              # GPT 第十轮 P1：盖章脚本（CI harness）走锁定 .venv，与 A-1/门禁同源，
+              # 不再裸调 PATH python。spike wrapper 自身仍按设计探测平台上的 python/cargo
+              # （其能力由 receipt 证据 + 退出码判定，非依赖锁；见本 job 末尾合同范围说明）。
+              uv run --locked python scripts/spikes/stamp_run_binding.py $receipt $name
+              if ($LASTEXITCODE -ne 0) { Write-Error "[$name] 盖章失败 exit=$LASTEXITCODE，fail-closed"; $hardFail = $true }
+            }
+            $vArgs = @{
+              Name               = $name
+              Path               = $receipt
+              EnvCompat          = ($envCompat -contains $name)
+              Allowlist          = $allowlist
+              RunStart           = $runStart
+              ReceiptMtime       = $preStampMtime
+              WrapperExitCode    = $wrapperExit
+              ExpectRunId        = $env:SPIKE_RUN_ID
+              ExpectRunNonce     = $env:SPIKE_RUN_NONCE
+              ExpectCandidateSha = $env:SPIKE_CANDIDATE_SHA
+              ExpectProbeDigest  = $expectProbeDigest
+            }
+            $v = Test-SpikeReceiptEvidence @vArgs
+            if ($v.ok) {
+              Write-Host "[$name] OK status=$($v.status); $($v.detail)"
+            } else {
+              Write-Error "[$name] fail-closed status=$($v.status); $($v.detail)"
+              $hardFail = $true
+            }
+          }
+          if ($hardFail) { exit 1 }
+      - name: 合同测试（Windows runner）
+        # GPT round-9 P1: --locked 使 uv run 前也校验锁未漂移（不因 run 阶段刷新锁）。
+        run: uv run --locked python -m pytest tests/contract/ -q

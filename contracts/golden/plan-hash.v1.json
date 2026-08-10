@@ -1,0 +1,176 @@
+{
+  "version": "plan-hash-v1",
+  "description": "semanticPlanHash / planRevisionDigest 跨语言 golden vectors。",
+  "semanticPlanHash": [
+    {
+      "name": "baseline",
+      "plan": {
+        "schemaVersion": 1,
+        "goal": "构建 AI Coding Factory Phase 0 基线",
+        "assumptions": [
+          "D 盘可写",
+          "Windows 平台"
+        ],
+        "scope": {
+          "included": [
+            "contracts"
+          ],
+          "excluded": [
+            "deploy"
+          ]
+        },
+        "constraints": [
+          "test-first"
+        ],
+        "acceptanceCriteria": [
+          "all tests pass"
+        ],
+        "targetStage": "MERGED",
+        "repository": {
+          "mode": "existing",
+          "root": "D:/codex项目",
+          "baseBranch": "main",
+          "baseCommit": "b1e3524",
+          "extraIgnored": "must-not-affect-hash"
+        },
+        "workPlan": {
+          "dagVersion": 1,
+          "nodes": [
+            {
+              "logicalNodeId": "n1",
+              "nodeType": "IMPLEMENT"
+            }
+          ],
+          "barriers": [
+            {
+              "businessPhase": "IMPLEMENTING",
+              "barrierOrdinal": 1
+            }
+          ],
+          "extraIgnored": "must-not-affect-hash"
+        },
+        "riskProfile": {
+          "level": "medium"
+        },
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "taskId": "task-abc",
+        "specRevision": 3,
+        "parentRevisionId": "rev-parent",
+        "intentAuthorizationId": "intent-1",
+        "createdAt": "2026-08-04T00:00:00Z",
+        "planRevisionDigest": "sha256:should-not-matter"
+      },
+      "expected": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3"
+    },
+    {
+      "name": "same-semantics-diff-excluded",
+      "plan": {
+        "schemaVersion": 1,
+        "goal": "构建 AI Coding Factory Phase 0 基线",
+        "assumptions": [
+          "D 盘可写",
+          "Windows 平台"
+        ],
+        "scope": {
+          "included": [
+            "contracts"
+          ],
+          "excluded": [
+            "deploy"
+          ]
+        },
+        "constraints": [
+          "test-first"
+        ],
+        "acceptanceCriteria": [
+          "all tests pass"
+        ],
+        "targetStage": "MERGED",
+        "repository": {
+          "mode": "existing",
+          "root": "D:/codex项目",
+          "baseBranch": "main",
+          "baseCommit": "b1e3524",
+          "extraIgnored": "must-not-affect-hash"
+        },
+        "workPlan": {
+          "dagVersion": 1,
+          "nodes": [
+            {
+              "logicalNodeId": "n1",
+              "nodeType": "IMPLEMENT"
+            }
+          ],
+          "barriers": [
+            {
+              "businessPhase": "IMPLEMENTING",
+              "barrierOrdinal": 1
+            }
+          ],
+          "extraIgnored": "must-not-affect-hash"
+        },
+        "riskProfile": {
+          "level": "medium"
+        },
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "taskId": "task-DIFFERENT",
+        "specRevision": 3,
+        "parentRevisionId": "rev-OTHER",
+        "intentAuthorizationId": "intent-1",
+        "createdAt": "2099-01-01T00:00:00Z",
+        "planRevisionDigest": "sha256:should-not-matter"
+      },
+      "expected": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3"
+    }
+  ],
+  "planRevisionDigest": [
+    {
+      "name": "revision-a",
+      "revision": {
+        "planRevisionId": "rev-A",
+        "parentRevisionId": null,
+        "semanticPlanHash": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3",
+        "intentAuthorizationId": "intent-1",
+        "createdAt": "2026-08-04T00:00:00Z",
+        "nodes": [
+          {
+            "logicalNodeId": "n1",
+            "nodeType": "IMPLEMENT"
+          }
+        ],
+        "signature": "sig-should-be-excluded"
+      },
+      "expected": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e"
+    },
+    {
+      "name": "revision-b-diff-lineage",
+      "revision": {
+        "planRevisionId": "rev-B",
+        "parentRevisionId": "rev-A",
+        "semanticPlanHash": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3",
+        "intentAuthorizationId": "intent-1",
+        "createdAt": "2026-08-04T00:00:00Z",
+        "nodes": [
+          {
+            "logicalNodeId": "n1",
+            "nodeType": "IMPLEMENT"
+          }
+        ],
+        "signature": "sig-should-be-excluded"
+      },
+      "expected": "sha256:2b5f33ba5bd7de30a4ec3e76f4845ec8ab39a3574992f506dcec4021c0493a58"
+    }
+  ],
+  "invariants": {
+    "sameSemanticsShareHash": {
+      "a": "baseline",
+      "b": "same-semantics-diff-excluded"
+    },
+    "differentLineageDiffersDigest": {
+      "a": "revision-a",
+      "b": "revision-b-diff-lineage"
+    }
+  }
+}

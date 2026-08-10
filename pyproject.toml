@@ -1,0 +1,56 @@
+[project]
+# AI Coding Factory Python 项目配置（uv 管理）
+name = "ai-coding-factory"
+version = "0.1.0"
+description = "AI Coding Factory — Python monorepo 根配置"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# jsonschema：receipts.py 的 TestReceipt.validate() 运行时用它做**权威全量** JSON
+# Schema 校验（GPT 第七轮 repro：不能靠 importorskip 依赖本机偶然环境）。声明为运行
+# 时依赖并写入 uv.lock，CI 用 frozen 安装锁定版本，验收环境行为可复现。
+dependencies = [
+    "jsonschema>=4.20.0",
+]
+
+[dependency-groups]
+# 所有缓存/数据均在 D 盘，由 scripts/dev.ps1 环境包装器控制。
+# 使用 PEP 735 dependency-groups；[tool.uv] dev-dependencies 已被 uv 弃用。
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "hypothesis>=6.112.0",
+    "PyYAML>=6.0.2",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "ANN", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试代码：assert 是 pytest 的核心断言机制，S101 在此不适用。
+# 合同/spike 测试需要 subprocess 调用真实 CLI 与探针，S603 属预期用法。
+# 脱敏测试必须硬编码假 token/password/secret 作为输入，再断言输出已脱敏；
+# 这些是测试夹具而非真实凭据，故放宽 S105/S106/S107。
+"tests/**" = ["S101", "S603", "S105", "S106", "S107", "S607"]
+# 平台 compatibility 探针本身就是要驱动外部进程和临时文件，故放宽相应规则。
+"tools/compat-probes/**" = ["S101", "S603", "S607", "S108"]
+# 代码生成脚本需要写入生成物路径，允许 subprocess 与断言自检。
+"contracts/codegen/**" = ["S101", "S603"]
+# 三语言 codegen 产物（Python/TS/Rust 同源生成）：行长度与 ruff 规则不应约束
+# 生成器输出，否则每改一次 schema 就破坏门禁。E501/ANN401 由 generate.py 端保证。
+"apps/agent/src/factory_agent/contracts/generated/**" = ["E501", "ANN401", "F401", "F811", "I001", "UP007", "UP045", "UP035"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths   = ["tests"]

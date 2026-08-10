@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/policies/stage-capability-map.v1.json",
+  "title": "StageCapabilityMapV1",
+  "description": "target_stage → capability 上限映射。stage 键取自 Master Spec §6.1 权威 target_stage 集合；每个 stage 的 capabilities 数组已完全展开并排序。",
+  "version": "1",
+  "specRef": "Master Design Spec §6.1",
+  "stageCapabilities": {
+    "DESIGN_APPROVED": {
+      "description": "目标：RunSpec 与技术方案通过 Codex 方案审核（stage-design-v1）。只允许规划和设计类只读操作。",
+      "capabilities": [
+        "git.local_commit",
+        "repo.bootstrap",
+        "repo.read"
+      ]
+    },
+    "CODEX_APPROVED": {
+      "description": "目标：Claude 实现+自审、确定性门禁与 Codex 独立代码审核通过（stage-codex-approved-v1）。在 DESIGN_APPROVED 基础上增加实现、验证、构建。",
+      "capabilities": [
+        "build.exec.isolated",
+        "git.local_commit",
+        "network.egress.scoped",
+        "repo.bootstrap",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "PR_READY": {
+      "description": "目标：已 push 精确 reviewed SHA 并创建通过远端门禁的 PR（stage-pr-ready-v1）。在 CODEX_APPROVED 基础上增加 push 和 PR 操作。",
+      "capabilities": [
+        "build.exec.isolated",
+        "check.publish",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "network.egress.scoped",
+        "pr.create",
+        "pr.update",
+        "repo.bootstrap",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "MERGED": {
+      "description": "目标：受保护合并完成（stage-merged-v1）。在 PR_READY 基础上增加合并操作。",
+      "capabilities": [
+        "build.exec.isolated",
+        "check.publish",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "network.egress.scoped",
+        "pr.create",
+        "pr.update",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "test.exec.isolated",
+        "worktree.write"
+      ]
+    },
+    "STAGING_ACCEPTED": {
+      "description": "目标：同一镜像 digest 在测试环境部署并验收（stage-staging-accepted-v1）。在 MERGED 基础上增加构建、registry、部署和验收操作；所有远端 scope 强制绑定 staging 资源。",
+      "capabilities": [
+        "acceptance.fixture.write",
+        "build.exec.isolated",
+        "check.publish",
+        "container.inspect.scoped",
+        "db.backup",
+        "db.check",
+        "db.migrate",
+        "db.read",
+        "db.restore",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "http.check.scoped",
+        "log.read.scoped",
+        "network.egress.scoped",
+        "nginx.switch",
+        "pr.create",
+        "pr.update",
+        "registry.observe.scoped",
+        "registry.push",
+        "remote.observe.scoped",
+        "remote.write.scoped",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "restore.validation.instance",
+        "rollback",
+        "service.restart.scoped",
+        "ssh.exec.scoped",
+        "test.exec.isolated",
+        "traffic.switch.scoped",
+        "worktree.write"
+      ]
+    },
+    "PRODUCTION_ACCEPTED": {
+      "description": "目标：生产发布、真实验收与 Codex 证据复核通过（stage-production-accepted-v1）。capability 名称全集与 STAGING_ACCEPTED 相同，但所有远端 scope 强制绑定 production 资源、生产风险上限与预声明 RollbackPlan，不能复用 staging 授权。target.guard.clear 不在普通 stage 上限内。",
+      "capabilities": [
+        "acceptance.fixture.write",
+        "build.exec.isolated",
+        "check.publish",
+        "container.inspect.scoped",
+        "db.backup",
+        "db.check",
+        "db.migrate",
+        "db.read",
+        "db.restore",
+        "forge.observe.scoped",
+        "git.local_commit",
+        "git.push",
+        "http.check.scoped",
+        "log.read.scoped",
+        "network.egress.scoped",
+        "nginx.switch",
+        "pr.create",
+        "pr.update",
+        "registry.observe.scoped",
+        "registry.push",
+        "remote.observe.scoped",
+        "remote.write.scoped",
+        "repo.bootstrap",
+        "repo.merge",
+        "repo.read",
+        "restore.validation.instance",
+        "rollback",
+        "service.restart.scoped",
+        "ssh.exec.scoped",
+        "test.exec.isolated",
+        "traffic.switch.scoped",
+        "worktree.write"
+      ]
+    }
+  }
+}

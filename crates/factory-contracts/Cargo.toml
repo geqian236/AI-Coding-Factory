@@ -1,0 +1,16 @@
+[package]
+name = "factory-contracts"
+version = "0.1.0"
+edition = "2021"
+description = "AI Coding Factory — Rust contract types (generated from JSON Schema)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Task 3：canonical JSON 需 Unicode NFC 归一化与 SHA-256。
+unicode-normalization = "0.1"
+sha2 = "0.10"
+
+[lib]
+name = "factory_contracts"
+path = "src/lib.rs"

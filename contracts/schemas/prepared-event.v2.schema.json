@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/prepared-event.v2.schema.json",
+  "title": "PreparedEventV2",
+  "description": "耐久性分配前的预备事件（由 Adapter 填写，禁止预填 taskSeq/eventId/eventDigest/head）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ingestEventId", "taskId", "eventType", "sourceSeq", "payload", "preparedAt"],
+  "properties": {
+    "ingestEventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Adapter 分配的摄取 ID，用于幂等去重"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属任务 ID"
+    },
+    "eventType": {
+      "type": "string",
+      "enum": [
+        "stream", "provider-semantic", "tool", "state",
+        "gate", "receipt", "control", "heartbeat"
+      ],
+      "description": "事件类型"
+    },
+    "sourceSeq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "来源端序号（用于顺序校验和去重）"
+    },
+    "transportSpanDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "传输 span 摘要（用于 STREAM-002 完整性检查）"
+    },
+    "payload": {
+      "type": "object",
+      "description": "事件负载（已脱敏）"
+    },
+    "payloadDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "负载内容摘要（SHA-256 hex）"
+    },
+    "preparedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "预备时间"
+    }
+  }
+}
