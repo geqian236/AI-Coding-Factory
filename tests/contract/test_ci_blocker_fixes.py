@@ -79,6 +79,8 @@ PLATFORM_HELPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "_runner-identity-platf
 RUNNER_IDENTITY_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-runner-identity.ps1"
 RUNNER_CERTIFIED_JOB = "runner-identity-certified"
 RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
+RUNNER_CERTIFIED_TRIGGER = {"push": {"branches": ["codex/**"]}}
+RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS = {"contents": "read"}
 RUNNER_APPROVED_ROOT_ENV = "RUNNER_APPROVED_ROOT"
 FACTORY_TEST_DATA_ROOT_ENV = "FACTORY_TEST_DATA_ROOT"
 RUNNER_PS51_ROOT_CAUSE_COMMENT = (
@@ -476,8 +478,8 @@ _DuplicateKeyRejectingSafeLoader.add_constructor(
 )
 
 
-def _runner_identity_yaml_job(workflow_text: str) -> tuple[dict[str, Any] | None, list[str]]:
-    """用拒重的真实 YAML 对象图定位唯一认证 job，并先完成必须的容器类型门。"""
+def _runner_identity_yaml_document(workflow_text: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """用拒重的真实 YAML loader 返回完整认证 workflow 对象图。"""
     try:
         # 仅使用 SafeLoader 子类；为实现全映射拒重，不能退回会静默覆盖键的 safe_load 便捷函数。
         document = yaml.load(workflow_text, Loader=_DuplicateKeyRejectingSafeLoader)  # noqa: S506
@@ -485,6 +487,11 @@ def _runner_identity_yaml_job(workflow_text: str) -> tuple[dict[str, Any] | None
         return None, [f"runner workflow YAML rejected: {error}"]
     if not isinstance(document, dict):
         return None, ["runner workflow document must be a mapping"]
+    return document, []
+
+
+def _runner_identity_yaml_job_from_document(document: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    """从完整对象图定位唯一认证 job，并先完成必须的容器类型门。"""
     jobs = document.get("jobs")
     if not isinstance(jobs, dict):
         return None, ["runner workflow jobs must be a mapping"]
@@ -498,6 +505,27 @@ def _runner_identity_yaml_job(workflow_text: str) -> tuple[dict[str, Any] | None
     if invalid_steps:
         return None, [f"runner-identity-certified has non-mapping steps at indexes {invalid_steps}"]
     return job, []
+
+
+def _runner_identity_yaml_job(workflow_text: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """兼容调用方：先取完整对象图，再返回唯一认证 job。"""
+    document, yaml_violations = _runner_identity_yaml_document(workflow_text)
+    if yaml_violations:
+        return None, yaml_violations
+    assert document is not None
+    return _runner_identity_yaml_job_from_document(document)
+
+
+def _runner_identity_workflow_document_violations(document: dict[str, Any]) -> list[str]:
+    """锁定认证 workflow 的顶层身份、触发器和最小权限，禁止文本诱饵替代对象字段。"""
+    violations: list[str] = []
+    if document.get("name") != RUNNER_CERTIFIED_JOB:
+        violations.append("workflow name must be exactly runner-identity-certified")
+    if document.get("on") != RUNNER_CERTIFIED_TRIGGER:
+        violations.append("workflow trigger must be exactly push on codex/**")
+    if document.get("permissions") != RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS:
+        violations.append("workflow top-level permissions must be exactly contents: read")
+    return violations
 
 
 def _runner_identity_steps_from_job(job: dict[str, Any]) -> list[dict[str, Any]]:
@@ -536,13 +564,17 @@ def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[st
     绝不先按 shell 过滤。这样 flow、anchor、alias、merge 要么被 YAML/类型门拒绝，要么其
     实际展开后的 run 一并接受同一 ASCII、安全环境变量与 shell 合同。
     """
-    job, yaml_violations = _runner_identity_yaml_job(workflow_text)
+    document, yaml_violations = _runner_identity_yaml_document(workflow_text)
     if yaml_violations:
         return yaml_violations
+    assert document is not None
+    violations = _runner_identity_workflow_document_violations(document)
+    job, job_violations = _runner_identity_yaml_job_from_document(document)
+    if job_violations:
+        return [*violations, *job_violations]
     assert job is not None
     steps = _runner_identity_steps_from_job(job)
     run_steps = [step for step in steps if "run" in step]
-    violations: list[str] = []
     if len(run_steps) != 6:
         violations.append(f"expected 6 executable run steps, found {len(run_steps)}")
     for index, step in enumerate(run_steps, start=1):
@@ -664,10 +696,20 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "主 ci.yml 不得声明 runner_identity 认证 job；否则 PR 会出现 skipped 的同名 check"
     )
     runner_workflow = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
-    meta, runner_yaml_violations = _runner_identity_yaml_job(runner_workflow)
-    assert not runner_yaml_violations and meta is not None, (
+    runner_document, runner_yaml_violations = _runner_identity_yaml_document(runner_workflow)
+    assert not runner_yaml_violations and runner_document is not None, (
         "认证 workflow 必须由拒绝重复键的真实 YAML loader 无歧义解析；"
         f"实际违规={runner_yaml_violations}"
+    )
+    assert runner_document.get("name") == RUNNER_CERTIFIED_JOB, "独立 workflow 名必须精确为 runner-identity-certified"
+    assert runner_document.get("on") == RUNNER_CERTIFIED_TRIGGER, "独立 workflow 只能监听 codex/** 的 push"
+    assert runner_document.get("permissions") == RUNNER_CERTIFIED_TOP_LEVEL_PERMISSIONS, (
+        "独立 workflow 顶层 permissions 必须精确为 contents: read"
+    )
+    meta, runner_job_violations = _runner_identity_yaml_job_from_document(runner_document)
+    assert not runner_job_violations and meta is not None, (
+        "认证 workflow 必须从完整 YAML 对象图无歧义定位唯一认证 job；"
+        f"实际违规={runner_job_violations}"
     )
     runs_on = meta.get("runs-on")
     assert isinstance(runs_on, list) and tuple(runs_on) == RUNNER_CERTIFIED_LABELS, (
@@ -729,6 +771,25 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "认证 workflow 的全部可执行 run 必须显式 shell: powershell、ASCII-only，并以 YAML env "
         f"传递 Unicode 数据根；实际违规={ps51_contract_violations}"
     )
+
+    # 变异 0b：合法 run-name 标量可伪装 raw 文本中的 push/branches，触发器只能按 YAML 对象值验证。
+    trigger_decoy_mutant = runner_workflow.replace(
+        "on:\n  push:\n    branches:\n      - codex/**\n",
+        "on:\n  workflow_dispatch:\nrun-name: |\n  push:\n    branches:\n      - codex/**\n",
+        1,
+    )
+    assert trigger_decoy_mutant != runner_workflow
+    trigger_decoy_document, trigger_decoy_yaml_violations = _runner_identity_yaml_document(
+        trigger_decoy_mutant
+    )
+    assert not trigger_decoy_yaml_violations, trigger_decoy_yaml_violations
+    assert trigger_decoy_document is not None
+    assert trigger_decoy_document.get("on") == {"workflow_dispatch": None}
+    trigger_decoy_violations = _runner_identity_ps51_run_contract_violations(trigger_decoy_mutant)
+    assert "workflow trigger must be exactly push on codex/**" in trigger_decoy_violations, (
+        "workflow_dispatch plus a run-name scalar decoy must not satisfy the runner trigger contract"
+    )
+
     certified_run_steps = [step for step in _runner_identity_certified_steps() if "run" in step]
     powershell_runs = [
         (str(step.get("name", f"run-{index}")), str(step["run"]))
@@ -876,16 +937,6 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     ), (
         "removing FACTORY_TEST_DATA_ROOT must fail the ASCII env-name contract"
     )
-    assert re.search(r"(?m)^name:\s*runner-identity-certified\s*$", runner_workflow), (
-        "独立 workflow 名必须是唯一的 runner-identity-certified"
-    )
-    assert re.search(r"(?m)^on:\s*$", runner_workflow), "独立 workflow 必须显式监听 push"
-    assert re.search(r"(?m)^\s*push:\s*$", runner_workflow), "独立 workflow 必须监听 push"
-    assert re.search(r"(?m)^\s*-\s*codex/\*\*\s*$", runner_workflow), (
-        "独立 workflow 只能监听 codex/** 分支"
-    )
-    assert "pull_request" not in _strip_ps_comments(runner_workflow)
-    assert "pull_request_target" not in _strip_ps_comments(runner_workflow)
     assert isinstance(meta.get("timeout-minutes"), int) and meta["timeout-minutes"] > 0, (
         "self-hosted 认证 job 必须设置正的 timeout-minutes，失控 Docker/WSL 命令不能无限占用专用 runner"
     )
