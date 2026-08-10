@@ -83,6 +83,12 @@
   漂移和 fail-closed 合同测试。CompatibilityManifest v1 已有 `nodeCapabilityMapDigest`，唯一真源为
   `emit_manifest.py` raw-file SHA-256，禁止换成 compact/sorted JSON 私有 hash。该工作不把 RunSpec
   的关联字符串误称为早期 `$ref`，也不实现授权运行时。
+  `semanticPlanHash` 快照现在直接承接运行时 `build_semantic_projection` 的完整 RunSpec 语义字段，
+  不再使用缩小样本（`schemaVersion` 为整数、`constraints` 为数组，assumptions/scope/acceptanceCriteria/
+  repository/workPlan/riskProfile 全部冻结）；`planRevisionDigest` 快照逐项承接
+  `plan-revision.v1.schema.json`，仅排除自身 digest 与签名，仍包含 DAG、map 版本、nodes、barriers、
+  stageMaps 与 createdAt。合同测试从权威投影/schema 派生 exact-set 断言，并对每个纳入字段的变更
+  重算摘要，防止静态 registry 与后续运行时实现分叉。
 - **后续 Task 4/5**：授权签发、从 `COMMITTED` 不可变 artifact 解析 ref、核验 artifact ID、
   schema/version、validator 与重算 digest、Execution/Manifest 实际 node map 值比对、撤销、`maxUses`
   消费、fencing token/control epoch 校验、CAS、动态 scope/lease/时间比较及真实执行消费仍是有状态

@@ -16,6 +16,7 @@ from typing import Any
 
 import jsonschema
 import pytest
+from factory_agent.policy import plan_hash
 from factory_agent.policy.canonical_json import canonicalize
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,8 @@ EXPECTED_NODE_POLICY_RAW_FILE_SHA256 = (
     "sha256:25da2cbe791024fbe31475f45c2302d84c5da3b53cafeae2f3c791551d8abff5"
 )
 SNAPSHOT_REGISTRY_PATH = REPO_ROOT / "contracts" / "policies" / "authorization-snapshot-registry.v1.json"
+RUN_SPEC_SCHEMA_PATH = SCHEMAS_DIR / "run-spec.v1.schema.json"
+PLAN_REVISION_SCHEMA_PATH = SCHEMAS_DIR / "plan-revision.v1.schema.json"
 MANIFEST_SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
 EMIT_MANIFEST_PATH = REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py"
 CODEGEN_PATH = REPO_ROOT / "contracts" / "codegen" / "generate.py"
@@ -1073,6 +1076,127 @@ def _registry_payload_schema(registry: dict[str, Any], binding: dict[str, Any]) 
     return registry["$defs"][ref["$ref"].removeprefix("#/$defs/")]
 
 
+def _complete_run_spec_for_semantic_snapshot() -> dict[str, Any]:
+    """构造完整 RunSpec，确保快照测试直接使用运行时语义投影而非缩小样本。"""
+    return {
+        "schemaVersion": 1,
+        "taskId": "task-001",
+        "goal": "完成授权摘要合同闭环",
+        "assumptions": ["合同目录可作为唯一协议源"],
+        "scope": {
+            "include": ["contracts/policies/authorization-snapshot-registry.v1.json"],
+            "exclude": ["runtime source"],
+        },
+        "constraints": ["摘要必须使用 NFC + RFC8785/JCS"],
+        "acceptanceCriteria": ["字段漂移必须 fail-closed"],
+        "targetStage": "CODEX_APPROVED",
+        "repository": {
+            "mode": "existing",
+            "root": "D:/codex项目/AI-Coding-Factory",
+            "baseBranch": "main",
+            "baseCommit": "a" * 40,
+        },
+        "workPlan": {
+            "dagVersion": 1,
+            "nodes": [
+                {
+                    "logicalNodeId": "node-plan-001",
+                    "businessPhase": "PLANNING",
+                    "barrierOrdinal": 0,
+                    "nodeType": "PLAN",
+                    "required": True,
+                    "dependsOn": [],
+                    "sideEffectClass": "read-only",
+                    "requiredArtifacts": [],
+                    "successPredicateId": "plan-created-v1",
+                    "timeoutMs": 1_000,
+                    "retryPolicyId": "no-retry",
+                }
+            ],
+            "barriers": [
+                {
+                    "businessPhase": "PLANNING",
+                    "barrierOrdinal": 0,
+                    "requiredNodeIds": ["node-plan-001"],
+                    "settleTimeoutMs": 1_000,
+                    "passPredicateId": "planning-complete-v1",
+                }
+            ],
+        },
+        "riskProfile": {"level": "low", "reasons": ["仅修改静态合同"]},
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "intentAuthorizationId": "intent-001",
+        "semanticPlanHash": "sha256:" + "e" * 64,
+    }
+
+
+def _complete_plan_revision_for_snapshot() -> dict[str, Any]:
+    """构造完整 PlanRevision，覆盖 digest material 的所有 schema 字段与谱系。"""
+    semantic_plan_hash = plan_hash.semantic_plan_hash(_complete_run_spec_for_semantic_snapshot())
+    return {
+        "planRevisionId": "plan-001",
+        "parentRevisionId": "plan-000",
+        "taskId": "task-001",
+        "specRevision": 1,
+        "intentAuthorizationId": "intent-001",
+        "semanticPlanHash": semantic_plan_hash,
+        "planRevisionDigest": "sha256:" + "f" * 64,
+        "dagVersion": 1,
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "nodes": [
+            {
+                "logicalNodeId": "node-plan-001",
+                "nodeType": "PLAN",
+                "businessPhase": "PLANNING",
+                "dependencies": [],
+                "hasSideEffect": False,
+                "requiredArtifacts": [],
+                "gate": "plan-created-v1",
+            }
+        ],
+        "barriers": [
+            {
+                "barrierId": "barrier-plan-001",
+                "businessPhase": "PLANNING",
+                "nodeIds": ["node-plan-001"],
+            }
+        ],
+        "stageMaps": {"CODEX_APPROVED": ["node-plan-001"]},
+        "createdAt": "2026-08-10T00:00:00Z",
+    }
+
+
+def _mutate_schema_valid_value(value: object, schema: dict[str, object]) -> object:
+    """在不改变字段类型/枚举约束的前提下构造不同值，验证每个字段均进入摘要。"""
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list):
+        return next(candidate for candidate in enum_values if candidate != value)
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, str):
+        if re.fullmatch(r"sha256:[a-f0-9]{64}", value):
+            return "sha256:" + ("0" if value[-1] != "0" else "1") * 64
+        if schema.get("format") == "date-time":
+            return "2026-08-10T00:00:01Z"
+        return value + "-drift"
+    if isinstance(value, list):
+        assert value, "测试样本必须为每个待变更数组提供至少一个合法元素"
+        return [*copy.deepcopy(value), copy.deepcopy(value[-1])]
+    if isinstance(value, dict):
+        changed = copy.deepcopy(value)
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for field, field_schema in properties.items():
+                if isinstance(field, str) and isinstance(field_schema, dict) and field in changed:
+                    changed[field] = _mutate_schema_valid_value(changed[field], field_schema)
+                    return changed
+    raise AssertionError(f"无法为 schema-valid 变更构造样本: {value!r}")
+
+
 def _selected_action_policy_snapshot(
     policy_map: dict[str, Any],
     *,
@@ -1116,6 +1240,11 @@ def _assert_action_snapshot_matches_node_map(payload: dict[str, Any], policy_map
 
 def _snapshot_payload_samples(policy_map: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """提供每个 registry payload schema 的最小有效样本，确保验证器可实际运行。"""
+    semantic_plan_payload = plan_hash.build_semantic_projection(_complete_run_spec_for_semantic_snapshot())
+    plan_revision = _complete_plan_revision_for_snapshot()
+    plan_revision_payload = {
+        field: value for field, value in plan_revision.items() if field not in plan_hash._DIGEST_EXCLUDED_FIELDS
+    }
     return {
         "IntentAuthorization.requirementDigest": {
             "requirementText": "为仓库增加可验证的授权合同",
@@ -1145,20 +1274,8 @@ def _snapshot_payload_samples(policy_map: dict[str, Any]) -> dict[str, dict[str,
             "alertThreshold": 100,
             "hardStopThreshold": 200,
         },
-        "ExecutionAuthorization.semanticPlanHash": {
-            "schemaVersion": "1",
-            "goal": "完成合同",
-            "targetStage": "CODEX_APPROVED",
-            "nodeCapabilityMapVersion": "1",
-            "stageCapabilityMapVersion": "1",
-        },
-        "ExecutionAuthorization.planRevisionDigest": {
-            "planRevisionId": "plan-001",
-            "taskId": "task-001",
-            "specRevision": 1,
-            "intentAuthorizationId": "intent-001",
-            "semanticPlanHash": "sha256:" + "1" * 64,
-        },
+        "ExecutionAuthorization.semanticPlanHash": semantic_plan_payload,
+        "ExecutionAuthorization.planRevisionDigest": plan_revision_payload,
         "ExecutionAuthorization.stageCapabilityMapDigest": {
             "mapVersion": "1",
             "targetStage": "CODEX_APPROVED",
@@ -1304,6 +1421,134 @@ def test_snapshot_registry_payload_validators_are_executable_and_fail_closed() -
     resource_extra = copy.deepcopy(resource_payload["fingerprint"])
     resource_extra["unapprovedOverlay"] = "blocked"
     assert _validate_fingerprint_schema_with_local_defs(policy_map, resource_schema, resource_extra)
+
+
+def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_field() -> None:
+    """真实 RunSpec 投影必须完整入 registry，逐字段删改都不能复用旧摘要。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding_key = "ExecutionAuthorization.semanticPlanHash"
+    binding = registry["snapshotBindings"][binding_key]
+    payload_schema = _registry_payload_schema(registry, binding)
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    run_spec = _complete_run_spec_for_semantic_snapshot()
+    _assert_accepted(run_spec_schema, run_spec)
+
+    # 不手抄字段表：直接以运行时 build_semantic_projection 的实际输出作为集合真源。
+    projection = plan_hash.build_semantic_projection(run_spec)
+    assert payload_schema["type"] == "object"
+    assert payload_schema["additionalProperties"] is False
+    assert set(payload_schema["properties"]) == set(projection)
+    assert set(payload_schema["required"]) == set(projection)
+    assert set(binding["payloadKeys"]["required"]) == set(projection)
+    assert binding["payloadKeys"]["optional"] == []
+
+    # 叶子字段复用 RunSpec schema；两个嵌套对象也只能包含运行时投影明确纳入的键。
+    for field, value in projection.items():
+        source_schema = run_spec_schema["properties"][field]
+        registered_schema = payload_schema["properties"][field]
+        if field not in {"repository", "workPlan"}:
+            assert registered_schema == source_schema, field
+            continue
+        assert registered_schema["type"] == "object", field
+        assert registered_schema["additionalProperties"] is False, field
+        assert set(registered_schema["properties"]) == set(value), field
+        assert set(registered_schema["required"]) == set(value), field
+        for nested_field in value:
+            assert registered_schema["properties"][nested_field] == source_schema["properties"][nested_field]
+
+    validator = _registry_payload_validator(registry, binding)
+    assert not list(validator.iter_errors(projection)), "真实 semantic projection 不得被 registry 拒绝"
+    ref = _snapshot_ref(binding_key, "semantic")
+    ref["digest"] = _snapshot_payload_digest(binding["schemaId"], binding["schemaVersion"], projection)
+    _assert_snapshot_ref_matches_payload(ref, projection)
+    baseline_hash = plan_hash.semantic_plan_hash(run_spec)
+
+    for field in sorted(projection):
+        missing = copy.deepcopy(projection)
+        missing.pop(field)
+        assert list(validator.iter_errors(missing)), f"缺失语义字段 {field} 不得通过"
+
+        changed_run_spec = copy.deepcopy(run_spec)
+        changed_run_spec[field] = _mutate_schema_valid_value(
+            changed_run_spec[field], run_spec_schema["properties"][field]
+        )
+        _assert_accepted(run_spec_schema, changed_run_spec)
+        changed_projection = plan_hash.build_semantic_projection(changed_run_spec)
+        assert not list(validator.iter_errors(changed_projection)), f"变更后的 {field} 仍应是合法 projection"
+        assert plan_hash.semantic_plan_hash(changed_run_spec) != baseline_hash, field
+        with pytest.raises(AssertionError, match="重算值不一致"):
+            _assert_snapshot_ref_matches_payload(ref, changed_projection)
+
+    nested_extra = copy.deepcopy(projection)
+    nested_extra["repository"]["unapproved"] = "blocked"
+    assert list(validator.iter_errors(nested_extra))
+
+
+def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_field() -> None:
+    """PlanRevision 快照只排除自身摘要/签名，其他 schema 字段均必须进入 digest material。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding_key = "ExecutionAuthorization.planRevisionDigest"
+    binding = registry["snapshotBindings"][binding_key]
+    payload_schema = _registry_payload_schema(registry, binding)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    revision = _complete_plan_revision_for_snapshot()
+    _assert_accepted(plan_revision_schema, revision)
+
+    # 排除集直接来自运行时摘要实现；PlanRevision schema 是 payload 字段和类型的唯一合同来源。
+    excluded_fields = set(plan_hash._DIGEST_EXCLUDED_FIELDS)
+    assert excluded_fields == {"planRevisionDigest", "signature"}
+    expected_properties = set(plan_revision_schema["properties"]) - excluded_fields
+    expected_required = set(plan_revision_schema["required"]) - excluded_fields
+    expected_optional = expected_properties - expected_required
+    assert payload_schema["type"] == "object"
+    assert payload_schema["additionalProperties"] is False
+    assert set(payload_schema["properties"]) == expected_properties
+    assert set(payload_schema["required"]) == expected_required
+    assert set(binding["payloadKeys"]["required"]) == expected_required
+    assert set(binding["payloadKeys"]["optional"]) == expected_optional
+    for field in expected_properties:
+        assert payload_schema["properties"][field] == plan_revision_schema["properties"][field], field
+
+    material = {field: value for field, value in revision.items() if field not in excluded_fields}
+    assert set(material) == expected_properties
+    validator = _registry_payload_validator(registry, binding)
+    assert not list(validator.iter_errors(material)), "完整 PlanRevision digest material 不得被 registry 拒绝"
+    ref = _snapshot_ref(binding_key, "revision")
+    ref["digest"] = _snapshot_payload_digest(binding["schemaId"], binding["schemaVersion"], material)
+    _assert_snapshot_ref_matches_payload(ref, material)
+    baseline_digest = plan_hash.plan_revision_digest(revision)
+
+    for field in sorted(material):
+        missing = copy.deepcopy(material)
+        missing.pop(field)
+        if field in expected_required:
+            assert list(validator.iter_errors(missing)), f"缺失 PlanRevision 必填字段 {field} 不得通过"
+        else:
+            # parentRevisionId 在权威 PlanRevision schema 中仍是可选字段，registry 不得擅自收紧。
+            assert not list(validator.iter_errors(missing)), f"可选 PlanRevision 字段 {field} 不得被擅自要求"
+
+        changed_revision = copy.deepcopy(revision)
+        changed_revision[field] = _mutate_schema_valid_value(
+            changed_revision[field], plan_revision_schema["properties"][field]
+        )
+        _assert_accepted(plan_revision_schema, changed_revision)
+        changed_material = {
+            name: value for name, value in changed_revision.items() if name not in excluded_fields
+        }
+        assert not list(validator.iter_errors(changed_material)), f"变更后的 {field} 仍应是合法 digest material"
+        assert plan_hash.plan_revision_digest(changed_revision) != baseline_digest, field
+        with pytest.raises(AssertionError, match="重算值不一致"):
+            _assert_snapshot_ref_matches_payload(ref, changed_material)
+
+    for excluded_field in sorted(excluded_fields):
+        extra = copy.deepcopy(material)
+        extra[excluded_field] = revision.get(excluded_field, "signature-001")
+        assert list(validator.iter_errors(extra)), f"registry 不得把 {excluded_field} 重新纳入 material"
+
+    signed_revision = {**revision, "signature": "signature-001"}
+    rewritten_digest = {**revision, "planRevisionDigest": "sha256:" + "0" * 64}
+    assert plan_hash.plan_revision_digest(signed_revision) == baseline_digest
+    assert plan_hash.plan_revision_digest(rewritten_digest) == baseline_digest
 
 
 def test_authorization_schemas_use_fixed_closed_snapshot_refs() -> None:

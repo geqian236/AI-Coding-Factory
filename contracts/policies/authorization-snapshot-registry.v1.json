@@ -162,27 +162,378 @@
     "semanticPlanPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schemaVersion", "goal", "targetStage", "nodeCapabilityMapVersion", "stageCapabilityMapVersion"],
+      "description": "字段集合与 factory_agent.policy.plan_hash.build_semantic_projection 的 RunSpec 语义投影严格同源。",
+      "required": [
+        "schemaVersion",
+        "goal",
+        "assumptions",
+        "scope",
+        "constraints",
+        "acceptanceCriteria",
+        "targetStage",
+        "riskProfile",
+        "nodeCapabilityMapVersion",
+        "stageCapabilityMapVersion",
+        "repository",
+        "workPlan"
+      ],
       "properties": {
-        "schemaVersion": {"const": "1"},
-        "goal": {"$ref": "#/$defs/nonEmptyString"},
-        "targetStage": {"$ref": "#/$defs/targetStage"},
-        "nodeCapabilityMapVersion": {"$ref": "#/$defs/nonEmptyString"},
-        "stageCapabilityMapVersion": {"$ref": "#/$defs/nonEmptyString"},
-        "constraints": {"$ref": "#/$defs/nonEmptyString"}
+        "schemaVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "RunSpec schema 版本号"
+        },
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "用户目标的结构化表达"
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "规划假设列表"
+        },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["include", "exclude"],
+          "description": "范围声明（§8：include/exclude）",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "纳入范围的路径/模块"
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "排除范围的路径/模块"
+            }
+          }
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "约束条件列表"
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "验收条件列表"
+        },
+        "targetStage": {
+          "type": "string",
+          "enum": [
+            "DESIGN_APPROVED",
+            "CODEX_APPROVED",
+            "PR_READY",
+            "MERGED",
+            "STAGING_ACCEPTED",
+            "PRODUCTION_ACCEPTED"
+          ],
+          "description": "目标终点阶段（Master Spec §6.1 权威 6 阶段）"
+        },
+        "riskProfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["level", "reasons"],
+          "description": "风险画像（§8：level/reasons）",
+          "properties": {
+            "level": {
+              "type": "string",
+              "enum": ["low", "medium", "high", "critical"],
+              "description": "风险等级"
+            },
+            "reasons": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "风险原因列表"
+            }
+          }
+        },
+        "nodeCapabilityMapVersion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "node-capability-map 版本标识"
+        },
+        "stageCapabilityMapVersion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "stage-capability-map 版本标识"
+        },
+        "repository": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "root", "baseBranch", "baseCommit"],
+          "description": "仓库绑定（§8：mode/root/baseBranch/baseCommit）",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["existing", "new"],
+              "description": "仓库模式"
+            },
+            "root": {
+              "type": "string",
+              "minLength": 1,
+              "description": "规范化后的 D 盘仓库根路径"
+            },
+            "baseBranch": {
+              "type": "string",
+              "minLength": 1,
+              "description": "基础分支名"
+            },
+            "baseCommit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{7,40}$",
+              "description": "existing 模式的可信 base commit SHA（new 模式 bootstrap 后填入）"
+            }
+          }
+        },
+        "workPlan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dagVersion", "nodes", "barriers"],
+          "description": "工作计划 DAG（§8：dagVersion/nodes/barriers）",
+          "properties": {
+            "dagVersion": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "DAG 结构版本"
+            },
+            "nodes": {
+              "type": "array",
+              "description": "DAG 工作节点列表",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "logicalNodeId",
+                  "businessPhase",
+                  "barrierOrdinal",
+                  "nodeType",
+                  "required",
+                  "dependsOn",
+                  "sideEffectClass",
+                  "requiredArtifacts",
+                  "successPredicateId",
+                  "timeoutMs",
+                  "retryPolicyId"
+                ],
+                "properties": {
+                  "logicalNodeId": {"type": "string", "minLength": 1},
+                  "businessPhase": {"type": "string", "minLength": 1},
+                  "barrierOrdinal": {"type": "integer", "minimum": 0},
+                  "nodeType": {
+                    "type": "string",
+                    "enum": [
+                      "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+                      "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+                      "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+                      "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+                      "RECONCILE_TARGET", "RESTORE_DRILL"
+                    ]
+                  },
+                  "required": {"type": "boolean"},
+                  "dependsOn": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "sideEffectClass": {"type": "string", "minLength": 1},
+                  "requiredArtifacts": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "successPredicateId": {"type": "string", "minLength": 1},
+                  "timeoutMs": {"type": "integer", "minimum": 1},
+                  "retryPolicyId": {"type": "string", "minLength": 1}
+                }
+              }
+            },
+            "barriers": {
+              "type": "array",
+              "description": "阶段屏障列表",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "businessPhase",
+                  "barrierOrdinal",
+                  "requiredNodeIds",
+                  "settleTimeoutMs",
+                  "passPredicateId"
+                ],
+                "properties": {
+                  "businessPhase": {"type": "string", "minLength": 1},
+                  "barrierOrdinal": {"type": "integer", "minimum": 0},
+                  "requiredNodeIds": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1}
+                  },
+                  "settleTimeoutMs": {"type": "integer", "minimum": 1},
+                  "passPredicateId": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
       }
     },
     "planRevisionPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash"],
+      "description": "字段类型和 required 集合逐项派生自 plan-revision.v1.schema.json；摘要 material 只排除自身值与签名。",
+      "required": [
+        "planRevisionId",
+        "taskId",
+        "specRevision",
+        "intentAuthorizationId",
+        "semanticPlanHash",
+        "dagVersion",
+        "nodeCapabilityMapVersion",
+        "stageCapabilityMapVersion",
+        "nodes",
+        "barriers",
+        "stageMaps",
+        "createdAt"
+      ],
       "properties": {
-        "planRevisionId": {"$ref": "#/$defs/nonEmptyString"},
-        "taskId": {"$ref": "#/$defs/nonEmptyString"},
-        "specRevision": {"type": "integer", "minimum": 1},
-        "intentAuthorizationId": {"$ref": "#/$defs/nonEmptyString"},
-        "semanticPlanHash": {"$ref": "#/$defs/sha256Digest"},
-        "parentRevisionId": {"$ref": "#/$defs/nonEmptyString"}
+        "planRevisionId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "本修订版本唯一 ID"
+        },
+        "parentRevisionId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "父修订版本 ID（范围内重规划时设置）"
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "所属任务 ID（§11 plan_revisions.task_id）"
+        },
+        "specRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "规格修订号，单调递增（§11 plan_revisions.spec_revision）"
+        },
+        "intentAuthorizationId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id）"
+        },
+        "dagVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "DAG 版本号（§11 plan_revisions.dag_version）"
+        },
+        "nodeCapabilityMapVersion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "node→capability 映射版本（§11 plan_revisions.node_capability_map_version）"
+        },
+        "stageCapabilityMapVersion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version）"
+        },
+        "semanticPlanHash": {
+          "type": "string",
+          "minLength": 1,
+          "description": "语义计划哈希，跨修订版本稳定"
+        },
+        "nodes": {
+          "type": "array",
+          "description": "DAG 节点列表",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "logicalNodeId",
+              "nodeType",
+              "businessPhase",
+              "dependencies",
+              "hasSideEffect",
+              "requiredArtifacts"
+            ],
+            "properties": {
+              "logicalNodeId": {"type": "string", "minLength": 1},
+              "nodeType": {
+                "type": "string",
+                "enum": [
+                  "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+                  "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+                  "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+                  "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+                  "RECONCILE_TARGET", "RESTORE_DRILL"
+                ]
+              },
+              "businessPhase": {"type": "string", "minLength": 1},
+              "dependencies": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "hasSideEffect": {"type": "boolean"},
+              "requiredArtifacts": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "gate": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "barriers": {
+          "type": "array",
+          "description": "阶段屏障列表",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["barrierId", "businessPhase", "nodeIds"],
+            "properties": {
+              "barrierId": {"type": "string", "minLength": 1},
+              "businessPhase": {"type": "string", "minLength": 1},
+              "nodeIds": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "stageMaps": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）",
+          "properties": {
+            "DESIGN_APPROVED": {"type": "array", "items": {"type": "string"}},
+            "CODEX_APPROVED": {"type": "array", "items": {"type": "string"}},
+            "PR_READY": {"type": "array", "items": {"type": "string"}},
+            "MERGED": {"type": "array", "items": {"type": "string"}},
+            "STAGING_ACCEPTED": {"type": "array", "items": {"type": "string"}},
+            "PRODUCTION_ACCEPTED": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
       }
     },
     "stageCapabilityMapPayload": {
@@ -356,14 +707,14 @@
       "schemaVersion": "1",
       "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/semanticPlanPayload"},
       "payloadSchema": {"$ref": "#/$defs/semanticPlanPayload"},
-      "payloadKeys": {"required": ["schemaVersion", "goal", "targetStage", "nodeCapabilityMapVersion", "stageCapabilityMapVersion"], "optional": ["constraints"]}
+      "payloadKeys": {"required": ["schemaVersion", "goal", "assumptions", "scope", "constraints", "acceptanceCriteria", "targetStage", "riskProfile", "nodeCapabilityMapVersion", "stageCapabilityMapVersion", "repository", "workPlan"], "optional": []}
     },
     "ExecutionAuthorization.planRevisionDigest": {
       "schemaId": "factory.authorization.execution.plan-revision.v1",
       "schemaVersion": "1",
       "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/planRevisionPayload"},
       "payloadSchema": {"$ref": "#/$defs/planRevisionPayload"},
-      "payloadKeys": {"required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash"], "optional": ["parentRevisionId"]}
+      "payloadKeys": {"required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash", "dagVersion", "nodeCapabilityMapVersion", "stageCapabilityMapVersion", "nodes", "barriers", "stageMaps", "createdAt"], "optional": ["parentRevisionId"]}
     },
     "ExecutionAuthorization.stageCapabilityMapDigest": {
       "schemaId": "factory.authorization.execution.stage-capability-map.v1",
