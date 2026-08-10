@@ -422,20 +422,67 @@ def _runner_identity_certified_steps() -> list[dict[str, Any]]:
 
 
 def _runner_identity_unsupported_step_syntax(workflow_text: str) -> list[str]:
-    """拒绝现有缩进式 workflow 解析器无法无歧义覆盖的 step YAML 构造。
+    """拒绝认证 job 受控 YAML 子集外的 job/step 构造。
 
-    locked venv 没有 PyYAML，现有 `_load_jobs` 只承诺本仓固定的 block-style steps。若接受
-    flow mapping、alias、anchor 或 merge，解析器可能静默漏掉真实 run；安全合同必须在解析前
-    fail-closed，而不是自行扩展一套不完整的 YAML 解释器。
+    locked venv 没有 PyYAML，现有 `_load_jobs` 只承诺本仓固定的 bare-key job mapping 和
+    block-style steps。若接受 quoted/explicit/complex/duplicate job key 或 step 的 flow mapping、
+    alias、anchor、merge，解析器可能静默漏掉真实 run；安全合同必须在解析前 fail-closed，
+    而不是自行扩展一套不完整的 YAML 解释器。
     """
     job_lines = _load_job_blocks(workflow_text).get(RUNNER_CERTIFIED_JOB)
     if job_lines is None:
         return ["runner-identity-certified job is missing"]
 
+    allowed_job_keys = {
+        "name",
+        "if",
+        "runs-on",
+        "timeout-minutes",
+        "permissions",
+        "env",
+        "steps",
+    }
+    job_key_lines: dict[str, list[int]] = {}
     violations: list[str] = []
+    for line_number, line in enumerate(job_lines, start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent != 4:
+            continue
+        declaration = re.fullmatch(r"    ([A-Za-z][A-Za-z0-9-]*):\s*(.*)", line)
+        if declaration is None:
+            violations.append(f"unsupported runner job-level declaration at runner job line {line_number}")
+            continue
+        key, value = declaration.groups()
+        if key not in allowed_job_keys:
+            violations.append(
+                f"unsupported runner job-level declaration key {key!r} at runner job line {line_number}"
+            )
+            continue
+        job_key_lines.setdefault(key, []).append(line_number)
+        if key in {"permissions", "env", "steps"} and value:
+            violations.append(
+                f"runner job {key} declaration is not the supported unambiguous block mapping "
+                f"at runner job line {line_number}"
+            )
+    if violations:
+        return violations
+
+    steps_lines = job_key_lines.get("steps", [])
+    if len(steps_lines) != 1:
+        return [f"runner job must declare exactly one steps key, found {len(steps_lines)}"]
+    duplicate_keys = [key for key, lines in job_key_lines.items() if len(lines) != 1]
+    if duplicate_keys:
+        return [
+            f"duplicate runner job-level key {key!r} makes the job mapping ambiguous"
+            for key in duplicate_keys
+        ]
+
+    steps_line_number = steps_lines[0]
     in_steps = False
     for line_number, line in enumerate(job_lines, start=1):
-        if re.match(r"^    steps:\s*$", line):
+        if line_number == steps_line_number:
             in_steps = True
             continue
         if not in_steps:
@@ -632,7 +679,78 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "flow-style PowerShell run must fail closed instead of bypassing structured enumeration"
     )
 
-    # 变异 3：execute 不得在 PS5.1 脚本内恢复 CJK 数据根字面量。
+    # step-level flow/anchor/alias/merge 同样不在受控 block-style 子集内，不能随 job-level 加固退化。
+    step_syntax_mutants = {
+        "anchor": runner_workflow.replace("        run: |", "        run: &shared_run |", 1),
+        "alias": runner_workflow.replace("        run: |", "        run: *shared_run", 1),
+        "merge": runner_workflow.replace(
+            "        shell: powershell",
+            "        <<: *shared_step\n        shell: powershell",
+            1,
+        ),
+    }
+    for mutation_name, step_syntax_mutant in step_syntax_mutants.items():
+        step_syntax_violations = _runner_identity_ps51_run_contract_violations(step_syntax_mutant)
+        assert any("unsupported" in item and "step" in item for item in step_syntax_violations), (
+            f"{mutation_name} step syntax must fail closed: {step_syntax_violations}"
+        )
+
+    # 变异 3：重复 job-level steps 会让 YAML 后一键替代前一键，必须在枚举前 fail-closed。
+    duplicate_steps_mutant = (
+        runner_workflow
+        + '\n    steps:\n'
+        + '      - name: duplicate-steps-cjk-run\n'
+        + '        shell: powershell\n'
+        + '        run: |\n'
+        + '          Write-Host 中文\n'
+    )
+    duplicate_steps_violations = _runner_identity_ps51_run_contract_violations(duplicate_steps_mutant)
+    assert any("exactly one steps key" in item for item in duplicate_steps_violations), (
+        "a duplicate runner job steps key must fail closed instead of hiding its CJK PowerShell run"
+    )
+
+    # 变异 4：认证 job 只接受受控的 bare key 子集；quoted/explicit/complex key 均不能绕过。
+    job_key_syntax_mutants = {
+        "quoted": (
+            runner_workflow
+            + '\n    "steps":\n'
+            + '      - name: quoted-steps-cjk-run\n'
+            + '        shell: powershell\n'
+            + '        run: |\n'
+            + '          Write-Host 中文\n',
+            "unsupported runner job-level declaration",
+        ),
+        "explicit": (
+            runner_workflow
+            + '\n    ? steps\n'
+            + '    :\n'
+            + '      - name: explicit-steps-cjk-run\n'
+            + '        shell: powershell\n'
+            + '        run: |\n'
+            + '          Write-Host 中文\n',
+            "unsupported runner job-level declaration",
+        ),
+        "complex": (
+            runner_workflow
+            + '\n    [steps]:\n'
+            + '      - name: complex-steps-cjk-run\n'
+            + '        shell: powershell\n'
+            + '        run: |\n'
+            + '          Write-Host 中文\n',
+            "unsupported runner job-level declaration",
+        ),
+        "duplicate-env": (
+            runner_workflow + '\n    env:\n      EXTRA_DUPLICATE: denied\n',
+            "duplicate runner job-level key",
+        ),
+    }
+    for mutation_name, (job_key_mutant, expected_violation) in job_key_syntax_mutants.items():
+        job_key_violations = _runner_identity_ps51_run_contract_violations(job_key_mutant)
+        assert any(expected_violation in item for item in job_key_violations), (
+            f"{mutation_name} job-level YAML key syntax must fail closed: {job_key_violations}"
+        )
+
+    # 变异 5：execute 不得在 PS5.1 脚本内恢复 CJK 数据根字面量。
     hardcoded_data_root_mutant = runner_workflow.replace(
         "$dataRoot = [string]$env:FACTORY_TEST_DATA_ROOT",
         r'$dataRoot = "D:\codex项目\AI-Coding-Factory-Data\dev"',
@@ -648,7 +766,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "restoring a hardcoded CJK runtime data root must fail the ASCII contract"
     )
 
-    # 变异 4：缺少 YAML Unicode 值时，ASCII 环境变量名合同必须 fail-closed。
+    # 变异 6：缺少 YAML Unicode 值时，ASCII 环境变量名合同必须 fail-closed。
     missing_data_root_env_mutant = runner_workflow.replace(
         "      FACTORY_TEST_DATA_ROOT: D:\\codex项目\\AI-Coding-Factory-Data\\dev\n", "", 1
     )
@@ -1210,7 +1328,7 @@ def _run_d_root_guard_as_utf8_no_bom(
     cwd: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """用真实 Windows PowerShell 5.1 执行 UTF-8 无 BOM 的 workflow run block。
+    """用真实 Windows PowerShell 5.1 先 ParseFile、再执行 UTF-8 无 BOM 的 run block。
 
     GitHub runner 会把 ``shell: powershell`` 的 run 内容写成无 BOM 临时 ``.ps1``；这里严格
     复现该读取边界，防止 CJK 路径又被内联进脚本而在 PS 5.1 按本地代码页误解码。
@@ -1227,6 +1345,37 @@ def _run_d_root_guard_as_utf8_no_bom(
     script_path.write_bytes(run.encode("utf-8"))
     assert not script_path.read_bytes().startswith(b"\xef\xbb\xbf"), (
         "回归脚本必须是 UTF-8 无 BOM，才能复现 runner 临时脚本读取边界"
+    )
+    parse_env = dict(env)
+    parse_env["FACTORY_PS51_PARSE_FILE"] = str(script_path)
+    parse = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                "$tokens = $null; $parseErrors = $null; "
+                "[void][System.Management.Automation.Language.Parser]::ParseFile("
+                "$env:FACTORY_PS51_PARSE_FILE, [ref]$tokens, [ref]$parseErrors); "
+                "$parseErrorCount = @($parseErrors).Count; "
+                "[Console]::Out.Write($parseErrorCount); "
+                "if ($parseErrorCount -ne 0) { "
+                "$parseErrors | ForEach-Object { [Console]::Error.WriteLine($_.Message) }; exit 1 }"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(cwd),
+        timeout=30,
+        env=parse_env,
+    )
+    assert parse.returncode == 0 and parse.stdout.strip() == "0", (
+        "真实 Windows PowerShell 5.1 Parser.ParseFile 必须以零错误读取 UTF-8 无 BOM 实体脚本；"
+        f"stdout={parse.stdout!r} stderr={parse.stderr!r}"
     )
     return subprocess.run(
         [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
