@@ -28,6 +28,9 @@ jobs:
       TMP: D:\codex项目\AI-Coding-Factory-Data\dev\tmp
       CARGO_HOME: D:\codex项目\AI-Coding-Factory-Data\dev\cargo-home
       RUSTUP_HOME: D:\codex项目\AI-Coding-Factory-Data\dev\rustup-home
+      # YAML 环境变量会以 Unicode 传给进程；PowerShell 临时 run 文件只读取 ASCII 变量名，
+      # 避免 Windows PowerShell 5.1 按本地代码页误解码批准根中的 CJK 字符。
+      RUNNER_APPROVED_ROOT: D:\codex项目
       EXPECTED_CANDIDATE_SHA: ${{ github.sha }}
     steps:
       - name: 认证机 D 根路径前置（fail-closed）
@@ -35,7 +38,8 @@ jobs:
         # RUNNER_* 的真实位置只能由外部 runner 安装目录与 --work 配置保证，workflow 不伪造覆盖。
         shell: powershell
         run: |
-          $approvedRoot = "D:\codex项目"
+          # 批准根的 Unicode 值由 YAML env 注入；run block 只保留 ASCII 的环境变量名。
+          $approvedRoot = [string]$env:RUNNER_APPROVED_ROOT
           # 认证机只能使用固定 D: 文件系统卷；SUBST、网络盘或未映射卷不能作为受控运行根。
           $dVolume = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='D:'" -ErrorAction SilentlyContinue
           $dDrive = Get-PSDrive -Name D -PSProvider FileSystem -ErrorAction SilentlyContinue

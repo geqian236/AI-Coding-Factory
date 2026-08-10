@@ -75,6 +75,7 @@ PLATFORM_HELPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "_runner-identity-platf
 RUNNER_IDENTITY_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-runner-identity.ps1"
 RUNNER_CERTIFIED_JOB = "runner-identity-certified"
 RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
+RUNNER_APPROVED_ROOT_ENV = "RUNNER_APPROVED_ROOT"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,6 +272,32 @@ def _job_metadata(
         "if": field(r"^    if:\s*(.+?)\s*$"),
         "permissions": {"contents": field(r"^      contents:\s*(.+?)\s*$")},
     }
+
+
+def _job_env(
+    name: str,
+    workflow_text: str | None = None,
+    *,
+    workflow_path: Path = CI_YML,
+) -> dict[str, str]:
+    """解析 job 顶层 ``env`` 映射，避免把 run 正文或注释里的同名变量当作实际环境绑定。"""
+    text = workflow_path.read_text(encoding="utf-8") if workflow_text is None else workflow_text
+    blocks = _load_job_blocks(text)
+    assert name in blocks, f"ci.yml 缺少 job '{name}'"
+    lines = blocks[name]
+    env_indexes = [index for index, line in enumerate(lines) if re.match(r"^    env:\s*$", line)]
+    assert len(env_indexes) == 1, f"认证 job 必须且只能有一个顶层 env 映射，实际={env_indexes!r}"
+    values: dict[str, str] = {}
+    for line in lines[env_indexes[0] + 1:]:
+        if line.strip() == "" or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 4:
+            break
+        match = re.match(r"^      ([A-Za-z_][A-Za-z0-9_]*):\s?(.*)$", line)
+        assert match is not None, f"认证 job env 出现无法解析的结构行：{line!r}"
+        values[match.group(1)] = _scalar(match.group(2))
+    return values
 
 
 def _find_step(
@@ -552,6 +579,93 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "D 根路径断言必须是认证 job 首个 step，并在 checkout/任何下载前 fail-closed"
     )
     d_root_code = _strip_ps_comments(str(d_root_guard.get("run", "")))
+
+    # GitHub runner 会以 UTF-8 无 BOM 临时文件交给 Windows PowerShell 5.1。批准根的 CJK
+    # 值只能由 YAML 环境变量传入，run block 自身必须只读取 ASCII 的 $env 名称；否则
+    # PS 5.1 会按本地代码页把内联 ``D:\\codex项目`` 误解码，首个安全检查反而误拒。
+    d_root_env = _job_env(RUNNER_CERTIFIED_JOB, runner_workflow, workflow_path=RUNNER_CERTIFIED_YML)
+    approved_root = d_root_env.get(RUNNER_APPROVED_ROOT_ENV, "")
+    if sys.platform == "win32":
+        encoding_tmp = _unique_tmp_dir("runner-approved-root-ps51")
+        try:
+            runner_temp = encoding_tmp / "runner" / "_work" / "_temp"
+            runner_tool_cache = encoding_tmp / "runner" / "_work" / "_tool"
+            workspace = encoding_tmp / "workspace"
+            factory_tmp = encoding_tmp / "factory" / "tmp"
+            cargo_home = encoding_tmp / "factory" / "cargo-home"
+            rustup_home = encoding_tmp / "factory" / "rustup-home"
+            for owned in (runner_temp, runner_tool_cache, workspace, factory_tmp, cargo_home, rustup_home):
+                owned.mkdir(parents=True, exist_ok=True)
+            encoding_env = dict(os.environ)
+            encoding_env.update({
+                RUNNER_APPROVED_ROOT_ENV: approved_root,
+                "RUNNER_TEMP": str(runner_temp),
+                "RUNNER_TOOL_CACHE": str(runner_tool_cache),
+                "GITHUB_WORKSPACE": str(workspace),
+                "TEMP": str(factory_tmp),
+                "TMP": str(factory_tmp),
+                "FACTORY_TEST_DATA_ROOT": str(encoding_tmp / "factory"),
+                "CARGO_HOME": str(cargo_home),
+                "RUSTUP_HOME": str(rustup_home),
+            })
+            dynamic = _run_d_root_guard_as_utf8_no_bom(
+                d_root_code,
+                script_path=encoding_tmp / "d-root-good.ps1",
+                cwd=encoding_tmp,
+                env=encoding_env,
+            )
+            assert dynamic.returncode == 0, (
+                "真实 PS 5.1 UTF-8 无 BOM D 根 guard 必须接受 YAML 环境变量提供的批准根；"
+                f"stdout={dynamic.stdout!r} stderr={dynamic.stderr!r}"
+            )
+
+            # 把生产代码恢复为 CJK 字面量时，同一无 BOM 临时脚本必须重现远程误解码并失败，
+            # 不能只靠文本断言宣称编码安全。
+            hardcoded_root = d_root_code.replace(
+                f"$approvedRoot = [string]$env:{RUNNER_APPROVED_ROOT_ENV}",
+                r'$approvedRoot = "D:\codex项目"',
+                1,
+            )
+            assert hardcoded_root != d_root_code, "D 根 guard 必须从 RUNNER_APPROVED_ROOT 环境变量读取批准根"
+            hardcoded = _run_d_root_guard_as_utf8_no_bom(
+                hardcoded_root,
+                script_path=encoding_tmp / "d-root-hardcoded.ps1",
+                cwd=encoding_tmp,
+                env=encoding_env,
+            )
+            assert hardcoded.returncode != 0, (
+                "恢复内联 CJK 批准根后，PS 5.1 UTF-8 无 BOM 回归必须失败，防止编码问题假绿"
+            )
+
+            # 删除 workflow env 绑定会让生产代码拿到空值，必须同样 fail-closed；避免有人
+            # 保留 $env 读取形式却忘了把 Unicode 值真正交给 runner。
+            missing_env = dict(encoding_env)
+            missing_env.pop(RUNNER_APPROVED_ROOT_ENV, None)
+            missing = _run_d_root_guard_as_utf8_no_bom(
+                d_root_code,
+                script_path=encoding_tmp / "d-root-missing-env.ps1",
+                cwd=encoding_tmp,
+                env=missing_env,
+            )
+            assert missing.returncode != 0, "缺少 RUNNER_APPROVED_ROOT 时 D 根 guard 必须 fail-closed"
+        finally:
+            _remove_tree_strict(encoding_tmp)
+
+    assert approved_root == r"D:\codex项目", (
+        "认证 job 必须在 YAML 顶层 env 绑定 Unicode RUNNER_APPROVED_ROOT，不能把批准根写进 PS run block"
+    )
+    assert re.search(
+        rf"(?m)^\s*\$approvedRoot\s*=\s*\[string\]\$env:{RUNNER_APPROVED_ROOT_ENV}\s*$",
+        d_root_code,
+    ), "D 根 guard 的生产代码必须只从 RUNNER_APPROVED_ROOT 环境变量读取批准根"
+    removed_env = runner_workflow.replace(
+        f"      {RUNNER_APPROVED_ROOT_ENV}: {approved_root}\n", "", 1,
+    )
+    assert removed_env != runner_workflow, "未能对 YAML 的 RUNNER_APPROVED_ROOT 绑定施加删除 mutation"
+    assert RUNNER_APPROVED_ROOT_ENV not in _job_env(
+        RUNNER_CERTIFIED_JOB, removed_env, workflow_path=RUNNER_CERTIFIED_YML,
+    ), "删除 YAML 环境变量绑定后，结构化合同必须拒绝"
+
     d_root_requirements = (
         "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE", "CURRENT_WORKING_DIRECTORY",
         "TEMP", "TMP", "FACTORY_TEST_DATA_ROOT", "CARGO_HOME", "RUSTUP_HOME",
@@ -902,6 +1016,37 @@ def _invoke_d_root_path_guard(run: str, target: Path) -> dict[str, Any]:
     """让 workflow 内的生产 Assert-ApprovedRunnerPath 审计一个真实 D 盘路径。"""
     payload = json.dumps({"run": run, "target": str(target)}, ensure_ascii=False)
     return _run_ps_analyzer(_D_ROOT_PATH_GUARD_HARNESS, payload)
+
+
+def _run_d_root_guard_as_utf8_no_bom(
+    run: str,
+    *,
+    script_path: Path,
+    cwd: Path,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """用真实 Windows PowerShell 5.1 执行 UTF-8 无 BOM 的 workflow run block。
+
+    GitHub runner 会把 ``shell: powershell`` 的 run 内容写成无 BOM 临时 ``.ps1``；这里严格
+    复现该读取边界，防止 CJK 路径又被内联进脚本而在 PS 5.1 按本地代码页误解码。
+    """
+    powershell = shutil.which("powershell")
+    assert powershell is not None, "Windows 动态编码回归必须找到 powershell.exe"
+    version = subprocess.run(
+        [powershell, "-NoProfile", "-Command", "[Console]::Out.Write($PSVersionTable.PSVersion.Major)"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(cwd), timeout=30,
+    )
+    assert version.returncode == 0 and version.stdout.strip() == "5", (
+        f"动态编码回归必须由 Windows PowerShell 5.1 执行，实际 stdout={version.stdout!r} stderr={version.stderr!r}"
+    )
+    script_path.write_bytes(run.encode("utf-8"))
+    assert not script_path.read_bytes().startswith(b"\xef\xbb\xbf"), (
+        "回归脚本必须是 UTF-8 无 BOM，才能复现 runner 临时脚本读取边界"
+    )
+    return subprocess.run(
+        [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(cwd), timeout=60, env=env,
+    )
 
 
 # runner_identity 的本地 wrapper 也可能直接产生 authoritative receipt，不能只依赖 CI
