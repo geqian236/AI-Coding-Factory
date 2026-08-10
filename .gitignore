@@ -1,0 +1,51 @@
+# 本项目所有可控数据均应保存在 D 盘项目根目录下，并避免运行产物进入 Git。
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Rust / 构建产物
+node_modules/
+dist/
+build/
+target/
+coverage/
+
+# 本地运行数据
+logs/*
+!logs/.gitkeep
+data/runtime/
+data/backups/
+artifacts/
+transcripts/
+crash-dumps/
+tmp/
+.tmp/
+
+# 本地设计预览和工作区
+.superpowers/
+.worktrees/
+worktrees/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
