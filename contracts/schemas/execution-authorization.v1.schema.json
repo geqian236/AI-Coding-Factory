@@ -1,0 +1,183 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/execution-authorization.v1.schema.json",
+  "title": "ExecutionAuthorization",
+  "description": "Phase 1 v1 设计决定：Policy Engine 为单个 action capability 派生可消费授权。resourceFingerprint、capability scope 和 action policy 都以内容寻址且可解析、可重算的摘要绑定；裸 digest 不是充分证据。Task 4/5 仍负责动态验证 scope、lease、TTL、目标 guard、issuedAt < expiresAt 和 snapshot 解析/重算。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "executionAuthorizationId",
+    "intentAuthorizationId",
+    "planRevisionId",
+    "semanticPlanHash",
+    "planRevisionDigest",
+    "stageCapabilityMapVersion",
+    "stageCapabilityMapDigest",
+    "nodeCapabilityMapVersion",
+    "nodeCapabilityMapDigest",
+    "runId",
+    "stepId",
+    "attemptId",
+    "nodeType",
+    "executorId",
+    "resourceFingerprint",
+    "capabilityScopeDigest",
+    "idempotencyKey",
+    "inputBindings",
+    "actionCapability",
+    "actionPolicySnapshotDigest",
+    "fencingToken",
+    "controlEpoch",
+    "acceptedControlCommandSeq",
+    "maxUses",
+    "consumptionState",
+    "issuedAt",
+    "expiresAt",
+    "revokedAt",
+    "revokeReason"
+  ],
+  "properties": {
+    "executionAuthorizationId": {"type": "string", "minLength": 1, "description": "派生授权稳定身份。"},
+    "intentAuthorizationId": {"type": "string", "minLength": 1, "description": "来源 IntentAuthorization 身份。"},
+    "planRevisionId": {"type": "string", "minLength": 1, "description": "绑定的不可变 PlanRevision 身份。"},
+    "semanticPlanHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "计划语义哈希。"},
+    "planRevisionDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "完整 PlanRevision 摘要。"},
+    "stageCapabilityMapVersion": {"type": "string", "minLength": 1, "description": "stage capability map 版本。"},
+    "stageCapabilityMapDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "stage capability map 内容摘要。"},
+    "nodeCapabilityMapVersion": {"type": "string", "minLength": 1, "description": "node capability map 版本。"},
+    "nodeCapabilityMapDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "node capability map 内容摘要。"},
+    "runId": {"type": "string", "minLength": 1, "description": "绑定的 Run 身份。"},
+    "stepId": {"type": "string", "minLength": 1, "description": "绑定的 Step 身份。"},
+    "attemptId": {"type": "string", "minLength": 1, "description": "绑定的不可复用 Attempt 身份。"},
+    "nodeType": {
+      "type": "string",
+      "enum": [
+        "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+        "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+        "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+        "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+        "RECONCILE_TARGET", "RESTORE_DRILL"
+      ],
+      "description": "冻结 node-capability-map 的节点类型。"
+    },
+    "executorId": {"type": "string", "minLength": 1, "description": "当前 lease owner 的执行器身份。"},
+    "resourceFingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaDigest", "fingerprintDigest"],
+      "properties": {
+        "schemaDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "node policy 内嵌 resourceFingerprintSchema 的内容寻址规范化摘要；运行时必须解析并重算。"},
+        "fingerprintDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "按该 schema 产生的稳定物理资源指纹内容摘要；运行时必须解析并重算。"}
+      }
+    },
+    "capabilityScopeDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "可解析 capability/resource scope 快照摘要。"},
+    "idempotencyKey": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。"},
+    "inputBindings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": {"type": "string", "enum": ["BASE_SHA", "CANDIDATE_SHA", "CONTENT_DIGEST"]},
+          "value": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "value"],
+              "properties": {
+                "kind": {"enum": ["BASE_SHA", "CANDIDATE_SHA"]},
+                "value": {"type": "string", "minLength": 1}
+              }
+            },
+            "then": {"properties": {"value": {"pattern": "^[0-9a-f]{40}$"}}}
+          },
+          {
+            "if": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "value"],
+              "properties": {
+                "kind": {"const": "CONTENT_DIGEST"},
+                "value": {"type": "string", "minLength": 1}
+              }
+            },
+            "then": {"properties": {"value": {"pattern": "^sha256:[0-9a-f]{64}$"}}}
+          }
+        ]
+      },
+      "description": "输入身份绑定；不使用自由文本或短 SHA。"
+    },
+    "actionCapability": {
+      "type": "string",
+      "enum": [
+        "acceptance.fixture.write", "build.exec.isolated", "check.publish", "container.inspect.scoped",
+        "db.backup", "db.check", "db.migrate", "db.read", "db.restore", "forge.observe.scoped",
+        "git.local_commit", "git.push", "http.check.scoped", "log.read.scoped", "network.egress.scoped",
+        "nginx.switch", "pr.create", "pr.update", "registry.observe.scoped", "registry.push",
+        "remote.observe.scoped", "remote.write.scoped", "repo.bootstrap", "repo.merge", "repo.read",
+        "restore.validation.instance", "rollback", "service.restart.scoped", "ssh.exec.scoped",
+        "target.guard.clear", "test.exec.isolated", "traffic.switch.scoped", "worktree.write"
+      ],
+      "description": "本 ExecutionAuthorization 唯一对应的 capability action。"
+    },
+    "actionPolicySnapshotDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。"},
+    "fencingToken": {"type": "integer", "minimum": 1, "maximum": 9007199254740991, "description": "严格单调 lease fencing token。"},
+    "controlEpoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "控制权 epoch。"},
+    "acceptedControlCommandSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "派生时接受的控制命令序号。"},
+    "maxUses": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "剩余可消费次数；不会使用第二个 ttlMs 真源。"},
+    "consumptionState": {"type": "string", "enum": ["AVAILABLE", "CONSUMED"], "description": "仅表示消费投影；撤销/过期分别由 revokedAt/expiresAt 表达，未知状态不能视为成功。"},
+    "issuedAt": {"type": "string", "format": "date-time", "description": "派生授权签发时间。"},
+    "expiresAt": {"type": "string", "format": "date-time", "description": "派生授权绝对 TTL。"},
+    "revokedAt": {"type": ["string", "null"], "format": "date-time", "description": "撤销时间；未撤销时显式为 null。"},
+    "revokeReason": {"type": ["string", "null"], "minLength": 1, "description": "撤销原因；未撤销时显式为 null。"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"consumptionState": {"const": "AVAILABLE"}}},
+      "then": {"properties": {"maxUses": {"minimum": 1}}}
+    },
+    {
+      "if": {"properties": {"consumptionState": {"const": "CONSUMED"}}},
+      "then": {"properties": {"maxUses": {"const": 0}}}
+    },
+    {
+      "if": {"properties": {"revokedAt": {"type": "null"}}},
+      "then": {"properties": {"revokeReason": {"type": "null"}}},
+      "else": {"properties": {"revokeReason": {"type": "string", "minLength": 1}}}
+    },
+    {
+      "if": {
+        "properties": {
+          "nodeType": {
+            "enum": [
+              "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT", "DEPLOY_STAGING",
+              "ACCEPT_STAGING", "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+              "RECONCILE_TARGET", "RESTORE_DRILL"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "inputBindings": {
+            "contains": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"enum": ["CANDIDATE_SHA", "CONTENT_DIGEST"]},
+                "value": {"type": "string", "minLength": 1}
+              },
+              "required": ["kind", "value"]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

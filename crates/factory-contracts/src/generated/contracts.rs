@@ -143,6 +143,172 @@ pub struct PlanRevision {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct IntentAuthorization {
+    /// IntentAuthorization 的稳定身份。
+    #[serde(rename = "intentAuthorizationId")]
+    pub intent_authorization_id: String,
+    /// 被授权任务的稳定身份。
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    /// 做出一次性授权的用户身份。
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    /// 规范化用户需求的 JCS/NFC 内容摘要。
+    #[serde(rename = "requirementDigest")]
+    pub requirement_digest: String,
+    /// 项目身份，禁止跨项目复用授权。
+    #[serde(rename = "projectId")]
+    pub project_id: String,
+    /// 规范化后的仓库身份。
+    #[serde(rename = "repositoryId")]
+    pub repository_id: String,
+    /// 可解析的仓库/物理路径/模式绑定快照摘要。
+    #[serde(rename = "repositoryBindingDigest")]
+    pub repository_binding_digest: String,
+    /// 可解析的基础分支、base SHA 或 bootstrap 前置事实快照摘要。
+    #[serde(rename = "baselineDigest")]
+    pub baseline_digest: String,
+    /// 用户选择的目标终点阶段；只给出 capability 上限。
+    #[serde(rename = "targetStage")]
+    pub target_stage: String,
+    /// 派生授权时使用的 stage-capability-map 版本。
+    #[serde(rename = "stageCapabilityMapVersion")]
+    pub stage_capability_map_version: String,
+    /// targetStage 展开后的排序 capability 集合摘要。
+    #[serde(rename = "allowedCapabilitySetDigest")]
+    pub allowed_capability_set_digest: String,
+    /// 可解析的环境、ServerProfile、数据库和资源目标绑定快照摘要。
+    #[serde(rename = "targetBindingDigest")]
+    pub target_binding_digest: String,
+    /// 用户接受的最高风险等级。
+    #[serde(rename = "riskCeiling")]
+    pub risk_ceiling: String,
+    /// 可解析的估算成本告警策略摘要；不把订阅 CLI 估算伪装成真实账单。
+    #[serde(rename = "estimatedCostAlertDigest")]
+    pub estimated_cost_alert_digest: String,
+    /// 端到端自主执行预算（毫秒）；禁止无限值。
+    #[serde(rename = "autonomousExecutionBudgetMs")]
+    pub autonomous_execution_budget_ms: i64,
+    /// 自动修复轮数上限。
+    #[serde(rename = "repairLoopLimit")]
+    pub repair_loop_limit: i64,
+    /// 自动重规划次数上限。
+    #[serde(rename = "autoReplanLimit")]
+    pub auto_replan_limit: i64,
+    /// Attempt 总数上限。
+    #[serde(rename = "attemptLimit")]
+    pub attempt_limit: i64,
+    /// 授权签发时间。
+    #[serde(rename = "issuedAt")]
+    pub issued_at: String,
+    /// 绝对有效期；暂停不会延长它。
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
+    /// 撤销时间；未撤销时显式为 null。
+    #[serde(rename = "revokedAt")]
+    pub revoked_at: Option<String>,
+    /// 撤销原因；未撤销时显式为 null。
+    #[serde(rename = "revokeReason")]
+    pub revoke_reason: Option<String>,
+}
+
+/// 由 generate.py 自动生成，禁止手动修改。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAuthorization {
+    /// 派生授权稳定身份。
+    #[serde(rename = "executionAuthorizationId")]
+    pub execution_authorization_id: String,
+    /// 来源 IntentAuthorization 身份。
+    #[serde(rename = "intentAuthorizationId")]
+    pub intent_authorization_id: String,
+    /// 绑定的不可变 PlanRevision 身份。
+    #[serde(rename = "planRevisionId")]
+    pub plan_revision_id: String,
+    /// 计划语义哈希。
+    #[serde(rename = "semanticPlanHash")]
+    pub semantic_plan_hash: String,
+    /// 完整 PlanRevision 摘要。
+    #[serde(rename = "planRevisionDigest")]
+    pub plan_revision_digest: String,
+    /// stage capability map 版本。
+    #[serde(rename = "stageCapabilityMapVersion")]
+    pub stage_capability_map_version: String,
+    /// stage capability map 内容摘要。
+    #[serde(rename = "stageCapabilityMapDigest")]
+    pub stage_capability_map_digest: String,
+    /// node capability map 版本。
+    #[serde(rename = "nodeCapabilityMapVersion")]
+    pub node_capability_map_version: String,
+    /// node capability map 内容摘要。
+    #[serde(rename = "nodeCapabilityMapDigest")]
+    pub node_capability_map_digest: String,
+    /// 绑定的 Run 身份。
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    /// 绑定的 Step 身份。
+    #[serde(rename = "stepId")]
+    pub step_id: String,
+    /// 绑定的不可复用 Attempt 身份。
+    #[serde(rename = "attemptId")]
+    pub attempt_id: String,
+    /// 冻结 node-capability-map 的节点类型。
+    #[serde(rename = "nodeType")]
+    pub node_type: String,
+    /// 当前 lease owner 的执行器身份。
+    #[serde(rename = "executorId")]
+    pub executor_id: String,
+    #[serde(rename = "resourceFingerprint")]
+    pub resource_fingerprint: serde_json::Value,
+    /// 可解析 capability/resource scope 快照摘要。
+    #[serde(rename = "capabilityScopeDigest")]
+    pub capability_scope_digest: String,
+    /// 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。
+    #[serde(rename = "idempotencyKey")]
+    pub idempotency_key: String,
+    /// 输入身份绑定；不使用自由文本或短 SHA。
+    #[serde(rename = "inputBindings")]
+    pub input_bindings: Vec<serde_json::Value>,
+    /// 本 ExecutionAuthorization 唯一对应的 capability action。
+    #[serde(rename = "actionCapability")]
+    pub action_capability: String,
+    /// selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。
+    #[serde(rename = "actionPolicySnapshotDigest")]
+    pub action_policy_snapshot_digest: String,
+    /// 严格单调 lease fencing token。
+    #[serde(rename = "fencingToken")]
+    pub fencing_token: i64,
+    /// 控制权 epoch。
+    #[serde(rename = "controlEpoch")]
+    pub control_epoch: i64,
+    /// 派生时接受的控制命令序号。
+    #[serde(rename = "acceptedControlCommandSeq")]
+    pub accepted_control_command_seq: i64,
+    /// 剩余可消费次数；不会使用第二个 ttlMs 真源。
+    #[serde(rename = "maxUses")]
+    pub max_uses: i64,
+    /// 仅表示消费投影；撤销/过期分别由 revokedAt/expiresAt 表达，未知状态不能视为成功。
+    #[serde(rename = "consumptionState")]
+    pub consumption_state: String,
+    /// 派生授权签发时间。
+    #[serde(rename = "issuedAt")]
+    pub issued_at: String,
+    /// 派生授权绝对 TTL。
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
+    /// 撤销时间；未撤销时显式为 null。
+    #[serde(rename = "revokedAt")]
+    pub revoked_at: Option<String>,
+    /// 撤销原因；未撤销时显式为 null。
+    #[serde(rename = "revokeReason")]
+    pub revoke_reason: Option<String>,
+}
+
+/// 由 generate.py 自动生成，禁止手动修改。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ControlCommand {
     /// 命令唯一 ID
     #[serde(rename = "commandId")]

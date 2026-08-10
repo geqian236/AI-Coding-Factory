@@ -11,6 +11,8 @@ __all__ = [
     "CredentialRef",
     "RunSpec",
     "PlanRevision",
+    "IntentAuthorization",
+    "ExecutionAuthorization",
     "ControlCommand",
     "TaskIntakeRequest",
     "TaskIntakeAccepted",
@@ -105,6 +107,113 @@ class PlanRevision(TypedDict, total=False):
     # target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）
     stageMaps: dict[str, Any]
     createdAt: str
+
+class IntentAuthorization(TypedDict, total=False):
+    """由 generate.py 自动生成，禁止手动修改。"""
+    # IntentAuthorization 的稳定身份。
+    intentAuthorizationId: str
+    # 被授权任务的稳定身份。
+    taskId: str
+    # 做出一次性授权的用户身份。
+    userId: str
+    # 规范化用户需求的 JCS/NFC 内容摘要。
+    requirementDigest: str
+    # 项目身份，禁止跨项目复用授权。
+    projectId: str
+    # 规范化后的仓库身份。
+    repositoryId: str
+    # 可解析的仓库/物理路径/模式绑定快照摘要。
+    repositoryBindingDigest: str
+    # 可解析的基础分支、base SHA 或 bootstrap 前置事实快照摘要。
+    baselineDigest: str
+    # 用户选择的目标终点阶段；只给出 capability 上限。
+    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
+    # 派生授权时使用的 stage-capability-map 版本。
+    stageCapabilityMapVersion: str
+    # targetStage 展开后的排序 capability 集合摘要。
+    allowedCapabilitySetDigest: str
+    # 可解析的环境、ServerProfile、数据库和资源目标绑定快照摘要。
+    targetBindingDigest: str
+    # 用户接受的最高风险等级。
+    riskCeiling: Literal["low", "medium", "high", "critical"]
+    # 可解析的估算成本告警策略摘要；不把订阅 CLI 估算伪装成真实账单。
+    estimatedCostAlertDigest: str
+    # 端到端自主执行预算（毫秒）；禁止无限值。
+    autonomousExecutionBudgetMs: int
+    # 自动修复轮数上限。
+    repairLoopLimit: int
+    # 自动重规划次数上限。
+    autoReplanLimit: int
+    # Attempt 总数上限。
+    attemptLimit: int
+    # 授权签发时间。
+    issuedAt: str
+    # 绝对有效期；暂停不会延长它。
+    expiresAt: str
+    # 撤销时间；未撤销时显式为 null。
+    revokedAt: Optional[str]
+    # 撤销原因；未撤销时显式为 null。
+    revokeReason: Optional[str]
+
+class ExecutionAuthorization(TypedDict, total=False):
+    """由 generate.py 自动生成，禁止手动修改。"""
+    # 派生授权稳定身份。
+    executionAuthorizationId: str
+    # 来源 IntentAuthorization 身份。
+    intentAuthorizationId: str
+    # 绑定的不可变 PlanRevision 身份。
+    planRevisionId: str
+    # 计划语义哈希。
+    semanticPlanHash: str
+    # 完整 PlanRevision 摘要。
+    planRevisionDigest: str
+    # stage capability map 版本。
+    stageCapabilityMapVersion: str
+    # stage capability map 内容摘要。
+    stageCapabilityMapDigest: str
+    # node capability map 版本。
+    nodeCapabilityMapVersion: str
+    # node capability map 内容摘要。
+    nodeCapabilityMapDigest: str
+    # 绑定的 Run 身份。
+    runId: str
+    # 绑定的 Step 身份。
+    stepId: str
+    # 绑定的不可复用 Attempt 身份。
+    attemptId: str
+    # 冻结 node-capability-map 的节点类型。
+    nodeType: Literal["PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT", "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING", "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK", "RECONCILE_TARGET", "RESTORE_DRILL"]
+    # 当前 lease owner 的执行器身份。
+    executorId: str
+    resourceFingerprint: dict[str, Any]
+    # 可解析 capability/resource scope 快照摘要。
+    capabilityScopeDigest: str
+    # 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。
+    idempotencyKey: str
+    # 输入身份绑定；不使用自由文本或短 SHA。
+    inputBindings: list[dict[str, Any]]
+    # 本 ExecutionAuthorization 唯一对应的 capability action。
+    actionCapability: Literal["acceptance.fixture.write", "build.exec.isolated", "check.publish", "container.inspect.scoped", "db.backup", "db.check", "db.migrate", "db.read", "db.restore", "forge.observe.scoped", "git.local_commit", "git.push", "http.check.scoped", "log.read.scoped", "network.egress.scoped", "nginx.switch", "pr.create", "pr.update", "registry.observe.scoped", "registry.push", "remote.observe.scoped", "remote.write.scoped", "repo.bootstrap", "repo.merge", "repo.read", "restore.validation.instance", "rollback", "service.restart.scoped", "ssh.exec.scoped", "target.guard.clear", "test.exec.isolated", "traffic.switch.scoped", "worktree.write"]
+    # selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。
+    actionPolicySnapshotDigest: str
+    # 严格单调 lease fencing token。
+    fencingToken: int
+    # 控制权 epoch。
+    controlEpoch: int
+    # 派生时接受的控制命令序号。
+    acceptedControlCommandSeq: int
+    # 剩余可消费次数；不会使用第二个 ttlMs 真源。
+    maxUses: int
+    # 仅表示消费投影；撤销/过期分别由 revokedAt/expiresAt 表达，未知状态不能视为成功。
+    consumptionState: Literal["AVAILABLE", "CONSUMED"]
+    # 派生授权签发时间。
+    issuedAt: str
+    # 派生授权绝对 TTL。
+    expiresAt: str
+    # 撤销时间；未撤销时显式为 null。
+    revokedAt: Optional[str]
+    # 撤销原因；未撤销时显式为 null。
+    revokeReason: Optional[str]
 
 class ControlCommand(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""

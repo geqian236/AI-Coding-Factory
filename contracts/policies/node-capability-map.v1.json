@@ -2,121 +2,896 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://factory.local/contracts/policies/node-capability-map.v1.json",
   "title": "NodeCapabilityMapV1",
-  "description": "首版冻结的 node→requiredCapabilities 映射。共 17 种 nodeType，Policy Engine 不接受模型自由填写 capability。",
+  "description": "首版冻结的 node→capability 与运行时策略映射。资源指纹、幂等键和完成事实均为可机械解析的闭集；Policy Engine 不接受模型自由填写 capability 或未知状态成功。",
   "version": "1",
-  "specRef": "Master Design Spec §6.3",
+  "specRef": "Master Design Spec §6.3、§13.2、§17",
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "serverPhysical": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostKey", "remoteRoot"],
+      "properties": {
+        "hostKey": {"$ref": "#/$defs/nonEmptyString"},
+        "remoteRoot": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "databasePhysical": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clusterIdentity", "databaseIdentity"],
+      "properties": {
+        "clusterIdentity": {"$ref": "#/$defs/nonEmptyString"},
+        "databaseIdentity": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "trafficAdapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapterIdentity"],
+      "properties": {
+        "adapterIdentity": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "repository"],
+      "properties": {
+        "host": {"$ref": "#/$defs/nonEmptyString"},
+        "repository": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "releaseIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseId", "containerIdentity"],
+      "properties": {
+        "releaseId": {"$ref": "#/$defs/nonEmptyString"},
+        "containerIdentity": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    }
+  },
   "nodeTypes": {
     "PLAN": {
       "requiredCapabilities": ["repo.read"],
       "optionalCapabilities": [],
       "sideEffectClass": "read-only",
-      "description": "规划节点：只读仓库，生成 RunSpec 和 PlanRevision Artifact"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repositoryId", "physicalRootIdentity"],
+        "properties": {
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"},
+          "physicalRootIdentity": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"repositoryId": {"minLength": 1}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {
+              "jcsInputFields": ["nodeType", "stepId", "requirementDigest", "parentRevisionOrGenesis", "plannerContractDigest"]
+            }
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {
+              "predicateId": "plan-artifacts-committed-v1",
+              "requiredEvidence": ["run-spec-schema-valid", "plan-revision-schema-valid", "dual-hash-recomputed", "required-artifacts-committed"]
+            }
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "before-capability-dispatch",
+      "retryClass": "bounded-no-external-side-effect",
+      "description": "规划节点：资源限定为仓库及物理根；H=sha256(JCS/NFC([factory-action-v1,…])) 不含尝试、令牌或时间。"
     },
     "DESIGN_REVIEW": {
       "requiredCapabilities": ["repo.read"],
       "optionalCapabilities": [],
       "sideEffectClass": "read-only",
-      "description": "设计审核节点：只读仓库，产出设计审核 Artifact"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repositoryId", "physicalRootIdentity"],
+        "properties": {
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"},
+          "physicalRootIdentity": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"physicalRootIdentity": {"minLength": 1}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {
+              "jcsInputFields": ["repositoryId", "planRevisionDigest", "rubricDigest", "reviewerVersion"]
+            }
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {
+              "predicateId": "design-review-passed-v1",
+              "requiredEvidence": ["review-receipt-binds-plan-revision", "no-blocking-finding", "review-artifact-committed"]
+            }
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "before-capability-dispatch",
+      "retryClass": "bounded-no-external-side-effect",
+      "description": "设计审核节点：只读资源指纹与审核输入共同冻结；完成事实不接受模型自报通过。"
     },
     "BOOTSTRAP_REPOSITORY": {
       "requiredCapabilities": ["repo.bootstrap", "git.local_commit"],
       "optionalCapabilities": [],
       "sideEffectClass": "local-write",
-      "description": "新建仓库节点：仅限 D 盘空目录，本地提交"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["volumeIdentity", "canonicalRoot", "mode"],
+        "properties": {
+          "volumeIdentity": {"$ref": "#/$defs/nonEmptyString"},
+          "canonicalRoot": {"$ref": "#/$defs/nonEmptyString"},
+          "mode": {"const": "new"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"mode": {"const": "new"}}},
+            "then": {"required": ["volumeIdentity", "canonicalRoot"]}
+          }
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.bootstrap": {"jcsInputFields": ["targetResourceFingerprintDigest", "bootstrapPlanDigest"]},
+            "git.local_commit": {"jcsInputFields": ["targetResourceFingerprintDigest", "bootstrapPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.bootstrap": {
+              "predicateId": "bootstrap-commit-matches-v1",
+              "requiredEvidence": ["d-volume-empty-no-git-precondition", "repository-identity", "head-and-tree-match", "local-commit-exact"]
+            },
+            "git.local_commit": {
+              "predicateId": "bootstrap-commit-matches-v1",
+              "requiredEvidence": ["d-volume-empty-no-git-precondition", "repository-identity", "head-and-tree-match", "local-commit-exact"]
+            }
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "local-fact-before-retry",
+      "description": "新建仓库节点：派发前另证目标为 D 盘空目录且无 .git；本地写入先核对 HEAD/tree 完成事实。"
     },
     "IMPLEMENT": {
       "requiredCapabilities": ["repo.read", "worktree.write", "git.local_commit"],
       "optionalCapabilities": [],
       "sideEffectClass": "local-write",
-      "description": "实现节点：独立 worktree 写入，本地提交，不含 push/部署权限"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repoId", "worktreePhysicalIdentity"],
+        "properties": {
+          "repoId": {"$ref": "#/$defs/nonEmptyString"},
+          "worktreePhysicalIdentity": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"worktreePhysicalIdentity": {"minLength": 1}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"jcsInputFields": ["repoId", "baseSha", "logicalNodeId", "implementationInputDigest"]},
+            "worktree.write": {"jcsInputFields": ["repoId", "baseSha", "logicalNodeId", "implementationInputDigest"]},
+            "git.local_commit": {"jcsInputFields": ["repoId", "baseSha", "logicalNodeId", "implementationInputDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"predicateId": "candidate-commit-matches-v1", "requiredEvidence": ["candidate-sha", "candidate-tree", "allowed-paths-only", "artifacts-committed"]},
+            "worktree.write": {"predicateId": "candidate-commit-matches-v1", "requiredEvidence": ["candidate-sha", "candidate-tree", "allowed-paths-only", "artifacts-committed"]},
+            "git.local_commit": {"predicateId": "candidate-commit-matches-v1", "requiredEvidence": ["candidate-sha", "candidate-tree", "allowed-paths-only", "artifacts-committed"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "local-fact-before-retry",
+      "description": "实现节点：stable worktree 身份与可变 base/candidate 输入分离；重试前本地核对候选提交事实。"
     },
     "VERIFY": {
       "requiredCapabilities": ["repo.read", "test.exec.isolated"],
       "optionalCapabilities": ["network.egress.scoped"],
       "sideEffectClass": "isolated-exec",
-      "description": "验证节点：隔离容器运行测试，无 Git/部署写权限"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repoId", "checkoutIdentity", "verifierImageDigest", "networkEgressSelected"],
+        "properties": {
+          "repoId": {"$ref": "#/$defs/nonEmptyString"},
+          "checkoutIdentity": {"$ref": "#/$defs/nonEmptyString"},
+          "verifierImageDigest": {"$ref": "#/$defs/sha256Digest"},
+          "networkEgressSelected": {"type": "boolean"},
+          "egressPolicyDigest": {"$ref": "#/$defs/sha256Digest"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"networkEgressSelected": {"const": true}}},
+            "then": {"required": ["egressPolicyDigest"]}
+          },
+          {
+            "if": {"properties": {"networkEgressSelected": {"const": false}}},
+            "then": {"not": {"required": ["egressPolicyDigest"]}}
+          }
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"jcsInputFields": ["repoId", "candidateSha", "testPlanDigest", "commandIdsDigest", "verifierImageDigest"]},
+            "test.exec.isolated": {"jcsInputFields": ["repoId", "candidateSha", "testPlanDigest", "commandIdsDigest", "verifierImageDigest"]},
+            "network.egress.scoped": {"jcsInputFields": ["repoId", "candidateSha", "testPlanDigest", "commandIdsDigest", "verifierImageDigest", "egressPolicyDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"predicateId": "verification-receipts-pass-v1", "requiredEvidence": ["candidate-input-bound", "container-exit-observed", "required-checks-pass"]},
+            "test.exec.isolated": {"predicateId": "verification-receipts-pass-v1", "requiredEvidence": ["candidate-input-bound", "container-exit-observed", "required-checks-pass"]},
+            "network.egress.scoped": {"predicateId": "verification-receipts-pass-v1", "requiredEvidence": ["candidate-input-bound", "egress-policy-bound", "container-exit-observed", "required-checks-pass"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "before-capability-dispatch",
+      "retryClass": "bounded-no-external-side-effect",
+      "description": "验证节点：隔离 checkout/image 固定；只有选择 network.egress.scoped 才可带入闭合 egress policy overlay。"
     },
     "CODE_REVIEW": {
       "requiredCapabilities": ["repo.read"],
       "optionalCapabilities": [],
       "sideEffectClass": "read-only",
-      "description": "代码审核节点：只读仓库，产出代码审核 Artifact（不能被 self-review 替代）"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repositoryId", "physicalRootIdentity"],
+        "properties": {
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"},
+          "physicalRootIdentity": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"repositoryId": {"minLength": 1}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"jcsInputFields": ["repositoryId", "candidateSha", "rubricDigest", "reviewerVersion"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"predicateId": "codex-review-passed-v1", "requiredEvidence": ["receipt-binds-candidate-sha", "receipt-binds-rubric", "no-open-blocker-or-high", "review-artifact-committed"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "before-capability-dispatch",
+      "retryClass": "bounded-no-external-side-effect",
+      "description": "代码审核节点：只读仓库，独立审核回执必须绑定候选 SHA 与 rubric。"
     },
     "ATTEST_REVIEW": {
       "requiredCapabilities": ["repo.read", "check.publish"],
       "optionalCapabilities": [],
       "sideEffectClass": "external-write-limited",
-      "description": "Codex 独立审核认证节点：只读仓库 + 发布固定 check name"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["forge", "repositoryId"],
+        "properties": {
+          "forge": {"type": "string", "enum": ["github"]},
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"forge": {"const": "github"}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"jcsInputFields": ["repositoryId", "fixedCheckName", "expectedAppId", "reviewedHeadSha", "codexReceiptDigest", "rubricDigest"]},
+            "check.publish": {"jcsInputFields": ["repositoryId", "fixedCheckName", "expectedAppId", "reviewedHeadSha", "codexReceiptDigest", "rubricDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "repo.read": {"predicateId": "attestation-check-matches-v1", "requiredEvidence": ["remote-check-name", "source-app-id", "reviewed-head-sha", "codex-receipt-digest", "rubric-digest", "check-conclusion"]},
+            "check.publish": {"predicateId": "attestation-check-matches-v1", "requiredEvidence": ["remote-check-name", "source-app-id", "reviewed-head-sha", "codex-receipt-digest", "rubric-digest", "check-conclusion"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "认证审核节点：发布固定 check 后，必须以 Forge 的远端 check 事实而非调用返回值判定完成。"
     },
     "PUBLISH_PR": {
       "requiredCapabilities": ["git.push", "pr.create", "pr.update", "forge.observe.scoped"],
       "optionalCapabilities": [],
       "sideEffectClass": "external-write",
-      "description": "发布 PR 节点：push+创建/更新 PR+只读观察"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["forge", "repositoryId"],
+        "properties": {
+          "forge": {"type": "string", "enum": ["github"]},
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"repositoryId": {"minLength": 1}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "git.push": {"jcsInputFields": ["repositoryId", "remoteRef", "candidateSha"]},
+            "pr.create": {"jcsInputFields": ["repositoryId", "headSha", "targetBranch"]},
+            "pr.update": {"jcsInputFields": ["repositoryId", "prId", "expectedHeadSha", "desiredDraftReadyState", "metadataDigest"]},
+            "forge.observe.scoped": {"jcsInputFields": ["repositoryId", "prId", "expectedHeadSha", "evidenceQuerySetDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "git.push": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
+            "pr.create": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
+            "pr.update": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
+            "forge.observe.scoped": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "发布 PR 节点：push、create 与 update 均有独立 action 键；未知送达进入运行时 UNKNOWN_STATE/RECONCILING。"
     },
     "MERGE": {
       "requiredCapabilities": ["forge.observe.scoped", "repo.merge"],
       "optionalCapabilities": [],
       "sideEffectClass": "external-write",
-      "description": "合并节点：观察 Forge 状态后执行受保护合并"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["forge", "repositoryId"],
+        "properties": {
+          "forge": {"type": "string", "enum": ["github"]},
+          "repositoryId": {"$ref": "#/$defs/nonEmptyString"}
+        },
+        "allOf": [
+          {"properties": {"forge": {"const": "github"}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "forge.observe.scoped": {"jcsInputFields": ["prId", "expectedReviewedHeadSha", "expectedBaseSha", "mergeMethod"]},
+            "repo.merge": {"jcsInputFields": ["prId", "expectedReviewedHeadSha", "expectedBaseSha", "mergeMethod"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "forge.observe.scoped": {"predicateId": "protected-squash-merge-matches-v1", "requiredEvidence": ["strict-up-to-date-transaction", "unique-parent-equals-base", "tree-equals-reviewed-tree", "receipt-and-remote-sha-match"]},
+            "repo.merge": {"predicateId": "protected-squash-merge-matches-v1", "requiredEvidence": ["strict-up-to-date-transaction", "unique-parent-equals-base", "tree-equals-reviewed-tree", "receipt-and-remote-sha-match"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "合并节点：仅允许 squash；重试以前读取保护分支的远端合并事实。"
     },
     "BUILD_ARTIFACT": {
       "requiredCapabilities": ["build.exec.isolated"],
       "optionalCapabilities": ["registry.push", "registry.observe.scoped"],
       "sideEffectClass": "isolated-exec",
-      "description": "构建 Artifact 节点：隔离构建，推送时另需 registry 权限"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repoId", "builderImageDigest", "platform", "registrySelected"],
+        "properties": {
+          "repoId": {"$ref": "#/$defs/nonEmptyString"},
+          "builderImageDigest": {"$ref": "#/$defs/sha256Digest"},
+          "platform": {"$ref": "#/$defs/nonEmptyString"},
+          "registrySelected": {"type": "boolean"},
+          "registry": {"$ref": "#/$defs/registry"}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"registrySelected": {"const": true}}},
+            "then": {"required": ["registry"]}
+          },
+          {
+            "if": {"properties": {"registrySelected": {"const": false}}},
+            "then": {"not": {"required": ["registry"]}}
+          }
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "build.exec.isolated": {"jcsInputFields": ["repoId", "candidateSha", "buildPlanDigest", "builderImageDigest", "platform"]},
+            "registry.push": {"jcsInputFields": ["registryRepository", "imageDigest"]},
+            "registry.observe.scoped": {"jcsInputFields": ["registryRepository", "imageDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "build.exec.isolated": {"predicateId": "build-artifact-matches-v1", "requiredEvidence": ["oci-digest", "platform-match", "sbom-committed", "provenance-committed"]},
+            "registry.push": {"predicateId": "build-artifact-matches-v1", "requiredEvidence": ["oci-digest", "platform-match", "sbom-committed", "provenance-committed", "registry-manifest-readable-by-digest"]},
+            "registry.observe.scoped": {"predicateId": "build-artifact-matches-v1", "requiredEvidence": ["oci-digest", "platform-match", "sbom-committed", "provenance-committed", "registry-manifest-readable-by-digest"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "构建节点：选 registry capability 时强制 host/repository overlay；按最危险的可选远端写分支消费授权。"
     },
     "DEPLOY_STAGING": {
       "requiredCapabilities": ["ssh.exec.scoped", "remote.write.scoped"],
       "optionalCapabilities": ["db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"],
       "sideEffectClass": "remote-write",
-      "description": "测试环境部署节点：SSH+远端写，按计划附加 DB/Nginx 操作"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["environment", "serverPhysical", "databaseSelected", "trafficSelected"],
+        "properties": {
+          "environment": {"const": "STAGING"},
+          "serverPhysical": {"$ref": "#/$defs/serverPhysical"},
+          "databaseSelected": {"type": "boolean"},
+          "trafficSelected": {"type": "boolean"},
+          "databasePhysical": {"$ref": "#/$defs/databasePhysical"},
+          "trafficAdapter": {"$ref": "#/$defs/trafficAdapter"}
+        },
+        "allOf": [
+          {"if": {"properties": {"databaseSelected": {"const": true}}}, "then": {"required": ["databasePhysical"]}},
+          {"if": {"properties": {"databaseSelected": {"const": false}}}, "then": {"not": {"required": ["databasePhysical"]}}},
+          {"if": {"properties": {"trafficSelected": {"const": true}}}, "then": {"required": ["trafficAdapter"]}},
+          {"if": {"properties": {"trafficSelected": {"const": false}}}, "then": {"not": {"required": ["trafficAdapter"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "ssh.exec.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "db.backup": {"jcsInputFields": ["databaseProfileRevision", "releaseId", "backupPlanDigest"]},
+            "db.migrate": {"jcsInputFields": ["databaseProfileRevision", "migrationChecksum", "releaseId"]},
+            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "releaseId", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "ssh.exec.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "direct-target-fact"]},
+            "remote.write.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "direct-target-fact"]},
+            "db.backup": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "backup-target-fact"]},
+            "db.migrate": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "migration-target-fact"]},
+            "nginx.switch": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "upstream-target-fact"]},
+            "traffic.switch.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "traffic-target-fact"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "测试环境部署：每个远端步骤、DB、Nginx 与流量操作均有独立 key；未定义的远端 action 拒绝签发。"
     },
     "ACCEPT_STAGING": {
-      "requiredCapabilities": [
-        "http.check.scoped", "network.egress.scoped",
-        "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"
-      ],
+      "requiredCapabilities": ["http.check.scoped", "network.egress.scoped", "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"],
       "optionalCapabilities": ["db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"],
       "sideEffectClass": "remote-observe",
-      "description": "测试环境验收节点：观察+检查，按计划附加 DB 读/fixture"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["environment", "serverPhysical", "releaseIdentity", "endpointPolicyDigest", "databaseSelected"],
+        "properties": {
+          "environment": {"const": "STAGING"},
+          "serverPhysical": {"$ref": "#/$defs/serverPhysical"},
+          "releaseIdentity": {"$ref": "#/$defs/releaseIdentity"},
+          "endpointPolicyDigest": {"$ref": "#/$defs/sha256Digest"},
+          "databaseSelected": {"type": "boolean"},
+          "databasePhysical": {"$ref": "#/$defs/databasePhysical"}
+        },
+        "allOf": [
+          {"if": {"properties": {"databaseSelected": {"const": true}}}, "then": {"required": ["databasePhysical"]}},
+          {"if": {"properties": {"databaseSelected": {"const": false}}}, "then": {"not": {"required": ["databasePhysical"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "http.check.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "network.egress.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "remote.observe.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "container.inspect.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "log.read.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.read": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.check": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "acceptance.fixture.write": {"jcsInputFields": ["environment", "releaseId", "fixtureDigest"]},
+            "service.restart.scoped": {"jcsInputFields": ["environment", "releaseId", "restartPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "http.check.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"]},
+            "network.egress.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"]},
+            "remote.observe.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"]},
+            "container.inspect.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"]},
+            "log.read.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"]},
+            "db.read": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "database-evidence", "fixture-cleanup-proof"]},
+            "db.check": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "database-evidence", "fixture-cleanup-proof"]},
+            "acceptance.fixture.write": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "fixture-cleanup-proof", "evidence-committed"]},
+            "service.restart.scoped": {"predicateId": "acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "all-blocking-non-skipped", "restart-observed", "evidence-committed"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "测试环境验收：fixture/restart 是最危险分支，故采用 started transaction 与远端完成事实。"
     },
     "DEPLOY_PRODUCTION": {
       "requiredCapabilities": ["ssh.exec.scoped", "remote.write.scoped"],
       "optionalCapabilities": ["db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"],
       "sideEffectClass": "remote-write",
-      "description": "生产环境部署节点：同 DEPLOY_STAGING 但指向生产目标"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["environment", "serverPhysical", "databaseSelected", "trafficSelected"],
+        "properties": {
+          "environment": {"const": "PRODUCTION"},
+          "serverPhysical": {"$ref": "#/$defs/serverPhysical"},
+          "databaseSelected": {"type": "boolean"},
+          "trafficSelected": {"type": "boolean"},
+          "databasePhysical": {"$ref": "#/$defs/databasePhysical"},
+          "trafficAdapter": {"$ref": "#/$defs/trafficAdapter"}
+        },
+        "allOf": [
+          {"if": {"properties": {"databaseSelected": {"const": true}}}, "then": {"required": ["databasePhysical"]}},
+          {"if": {"properties": {"databaseSelected": {"const": false}}}, "then": {"not": {"required": ["databasePhysical"]}}},
+          {"if": {"properties": {"trafficSelected": {"const": true}}}, "then": {"required": ["trafficAdapter"]}},
+          {"if": {"properties": {"trafficSelected": {"const": false}}}, "then": {"not": {"required": ["trafficAdapter"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "ssh.exec.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "db.backup": {"jcsInputFields": ["databaseProfileRevision", "releaseId", "backupPlanDigest"]},
+            "db.migrate": {"jcsInputFields": ["databaseProfileRevision", "migrationChecksum", "releaseId"]},
+            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "releaseId", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "ssh.exec.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "direct-production-target-fact"]},
+            "remote.write.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "direct-production-target-fact"]},
+            "db.backup": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "backup-production-target-fact"]},
+            "db.migrate": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "migration-production-target-fact"]},
+            "nginx.switch": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "upstream-production-target-fact"]},
+            "traffic.switch.scoped": {"predicateId": "deploy-plan-observed-complete-v1", "requiredEvidence": ["planned-step-journal-completed-fsync", "traffic-production-target-fact"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "生产部署：环境 const=PRODUCTION，与 staging 的指纹、授权及完成事实不可复用。"
     },
     "ACCEPT_PRODUCTION": {
-      "requiredCapabilities": [
-        "http.check.scoped", "network.egress.scoped",
-        "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"
-      ],
+      "requiredCapabilities": ["http.check.scoped", "network.egress.scoped", "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped"],
       "optionalCapabilities": ["db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"],
       "sideEffectClass": "remote-observe",
-      "description": "生产环境验收节点：同 ACCEPT_STAGING 但指向生产目标"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["environment", "serverPhysical", "releaseIdentity", "endpointPolicyDigest", "databaseSelected"],
+        "properties": {
+          "environment": {"const": "PRODUCTION"},
+          "serverPhysical": {"$ref": "#/$defs/serverPhysical"},
+          "releaseIdentity": {"$ref": "#/$defs/releaseIdentity"},
+          "endpointPolicyDigest": {"$ref": "#/$defs/sha256Digest"},
+          "databaseSelected": {"type": "boolean"},
+          "databasePhysical": {"$ref": "#/$defs/databasePhysical"}
+        },
+        "allOf": [
+          {"if": {"properties": {"databaseSelected": {"const": true}}}, "then": {"required": ["databasePhysical"]}},
+          {"if": {"properties": {"databaseSelected": {"const": false}}}, "then": {"not": {"required": ["databasePhysical"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "http.check.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "network.egress.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "remote.observe.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "container.inspect.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "log.read.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.read": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.check": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "acceptance.fixture.write": {"jcsInputFields": ["environment", "releaseId", "fixtureDigest"]},
+            "service.restart.scoped": {"jcsInputFields": ["environment", "releaseId", "restartPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "http.check.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "all-blocking-non-skipped", "fixture-cleanup-proof"]},
+            "network.egress.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "all-blocking-non-skipped", "fixture-cleanup-proof"]},
+            "remote.observe.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "all-blocking-non-skipped", "fixture-cleanup-proof"]},
+            "container.inspect.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "all-blocking-non-skipped", "fixture-cleanup-proof"]},
+            "log.read.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "all-blocking-non-skipped", "fixture-cleanup-proof"]},
+            "db.read": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "database-evidence", "fixture-cleanup-proof"]},
+            "db.check": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "database-evidence", "fixture-cleanup-proof"]},
+            "acceptance.fixture.write": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "fixture-cleanup-proof"]},
+            "service.restart.scoped": {"predicateId": "production-acceptance-blocking-pass-v1", "requiredEvidence": ["target-identity-match", "active-release-digest-match", "git-sha-and-config-hash-match", "codex-evidence-receipt", "restart-observed"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "生产验收：完成事实还强制绑定 Codex evidence receipt、活动 release digest、Git SHA 与 config hash。"
     },
     "ROLLBACK": {
       "requiredCapabilities": ["rollback", "ssh.exec.scoped", "remote.write.scoped"],
       "optionalCapabilities": ["db.restore", "nginx.switch", "traffic.switch.scoped"],
       "sideEffectClass": "remote-write",
-      "description": "回滚节点：仅在预声明路径可附加 db.restore/nginx.switch/traffic.switch.scoped"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["environment", "serverPhysical", "databaseSelected", "trafficSelected"],
+        "properties": {
+          "environment": {"type": "string", "enum": ["STAGING", "PRODUCTION"]},
+          "serverPhysical": {"$ref": "#/$defs/serverPhysical"},
+          "databaseSelected": {"type": "boolean"},
+          "trafficSelected": {"type": "boolean"},
+          "databasePhysical": {"$ref": "#/$defs/databasePhysical"},
+          "trafficAdapter": {"$ref": "#/$defs/trafficAdapter"}
+        },
+        "allOf": [
+          {"if": {"properties": {"databaseSelected": {"const": true}}}, "then": {"required": ["databasePhysical"]}},
+          {"if": {"properties": {"databaseSelected": {"const": false}}}, "then": {"not": {"required": ["databasePhysical"]}}},
+          {"if": {"properties": {"trafficSelected": {"const": true}}}, "then": {"required": ["trafficAdapter"]}},
+          {"if": {"properties": {"trafficSelected": {"const": false}}}, "then": {"not": {"required": ["trafficAdapter"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "rollback": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "ssh.exec.scoped": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "db.restore": {"jcsInputFields": ["databaseProfileRevision", "goodReleaseDigest", "rollbackPlanHash"]},
+            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "goodReleaseDigest", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "goodReleaseDigest", "rollbackPlanHash"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "rollback": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]},
+            "ssh.exec.scoped": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]},
+            "remote.write.scoped": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]},
+            "db.restore": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]},
+            "nginx.switch": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]},
+            "traffic.switch.scoped": {"predicateId": "rollback-observed-accepted-v1", "requiredEvidence": ["old-release-digest-or-upstream-restored", "database-allowed-version", "blocking-rollback-acceptance-pass", "receipt-match"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "回滚节点：按 capability 单独绑定 DB/流量物理 overlay，恢复未知状态前必须观察目标事实。"
     },
     "RESTORE_DRILL": {
       "requiredCapabilities": ["db.restore", "restore.validation.instance", "db.check"],
       "optionalCapabilities": [],
       "sideEffectClass": "isolated-restore",
-      "description": "恢复演练节点：必须绑定 resource fingerprint 证明目标不是生产实例，禁止指向生产实例"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sourceDatabasePhysical", "validationInstanceIdentity", "validationEnvironment", "sourceAndValidationDistinct"],
+        "properties": {
+          "sourceDatabasePhysical": {"$ref": "#/$defs/databasePhysical"},
+          "validationInstanceIdentity": {"$ref": "#/$defs/nonEmptyString"},
+          "validationEnvironment": {"const": "NON_PRODUCTION"},
+          "sourceAndValidationDistinct": {"const": true}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"validationEnvironment": {"const": "NON_PRODUCTION"}}},
+            "then": {"required": ["validationInstanceIdentity", "sourceAndValidationDistinct"]}
+          }
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "db.restore": {"jcsInputFields": ["databaseProfileRevision", "backupIdOrSampleDigest", "validationInstanceIdentity", "drillPlanDigest"]},
+            "restore.validation.instance": {"jcsInputFields": ["databaseProfileRevision", "backupIdOrSampleDigest", "validationInstanceIdentity", "drillPlanDigest"]},
+            "db.check": {"jcsInputFields": ["databaseProfileRevision", "backupIdOrSampleDigest", "validationInstanceIdentity", "drillPlanDigest"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "db.restore": {"predicateId": "restore-drill-receipt-and-destroy-v1", "requiredEvidence": ["section-16-2-binding", "rto-rpo-evidence", "expiry-evidence", "forced-destroy-receipt"]},
+            "restore.validation.instance": {"predicateId": "restore-drill-receipt-and-destroy-v1", "requiredEvidence": ["section-16-2-binding", "rto-rpo-evidence", "expiry-evidence", "forced-destroy-receipt"]},
+            "db.check": {"predicateId": "restore-drill-receipt-and-destroy-v1", "requiredEvidence": ["section-16-2-binding", "rto-rpo-evidence", "expiry-evidence", "forced-destroy-receipt"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "external-fact-before-retry",
+      "description": "恢复演练：schema 固定 NON_PRODUCTION 并要求声明源与验证实例不同；实际身份比较仍由后续 Policy Engine 拒绝失败闭合。"
     },
     "RECONCILE_TARGET": {
       "requiredCapabilities": [],
-      "optionalCapabilities": [
-        "remote.observe.scoped", "container.inspect.scoped",
-        "log.read.scoped", "db.read", "db.check",
-        "registry.observe.scoped", "target.guard.clear"
-      ],
+      "optionalCapabilities": ["remote.observe.scoped", "container.inspect.scoped", "log.read.scoped", "db.read", "db.check", "registry.observe.scoped", "target.guard.clear"],
       "sideEffectClass": "remote-observe",
-      "description": "Reconcile 节点：按目标附加观察权限；target.guard.clear 只有证据齐全且专用用户授权后才附加"
+      "resourceFingerprintSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetKind", "guardFingerprint"],
+        "properties": {
+          "targetKind": {"type": "string", "enum": ["server", "database", "registry"]},
+          "server": {"$ref": "#/$defs/serverPhysical"},
+          "database": {"$ref": "#/$defs/databasePhysical"},
+          "registry": {"$ref": "#/$defs/registry"},
+          "guardFingerprint": {
+            "oneOf": [
+              {"$ref": "#/$defs/serverPhysical"},
+              {"$ref": "#/$defs/databasePhysical"},
+              {"$ref": "#/$defs/registry"}
+            ]
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {"targetKind": {"const": "server"}},
+            "required": ["targetKind", "server", "guardFingerprint"],
+            "not": {"anyOf": [{"required": ["database"]}, {"required": ["registry"]}]}
+          },
+          {
+            "properties": {"targetKind": {"const": "database"}},
+            "required": ["targetKind", "database", "guardFingerprint"],
+            "not": {"anyOf": [{"required": ["server"]}, {"required": ["registry"]}]}
+          },
+          {
+            "properties": {"targetKind": {"const": "registry"}},
+            "required": ["targetKind", "registry", "guardFingerprint"],
+            "not": {"anyOf": [{"required": ["server"]}, {"required": ["database"]}]}
+          }
+        ],
+        "allOf": [
+          {"properties": {"targetKind": {"enum": ["server", "database", "registry"]}}}
+        ]
+      },
+      "idempotencyKeyTemplate": {
+        "version": "factory-action-v1",
+        "hashAlgorithm": "sha256-jcs-nfc",
+        "actions": {
+          "byCapability": {
+            "remote.observe.scoped": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "container.inspect.scoped": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "log.read.scoped": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "db.read": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "db.check": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "registry.observe.scoped": {"jcsInputFields": ["resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"]},
+            "target.guard.clear": {"jcsInputFields": ["resourceFingerprintDigest", "originalReasonEvidenceDigest", "reconciliationPlanDigest", "userIdentity", "expectedGuardVersion"]}
+          }
+        }
+      },
+      "completionFact": {
+        "version": "v1",
+        "actions": {
+          "byCapability": {
+            "remote.observe.scoped": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "container.inspect.scoped": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "log.read.scoped": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "db.read": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "db.check": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "registry.observe.scoped": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"]},
+            "target.guard.clear": {"predicateId": "reconciliation-known-state-v1", "requiredEvidence": ["stable-resource-fingerprint-match", "intervention-required-to-open-cas", "clear-receipt-digest", "known-state-classification"]}
+          }
+        }
+      },
+      "authorizationConsumptionPoint": "with-action-started-transaction",
+      "retryClass": "one-shot-cas-reconcile-only",
+      "description": "目标核对：oneOf 只允许一个 server/database/registry 物理目标；guardFingerprint 必须在运行时等同稳定资源指纹，clear 只能一次性 CAS。"
     }
   }
 }

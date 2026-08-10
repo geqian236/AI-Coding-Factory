@@ -21,9 +21,11 @@
   独立进程读回、容器孤儿存活 inspect、pack roundtrip 校验等**实测事实**，非硬编码。
   receipt 聚合层强制 owner 白名单 + catalog 冻结值匹配 + qualification=FINAL + replay 去重
   + digest 绑定 + receiptId 唯一 + expected/actual 非空（6 负例 fixture fail-closed）。
-- **后移 Phase 1 部分**：完整隔离容器 **Deterministic Verifier**——receipt 的
-  `expected`/`actual`/`artifactDigests` 内容本身由 Verifier 在隔离容器中**实际执行测试**
-  后写入并交叉核验，调用方无法自报 `observed:true`。属 §9.2 容器化执行实现。
+- **总计划归属裁决**：Phase 1 只实现 receipt plumbing 与本阶段的确定性测试（字段绑定、
+  catalog/owner/digest/qualification 机械校验），不提前实现隔离执行器。完整隔离容器
+  **Deterministic Verifier**——由它实际执行测试并写入/交叉核验
+  `expected`/`actual`/`artifactDigests`、使调用方不能自报 `observed:true`——明确保留至
+  **Phase 4 Task 5**。
 - **审核出处**：第二/三轮 P0-6 深层点。
 
 ### B2. TestReceipt 单一真源 — ✅ 已在 Phase 0 消除（第四轮 REVISE item 2）
@@ -41,6 +43,7 @@
 - **不再属 Phase 1**：双源已消除、漂移由测试机械防护，从 backlog 移除。
 
 ### B3. 真实 ENOSPC 认证
+- **状态：未完成**。不得通过模拟磁盘满、合成 PASS 或结构性门禁把它标为已认证。
 - **现状（Phase 0）**：sqlite spike disk-full 子项诚实标 `BLOCKED_UNCERTIFIED`；
   bench.py 支持 `--probe-dir` 指向 VHD；`scripts/spikes/create_enospc_vhd.ps1` 提供
   admin 挂载 ≤16MiB VHD 的完整脚本。
@@ -66,23 +69,15 @@
   CAS 落败重建。这些是**有状态运行时**，Phase 0 不实现。
 
 ### B6. 授权合同 + 运行时状态机（整体 Phase 1）
-- **Phase 0 实际状态（诚实更正）**：`contracts/schemas/` 下**不存在** intent-authorization /
-  execution-authorization schema 文件。RunSpec 仅含一个普通字符串字段
-  `intentAuthorizationId`（`type: string`，非 `$ref`），用于关联 ID——不导入任何授权合同，
-  故无编译期悬空引用，但**也不构成"Phase 0 已冻结授权 schema"**。第三轮审核 item 4 指出
-  原主张（"Phase 0 冻结 IntentAuthorization/ExecutionAuthorization schema 字段"）无对应
-  schema，属夸大，此处删除该主张。
-- **Phase 1 目标（合同 + 运行时一并实现）**：
-  1. 按 Master Spec §11 L739 新建 `intent-authorization.v1.schema.json`（issued_at/expires_at/
-     revoked_at/revoke_reason/stage_capability_map_version/allowed_capability_set_digest/
-     autonomous_execution_budget_ms/修复·重规划·Attempt 上限）与
-     `execution-authorization.v1.schema.json`（绑定 intent_authorization_id/plan_revision_id/
-     semantic_plan_hash/plan_revision_digest/capability map version+digest/run·step·attempt/
-     owner executor/resource fingerprint/capability scope digest/幂等键/fencing token/
-     control epoch/accepted control command sequence/输入 SHA/max_uses/消费状态），
-     注册 codegen 并加合同测试。
-  2. 授权的**消费/撤销有状态机**（`max_uses` 递减、fencing token 递增、control epoch 校验、
-     consumed 状态 CAS），属 §11 运行时。
+- **本节点已完成的合同前置**：新增 `intent-authorization.v1.schema.json` 与
+  `execution-authorization.v1.schema.json`，以 camelCase 冻结 Intent 的阶段/预算/撤销快照和
+  Execution 的 plan/map digest、action policy snapshot、资源指纹、fencing/control/输入绑定及
+  消费投影；已注册 catalog，由现有生成器确定性生成 Python/TypeScript/Rust，并有 schema、
+  catalog、codegen 漂移和 fail-closed 合同测试。该工作不把 RunSpec 的关联字符串误称为早期
+  `$ref`，也不实现授权运行时。
+- **后续 Task 4/5**：授权签发、解析/重算 digest-backed 快照、撤销、`maxUses` 消费、fencing
+  token/control epoch 校验、CAS、动态 scope/lease/时间比较及真实执行消费仍是有状态运行时；
+  本节点的合同不是这些流程已完成的声明。
 
 ### B7. durable-event.v2 §10.1 全字段的**运行时填充**（第三轮 REVISE item 4 要求拆分）
 - **Phase 0 冻结（✅）**：schema 含 §10.1 全 32 字段（执行身份、双 span、脱敏证据、
@@ -95,10 +90,14 @@
   数据源接入，依赖 Phase 3 harness/runner。
 
 ### B8. node-capability-map 5 字段的**策略引擎消费**
-- **Phase 0 冻结**：node-capability-map schema 含 requiredCapabilities/sideEffectClass 等。
-- **Phase 1 目标**：resource fingerprint schema、幂等键模板、完成事实、授权消费点、
-  retry class 的**策略引擎运行时消费**（Policy Engine 按 nodeType 派生 capability 并校验），
-  属 §6.3 运行时。
+- **本节点已完成的合同前置**：17 种 nodeType 均冻结既有 `requiredCapabilities`/
+  `sideEffectClass` 与五个新增字段：本文件本地 `$defs` 可解析的闭合 resource fingerprint
+  schema、按 capability 独立的 `factory-action-v1` 幂等键输入、外部完成事实、授权消费点及
+  静态 retry envelope。staging/production 隔离、可选 overlay、未知字段、未知 retry class 和
+  key/fact 漂移均由合同测试 fail-closed。
+- **后续 Task 4/5**：Policy Engine 按 nodeType/action 派生 capability、验证资源指纹/完成事实、
+  记录 started transaction、处理 `UNKNOWN_STATE/RECONCILING` 并执行 CAS/重试包络，仍属于
+  运行时消费；本节点不提前实现该引擎，也不把静态 retry class 误作 §17 的动态错误类别。
 
 ---
 

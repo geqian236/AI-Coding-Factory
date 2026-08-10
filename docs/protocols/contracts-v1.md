@@ -1,6 +1,6 @@
 # AI Coding Factory — Contracts v1 Protocol Reference
 
-> **状态**：Phase 0 基线已冻结，全部 spike 认证完毕（HEAD: ef9a33f）。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
+> **状态**：Phase 0 基线已冻结；本次补入 Phase 1 授权合同前置（schema、catalog、策略映射与确定性测试），不实现运行时服务。SQLite 真实 ENOSPC 仍是 Phase 1 待认证实证项，故不得声称全部 spike 已认证完毕。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
 >
 > **版本**：v1（2026-08-05）
 
@@ -32,14 +32,14 @@ contracts/
     node-pause-policy.v1.json   — 每种 nodeType 的暂停安全点策略
     stage-capability-map.v1.json — 6 个 target_stage 的渐进式 capability 集合
   schemas/
-    *.schema.json               — 13 个 JSON Schema 定义（见第 3 节）
+    *.schema.json               — 15 个 JSON Schema 定义（见第 3 节）
   testing/
     required-test-catalog.v1.json — Phase 0 冻结的 47 个必须通过的测试 ID
 ```
 
 ---
 
-## 3. 13 个 JSON Schema
+## 3. 15 个 JSON Schema
 
 | 文件 | 用途 | 生成代码 |
 |------|------|---------|
@@ -54,14 +54,21 @@ contracts/
 | `durable-event.v2.schema.json` | 物化后的耐久事件（含 head 链） | 是 |
 | `ipc-envelope.v1.schema.json` | Named Pipe IPC 信封（含 nonce） | 是 |
 | `runner-protocol.v1.schema.json` | Runner 生命周期协议消息 | 是 |
-| `test-receipt.v1.schema.json` | 机器可读测试回执 | 是 |
+| `test-receipt.v1.schema.json` | 机器可读测试回执 | 否（runtime-only） |
 | `compatibility-manifest.v1.schema.json` | 兼容性 Manifest（`synchronous` 固定为 `FULL`） | 否（runtime-only） |
+| `intent-authorization.v1.schema.json` | Intent 授权的不可变预算、阶段、绑定与撤销快照 | 是 |
+| `execution-authorization.v1.schema.json` | 单 capability action 的派生执行授权、fencing 与消费投影 | 是 |
 
 ### Schema 通用规则
 
 - 所有顶层对象设置 `"additionalProperties": false`（fail-closed）。
 - 数值范围满足 I-JSON/JCS（无 NaN、无 Infinity、无超范围整数）。
 - `enum` 字段使用固定字符串值，不允许自由文本。
+- `IntentAuthorization` 的摘要化快照仍必须可由后续 Policy Engine 解析和重算，不能以“找不到内容的 digest”替代绑定。
+- `ExecutionAuthorization` 使用正确拼写 `stageCapabilityMapDigest`；历史 v1 的 `stageCapeabilityMapDigest` 不在本 schema 双拼写放行范围，后续版本必须经显式 adapter/migration 映射。
+- `ExecutionAuthorization.consumptionState` 只表示 `AVAILABLE`（`maxUses >= 1`）或 `CONSUMED`（`maxUses == 0`）；撤销和过期分别由 `revokedAt` 与 `expiresAt` 表达，不能混为消费状态。
+
+`TestReceipt` 在 catalog 中为 `category: "runtime-only"`、`codegen: false`：它由运行时 `TestReceipt` 表示和 schema 一致性测试消费，三语言生成树不生成第四份静态类型。`CompatibilityManifest` 同样保持 runtime-only。
 
 ---
 
@@ -106,9 +113,19 @@ DEPLOY_STAGING, ACCEPT_STAGING, DEPLOY_PRODUCTION,
 ACCEPT_PRODUCTION, ROLLBACK, RECONCILE_TARGET, RESTORE_DRILL
 ```
 
-每种 nodeType 必须声明：
-- `requiredCapabilities`: 执行所需能力列表
-- `sideEffectClass`: 副作用分类（`read-only` / `local-write` / `external-write` / `destructive`）
+每种 nodeType 必须声明并冻结下列单一真源字段：
+
+- `requiredCapabilities` / `optionalCapabilities`：闭集 capability 列表；运行时不得接收模型自由填写的 capability。
+- `sideEffectClass`：实际使用的类别为 `read-only`、`local-write`、`isolated-exec`、`external-write-limited`、`external-write`、`remote-write`、`remote-observe`、`isolated-restore`。
+- `resourceFingerprintSchema`：同一 node map 内本地 `$defs` 可解析的 JSON Schema 子对象；顶层及嵌套对象 fail-closed，稳定物理身份与可变 SHA/revision/release/digest 分离。
+- `idempotencyKeyTemplate`：版本化的 `factory-action-v1` / `sha256-jcs-nfc` `actions.byCapability` 闭集。每项为 `H=sha256(JCS/NFC(["factory-action-v1", …]))` 的派发前已知输入，绝不含 attempt、token、epoch、TTL 或时间。
+- `completionFact`：版本化 `actions.byCapability` 的外部可观察 `predicateId` 与 `requiredEvidence`，不是模型自报成功。
+- `authorizationConsumptionPoint`：仅 `before-capability-dispatch` 或 `with-action-started-transaction`；写能力一律采用后者，未知送达进入运行时 `UNKNOWN_STATE/RECONCILING`。
+- `retryClass`：静态重试包络仅为 `bounded-no-external-side-effect`、`local-fact-before-retry`、`external-fact-before-retry`、`one-shot-cas-reconcile-only`，与 Master Spec §17 的动态错误类别分离。
+
+可选 capability 被选择时必须触发对应物理 overlay；若某个写 action 无法定义独立 key 与完成事实，Policy Engine 必须拒绝签发（`unsupported`），不得退回通用自由文本。
+
+本节点的合同测试只证明 node map 的规范化内容摘要会随实质策略变化而变化；**既有 `compatibility-manifest.v1` 未在本节点改写或绑定该摘要**，以避免破坏已冻结历史 v1。Task 4 必须在启动/派生授权时显式绑定并重算 node policy compatibility digest，解析不到或不一致即拒绝。
 
 `RESTORE_DRILL` 固定需要 `db.restore`、`restore.validation.instance`、`db.check`，且 resource fingerprint 必须证明目标不是生产实例。
 
@@ -117,7 +134,7 @@ ACCEPT_PRODUCTION, ROLLBACK, RECONCILE_TARGET, RESTORE_DRILL
 6 个 target_stage 的 capabilities 数组满足渐进式超集关系：
 
 ```
-DESIGN_REVIEW ⊂ CODE_REVIEW ⊂ PUBLISH_PR ⊂ MERGE ⊂ ACCEPT_STAGING ⊂ ACCEPT_PRODUCTION
+DESIGN_APPROVED ⊂ CODEX_APPROVED ⊂ PR_READY ⊂ MERGED ⊂ STAGING_ACCEPTED ⊂ PRODUCTION_ACCEPTED
 ```
 
 每个数组已排序且无重复。
@@ -197,12 +214,12 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 
 ---
 
-## 11. 门禁检查（Phase 0 总门禁）
+## 11. 门禁检查
 
-提交前必须通过 `scripts/check.ps1` 的 9 项检查：
+提交前必须通过 `scripts/check.ps1` 的 15 项检查：
 
 1. Codegen drift 检测
-2. 13 个 JSON Schema 有效性
+2. 15 个 JSON Schema 有效性
 3. Golden vectors（plan_hash + event_hash）
 4. 中文注释覆盖
 5. 无裸 print/console.log
@@ -210,7 +227,15 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 7. 无可控 C 盘路径
 8. Catalog 精确 47 个 ID
 9. docs/ 无占位符
+10. Ruff lint
+11. mypy strict（`apps/agent/src`）
+12. TypeScript `tsc --noEmit`
+13. TypeScript Vitest
+14. Rust contracts test
+15. bootstrap-dev `-VerifyOnly`
+
+真实 ENOSPC 认证不因上述结构性门禁通过而变为 PASS：在具备管理员卷管理权限的 Windows CI runner 上完成真实 VHD/ENOSPC 实验之前，该 Phase 1 实证项保持未完成和 `BLOCKED_UNCERTIFIED`。
 
 ---
 
-*本文档由 Task 8 生成，属于 Phase 0 基线（收口于 2026-08-05，HEAD: ef9a33f）。如需修改合同，请通过标准 PR 流程并更新相关 golden vector。*
+*本文档保留 Phase 0 冻结合同，并记录本节点新增的 Phase 1 授权合同前置。授权签发、撤销、消费、动态 scope/lease/时间比较及策略引擎执行仍属于后续 Task 4/5；如需修改合同，请通过标准评审流程并更新相关测试与兼容性绑定。*

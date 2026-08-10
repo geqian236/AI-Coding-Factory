@@ -35,6 +35,22 @@
       "description": "计划修订版本（DAG 节点+barrier+stage 映射）"
     },
     {
+      "name": "IntentAuthorization",
+      "schemaPath": "contracts/schemas/intent-authorization.v1.schema.json",
+      "schemaId": "intent-authorization.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "用户任务授权包络（预算、风险、资源与 capability 上限）"
+    },
+    {
+      "name": "ExecutionAuthorization",
+      "schemaPath": "contracts/schemas/execution-authorization.v1.schema.json",
+      "schemaId": "execution-authorization.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "绑定 PlanRevision、资源、lease/fencing 与消费状态的步骤授权"
+    },
+    {
       "name": "ControlCommand",
       "schemaPath": "contracts/schemas/control-command.v1.schema.json",
       "schemaId": "control-command.v1",
