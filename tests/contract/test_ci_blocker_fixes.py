@@ -76,6 +76,10 @@ RUNNER_IDENTITY_WRAPPER_PS1 = REPO_ROOT / "scripts" / "spikes" / "test-runner-id
 RUNNER_CERTIFIED_JOB = "runner-identity-certified"
 RUNNER_CERTIFIED_LABELS = ("self-hosted", "Windows", "X64", "acf-wsl2-linux", "ephemeral")
 RUNNER_APPROVED_ROOT_ENV = "RUNNER_APPROVED_ROOT"
+FACTORY_TEST_DATA_ROOT_ENV = "FACTORY_TEST_DATA_ROOT"
+RUNNER_PS51_ROOT_CAUSE_COMMENT = (
+    "中文根因：GitHub 将此 run 写入 UTF-8 无 BOM 临时脚本，Windows PowerShell 5.1 可能按本地代码页解码。"
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,6 +421,89 @@ def _runner_identity_certified_steps() -> list[dict[str, Any]]:
     return jobs[RUNNER_CERTIFIED_JOB]
 
 
+def _runner_identity_unsupported_step_syntax(workflow_text: str) -> list[str]:
+    """拒绝现有缩进式 workflow 解析器无法无歧义覆盖的 step YAML 构造。
+
+    locked venv 没有 PyYAML，现有 `_load_jobs` 只承诺本仓固定的 block-style steps。若接受
+    flow mapping、alias、anchor 或 merge，解析器可能静默漏掉真实 run；安全合同必须在解析前
+    fail-closed，而不是自行扩展一套不完整的 YAML 解释器。
+    """
+    job_lines = _load_job_blocks(workflow_text).get(RUNNER_CERTIFIED_JOB)
+    if job_lines is None:
+        return ["runner-identity-certified job is missing"]
+
+    violations: list[str] = []
+    in_steps = False
+    for line_number, line in enumerate(job_lines, start=1):
+        if re.match(r"^    steps:\s*$", line):
+            in_steps = True
+            continue
+        if not in_steps:
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 4:
+            break
+        if indent == 6:
+            if not re.match(r"^      - (?:name|uses):\s+.+$", line):
+                violations.append(f"unsupported step declaration syntax at runner job line {line_number}")
+            continue
+        if indent == 8:
+            if not re.match(r"^        [A-Za-z][A-Za-z0-9_.-]*:\s*.*$", line):
+                violations.append(f"unsupported step field syntax at runner job line {line_number}")
+            elif re.search(r":\s*(?:[&*]|\{|\[)", line):
+                violations.append(f"unsupported flow/alias step field at runner job line {line_number}")
+    return violations
+
+
+def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[str]:
+    """结构化检查认证 workflow 的所有可执行 run 块均受 PS5.1 ASCII 合同约束。
+
+    不能先按 shell 过滤：若有人删除或改成 pwsh，就会把一个实际可执行的 run 块偷偷移出
+    编码门禁。这里先枚举全部 run，再锁定其 shell、ASCII 正文、Unicode 数据根的 YAML env
+    传递和紧邻的中文根因说明。
+    """
+    syntax_violations = _runner_identity_unsupported_step_syntax(workflow_text)
+    if syntax_violations:
+        return syntax_violations
+
+    steps = _load_jobs(
+        workflow_text, required_jobs=(RUNNER_CERTIFIED_JOB,)
+    )[RUNNER_CERTIFIED_JOB]
+    run_steps = [step for step in steps if "run" in step]
+    violations: list[str] = []
+    if len(run_steps) != 6:
+        violations.append(f"expected 6 executable run steps, found {len(run_steps)}")
+    for index, step in enumerate(run_steps, start=1):
+        name = str(step.get("name", f"run-{index}"))
+        if str(step.get("shell", "")).strip().lower() != "powershell":
+            violations.append(f"{name}: shell is not explicit powershell")
+        run = step.get("run")
+        if not isinstance(run, str) or not run:
+            violations.append(f"{name}: missing run text")
+        elif not run.isascii():
+            violations.append(f"{name}: run text contains non-ASCII characters")
+
+    env = _job_env(RUNNER_CERTIFIED_JOB, workflow_text, workflow_path=RUNNER_CERTIFIED_YML)
+    if env.get(FACTORY_TEST_DATA_ROOT_ENV) != r"D:\codex项目\AI-Coding-Factory-Data\dev":
+        violations.append("FACTORY_TEST_DATA_ROOT is not bound to the approved Unicode YAML value")
+    execute = _find_step(
+        run_steps, lambda step: str(step.get("name", "")) == RUNNER_IDENTITY_EXECUTE_STEP_NAME
+    )
+    if execute is None or (
+        "$dataRoot = [string]$env:FACTORY_TEST_DATA_ROOT" not in str(execute.get("run", ""))
+    ):
+        violations.append("execute step does not read FACTORY_TEST_DATA_ROOT through its ASCII env name")
+    adjacent_comment = re.compile(
+        rf"(?m)^        # {re.escape(RUNNER_PS51_ROOT_CAUSE_COMMENT)}\s*$\n"
+        r"^        shell:\s*powershell\s*$\n^        run:\s*\|\s*$"
+    )
+    if len(adjacent_comment.findall(workflow_text)) != len(run_steps):
+        violations.append("each powershell run lacks its adjacent Chinese PS5.1 root-cause comment")
+    return violations
+
+
 def _required_named_step(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
     step = _find_step(steps, lambda s: str(s.get("name", "")).strip() == name)
     assert step is not None, f"缺少 CI 结构步骤 {name!r}"
@@ -511,6 +598,68 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     )
     assert meta["permissions"].get("contents") == "read", "认证 job 必须最小权限 contents: read"
     runner_workflow = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
+    ps51_contract_violations = _runner_identity_ps51_run_contract_violations(runner_workflow)
+    assert not ps51_contract_violations, (
+        "认证 workflow 的全部可执行 run 必须显式 shell: powershell、ASCII-only，并以 YAML env "
+        f"传递 Unicode 数据根；实际违规={ps51_contract_violations}"
+    )
+    certified_run_steps = [step for step in _runner_identity_certified_steps() if "run" in step]
+    powershell_runs = [
+        (str(step.get("name", f"run-{index}")), str(step["run"]))
+        for index, step in enumerate(certified_run_steps, start=1)
+    ]
+    assert len(powershell_runs) == 6
+
+    # 变异 1：向可执行 run 注入任意 CJK 字节，结构化 ASCII 合同必须翻转。
+    cjk_run_mutant = runner_workflow.replace(
+        "$pythonExit = $LASTEXITCODE",
+        "$pythonExit = $LASTEXITCODE # CJK regression: 中文",
+        1,
+    )
+    assert cjk_run_mutant != runner_workflow
+    cjk_violations = _runner_identity_ps51_run_contract_violations(cjk_run_mutant)
+    assert any("run text contains non-ASCII characters" in item for item in cjk_violations), (
+        "inserting CJK into a PowerShell run must fail the ASCII contract"
+    )
+
+    # 变异 2：有效 YAML flow-style step 不能被缩进解析器静默忽略后绕过 ASCII 审计。
+    flow_style_mutant = (
+        runner_workflow
+        + '\n      - { name: extra-flow-run, shell: powershell, run: "Write-Host 中文" }\n'
+    )
+    flow_style_violations = _runner_identity_ps51_run_contract_violations(flow_style_mutant)
+    assert any("unsupported step declaration syntax" in item for item in flow_style_violations), (
+        "flow-style PowerShell run must fail closed instead of bypassing structured enumeration"
+    )
+
+    # 变异 3：execute 不得在 PS5.1 脚本内恢复 CJK 数据根字面量。
+    hardcoded_data_root_mutant = runner_workflow.replace(
+        "$dataRoot = [string]$env:FACTORY_TEST_DATA_ROOT",
+        r'$dataRoot = "D:\codex项目\AI-Coding-Factory-Data\dev"',
+        1,
+    )
+    assert hardcoded_data_root_mutant != runner_workflow
+    hardcoded_data_root_violations = _runner_identity_ps51_run_contract_violations(hardcoded_data_root_mutant)
+    assert (
+        any("run text contains non-ASCII characters" in item for item in hardcoded_data_root_violations)
+        and "execute step does not read FACTORY_TEST_DATA_ROOT through its ASCII env name"
+        in hardcoded_data_root_violations
+    ), (
+        "restoring a hardcoded CJK runtime data root must fail the ASCII contract"
+    )
+
+    # 变异 4：缺少 YAML Unicode 值时，ASCII 环境变量名合同必须 fail-closed。
+    missing_data_root_env_mutant = runner_workflow.replace(
+        "      FACTORY_TEST_DATA_ROOT: D:\\codex项目\\AI-Coding-Factory-Data\\dev\n", "", 1
+    )
+    assert missing_data_root_env_mutant != runner_workflow
+    missing_data_root_env_violations = _runner_identity_ps51_run_contract_violations(missing_data_root_env_mutant)
+    assert (
+        "FACTORY_TEST_DATA_ROOT is not bound to the approved Unicode YAML value"
+        in missing_data_root_env_violations
+    ), (
+        "removing FACTORY_TEST_DATA_ROOT must fail the ASCII env-name contract"
+    )
     assert re.search(r"(?m)^name:\s*runner-identity-certified\s*$", runner_workflow), (
         "独立 workflow 名必须是唯一的 runner-identity-certified"
     )
@@ -608,8 +757,23 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
                 "CARGO_HOME": str(cargo_home),
                 "RUSTUP_HOME": str(rustup_home),
             })
+
+            # 每个 raw run 都按 GitHub 方式物化为 UTF-8 无 BOM 实体脚本并交给 PS5.1 读取。
+            # 首行成功退出避免 Docker/receipt 副作用，但引擎仍必须先解析完整物理脚本文件。
+            for index, (name, run_text) in enumerate(powershell_runs, start=1):
+                parsed = _run_d_root_guard_as_utf8_no_bom(
+                    "exit 0\n" + run_text,
+                    script_path=encoding_tmp / f"ps51-parse-{index}.ps1",
+                    cwd=encoding_tmp,
+                    env=encoding_env,
+                )
+                assert parsed.returncode == 0, (
+                    f"真实 PS 5.1 必须解析 UTF-8 无 BOM 的 {name!r} run 实体脚本；"
+                    f"stdout={parsed.stdout!r} stderr={parsed.stderr!r}"
+                )
+
             dynamic = _run_d_root_guard_as_utf8_no_bom(
-                d_root_code,
+                str(d_root_guard["run"]),
                 script_path=encoding_tmp / "d-root-good.ps1",
                 cwd=encoding_tmp,
                 env=encoding_env,
@@ -648,6 +812,17 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
                 env=missing_env,
             )
             assert missing.returncode != 0, "缺少 RUNNER_APPROVED_ROOT 时 D 根 guard 必须 fail-closed"
+
+            toolchain_runtime = _run_d_root_guard_as_utf8_no_bom(
+                str(toolchain_check["run"]),
+                script_path=encoding_tmp / "toolchain-runtime.ps1",
+                cwd=encoding_tmp,
+                env=encoding_env,
+            )
+            assert toolchain_runtime.returncode == 0, (
+                "真实 PS 5.1 UTF-8 无 BOM 受控 Python/工具链入口必须可运行；"
+                f"stdout={toolchain_runtime.stdout!r} stderr={toolchain_runtime.stderr!r}"
+            )
         finally:
             _remove_tree_strict(encoding_tmp)
 
@@ -674,6 +849,9 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     )
     for required in d_root_requirements:
         assert required in d_root_code, f"认证机 D 根首步缺少可执行断言：{required!r}"
+    assert "errorType=$($_.Exception.GetType().Name)" in d_root_code, (
+        "D 根路径拒绝必须保留稳定 ASCII 的异常类型，不能只输出无上下文的泛化失败文本"
+    )
     junction_mutant = d_root_code.replace("ReparsePoint", "NoJunctionFlag", 1)
     assert all(required in d_root_code for required in d_root_requirements)
     assert not all(required in junction_mutant for required in d_root_requirements), (
@@ -791,8 +969,15 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     ):
         assert required in execute_code, f"认证执行步骤缺少真实 receipt/probe 绑定动作：{required!r}"
     preflight_code = _strip_ps_comments(str(preflight.get("run", "")))
+    image_prep_code = _strip_ps_comments(str(image_prep.get("run", "")))
     assert "_runner-identity-platform.ps1" in preflight_code and "Test-RunnerIdentityPlatform" in preflight_code, (
         "CI 前置必须 dot-source 共享平台事实 helper，不能与 wrapper 复制 Docker/WSL 判定"
+    )
+    assert "detail=$($platform.detail)" in preflight_code and "detail=$($platform.detail)" in image_prep_code, (
+        "平台拒绝必须保留 helper 提供的稳定 ASCII detail，不能只记录无上下文的泛化失败文本"
+    )
+    assert "detail=$($v.detail)" in execute_code, (
+        "receipt/probe 拒绝必须保留 validator detail，不能只记录无上下文的泛化失败文本"
     )
 
 
@@ -3192,8 +3377,8 @@ def test_preheat_ast_immune_to_unused_string_mutation() -> None:
     assert _analyze_runner_identity_execute_run(interleaved_execute)["executeValid"] is False
 
     early_exit_execute = execute_run.replace(
-        'Write-Error "[runner_identity] wrapper exit=$wrapperExit，拒绝认证"',
-        'exit 0\n  Write-Error "[runner_identity] wrapper exit=$wrapperExit，拒绝认证"',
+        "if ($null -eq $wrapperExit -or $wrapperExit -ne 0) {",
+        "if ($null -eq $wrapperExit -or $wrapperExit -ne 0) {\n            exit 0",
         1,
     )
     assert early_exit_execute != execute_run
