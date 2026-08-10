@@ -56,6 +56,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+from yaml.resolver import BaseResolver
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -118,7 +122,8 @@ def _normalize_ws(text: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 缩进感知的 GitHub Actions workflow 解析器（解析可执行 YAML 结构，非注释）。
-# 无需第三方 YAML 库（locked venv 无 PyYAML）；只解析本仓 ci.yml 用到的构造：
+# 仅供固定形态的 ci.yml 合同使用；runner_identity 认证 workflow 在下方专用合同中必须使用
+# PyYAML 的拒重 loader，不能复用此简化解析器。这里仅解析本仓 ci.yml 用到的构造：
 #   jobs:(col0) → <job>:(col2) → steps:(col4) → '- key:'(col6) → 'key:'(col8)
 #   → 'with:' 子键(col10)；block scalar 'run: |' 捕获缩进 > 8 的正文。
 # 解析器自带 sanity 断言（见 _load_jobs），解析器 bug 不会静默放行。
@@ -408,123 +413,141 @@ def _windows_probes_steps() -> list[dict[str, Any]]:
     return _load_jobs(CI_YML.read_text(encoding="utf-8"))["windows-probes"]
 
 
+_YAML_BOOL_TAG = "tag:yaml.org,2002:bool"
+_YAML_12_BOOL = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
+
+
+class _DuplicateKeyRejectingSafeLoader(yaml.SafeLoader):
+    """认证 workflow 的真实 YAML loader：所有映射在对象构造前拒绝重复键。"""
+
+    # PyYAML 默认沿用 YAML 1.1，把 GitHub Actions 的裸 ``on`` 误构造成 bool；复制并收窄
+    # resolver 后，``on`` 与 ``"on"`` 会归一成相同字符串键，才能真正拒绝触发器重复声明。
+    yaml_implicit_resolvers = {
+        first: [entry for entry in entries if entry[0] != _YAML_BOOL_TAG]
+        for first, entries in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+_DuplicateKeyRejectingSafeLoader.add_implicit_resolver(
+    _YAML_BOOL_TAG,
+    _YAML_12_BOOL,
+    list("tTfF"),
+)
+
+
+def _construct_mapping_without_duplicate_keys(
+    loader: _DuplicateKeyRejectingSafeLoader,
+    node: MappingNode,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    """构造一个 YAML 映射，并在 merge 展平后拒绝语义相同的重复键。
+
+    quoted、explicit、flow-style 写法会先由 PyYAML 归一为真实 Python 对象；因此不能再通过
+    修改源文本的书写形式绕开重复键检查。``flatten_mapping`` 也使 merge/alias 的实际结果进入
+    同一个去重门，而不是由自制缩进解析器静默漏过。
+    """
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            hash(key)
+        except TypeError as error:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found unhashable YAML mapping key {key!r}",
+                key_node.start_mark,
+            ) from error
+        if key in mapping:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate YAML mapping key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_DuplicateKeyRejectingSafeLoader.add_constructor(
+    BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_without_duplicate_keys,
+)
+
+
+def _runner_identity_yaml_job(workflow_text: str) -> tuple[dict[str, Any] | None, list[str]]:
+    """用拒重的真实 YAML 对象图定位唯一认证 job，并先完成必须的容器类型门。"""
+    try:
+        # 仅使用 SafeLoader 子类；为实现全映射拒重，不能退回会静默覆盖键的 safe_load 便捷函数。
+        document = yaml.load(workflow_text, Loader=_DuplicateKeyRejectingSafeLoader)  # noqa: S506
+    except yaml.YAMLError as error:
+        return None, [f"runner workflow YAML rejected: {error}"]
+    if not isinstance(document, dict):
+        return None, ["runner workflow document must be a mapping"]
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return None, ["runner workflow jobs must be a mapping"]
+    job = jobs.get(RUNNER_CERTIFIED_JOB)
+    if not isinstance(job, dict):
+        return None, ["runner-identity-certified job must be a mapping"]
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return None, ["runner-identity-certified steps must be a sequence"]
+    invalid_steps = [index for index, step in enumerate(steps, start=1) if not isinstance(step, dict)]
+    if invalid_steps:
+        return None, [f"runner-identity-certified has non-mapping steps at indexes {invalid_steps}"]
+    return job, []
+
+
+def _runner_identity_steps_from_job(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """从已通过真实 YAML 类型门的认证 job 返回保序步骤，并只补测试用顺序号。"""
+    steps = job.get("steps")
+    assert isinstance(steps, list), "runner-identity-certified steps must be a sequence"
+    parsed_steps: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        assert isinstance(step, dict), f"runner-identity-certified step {index + 1} must be a mapping"
+        parsed_steps.append({**step, "_order": index})
+    return parsed_steps
+
+
+def _runner_identity_certified_job(workflow_text: str | None = None) -> dict[str, Any]:
+    """读取唯一受信认证 job；缺失、歧义或类型异常均 fail-closed。"""
+    if workflow_text is None:
+        assert RUNNER_CERTIFIED_YML.exists(), "缺少独立 runner_identity 认证 workflow"
+        workflow_text = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
+    job, violations = _runner_identity_yaml_job(workflow_text)
+    assert not violations and job is not None, (
+        "独立认证 workflow 必须提供唯一、可枚举的 runner-identity-certified job；"
+        f"实际违规={violations}"
+    )
+    return job
+
+
 def _runner_identity_certified_steps() -> list[dict[str, Any]]:
     """受信 self-hosted job 是 runner_identity 唯一可认证入口，缺失即 fail-closed。"""
-    assert RUNNER_CERTIFIED_YML.exists(), "缺少独立 runner_identity 认证 workflow"
-    jobs = _load_jobs(
-        RUNNER_CERTIFIED_YML.read_text(encoding="utf-8"),
-        required_jobs=(RUNNER_CERTIFIED_JOB,),
-    )
-    assert RUNNER_CERTIFIED_JOB in jobs, (
-        "独立认证 workflow 必须提供 runner-identity-certified；hosted Windows Docker 不能认证 WSL2 Linux 容器语义"
-    )
-    return jobs[RUNNER_CERTIFIED_JOB]
-
-
-def _runner_identity_unsupported_step_syntax(workflow_text: str) -> list[str]:
-    """拒绝认证 job 受控 YAML 子集外的 job/step 构造。
-
-    locked venv 没有 PyYAML，现有 `_load_jobs` 只承诺本仓固定的 bare-key job mapping 和
-    block-style steps。若接受 quoted/explicit/complex/duplicate job key 或 step 的 flow mapping、
-    alias、anchor、merge，解析器可能静默漏掉真实 run；安全合同必须在解析前 fail-closed，
-    而不是自行扩展一套不完整的 YAML 解释器。
-    """
-    job_lines = _load_job_blocks(workflow_text).get(RUNNER_CERTIFIED_JOB)
-    if job_lines is None:
-        return ["runner-identity-certified job is missing"]
-
-    allowed_job_keys = {
-        "name",
-        "if",
-        "runs-on",
-        "timeout-minutes",
-        "permissions",
-        "env",
-        "steps",
-    }
-    job_key_lines: dict[str, list[int]] = {}
-    violations: list[str] = []
-    for line_number, line in enumerate(job_lines, start=1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent != 4:
-            continue
-        declaration = re.fullmatch(r"    ([A-Za-z][A-Za-z0-9-]*):\s*(.*)", line)
-        if declaration is None:
-            violations.append(f"unsupported runner job-level declaration at runner job line {line_number}")
-            continue
-        key, value = declaration.groups()
-        if key not in allowed_job_keys:
-            violations.append(
-                f"unsupported runner job-level declaration key {key!r} at runner job line {line_number}"
-            )
-            continue
-        job_key_lines.setdefault(key, []).append(line_number)
-        if key in {"permissions", "env", "steps"} and value:
-            violations.append(
-                f"runner job {key} declaration is not the supported unambiguous block mapping "
-                f"at runner job line {line_number}"
-            )
-    if violations:
-        return violations
-
-    steps_lines = job_key_lines.get("steps", [])
-    if len(steps_lines) != 1:
-        return [f"runner job must declare exactly one steps key, found {len(steps_lines)}"]
-    duplicate_keys = [key for key, lines in job_key_lines.items() if len(lines) != 1]
-    if duplicate_keys:
-        return [
-            f"duplicate runner job-level key {key!r} makes the job mapping ambiguous"
-            for key in duplicate_keys
-        ]
-
-    steps_line_number = steps_lines[0]
-    in_steps = False
-    for line_number, line in enumerate(job_lines, start=1):
-        if line_number == steps_line_number:
-            in_steps = True
-            continue
-        if not in_steps:
-            continue
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= 4:
-            break
-        if indent == 6:
-            if not re.match(r"^      - (?:name|uses):\s+.+$", line):
-                violations.append(f"unsupported step declaration syntax at runner job line {line_number}")
-            continue
-        if indent == 8:
-            if not re.match(r"^        [A-Za-z][A-Za-z0-9_.-]*:\s*.*$", line):
-                violations.append(f"unsupported step field syntax at runner job line {line_number}")
-            elif re.search(r":\s*(?:[&*]|\{|\[)", line):
-                violations.append(f"unsupported flow/alias step field at runner job line {line_number}")
-    return violations
+    return _runner_identity_steps_from_job(_runner_identity_certified_job())
 
 
 def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[str]:
-    """结构化检查认证 workflow 的所有可执行 run 块均受 PS5.1 ASCII 合同约束。
+    """检查真实 YAML 对象图中所有可执行 run 块均受 PS5.1 ASCII 合同约束。
 
-    不能先按 shell 过滤：若有人删除或改成 pwsh，就会把一个实际可执行的 run 块偷偷移出
-    编码门禁。这里先枚举全部 run，再锁定其 shell、ASCII 正文、Unicode 数据根的 YAML env
-    传递和紧邻的中文根因说明。
+    先由 PyYAML 拒绝全图重复映射，再从唯一认证 job 的 steps 序列枚举**所有**含 run 的 step，
+    绝不先按 shell 过滤。这样 flow、anchor、alias、merge 要么被 YAML/类型门拒绝，要么其
+    实际展开后的 run 一并接受同一 ASCII、安全环境变量与 shell 合同。
     """
-    syntax_violations = _runner_identity_unsupported_step_syntax(workflow_text)
-    if syntax_violations:
-        return syntax_violations
-
-    steps = _load_jobs(
-        workflow_text, required_jobs=(RUNNER_CERTIFIED_JOB,)
-    )[RUNNER_CERTIFIED_JOB]
+    job, yaml_violations = _runner_identity_yaml_job(workflow_text)
+    if yaml_violations:
+        return yaml_violations
+    assert job is not None
+    steps = _runner_identity_steps_from_job(job)
     run_steps = [step for step in steps if "run" in step]
     violations: list[str] = []
     if len(run_steps) != 6:
         violations.append(f"expected 6 executable run steps, found {len(run_steps)}")
     for index, step in enumerate(run_steps, start=1):
         name = str(step.get("name", f"run-{index}"))
-        if str(step.get("shell", "")).strip().lower() != "powershell":
+        if step.get("shell") != "powershell":
             violations.append(f"{name}: shell is not explicit powershell")
         run = step.get("run")
         if not isinstance(run, str) or not run:
@@ -532,8 +555,8 @@ def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[st
         elif not run.isascii():
             violations.append(f"{name}: run text contains non-ASCII characters")
 
-    env = _job_env(RUNNER_CERTIFIED_JOB, workflow_text, workflow_path=RUNNER_CERTIFIED_YML)
-    if env.get(FACTORY_TEST_DATA_ROOT_ENV) != r"D:\codex项目\AI-Coding-Factory-Data\dev":
+    env = job.get("env")
+    if not isinstance(env, dict) or env.get(FACTORY_TEST_DATA_ROOT_ENV) != r"D:\codex项目\AI-Coding-Factory-Data\dev":
         violations.append("FACTORY_TEST_DATA_ROOT is not bound to the approved Unicode YAML value")
     execute = _find_step(
         run_steps, lambda step: str(step.get("name", "")) == RUNNER_IDENTITY_EXECUTE_STEP_NAME
@@ -542,11 +565,12 @@ def _runner_identity_ps51_run_contract_violations(workflow_text: str) -> list[st
         "$dataRoot = [string]$env:FACTORY_TEST_DATA_ROOT" not in str(execute.get("run", ""))
     ):
         violations.append("execute step does not read FACTORY_TEST_DATA_ROOT through its ASCII env name")
-    adjacent_comment = re.compile(
-        rf"(?m)^        # {re.escape(RUNNER_PS51_ROOT_CAUSE_COMMENT)}\s*$\n"
-        r"^        shell:\s*powershell\s*$\n^        run:\s*\|\s*$"
+    adjacent_comment = (
+        f"        # {RUNNER_PS51_ROOT_CAUSE_COMMENT}\n"
+        "        shell: powershell\n"
+        "        run: |\n"
     )
-    if len(adjacent_comment.findall(workflow_text)) != len(run_steps):
+    if workflow_text.count(adjacent_comment) != len(run_steps):
         violations.append("each powershell run lacks its adjacent Chinese PS5.1 root-cause comment")
     return violations
 
@@ -639,12 +663,67 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     assert RUNNER_CERTIFIED_JOB not in main_jobs, (
         "主 ci.yml 不得声明 runner_identity 认证 job；否则 PR 会出现 skipped 的同名 check"
     )
-    meta = _job_metadata(RUNNER_CERTIFIED_JOB, workflow_path=RUNNER_CERTIFIED_YML)
-    assert _parse_inline_labels(str(meta.get("runs-on", ""))) == RUNNER_CERTIFIED_LABELS, (
+    runner_workflow = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
+    meta, runner_yaml_violations = _runner_identity_yaml_job(runner_workflow)
+    assert not runner_yaml_violations and meta is not None, (
+        "认证 workflow 必须由拒绝重复键的真实 YAML loader 无歧义解析；"
+        f"实际违规={runner_yaml_violations}"
+    )
+    runs_on = meta.get("runs-on")
+    assert isinstance(runs_on, list) and tuple(runs_on) == RUNNER_CERTIFIED_LABELS, (
         "runner_identity 必须只投递到受信 Windows+WSL2 Linux-container 专用标签"
     )
+    assert isinstance(meta.get("permissions"), dict), "认证 job permissions 必须是 YAML 映射"
     assert meta["permissions"].get("contents") == "read", "认证 job 必须最小权限 contents: read"
-    runner_workflow = RUNNER_CERTIFIED_YML.read_text(encoding="utf-8")
+
+    # 变异 0：YAML 语义允许不同书写形式落到同一键；认证合同必须拒绝所有重复映射，
+    # 不能只扫描首个 jobs 或裸 job-id 后静默漏掉后续的 PowerShell run。
+    duplicate_mapping_mutants = {
+        "second-top-level-jobs": (
+            runner_workflow
+            + "\njobs:\n"
+            + "  runner-identity-certified:\n"
+            + "    steps:\n"
+            + "      - name: second-jobs-cjk-run\n"
+            + "        shell: powershell\n"
+            + "        run: |\n"
+            + "          Write-Host 中文\n"
+        ),
+        "flow-duplicate-job": (
+            runner_workflow
+            + '\n  runner-identity-certified: {steps: [{name: flow-job-cjk-run, '
+            + 'shell: powershell, run: "Write-Host 中文"}]}\n'
+        ),
+        "quoted-duplicate-job": (
+            runner_workflow
+            + '\n  "runner-identity-certified":\n'
+            + "    steps:\n"
+            + "      - name: quoted-job-cjk-run\n"
+            + "        shell: powershell\n"
+            + "        run: |\n"
+            + "          Write-Host 中文\n"
+        ),
+        "explicit-duplicate-job": (
+            runner_workflow
+            + "\n  ? runner-identity-certified\n"
+            + "  :\n"
+            + "    steps:\n"
+            + "      - name: explicit-job-cjk-run\n"
+            + "        shell: powershell\n"
+            + "        run: |\n"
+            + "          Write-Host 中文\n"
+        ),
+        "quoted-duplicate-on": runner_workflow + '\n"on": {workflow_dispatch: {}}\n',
+    }
+    for mutation_name, duplicate_mapping_mutant in duplicate_mapping_mutants.items():
+        duplicate_mapping_violations = _runner_identity_ps51_run_contract_violations(
+            duplicate_mapping_mutant
+        )
+        assert any("duplicate YAML mapping key" in item for item in duplicate_mapping_violations), (
+            f"{mutation_name} must fail closed on a duplicate YAML mapping key: "
+            f"{duplicate_mapping_violations}"
+        )
+
     ps51_contract_violations = _runner_identity_ps51_run_contract_violations(runner_workflow)
     assert not ps51_contract_violations, (
         "认证 workflow 的全部可执行 run 必须显式 shell: powershell、ASCII-only，并以 YAML env "
@@ -669,30 +748,49 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         "inserting CJK into a PowerShell run must fail the ASCII contract"
     )
 
+    # 变异 1b：shell 必须是对象图中的精确值，不得靠相邻注释门间接拒绝空白或其他别名。
+    shell_whitespace_mutant = runner_workflow.replace(
+        "        shell: powershell", '        shell: " powershell "', 1
+    )
+    assert shell_whitespace_mutant != runner_workflow
+    shell_whitespace_violations = _runner_identity_ps51_run_contract_violations(shell_whitespace_mutant)
+    assert any("shell is not explicit powershell" in item for item in shell_whitespace_violations), (
+        "a non-exact PowerShell shell value must fail the executable shell contract directly"
+    )
+
     # 变异 2：有效 YAML flow-style step 不能被缩进解析器静默忽略后绕过 ASCII 审计。
     flow_style_mutant = (
         runner_workflow
         + '\n      - { name: extra-flow-run, shell: powershell, run: "Write-Host 中文" }\n'
     )
     flow_style_violations = _runner_identity_ps51_run_contract_violations(flow_style_mutant)
-    assert any("unsupported step declaration syntax" in item for item in flow_style_violations), (
-        "flow-style PowerShell run must fail closed instead of bypassing structured enumeration"
+    assert any("run text contains non-ASCII characters" in item for item in flow_style_violations), (
+        "flow-style PowerShell run must be materially enumerated by the YAML object graph"
     )
 
-    # step-level flow/anchor/alias/merge 同样不在受控 block-style 子集内，不能随 job-level 加固退化。
+    # step-level flow/anchor/alias/merge 必须由真实 YAML 展开后逐个审计，不能再被自制子集静默跳过。
     step_syntax_mutants = {
-        "anchor": runner_workflow.replace("        run: |", "        run: &shared_run |", 1),
-        "alias": runner_workflow.replace("        run: |", "        run: *shared_run", 1),
-        "merge": runner_workflow.replace(
-            "        shell: powershell",
-            "        <<: *shared_step\n        shell: powershell",
-            1,
+        "anchor": runner_workflow.replace(
+            "        run: |", "        run: &shared_run |\n          Write-Host 中文", 1
+        ),
+        "alias": (
+            runner_workflow
+            + "\n      - &shared_step\n"
+            + "        name: alias-cjk-run\n"
+            + "        shell: powershell\n"
+            + '        run: "Write-Host 中文"\n'
+            + "      - *shared_step\n"
+        ),
+        "merge": (
+            runner_workflow
+            + '\n      - <<: &shared_step {name: merged-cjk-run, shell: powershell, '
+            + 'run: "Write-Host 中文"}\n'
         ),
     }
     for mutation_name, step_syntax_mutant in step_syntax_mutants.items():
         step_syntax_violations = _runner_identity_ps51_run_contract_violations(step_syntax_mutant)
-        assert any("unsupported" in item and "step" in item for item in step_syntax_violations), (
-            f"{mutation_name} step syntax must fail closed: {step_syntax_violations}"
+        assert any("run text contains non-ASCII characters" in item for item in step_syntax_violations), (
+            f"{mutation_name} step construction must be materially enumerated: {step_syntax_violations}"
         )
 
     # 变异 3：重复 job-level steps 会让 YAML 后一键替代前一键，必须在枚举前 fail-closed。
@@ -705,11 +803,11 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         + '          Write-Host 中文\n'
     )
     duplicate_steps_violations = _runner_identity_ps51_run_contract_violations(duplicate_steps_mutant)
-    assert any("exactly one steps key" in item for item in duplicate_steps_violations), (
+    assert any("duplicate YAML mapping key" in item for item in duplicate_steps_violations), (
         "a duplicate runner job steps key must fail closed instead of hiding its CJK PowerShell run"
     )
 
-    # 变异 4：认证 job 只接受受控的 bare key 子集；quoted/explicit/complex key 均不能绕过。
+    # 变异 4：quoted/explicit/complex 等语法归一后的 mapping key 同样不能绕过拒重或类型门。
     job_key_syntax_mutants = {
         "quoted": (
             runner_workflow
@@ -718,7 +816,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
             + '        shell: powershell\n'
             + '        run: |\n'
             + '          Write-Host 中文\n',
-            "unsupported runner job-level declaration",
+            "duplicate YAML mapping key",
         ),
         "explicit": (
             runner_workflow
@@ -728,7 +826,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
             + '        shell: powershell\n'
             + '        run: |\n'
             + '          Write-Host 中文\n',
-            "unsupported runner job-level declaration",
+            "duplicate YAML mapping key",
         ),
         "complex": (
             runner_workflow
@@ -737,11 +835,11 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
             + '        shell: powershell\n'
             + '        run: |\n'
             + '          Write-Host 中文\n',
-            "unsupported runner job-level declaration",
+            "unhashable YAML mapping key",
         ),
         "duplicate-env": (
             runner_workflow + '\n    env:\n      EXTRA_DUPLICATE: denied\n',
-            "duplicate runner job-level key",
+            "duplicate YAML mapping key",
         ),
     }
     for mutation_name, (job_key_mutant, expected_violation) in job_key_syntax_mutants.items():
@@ -788,8 +886,7 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     )
     assert "pull_request" not in _strip_ps_comments(runner_workflow)
     assert "pull_request_target" not in _strip_ps_comments(runner_workflow)
-    certified_block = "\n".join(_load_job_blocks(runner_workflow)[RUNNER_CERTIFIED_JOB])
-    assert re.search(r"^    timeout-minutes:\s*[1-9]\d*\s*$", certified_block, re.M), (
+    assert isinstance(meta.get("timeout-minutes"), int) and meta["timeout-minutes"] > 0, (
         "self-hosted 认证 job 必须设置正的 timeout-minutes，失控 Docker/WSL 命令不能无限占用专用 runner"
     )
     # 触发器负责事件类型和分支白名单；job guard 只再约束认证机所属仓库，避免
@@ -812,8 +909,9 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     ):
         mutated = workflow.replace(policy, policy.replace(removed, replacement), 1)
         assert mutated != workflow, f"未能对认证 job trust guard 施加 mutation：{removed!r}"
-        altered = _job_metadata(
-            RUNNER_CERTIFIED_JOB, mutated, workflow_path=RUNNER_CERTIFIED_YML,
+        altered, altered_yaml_violations = _runner_identity_yaml_job(mutated)
+        assert not altered_yaml_violations and altered is not None, (
+            f"trust-guard mutation must remain valid YAML for object-graph review: {altered_yaml_violations}"
         )
         assert _normalize_expression(str(altered.get("if", ""))) != _normalize_expression(expected_if), (
             f"删除/替换 trust guard {removed!r} 后仍与受信策略等价，测试无法防止 self-hosted 误调度"
@@ -826,16 +924,21 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     assert checkout is not None and checkout.get("uses") == expected_checkout, (
         "自托管认证 job 必须以经核验的不可变 actions/checkout commit 运行，不能使用可变 tag"
     )
-    assert checkout.get("with", {}).get("persist-credentials") == "false", (
+    assert checkout.get("with", {}).get("persist-credentials") is False, (
         "self-hosted checkout 必须关闭 persist-credentials，避免把可写 token 暴露给认证机"
     )
     credential_mutant = workflow.replace("persist-credentials: false", "persist-credentials: true", 1)
+    altered_job, altered_checkout_violations = _runner_identity_yaml_job(credential_mutant)
+    assert not altered_checkout_violations and altered_job is not None, (
+        "checkout credential mutation must remain valid YAML for object-graph review: "
+        f"{altered_checkout_violations}"
+    )
     altered_checkout = _find_step(
-        _load_jobs(credential_mutant, required_jobs=(RUNNER_CERTIFIED_JOB,))[RUNNER_CERTIFIED_JOB],
+        _runner_identity_steps_from_job(altered_job),
         lambda step: "actions/checkout" in str(step.get("uses", "")),
     )
     assert altered_checkout is not None
-    assert altered_checkout.get("with", {}).get("persist-credentials") != "false", (
+    assert altered_checkout.get("with", {}).get("persist-credentials") is not False, (
         "将 checkout 的凭据持久化改为 true 后，结构化 CI 合同必须翻转为拒绝"
     )
     preflight = _required_named_step(certified, RUNNER_IDENTITY_PREFLIGHT_STEP_NAME)
@@ -850,7 +953,8 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
     # GitHub runner 会以 UTF-8 无 BOM 临时文件交给 Windows PowerShell 5.1。批准根的 CJK
     # 值只能由 YAML 环境变量传入，run block 自身必须只读取 ASCII 的 $env 名称；否则
     # PS 5.1 会按本地代码页把内联 ``D:\\codex项目`` 误解码，首个安全检查反而误拒。
-    d_root_env = _job_env(RUNNER_CERTIFIED_JOB, runner_workflow, workflow_path=RUNNER_CERTIFIED_YML)
+    assert isinstance(meta.get("env"), dict), "认证 job env 必须是 YAML 映射"
+    d_root_env = meta["env"]
     approved_root = d_root_env.get(RUNNER_APPROVED_ROOT_ENV, "")
     if sys.platform == "win32":
         encoding_tmp = _unique_tmp_dir("runner-approved-root-ps51")
@@ -955,9 +1059,15 @@ def test_windows_probes_preheats_toolchain_before_spike_loop() -> None:
         f"      {RUNNER_APPROVED_ROOT_ENV}: {approved_root}\n", "", 1,
     )
     assert removed_env != runner_workflow, "未能对 YAML 的 RUNNER_APPROVED_ROOT 绑定施加删除 mutation"
-    assert RUNNER_APPROVED_ROOT_ENV not in _job_env(
-        RUNNER_CERTIFIED_JOB, removed_env, workflow_path=RUNNER_CERTIFIED_YML,
-    ), "删除 YAML 环境变量绑定后，结构化合同必须拒绝"
+    removed_env_job, removed_env_violations = _runner_identity_yaml_job(removed_env)
+    assert not removed_env_violations and removed_env_job is not None, (
+        "删除 env 绑定后的 workflow 仍须由真实 YAML loader 无歧义解析："
+        f"{removed_env_violations}"
+    )
+    assert isinstance(removed_env_job.get("env"), dict), "删除 mutation 后 env 仍必须是 YAML 映射"
+    assert RUNNER_APPROVED_ROOT_ENV not in removed_env_job["env"], (
+        "删除 YAML 环境变量绑定后，结构化合同必须拒绝"
+    )
 
     d_root_requirements = (
         "RUNNER_TEMP", "RUNNER_TOOL_CACHE", "GITHUB_WORKSPACE", "CURRENT_WORKING_DIRECTORY",
