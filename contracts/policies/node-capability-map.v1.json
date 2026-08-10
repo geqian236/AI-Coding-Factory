@@ -393,16 +393,16 @@
         "version": "v1",
         "actions": {
           "byCapability": {
-            "git.push": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
-            "pr.create": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
-            "pr.update": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]},
-            "forge.observe.scoped": {"predicateId": "published-pr-matches-v1", "requiredEvidence": ["remote-ref-equals-candidate", "head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift"]}
+            "git.push": {"predicateId": "pushed-ref-matches-candidate-v1", "requiredEvidence": ["remote-ref-equals-candidate", "remote-ref-name", "push-receipt-binds-candidate"]},
+            "pr.create": {"predicateId": "created-pr-matches-candidate-v1", "requiredEvidence": ["head-base-pr-identity", "created-pr-id", "created-pr-head-equals-candidate"]},
+            "pr.update": {"predicateId": "updated-pr-state-matches-v1", "requiredEvidence": ["pr-id", "expected-head-matches-candidate", "ready-state-no-drift", "metadata-digest-matches"]},
+            "forge.observe.scoped": {"predicateId": "published-pr-observation-matches-v1", "requiredEvidence": ["head-base-pr-identity", "required-actions-checks-attestation-pass", "ready-state-no-drift", "observation-query-binds-pr"]}
           }
         }
       },
       "authorizationConsumptionPoint": "with-action-started-transaction",
       "retryClass": "external-fact-before-retry",
-      "description": "发布 PR 节点：push、create 与 update 均有独立 action 键；未知送达进入运行时 UNKNOWN_STATE/RECONCILING。"
+      "description": "发布 PR 节点：push、create、update 与 observe 均有独立 action 键和完成事实；未知送达进入运行时 UNKNOWN_STATE/RECONCILING。"
     },
     "MERGE": {
       "requiredCapabilities": ["forge.observe.scoped", "repo.merge"],
@@ -522,12 +522,12 @@
         "hashAlgorithm": "sha256-jcs-nfc",
         "actions": {
           "byCapability": {
-            "ssh.exec.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
-            "remote.write.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
-            "db.backup": {"jcsInputFields": ["databaseProfileRevision", "releaseId", "backupPlanDigest"]},
-            "db.migrate": {"jcsInputFields": ["databaseProfileRevision", "migrationChecksum", "releaseId"]},
-            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "releaseId", "upstreamConfigHash"]},
-            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
+            "ssh.exec.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "db.backup": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseProfileRevision", "releaseId", "backupPlanDigest"]},
+            "db.migrate": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseProfileRevision", "migrationChecksum", "releaseId"]},
+            "nginx.switch": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverProfileRevision", "releaseId", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
           }
         }
       },
@@ -574,15 +574,15 @@
         "hashAlgorithm": "sha256-jcs-nfc",
         "actions": {
           "byCapability": {
-            "http.check.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "network.egress.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "remote.observe.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "container.inspect.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "log.read.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "db.read": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "db.check": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "acceptance.fixture.write": {"jcsInputFields": ["environment", "releaseId", "fixtureDigest"]},
-            "service.restart.scoped": {"jcsInputFields": ["environment", "releaseId", "restartPlanDigest"]}
+            "http.check.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "network.egress.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "remote.observe.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "container.inspect.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "log.read.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.read": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.check": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "acceptance.fixture.write": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "fixtureDigest"]},
+            "service.restart.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "restartPlanDigest"]}
           }
         }
       },
@@ -634,12 +634,12 @@
         "hashAlgorithm": "sha256-jcs-nfc",
         "actions": {
           "byCapability": {
-            "ssh.exec.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
-            "remote.write.scoped": {"jcsInputFields": ["serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
-            "db.backup": {"jcsInputFields": ["databaseProfileRevision", "releaseId", "backupPlanDigest"]},
-            "db.migrate": {"jcsInputFields": ["databaseProfileRevision", "migrationChecksum", "releaseId"]},
-            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "releaseId", "upstreamConfigHash"]},
-            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
+            "ssh.exec.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"]},
+            "db.backup": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseProfileRevision", "releaseId", "backupPlanDigest"]},
+            "db.migrate": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseProfileRevision", "migrationChecksum", "releaseId"]},
+            "nginx.switch": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverProfileRevision", "releaseId", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"]}
           }
         }
       },
@@ -686,15 +686,15 @@
         "hashAlgorithm": "sha256-jcs-nfc",
         "actions": {
           "byCapability": {
-            "http.check.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "network.egress.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "remote.observe.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "container.inspect.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "log.read.scoped": {"jcsInputFields": ["environment", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "db.read": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "db.check": {"jcsInputFields": ["databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
-            "acceptance.fixture.write": {"jcsInputFields": ["environment", "releaseId", "fixtureDigest"]},
-            "service.restart.scoped": {"jcsInputFields": ["environment", "releaseId", "restartPlanDigest"]}
+            "http.check.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "network.egress.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "remote.observe.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "container.inspect.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "log.read.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.read": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "db.check": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"]},
+            "acceptance.fixture.write": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "fixtureDigest"]},
+            "service.restart.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "releaseId", "restartPlanDigest"]}
           }
         }
       },
@@ -746,12 +746,12 @@
         "hashAlgorithm": "sha256-jcs-nfc",
         "actions": {
           "byCapability": {
-            "rollback": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
-            "ssh.exec.scoped": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
-            "remote.write.scoped": {"jcsInputFields": ["failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
-            "db.restore": {"jcsInputFields": ["databaseProfileRevision", "goodReleaseDigest", "rollbackPlanHash"]},
-            "nginx.switch": {"jcsInputFields": ["serverProfileRevision", "goodReleaseDigest", "upstreamConfigHash"]},
-            "traffic.switch.scoped": {"jcsInputFields": ["trafficAdapterFingerprintDigest", "goodReleaseDigest", "rollbackPlanHash"]}
+            "rollback": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "ssh.exec.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "remote.write.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"]},
+            "db.restore": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "databaseProfileRevision", "goodReleaseDigest", "rollbackPlanHash"]},
+            "nginx.switch": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "serverProfileRevision", "goodReleaseDigest", "upstreamConfigHash"]},
+            "traffic.switch.scoped": {"jcsInputFields": ["environment", "resourceFingerprintDigest", "trafficAdapterFingerprintDigest", "goodReleaseDigest", "rollbackPlanHash"]}
           }
         }
       },

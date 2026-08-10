@@ -178,7 +178,7 @@ def prop_ts_type(prop: dict[str, Any]) -> str:
     return TS_TYPE_MAP.get(str(prop_type), "unknown")
 
 
-def prop_py_type(prop: dict[str, Any], optional: bool = False) -> str:
+def prop_py_type(prop: dict[str, Any]) -> str:
     """将 schema property 定义转换为 Python 类型字符串。"""
     if "oneOf" in prop or "anyOf" in prop:
         variants = prop.get("oneOf", prop.get("anyOf", []))
@@ -212,10 +212,7 @@ def prop_py_type(prop: dict[str, Any], optional: bool = False) -> str:
         return f"list[{item_type}]"
     if prop_type == "object":
         return "dict[str, Any]"
-    result = PY_TYPE_MAP.get(str(prop_type), "Any")
-    if optional:
-        return f"Optional[{result}]"
-    return result
+    return PY_TYPE_MAP.get(str(prop_type), "Any")
 
 
 def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
@@ -299,7 +296,7 @@ def generate_typescript(entries: list[dict[str, Any]]) -> str:
 
 
 def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> str:
-    """生成单个 Python TypedDict 类定义。"""
+    """生成单个 Python TypedDict 类定义，逐字段保留 schema 的 required 语义。"""
     lines = [
         f"class {name}(TypedDict, total=False):",
         '    """由 generate.py 自动生成，禁止手动修改。"""',
@@ -309,7 +306,11 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
         return "\n".join(lines)
     for field, prop_def in props.items():
         is_required = field in required
-        py_type = prop_py_type(prop_def, optional=not is_required)
+        # total=False 让未包装字段保持 optional；只有 schema.required 中的字段使用
+        # Required[T]，避免生成类型把安全必填字段静默降级为可省略。
+        py_type = prop_py_type(prop_def)
+        if is_required:
+            py_type = f"Required[{py_type}]"
         desc = prop_def.get("description", "")
         if desc:
             lines.append(f"    # {desc}")
@@ -325,9 +326,7 @@ def generate_python(entries: list[dict[str, Any]]) -> str:
         "源 schema: contracts/schemas/*.schema.json",
         "算法版本: v1",
         '"""',
-        "from __future__ import annotations",
-        "",
-        "from typing import Any, Literal, Optional, TypedDict, Union",
+        "from typing import Any, Literal, Optional, Required, TypedDict, Union",
         "",
         "__all__ = [",
     ]

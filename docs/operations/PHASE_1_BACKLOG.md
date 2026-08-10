@@ -72,12 +72,21 @@
 - **本节点已完成的合同前置**：新增 `intent-authorization.v1.schema.json` 与
   `execution-authorization.v1.schema.json`，以 camelCase 冻结 Intent 的阶段/预算/撤销快照和
   Execution 的 plan/map digest、action policy snapshot、资源指纹、fencing/control/输入绑定及
-  消费投影；已注册 catalog，由现有生成器确定性生成 Python/TypeScript/Rust，并有 schema、
-  catalog、codegen 漂移和 fail-closed 合同测试。该工作不把 RunSpec 的关联字符串误称为早期
-  `$ref`，也不实现授权运行时。
-- **后续 Task 4/5**：授权签发、解析/重算 digest-backed 快照、撤销、`maxUses` 消费、fencing
-  token/control epoch 校验、CAS、动态 scope/lease/时间比较及真实执行消费仍是有状态运行时；
-  本节点的合同不是这些流程已完成的声明。
+  消费投影；所有 digest-backed 字段均改为闭合 `{artifactId,schemaId,schemaVersion,digest}` ref，
+  `contracts/policies/authorization-snapshot-registry.v1.json` 固定 NFC+RFC8785/JCS 域分离摘要、
+  每字段 schemaId/version、真实 validator 来源与闭合 payload。资源指纹使用 node map 内嵌 schema，
+  action 快照使用 selected action 投影并绑定 node map digest/node/action。输入绑定仍为闭合
+  `baseSha` / `candidateSha` / `contentDigest` 对象（其中 contentDigest 为快照 ref），按节点强制最小
+  SHA/content；且 `nodeType → actionCapability` 与 17-node policy map 精确求交。registry 是 policy，
+  不增加 schema/catalog 计数；既有两份授权 schema 继续由生成器确定性生成 Python/TypeScript/Rust，
+  Python TypedDict 仅将 schema required 字段标为 `Required[T]`，并有 schema、catalog、codegen
+  漂移和 fail-closed 合同测试。CompatibilityManifest v1 已有 `nodeCapabilityMapDigest`，唯一真源为
+  `emit_manifest.py` raw-file SHA-256，禁止换成 compact/sorted JSON 私有 hash。该工作不把 RunSpec
+  的关联字符串误称为早期 `$ref`，也不实现授权运行时。
+- **后续 Task 4/5**：授权签发、从 `COMMITTED` 不可变 artifact 解析 ref、核验 artifact ID、
+  schema/version、validator 与重算 digest、Execution/Manifest 实际 node map 值比对、撤销、`maxUses`
+  消费、fencing token/control epoch 校验、CAS、动态 scope/lease/时间比较及真实执行消费仍是有状态
+  运行时；本节点没有伪测数据库 COMMITTED 逻辑，也不是这些流程已完成的声明。
 
 ### B7. durable-event.v2 §10.1 全字段的**运行时填充**（第三轮 REVISE item 4 要求拆分）
 - **Phase 0 冻结（✅）**：schema 含 §10.1 全 32 字段（执行身份、双 span、脱敏证据、
@@ -93,8 +102,12 @@
 - **本节点已完成的合同前置**：17 种 nodeType 均冻结既有 `requiredCapabilities`/
   `sideEffectClass` 与五个新增字段：本文件本地 `$defs` 可解析的闭合 resource fingerprint
   schema、按 capability 独立的 `factory-action-v1` 幂等键输入、外部完成事实、授权消费点及
-  静态 retry envelope。staging/production 隔离、可选 overlay、未知字段、未知 retry class 和
-  key/fact 漂移均由合同测试 fail-closed。
+  静态 retry envelope。合同测试逐 node/action 精确冻结 required/optional capability、side effect、
+  授权消费点、retry class、key 输入、predicate 与 evidence；并自动穷举每个 selection 的
+  true-缺-overlay/false-携-overlay，以及资源指纹根对象和嵌套对象的未知字段注入。
+  DEPLOY/ACCEPT/ROLLBACK 每个 action key 均绑定 `environment + resourceFingerprintDigest`；
+  `target.guard.clear` 只属于 RECONCILE_TARGET optional，PUBLISH_PR 四个 action 保持 action-local，
+  同步改 key/fact 或换另一个合法 retry class 也会被精确 mutation 门禁拒绝。
 - **后续 Task 4/5**：Policy Engine 按 nodeType/action 派生 capability、验证资源指纹/完成事实、
   记录 started transaction、处理 `UNKNOWN_STATE/RECONCILING` 并执行 CAS/重试包络，仍属于
   运行时消费；本节点不提前实现该引擎，也不把静态 retry class 误作 §17 的动态错误类别。

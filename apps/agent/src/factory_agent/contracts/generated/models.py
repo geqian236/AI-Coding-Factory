@@ -3,9 +3,7 @@
 源 schema: contracts/schemas/*.schema.json
 算法版本: v1
 """
-from __future__ import annotations
-
-from typing import Any, Literal, Optional, TypedDict, Union
+from typing import Any, Literal, Optional, Required, TypedDict, Union
 
 __all__ = [
     "CredentialRef",
@@ -27,422 +25,423 @@ __all__ = [
 class CredentialRef(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 凭据唯一 ID（不含明文值）
-    credentialId: str
+    credentialId: Required[str]
     # 凭据类型
-    credentialType: Literal["SSH_KEY", "REGISTRY_TOKEN", "API_KEY", "GITHUB_APP", "FACTORY_PROFILE_TOKEN"]
+    credentialType: Required[Literal["SSH_KEY", "REGISTRY_TOKEN", "API_KEY", "GITHUB_APP", "FACTORY_PROFILE_TOKEN"]]
     # 凭据所属 D-backed 隔离 profile 作用域
-    profileScope: str
+    profileScope: Required[str]
     # 绑定凭据的资源指纹（如 host-key、repository ID）
-    resourceFingerprint: Optional[str]
+    resourceFingerprint: str
     # 凭据绝对过期时间（ISO 8601）
-    expiresAt: Optional[str]
+    expiresAt: str
 
 class RunSpec(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # RunSpec schema 版本号
-    schemaVersion: int
+    schemaVersion: Required[int]
     # 同一 taskId 下的规格修订序号
-    specRevision: Optional[int]
+    specRevision: int
     # 父 PlanRevision ID；genesis 修订为 null
     parentRevisionId: Optional[str]
     # 关联任务 ID
-    taskId: str
+    taskId: Required[str]
     # 用户目标的结构化表达
-    goal: str
+    goal: Required[str]
     # 规划假设列表
-    assumptions: list[str]
+    assumptions: Required[list[str]]
     # 范围声明（§8：include/exclude）
-    scope: dict[str, Any]
+    scope: Required[dict[str, Any]]
     # 约束条件列表
-    constraints: list[str]
+    constraints: Required[list[str]]
     # 验收条件列表
-    acceptanceCriteria: list[str]
+    acceptanceCriteria: Required[list[str]]
     # 目标终点阶段（Master Spec §6.1 权威 6 阶段）
-    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
+    targetStage: Required[Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]]
     # 仓库绑定（§8：mode/root/baseBranch/baseCommit）
-    repository: dict[str, Any]
+    repository: Required[dict[str, Any]]
     # 工作计划 DAG（§8：dagVersion/nodes/barriers）
-    workPlan: dict[str, Any]
+    workPlan: Required[dict[str, Any]]
     # 风险画像（§8：level/reasons）
-    riskProfile: dict[str, Any]
+    riskProfile: Required[dict[str, Any]]
     # node-capability-map 版本标识
-    nodeCapabilityMapVersion: str
+    nodeCapabilityMapVersion: Required[str]
     # stage-capability-map 版本标识
-    stageCapabilityMapVersion: str
+    stageCapabilityMapVersion: Required[str]
     # 关联 IntentAuthorization ID
-    intentAuthorizationId: str
+    intentAuthorizationId: Required[str]
     # 语义计划哈希（跨修订版本稳定，从语义字段投影派生）
-    semanticPlanHash: str
+    semanticPlanHash: Required[str]
     # 完整不可变修订记录摘要（写入 PlanRevision 后填入）
-    planRevisionDigest: Optional[str]
+    planRevisionDigest: str
     # RunSpec 创建时间
-    createdAt: Optional[str]
+    createdAt: str
 
 class PlanRevision(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 本修订版本唯一 ID
-    planRevisionId: str
+    planRevisionId: Required[str]
     # 父修订版本 ID（范围内重规划时设置）
-    parentRevisionId: Optional[str]
+    parentRevisionId: str
     # 所属任务 ID（§11 plan_revisions.task_id）
-    taskId: str
+    taskId: Required[str]
     # 规格修订号，单调递增（§11 plan_revisions.spec_revision）
-    specRevision: int
+    specRevision: Required[int]
     # 关联 IntentAuthorization ID（§11 plan_revisions.intent_authorization_id）
-    intentAuthorizationId: str
+    intentAuthorizationId: Required[str]
     # DAG 版本号（§11 plan_revisions.dag_version）
-    dagVersion: int
+    dagVersion: Required[int]
     # node→capability 映射版本（§11 plan_revisions.node_capability_map_version）
-    nodeCapabilityMapVersion: str
+    nodeCapabilityMapVersion: Required[str]
     # stage→capability 映射版本（§11 plan_revisions.stage_capability_map_version）
-    stageCapabilityMapVersion: str
+    stageCapabilityMapVersion: Required[str]
     # 语义计划哈希，跨修订版本稳定
-    semanticPlanHash: str
+    semanticPlanHash: Required[str]
     # 本修订版本内容摘要
-    planRevisionDigest: str
+    planRevisionDigest: Required[str]
     # DAG 节点列表
-    nodes: list[dict[str, Any]]
+    nodes: Required[list[dict[str, Any]]]
     # 阶段屏障列表
-    barriers: list[dict[str, Any]]
+    barriers: Required[list[dict[str, Any]]]
     # target_stage 到节点集合的映射（Master Spec §6.1 权威 target_stage 分类）
-    stageMaps: dict[str, Any]
-    createdAt: str
+    stageMaps: Required[dict[str, Any]]
+    createdAt: Required[str]
 
 class IntentAuthorization(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # IntentAuthorization 的稳定身份。
-    intentAuthorizationId: str
+    intentAuthorizationId: Required[str]
     # 被授权任务的稳定身份。
-    taskId: str
+    taskId: Required[str]
     # 做出一次性授权的用户身份。
-    userId: str
-    # 规范化用户需求的 JCS/NFC 内容摘要。
-    requirementDigest: str
+    userId: Required[str]
+    # 规范化用户需求的闭合 JCS/NFC 快照引用。
+    requirementDigest: Required[dict[str, Any]]
     # 项目身份，禁止跨项目复用授权。
-    projectId: str
+    projectId: Required[str]
     # 规范化后的仓库身份。
-    repositoryId: str
-    # 可解析的仓库/物理路径/模式绑定快照摘要。
-    repositoryBindingDigest: str
-    # 可解析的基础分支、base SHA 或 bootstrap 前置事实快照摘要。
-    baselineDigest: str
+    repositoryId: Required[str]
+    # 可解析的仓库/物理路径/模式绑定快照引用。
+    repositoryBindingDigest: Required[dict[str, Any]]
+    # 可解析的基础分支、base SHA 或 bootstrap 前置事实快照引用。
+    baselineDigest: Required[dict[str, Any]]
     # 用户选择的目标终点阶段；只给出 capability 上限。
-    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
+    targetStage: Required[Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]]
     # 派生授权时使用的 stage-capability-map 版本。
-    stageCapabilityMapVersion: str
-    # targetStage 展开后的排序 capability 集合摘要。
-    allowedCapabilitySetDigest: str
-    # 可解析的环境、ServerProfile、数据库和资源目标绑定快照摘要。
-    targetBindingDigest: str
+    stageCapabilityMapVersion: Required[str]
+    # targetStage 展开后的排序 capability 集合快照引用。
+    allowedCapabilitySetDigest: Required[dict[str, Any]]
+    # 可解析的环境、ServerProfile、数据库和资源目标绑定快照引用。
+    targetBindingDigest: Required[dict[str, Any]]
     # 用户接受的最高风险等级。
-    riskCeiling: Literal["low", "medium", "high", "critical"]
-    # 可解析的估算成本告警策略摘要；不把订阅 CLI 估算伪装成真实账单。
-    estimatedCostAlertDigest: str
+    riskCeiling: Required[Literal["low", "medium", "high", "critical"]]
+    # 可解析的估算成本告警策略快照引用；不把订阅 CLI 估算伪装成真实账单。
+    estimatedCostAlertDigest: Required[dict[str, Any]]
     # 端到端自主执行预算（毫秒）；禁止无限值。
-    autonomousExecutionBudgetMs: int
+    autonomousExecutionBudgetMs: Required[int]
     # 自动修复轮数上限。
-    repairLoopLimit: int
+    repairLoopLimit: Required[int]
     # 自动重规划次数上限。
-    autoReplanLimit: int
+    autoReplanLimit: Required[int]
     # Attempt 总数上限。
-    attemptLimit: int
+    attemptLimit: Required[int]
     # 授权签发时间。
-    issuedAt: str
+    issuedAt: Required[str]
     # 绝对有效期；暂停不会延长它。
-    expiresAt: str
+    expiresAt: Required[str]
     # 撤销时间；未撤销时显式为 null。
-    revokedAt: Optional[str]
+    revokedAt: Required[Optional[str]]
     # 撤销原因；未撤销时显式为 null。
-    revokeReason: Optional[str]
+    revokeReason: Required[Optional[str]]
 
 class ExecutionAuthorization(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 派生授权稳定身份。
-    executionAuthorizationId: str
+    executionAuthorizationId: Required[str]
     # 来源 IntentAuthorization 身份。
-    intentAuthorizationId: str
+    intentAuthorizationId: Required[str]
     # 绑定的不可变 PlanRevision 身份。
-    planRevisionId: str
-    # 计划语义哈希。
-    semanticPlanHash: str
-    # 完整 PlanRevision 摘要。
-    planRevisionDigest: str
+    planRevisionId: Required[str]
+    # 计划语义的闭合快照引用。
+    semanticPlanHash: Required[dict[str, Any]]
+    # 完整 PlanRevision 的闭合快照引用。
+    planRevisionDigest: Required[dict[str, Any]]
     # stage capability map 版本。
-    stageCapabilityMapVersion: str
-    # stage capability map 内容摘要。
-    stageCapabilityMapDigest: str
+    stageCapabilityMapVersion: Required[str]
+    # stage capability map 的闭合快照引用。
+    stageCapabilityMapDigest: Required[dict[str, Any]]
     # node capability map 版本。
-    nodeCapabilityMapVersion: str
-    # node capability map 内容摘要。
-    nodeCapabilityMapDigest: str
+    nodeCapabilityMapVersion: Required[str]
+    # node capability map raw-file 内容的闭合快照引用。
+    nodeCapabilityMapDigest: Required[dict[str, Any]]
     # 绑定的 Run 身份。
-    runId: str
+    runId: Required[str]
     # 绑定的 Step 身份。
-    stepId: str
+    stepId: Required[str]
     # 绑定的不可复用 Attempt 身份。
-    attemptId: str
+    attemptId: Required[str]
     # 冻结 node-capability-map 的节点类型。
-    nodeType: Literal["PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT", "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING", "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK", "RECONCILE_TARGET", "RESTORE_DRILL"]
+    nodeType: Required[Literal["PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT", "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING", "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK", "RECONCILE_TARGET", "RESTORE_DRILL"]]
     # 当前 lease owner 的执行器身份。
-    executorId: str
-    resourceFingerprint: dict[str, Any]
-    # 可解析 capability/resource scope 快照摘要。
-    capabilityScopeDigest: str
-    # 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。
-    idempotencyKey: str
-    # 输入身份绑定；不使用自由文本或短 SHA。
-    inputBindings: list[dict[str, Any]]
+    executorId: Required[str]
+    # 资源指纹的闭合快照引用；其 payload 必须按 nodeType 使用 node map 内嵌 resourceFingerprintSchema 校验。
+    resourceFingerprint: Required[dict[str, Any]]
+    # 可解析 capability/resource scope 的闭合快照引用。
+    capabilityScopeDigest: Required[dict[str, Any]]
+    # 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key 快照引用。
+    idempotencyKey: Required[dict[str, Any]]
+    # 闭合且无歧义的输入身份对象；同一种 SHA/digest 至多一个字段，禁止数组重复绑定或自由文本。
+    inputBindings: Required[dict[str, Any]]
     # 本 ExecutionAuthorization 唯一对应的 capability action。
-    actionCapability: Literal["acceptance.fixture.write", "build.exec.isolated", "check.publish", "container.inspect.scoped", "db.backup", "db.check", "db.migrate", "db.read", "db.restore", "forge.observe.scoped", "git.local_commit", "git.push", "http.check.scoped", "log.read.scoped", "network.egress.scoped", "nginx.switch", "pr.create", "pr.update", "registry.observe.scoped", "registry.push", "remote.observe.scoped", "remote.write.scoped", "repo.bootstrap", "repo.merge", "repo.read", "restore.validation.instance", "rollback", "service.restart.scoped", "ssh.exec.scoped", "target.guard.clear", "test.exec.isolated", "traffic.switch.scoped", "worktree.write"]
-    # selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。
-    actionPolicySnapshotDigest: str
+    actionCapability: Required[Literal["acceptance.fixture.write", "build.exec.isolated", "check.publish", "container.inspect.scoped", "db.backup", "db.check", "db.migrate", "db.read", "db.restore", "forge.observe.scoped", "git.local_commit", "git.push", "http.check.scoped", "log.read.scoped", "network.egress.scoped", "nginx.switch", "pr.create", "pr.update", "registry.observe.scoped", "registry.push", "remote.observe.scoped", "remote.write.scoped", "repo.bootstrap", "repo.merge", "repo.read", "restore.validation.instance", "rollback", "service.restart.scoped", "ssh.exec.scoped", "target.guard.clear", "test.exec.isolated", "traffic.switch.scoped", "worktree.write"]]
+    # selected action 的 key template、completion fact 与消费点确定性投影的闭合快照引用；payload 必须绑定 nodeCapabilityMapDigest、nodeType 和 actionCapability。
+    actionPolicySnapshotDigest: Required[dict[str, Any]]
     # 严格单调 lease fencing token。
-    fencingToken: int
+    fencingToken: Required[int]
     # 控制权 epoch。
-    controlEpoch: int
+    controlEpoch: Required[int]
     # 派生时接受的控制命令序号。
-    acceptedControlCommandSeq: int
+    acceptedControlCommandSeq: Required[int]
     # 剩余可消费次数；不会使用第二个 ttlMs 真源。
-    maxUses: int
+    maxUses: Required[int]
     # 仅表示消费投影；撤销/过期分别由 revokedAt/expiresAt 表达，未知状态不能视为成功。
-    consumptionState: Literal["AVAILABLE", "CONSUMED"]
+    consumptionState: Required[Literal["AVAILABLE", "CONSUMED"]]
     # 派生授权签发时间。
-    issuedAt: str
+    issuedAt: Required[str]
     # 派生授权绝对 TTL。
-    expiresAt: str
+    expiresAt: Required[str]
     # 撤销时间；未撤销时显式为 null。
-    revokedAt: Optional[str]
+    revokedAt: Required[Optional[str]]
     # 撤销原因；未撤销时显式为 null。
-    revokeReason: Optional[str]
+    revokeReason: Required[Optional[str]]
 
 class ControlCommand(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 命令唯一 ID
-    commandId: str
+    commandId: Required[str]
     # 命令类型：软暂停、立即停止、取消（不可逆）、恢复
-    commandType: Literal["PAUSE", "IMMEDIATE_STOP", "CANCEL", "RESUME"]
+    commandType: Required[Literal["PAUSE", "IMMEDIATE_STOP", "CANCEL", "RESUME"]]
     # 目标任务 ID
-    taskId: str
+    taskId: Required[str]
     # 目标 Run ID（可选，指定具体 Run）
-    runId: Optional[str]
+    runId: str
     # 命令签发时间
-    issuedAt: str
+    issuedAt: Required[str]
     # 控制 epoch，用于防重放和顺序保证
-    controlEpoch: int
+    controlEpoch: Required[int]
     # 命令签发者标识
-    issuedBy: Optional[str]
+    issuedBy: str
     # 命令原因说明（可选）
-    reason: Optional[str]
+    reason: str
 
 class TaskIntakeRequest(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 用户自然语言需求描述
-    requirementText: str
+    requirementText: Required[str]
     # 用户选择的目标终点阶段（Master Spec §6.1 权威 target_stage 分类）
-    targetStage: Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]
-    repositorySelection: dict[str, Any]
+    targetStage: Required[Literal["DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED", "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"]]
+    repositorySelection: Required[dict[str, Any]]
     environmentSelection: dict[str, Any]
     # 用户设定的自主执行预算上限（毫秒）
-    budgetCapMs: Optional[int]
+    budgetCapMs: int
     # 用户已确认风险
-    userRiskAcknowledged: Literal[True]
+    userRiskAcknowledged: Required[Literal[True]]
 
 class TaskIntakeAccepted(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # Agent 生成的任务唯一 ID
-    taskId: str
+    taskId: Required[str]
     # IntentAuthorization 唯一 ID
-    intentAuthorizationId: str
-    normalizedRepositoryBinding: dict[str, Any]
+    intentAuthorizationId: Required[str]
+    normalizedRepositoryBinding: Required[dict[str, Any]]
     # 服务端求交后的允许 capability set 摘要
-    allowedCapabilitySetDigest: str
+    allowedCapabilitySetDigest: Required[str]
     # 有效自主执行预算（毫秒）
-    effectiveBudgetMs: int
+    effectiveBudgetMs: Required[int]
     # 风险摘要内容的摘要（不含明文风险详情）
-    riskSummaryDigest: str
+    riskSummaryDigest: Required[str]
     # 授权绝对过期时间
-    expiresAt: str
+    expiresAt: Required[str]
     # 接受时间
-    acceptedAt: str
+    acceptedAt: Required[str]
 
 class ClaudeSelfReview(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 自审回执唯一 ID
-    selfReviewId: str
+    selfReviewId: Required[str]
     # 关联任务 ID
-    taskId: Optional[str]
+    taskId: str
     # 关联 Step ID
-    stepId: Optional[str]
+    stepId: str
     # 被审核的 base commit SHA；漂移后本回执失效
-    reviewedBaseSha: str
+    reviewedBaseSha: Required[str]
     # 被审核的候选 commit SHA；漂移后本回执失效
-    reviewedCandidateSha: str
+    reviewedCandidateSha: Required[str]
     # 所用审核规则集版本
-    rubricVersion: str
+    rubricVersion: Required[str]
     # 自审结论：pass 表示通过，needs_fix 表示需要修复
-    result: Literal["pass", "needs_fix"]
+    result: Required[Literal["pass", "needs_fix"]]
     # 发现问题列表（result=pass 时可为空数组）
-    findings: list[dict[str, Any]]
+    findings: Required[list[dict[str, Any]]]
     # 证据摘要列表（每个证据的内容寻址摘要）
-    evidenceDigests: list[str]
+    evidenceDigests: Required[list[str]]
     # 自审完成时间
-    createdAt: str
+    createdAt: Required[str]
 
 class PreparedEventV2(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # Adapter 分配的摄取 ID，用于幂等去重
-    ingestEventId: str
+    ingestEventId: Required[str]
     # 所属任务 ID
-    taskId: str
+    taskId: Required[str]
     # 事件类型
-    eventType: Literal["stream", "provider-semantic", "tool", "state", "gate", "receipt", "control", "heartbeat"]
+    eventType: Required[Literal["stream", "provider-semantic", "tool", "state", "gate", "receipt", "control", "heartbeat"]]
     # 来源端序号（用于顺序校验和去重）
-    sourceSeq: int
+    sourceSeq: Required[int]
     # 传输 span 摘要（用于 STREAM-002 完整性检查）
-    transportSpanDigest: Optional[str]
+    transportSpanDigest: str
     # 事件负载（已脱敏）
-    payload: dict[str, Any]
+    payload: Required[dict[str, Any]]
     # 负载内容摘要（SHA-256 hex）
-    payloadDigest: Optional[str]
+    payloadDigest: str
     # 预备时间
-    preparedAt: str
+    preparedAt: Required[str]
 
 class PreparedBatchV2(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 批次唯一稳定 ID。
-    preparedBatchId: str
+    preparedBatchId: Required[str]
     # claim 时的 writer epoch（用于竞争检测）。
-    writerEpoch: int
+    writerEpoch: Required[int]
     # 批次状态机（§11 ingest_batches）。正常转换仅 CLAIMED → PREPARING → PREPARED → COMMITTED；旧 epoch pre-commit 状态只能由 Reconciler CAS 为 ABANDONED。COMMITTED/ABANDONED 均为终态。
-    state: Literal["CLAIMED", "PREPARING", "PREPARED", "COMMITTED"]
+    state: Required[Literal["CLAIMED", "PREPARING", "PREPARED", "COMMITTED"]]
     # 按 batchOrdinal 排列的全量稳定 ingestEventId 列表（权威顺序）。
-    orderedIngestIds: list[str]
+    orderedIngestIds: Required[list[str]]
     # 每个 Task 唯一的 expectedCommittedHead 锚点 + 批内 ordinal 范围（§11 ingest_batch_task_heads）。
-    perTaskExpectedHeads: list[dict[str, Any]]
+    perTaskExpectedHeads: Required[list[dict[str, Any]]]
     # segment digest 列表。
-    segmentDigests: list[dict[str, Any]]
+    segmentDigests: Required[list[dict[str, Any]]]
     # 总事件数。
-    eventCount: int
+    eventCount: Required[int]
     # 总 payload 字节数。
-    payloadBytes: int
+    payloadBytes: Required[int]
     # 本批首事件 batchOrdinal。
-    firstBatchOrdinal: int
+    firstBatchOrdinal: Required[int]
     # 本批末事件 batchOrdinal。
-    lastBatchOrdinal: int
+    lastBatchOrdinal: Required[int]
     # 本批最旧 ingestedAt。
-    oldestIngestedAt: str
+    oldestIngestedAt: Required[str]
     # 本批 prepared 完成时间。
-    preparedAt: str
+    preparedAt: Required[str]
     # PreparedBatch schema 版本。
-    schemaVersion: Literal[2]
+    schemaVersion: Required[Literal[2]]
     # coordinator 版本（compatibility manifest 绑定）。
-    coordinatorVersion: str
+    coordinatorVersion: Required[str]
 
 class DurableEventV2(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 事件 schema 版本（v2）。Phase 1+ 字段集演进时升级。
-    schemaVersion: Literal[2]
+    schemaVersion: Required[Literal[2]]
     # 耐久化等级（§10.4）：authoritative_state=内部权威 state.changed/lease/授权；side_effect_receipt=外部副作用 receipt；provider_source=Provider semantic/public frame；derived=UI summary/指标等可重建派生。
-    durabilityClass: Literal["authoritative_state", "side_effect_receipt", "provider_source", "derived"]
+    durabilityClass: Required[Literal["authoritative_state", "side_effect_receipt", "provider_source", "derived"]]
     # 物化器分配的全局唯一事件 ID（evt_<64 位小写十六进制>，SHA-256(JCS([factory-event-id-v2, ingestEventId]))）。崩溃重试得到同一身份。
-    eventId: str
+    eventId: Required[str]
     # 所属任务 ID。
-    taskId: str
+    taskId: Required[str]
     # 任务内单调递增序号（由物化器分配，CAS 持久）。UI cursor 用 (taskId, taskSeq)。
-    taskSeq: int
+    taskSeq: Required[int]
     # 所属 Run ID。
-    runId: str
+    runId: Required[str]
     # 单 Run 内诊断序号（不能跨 Run 唯一）。
-    runSeq: int
+    runSeq: Required[int]
     # 所属 Step ID。
-    stepId: str
+    stepId: Required[str]
     # 所属 Attempt ID。
-    attemptId: str
+    attemptId: Required[str]
     # 事件来源 actor 身份。
-    source: Literal["claude", "codex", "verifier", "release", "orchestrator"]
+    source: Required[Literal["claude", "codex", "verifier", "release", "orchestrator"]]
     # 原始摄取 ID（来自 PreparedEventV2）。
-    ingestEventId: str
+    ingestEventId: Required[str]
     # 具体事件类型（§10.1）。model.summary 必带 summaryOrigin=provider_public + providerEventId + sanitizedProviderFrameRef + sanitizedProviderFrameDigest。
-    eventType: Literal["process.started", "stream.segment.committed", "stream.terminated", "model.summary", "orchestrator.objective", "tool.call", "tool.result", "state.changed"]
+    eventType: Required[Literal["process.started", "stream.segment.committed", "stream.terminated", "model.summary", "orchestrator.objective", "tool.call", "tool.result", "state.changed"]]
     # Provider 事件 ID（model.summary 等 provider 源事件必填，普通事件 null）。
-    providerEventId: Optional[str]
+    providerEventId: Required[Optional[str]]
     # Provider 来源端序号（用于去重与对齐）。
-    sourceSeq: int
+    sourceSeq: Required[int]
     # Provider stream 稳定 ID（stream.* 事件必填；非 stream 事件 null）。
-    streamId: Optional[str]
+    streamId: Required[Optional[str]]
     # 所属 PreparedBatchV2 的 batchId。物化器先 claim 批次，再组装 PreparedBatch，最后逐条物化 DurableEvent。
-    preparedBatchId: str
+    preparedBatchId: Required[str]
     # 所属 PreparedBatch 内的事件序号（与 manifest 的 orderedIngestIds 一致）。
-    batchOrdinal: int
+    batchOrdinal: Required[int]
     # 源传输 span：内存中以原始传输字节精确计数。credential/secret/PII 仅存 providerEventId/sourceSeq 与诚实的 mappingPrecision（byte|field|frame|none），精确字节起止不能进普通事件。
-    sourceTransportSpan: dict[str, Any]
+    sourceTransportSpan: Required[dict[str, Any]]
     # 脱敏后 span：精确指向持久化脱敏字节。脱敏改变长度时不得与 sourceTransportSpan 冒充同一坐标。
-    sanitizedStreamSpan: dict[str, Any]
+    sanitizedStreamSpan: Required[dict[str, Any]]
     # RFC3339 接收 wall time（仅用于显示，不能参与排序）。
-    wallTime: str
+    wallTime: Required[str]
     # 单调时钟纳秒。
-    monotonicTimeNs: int
+    monotonicTimeNs: Required[int]
     # 完整 frame 闭合后写入脱敏器的时刻（首字节到闭合仅记录 frame_assembly_ms 不写入）。
-    ingestedAt: str
+    ingestedAt: Required[str]
     # Provider CLI 上报版本。
-    providerVersion: str
+    providerVersion: Required[str]
     # Adapter 自身 semver 版本。
-    adapterVersion: str
+    adapterVersion: Required[str]
     # 受管进程身份（§10.1）：用于 RUNNING 真实性校验（PID/Job Object/WSL/container exec）。
-    processIdentity: dict[str, Any]
+    processIdentity: Required[dict[str, Any]]
     # 事件负载（已脱敏，未脱敏原文不得落盘）。
-    payload: dict[str, Any]
+    payload: Required[dict[str, Any]]
     # 已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃。model.summary 必填，其它 null。
-    sanitizedProviderFrameDigest: Optional[str]
+    sanitizedProviderFrameDigest: Required[Optional[str]]
     # 脱敏后 payload 的 JCS 摘要。
-    payloadDigest: str
+    payloadDigest: Required[str]
     # 前驱事件 eventDigest（genesis 用 sha256:<64 个 0> 固定 predecessor）。
-    previousEventDigest: str
+    previousEventDigest: Required[str]
     # 本事件 SHA-256(JCS(去除 eventDigest 字段后完整对象))。previousEventDigest 仍参与计算。
-    eventDigest: str
+    eventDigest: Required[str]
     # 本事件命中脱敏点列表（不含原文、低熵 hash 或可推断秘密长度的 redaction manifest）。
-    redactions: list[dict[str, Any]]
+    redactions: Required[list[dict[str, Any]]]
     # redactions 列表内容的 SHA-256 摘要。
-    redactionManifestDigest: str
+    redactionManifestDigest: Required[str]
 
 class IpcEnvelope(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 信封唯一 ID（防重放）
-    envelopeId: str
+    envelopeId: Required[str]
     # 消息类型
-    messageType: Literal["CONTROL_COMMAND", "STATUS_UPDATE", "EVENT_BATCH", "HEARTBEAT", "ACK", "ERROR", "RUNNER_PROTOCOL"]
+    messageType: Required[Literal["CONTROL_COMMAND", "STATUS_UPDATE", "EVENT_BATCH", "HEARTBEAT", "ACK", "ERROR", "RUNNER_PROTOCOL"]]
     # 发送方进程身份（含 SID）
-    senderId: str
+    senderId: Required[str]
     # 接收方进程身份
-    recipientId: str
+    recipientId: Required[str]
     # 随机 nonce，防重放攻击
-    nonce: str
+    nonce: Required[str]
     # 关联 ID，用于请求-响应匹配
-    correlationId: Optional[str]
+    correlationId: str
     # 消息负载（类型由 messageType 决定）
-    payload: dict[str, Any]
+    payload: Required[dict[str, Any]]
     # 负载内容摘要，用于完整性验证
-    payloadDigest: Optional[str]
+    payloadDigest: str
     # 发送时间
-    sentAt: str
+    sentAt: Required[str]
 
 class RunnerProtocol(TypedDict, total=False):
     """由 generate.py 自动生成，禁止手动修改。"""
     # 协议消息唯一 ID
-    messageId: str
+    messageId: Required[str]
     # 协议消息类型
-    protocolMessageType: Literal["START", "INSPECT", "INTERRUPT", "KILL", "STATUS", "COMPLETED", "FAILED", "RECONCILING", "HEARTBEAT"]
+    protocolMessageType: Required[Literal["START", "INSPECT", "INTERRUPT", "KILL", "STATUS", "COMPLETED", "FAILED", "RECONCILING", "HEARTBEAT"]]
     # Attempt 唯一 ID（每次派发不可复用）
-    attemptId: str
+    attemptId: Required[str]
     # 执行者唯一标识
-    executorId: str
+    executorId: Required[str]
     # Fencing token，严格单调递增
-    fencingToken: int
+    fencingToken: Required[int]
     # 控制 epoch
-    controlEpoch: int
+    controlEpoch: Required[int]
     # 进程启动身份（containerId/execId/PID等）
     processStartIdentity: dict[str, Any]
     # 消息负载（按 protocolMessageType 定义结构）
-    payload: dict[str, Any]
+    payload: Required[dict[str, Any]]
     # 消息时间戳
-    timestamp: str
+    timestamp: Required[str]

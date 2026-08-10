@@ -64,9 +64,14 @@ contracts/
 - 所有顶层对象设置 `"additionalProperties": false`（fail-closed）。
 - 数值范围满足 I-JSON/JCS（无 NaN、无 Infinity、无超范围整数）。
 - `enum` 字段使用固定字符串值，不允许自由文本。
-- `IntentAuthorization` 的摘要化快照仍必须可由后续 Policy Engine 解析和重算，不能以“找不到内容的 digest”替代绑定。
+- `contracts/policies/authorization-snapshot-registry.v1.json` 是授权快照的 policy 真源，不是新增 schema/catalog 条目。所有 digest-backed 授权字段均为闭合 `{artifactId,schemaId,schemaVersion,digest}` 引用；`artifactId` 只定位对象，摘要固定为 `sha256(JCS/NFC([schemaId,schemaVersion,payload]))`，其中字符串先做 Unicode NFC，再按 RFC 8785/JCS 编码。
+- 每个 registry binding 固定 schemaId/schemaVersion、真实 validator 来源、闭合 payload schema 以及 required/optional 键。资源指纹 payload 按 `node-capability-map.v1.json` 对应 `nodeType` 的内嵌 `resourceFingerprintSchema` 校验；action policy payload 必须是 selected action 的确定性投影，并绑定 `nodeCapabilityMapDigest + nodeType + actionCapability`。
+- Task 4 消费边界：只能解析状态为 `COMMITTED` 且不可变的 artifact；`artifactId` 解析、schema/version、validator 来源和重算 digest 必须全部匹配，否则拒绝。此处只冻结合同，尚未实现数据库状态或运行时消费逻辑。
 - `ExecutionAuthorization` 使用正确拼写 `stageCapabilityMapDigest`；历史 v1 的 `stageCapeabilityMapDigest` 不在本 schema 双拼写放行范围，后续版本必须经显式 adapter/migration 映射。
 - `ExecutionAuthorization.consumptionState` 只表示 `AVAILABLE`（`maxUses >= 1`）或 `CONSUMED`（`maxUses == 0`）；撤销和过期分别由 `revokedAt` 与 `expiresAt` 表达，不能混为消费状态。
+- 两种 Authorization 的 `revokedAt` 与 `revokeReason` 必须同时为 `null`，或同时为合法 RFC3339 时间和非空原因；未知状态、格式错误时间和半撤销对象一律拒绝。
+- `ExecutionAuthorization.inputBindings` 是闭合对象，只允许完整 `baseSha`、`candidateSha`、`contentDigest` 三个具名键；数组和同类重复绑定不属于 v1 wire format。`contentDigest` 本身是 input-content 快照引用而非裸 hash。`IMPLEMENT` 必须有 `baseSha`，`VERIFY`、`CODE_REVIEW`、`PUBLISH_PR`、`MERGE` 必须有 `candidateSha`，staging/production deploy 与 acceptance 还必须同时有 `candidateSha + contentDigest`。
+- `nodeType → actionCapability` 是 17 个分支的精确闭集，不采用“全局 action 枚举通过即放行”的弱校验；每个 action 仍须由后续 Policy Engine 做动态 scope、lease、时间和 snapshot 重算。
 
 `TestReceipt` 在 catalog 中为 `category: "runtime-only"`、`codegen: false`：它由运行时 `TestReceipt` 表示和 schema 一致性测试消费，三语言生成树不生成第四份静态类型。`CompatibilityManifest` 同样保持 runtime-only。
 
@@ -91,6 +96,11 @@ python contracts/codegen/generate.py --check
 | TypeScript | `packages/factory-contracts/src/generated/contracts.ts` |
 | Python | `apps/agent/src/factory_agent/contracts/generated/models.py` |
 | Rust | `crates/factory-contracts/src/generated/contracts.rs` |
+
+Python 生成目标采用 `TypedDict(total=False)`：仅 JSON Schema `required` 中的字段生成
+`Required[T]`，未列入 `required` 的字段保持可省略；schema 已声明 `null` 时才额外生成
+`Optional[T]`。生成文件不启用 postponed annotations，以便 Python 运行时的
+`__required_keys__` / `__optional_keys__` 继续成为可机械核验的合同证据。
 
 ### 4.3 catalog.v1.json 字段说明
 
@@ -119,13 +129,15 @@ ACCEPT_PRODUCTION, ROLLBACK, RECONCILE_TARGET, RESTORE_DRILL
 - `sideEffectClass`：实际使用的类别为 `read-only`、`local-write`、`isolated-exec`、`external-write-limited`、`external-write`、`remote-write`、`remote-observe`、`isolated-restore`。
 - `resourceFingerprintSchema`：同一 node map 内本地 `$defs` 可解析的 JSON Schema 子对象；顶层及嵌套对象 fail-closed，稳定物理身份与可变 SHA/revision/release/digest 分离。
 - `idempotencyKeyTemplate`：版本化的 `factory-action-v1` / `sha256-jcs-nfc` `actions.byCapability` 闭集。每项为 `H=sha256(JCS/NFC(["factory-action-v1", …]))` 的派发前已知输入，绝不含 attempt、token、epoch、TTL 或时间。
-- `completionFact`：版本化 `actions.byCapability` 的外部可观察 `predicateId` 与 `requiredEvidence`，不是模型自报成功。
+- `completionFact`：版本化 `actions.byCapability` 的外部可观察 `predicateId` 与 `requiredEvidence`，不是模型自报成功；同一节点的不同外部 action 也必须有 action-local 事实，不能由一次泛化 PR 事实互相满足。
 - `authorizationConsumptionPoint`：仅 `before-capability-dispatch` 或 `with-action-started-transaction`；写能力一律采用后者，未知送达进入运行时 `UNKNOWN_STATE/RECONCILING`。
 - `retryClass`：静态重试包络仅为 `bounded-no-external-side-effect`、`local-fact-before-retry`、`external-fact-before-retry`、`one-shot-cas-reconcile-only`，与 Master Spec §17 的动态错误类别分离。
 
-可选 capability 被选择时必须触发对应物理 overlay；若某个写 action 无法定义独立 key 与完成事实，Policy Engine 必须拒绝签发（`unsupported`），不得退回通用自由文本。
+合同测试逐 node/action 精确冻结 required/optional capability、side effect、授权消费点、retry class、`jcsInputFields`、`predicateId` 与 `requiredEvidence`。所有 `*Selected` 条件都必须同时具备 true-需-overlay 与 false-禁-overlay 分支；测试会自动枚举两支，并在资源指纹的根对象和每个嵌套对象注入未知字段。`target.guard.clear` 只允许作为 `RECONCILE_TARGET` 的 optional capability；`PUBLISH_PR` 的四个 action 事实保持 action-local。
 
-本节点的合同测试只证明 node map 的规范化内容摘要会随实质策略变化而变化；**既有 `compatibility-manifest.v1` 未在本节点改写或绑定该摘要**，以避免破坏已冻结历史 v1。Task 4 必须在启动/派生授权时显式绑定并重算 node policy compatibility digest，解析不到或不一致即拒绝。
+`DEPLOY_STAGING`、`DEPLOY_PRODUCTION`、`ACCEPT_STAGING`、`ACCEPT_PRODUCTION` 与 `ROLLBACK` 的每个 action key 都显式包含 `environment + resourceFingerprintDigest`，因此相同业务输入不能跨环境或物理目标复用 identity。若 action 无法满足精确 key/fact 合同，后续 Policy Engine 必须拒绝签发，不得退回通用自由文本。
+
+v1 `CompatibilityManifest` 已要求 `nodeCapabilityMapDigest`，唯一算法真源是 `emit_manifest.py` 的 raw-file SHA-256；语义或纯格式字节变化都会改变摘要。ExecutionAuthorization 与 Manifest 实际值的运行时核对仍属于 Task 4，本合同节点不伪装已经实现消费逻辑。
 
 `RESTORE_DRILL` 固定需要 `db.restore`、`restore.validation.instance`、`db.check`，且 resource fingerprint 必须证明目标不是生产实例。
 
@@ -199,6 +211,7 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 - `synchronous` 固定为 `"FULL"`。
 - SQLite spike receipt 必须绑定参数 tuple、manifest schema digest、`benchmarkProfileDigest` 和环境 digest。
 - emitter、Phase 1 consumer 与 Phase 6 validator 都重算 tuple digest 并核对 receipt 输入，禁止只比较 receipt 文件名。
+- v1 `CompatibilityManifest` 已经要求 `nodeCapabilityMapDigest`。其唯一算法真源是 `tools/compat-probes/emit_manifest.py` 的 raw-file SHA-256：语义内容或纯格式字节任一变化都会改变摘要，不能用 compact/sorted JSON 私有 hash 替代。ExecutionAuthorization 与 Manifest 的实际 node map 值比对仍由 Task 4 在消费时完成。
 
 ---
 

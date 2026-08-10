@@ -100,28 +100,28 @@ export interface IntentAuthorization {
   taskId: string;
   /** 做出一次性授权的用户身份。 */
   userId: string;
-  /** 规范化用户需求的 JCS/NFC 内容摘要。 */
-  requirementDigest: string;
+  /** 规范化用户需求的闭合 JCS/NFC 快照引用。 */
+  requirementDigest: Record<string, unknown>;
   /** 项目身份，禁止跨项目复用授权。 */
   projectId: string;
   /** 规范化后的仓库身份。 */
   repositoryId: string;
-  /** 可解析的仓库/物理路径/模式绑定快照摘要。 */
-  repositoryBindingDigest: string;
-  /** 可解析的基础分支、base SHA 或 bootstrap 前置事实快照摘要。 */
-  baselineDigest: string;
+  /** 可解析的仓库/物理路径/模式绑定快照引用。 */
+  repositoryBindingDigest: Record<string, unknown>;
+  /** 可解析的基础分支、base SHA 或 bootstrap 前置事实快照引用。 */
+  baselineDigest: Record<string, unknown>;
   /** 用户选择的目标终点阶段；只给出 capability 上限。 */
   targetStage: "DESIGN_APPROVED" | "CODEX_APPROVED" | "PR_READY" | "MERGED" | "STAGING_ACCEPTED" | "PRODUCTION_ACCEPTED";
   /** 派生授权时使用的 stage-capability-map 版本。 */
   stageCapabilityMapVersion: string;
-  /** targetStage 展开后的排序 capability 集合摘要。 */
-  allowedCapabilitySetDigest: string;
-  /** 可解析的环境、ServerProfile、数据库和资源目标绑定快照摘要。 */
-  targetBindingDigest: string;
+  /** targetStage 展开后的排序 capability 集合快照引用。 */
+  allowedCapabilitySetDigest: Record<string, unknown>;
+  /** 可解析的环境、ServerProfile、数据库和资源目标绑定快照引用。 */
+  targetBindingDigest: Record<string, unknown>;
   /** 用户接受的最高风险等级。 */
   riskCeiling: "low" | "medium" | "high" | "critical";
-  /** 可解析的估算成本告警策略摘要；不把订阅 CLI 估算伪装成真实账单。 */
-  estimatedCostAlertDigest: string;
+  /** 可解析的估算成本告警策略快照引用；不把订阅 CLI 估算伪装成真实账单。 */
+  estimatedCostAlertDigest: Record<string, unknown>;
   /** 端到端自主执行预算（毫秒）；禁止无限值。 */
   autonomousExecutionBudgetMs: number;
   /** 自动修复轮数上限。 */
@@ -148,18 +148,18 @@ export interface ExecutionAuthorization {
   intentAuthorizationId: string;
   /** 绑定的不可变 PlanRevision 身份。 */
   planRevisionId: string;
-  /** 计划语义哈希。 */
-  semanticPlanHash: string;
-  /** 完整 PlanRevision 摘要。 */
-  planRevisionDigest: string;
+  /** 计划语义的闭合快照引用。 */
+  semanticPlanHash: Record<string, unknown>;
+  /** 完整 PlanRevision 的闭合快照引用。 */
+  planRevisionDigest: Record<string, unknown>;
   /** stage capability map 版本。 */
   stageCapabilityMapVersion: string;
-  /** stage capability map 内容摘要。 */
-  stageCapabilityMapDigest: string;
+  /** stage capability map 的闭合快照引用。 */
+  stageCapabilityMapDigest: Record<string, unknown>;
   /** node capability map 版本。 */
   nodeCapabilityMapVersion: string;
-  /** node capability map 内容摘要。 */
-  nodeCapabilityMapDigest: string;
+  /** node capability map raw-file 内容的闭合快照引用。 */
+  nodeCapabilityMapDigest: Record<string, unknown>;
   /** 绑定的 Run 身份。 */
   runId: string;
   /** 绑定的 Step 身份。 */
@@ -170,17 +170,18 @@ export interface ExecutionAuthorization {
   nodeType: "PLAN" | "DESIGN_REVIEW" | "BOOTSTRAP_REPOSITORY" | "IMPLEMENT" | "VERIFY" | "CODE_REVIEW" | "ATTEST_REVIEW" | "PUBLISH_PR" | "MERGE" | "BUILD_ARTIFACT" | "DEPLOY_STAGING" | "ACCEPT_STAGING" | "DEPLOY_PRODUCTION" | "ACCEPT_PRODUCTION" | "ROLLBACK" | "RECONCILE_TARGET" | "RESTORE_DRILL";
   /** 当前 lease owner 的执行器身份。 */
   executorId: string;
+  /** 资源指纹的闭合快照引用；其 payload 必须按 nodeType 使用 node map 内嵌 resourceFingerprintSchema 校验。 */
   resourceFingerprint: Record<string, unknown>;
-  /** 可解析 capability/resource scope 快照摘要。 */
-  capabilityScopeDigest: string;
-  /** 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。 */
-  idempotencyKey: string;
-  /** 输入身份绑定；不使用自由文本或短 SHA。 */
-  inputBindings: Record<string, unknown>[];
+  /** 可解析 capability/resource scope 的闭合快照引用。 */
+  capabilityScopeDigest: Record<string, unknown>;
+  /** 按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key 快照引用。 */
+  idempotencyKey: Record<string, unknown>;
+  /** 闭合且无歧义的输入身份对象；同一种 SHA/digest 至多一个字段，禁止数组重复绑定或自由文本。 */
+  inputBindings: Record<string, unknown>;
   /** 本 ExecutionAuthorization 唯一对应的 capability action。 */
   actionCapability: "acceptance.fixture.write" | "build.exec.isolated" | "check.publish" | "container.inspect.scoped" | "db.backup" | "db.check" | "db.migrate" | "db.read" | "db.restore" | "forge.observe.scoped" | "git.local_commit" | "git.push" | "http.check.scoped" | "log.read.scoped" | "network.egress.scoped" | "nginx.switch" | "pr.create" | "pr.update" | "registry.observe.scoped" | "registry.push" | "remote.observe.scoped" | "remote.write.scoped" | "repo.bootstrap" | "repo.merge" | "repo.read" | "restore.validation.instance" | "rollback" | "service.restart.scoped" | "ssh.exec.scoped" | "target.guard.clear" | "test.exec.isolated" | "traffic.switch.scoped" | "worktree.write";
-  /** selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。 */
-  actionPolicySnapshotDigest: string;
+  /** selected action 的 key template、completion fact 与消费点确定性投影的闭合快照引用；payload 必须绑定 nodeCapabilityMapDigest、nodeType 和 actionCapability。 */
+  actionPolicySnapshotDigest: Record<string, unknown>;
   /** 严格单调 lease fencing token。 */
   fencingToken: number;
   /** 控制权 epoch。 */

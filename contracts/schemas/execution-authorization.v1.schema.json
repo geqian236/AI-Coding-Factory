@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/execution-authorization.v1.schema.json",
   "title": "ExecutionAuthorization",
-  "description": "Phase 1 v1 设计决定：Policy Engine 为单个 action capability 派生可消费授权。resourceFingerprint、capability scope 和 action policy 都以内容寻址且可解析、可重算的摘要绑定；裸 digest 不是充分证据。Task 4/5 仍负责动态验证 scope、lease、TTL、目标 guard、issuedAt < expiresAt 和 snapshot 解析/重算。",
+  "description": "Phase 1 v1 设计决定：Policy Engine 为单个 action capability 派生可消费授权。所有 digest-backed 字段均为固定 schemaId/version 的闭合 artifact ref；Task 4 必须只从 COMMITTED 不可变 artifact 解析，核验 ID、schema/version、validator 与重算 digest，任一不匹配均拒绝。Task 4/5 仍负责动态验证 scope、lease、TTL、目标 guard、issuedAt < expiresAt 和实际消费。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -40,12 +40,44 @@
     "executionAuthorizationId": {"type": "string", "minLength": 1, "description": "派生授权稳定身份。"},
     "intentAuthorizationId": {"type": "string", "minLength": 1, "description": "来源 IntentAuthorization 身份。"},
     "planRevisionId": {"type": "string", "minLength": 1, "description": "绑定的不可变 PlanRevision 身份。"},
-    "semanticPlanHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "计划语义哈希。"},
-    "planRevisionDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "完整 PlanRevision 摘要。"},
+    "semanticPlanHash": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.semantic-plan.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.semanticPlanHash",
+      "description": "计划语义的闭合快照引用。"
+    },
+    "planRevisionDigest": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.plan-revision.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.planRevisionDigest",
+      "description": "完整 PlanRevision 的闭合快照引用。"
+    },
     "stageCapabilityMapVersion": {"type": "string", "minLength": 1, "description": "stage capability map 版本。"},
-    "stageCapabilityMapDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "stage capability map 内容摘要。"},
+    "stageCapabilityMapDigest": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.stage-capability-map.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.stageCapabilityMapDigest",
+      "description": "stage capability map 的闭合快照引用。"
+    },
     "nodeCapabilityMapVersion": {"type": "string", "minLength": 1, "description": "node capability map 版本。"},
-    "nodeCapabilityMapDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "node capability map 内容摘要。"},
+    "nodeCapabilityMapDigest": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.node-capability-map.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.nodeCapabilityMapDigest",
+      "description": "node capability map raw-file 内容的闭合快照引用。"
+    },
     "runId": {"type": "string", "minLength": 1, "description": "绑定的 Run 身份。"},
     "stepId": {"type": "string", "minLength": 1, "description": "绑定的 Step 身份。"},
     "attemptId": {"type": "string", "minLength": 1, "description": "绑定的不可复用 Attempt 身份。"},
@@ -63,55 +95,49 @@
     "executorId": {"type": "string", "minLength": 1, "description": "当前 lease owner 的执行器身份。"},
     "resourceFingerprint": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["schemaDigest", "fingerprintDigest"],
-      "properties": {
-        "schemaDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "node policy 内嵌 resourceFingerprintSchema 的内容寻址规范化摘要；运行时必须解析并重算。"},
-        "fingerprintDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "按该 schema 产生的稳定物理资源指纹内容摘要；运行时必须解析并重算。"}
-      }
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.resource-fingerprint.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.resourceFingerprint",
+      "description": "资源指纹的闭合快照引用；其 payload 必须按 nodeType 使用 node map 内嵌 resourceFingerprintSchema 校验。"
     },
-    "capabilityScopeDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "可解析 capability/resource scope 快照摘要。"},
-    "idempotencyKey": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key。"},
+    "capabilityScopeDigest": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.capability-scope.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.capabilityScopeDigest",
+      "description": "可解析 capability/resource scope 的闭合快照引用。"
+    },
+    "idempotencyKey": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.idempotency-key.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.idempotencyKey",
+      "description": "按 factory-action-v1 的 H=sha256(JCS/NFC(...)) 计算的稳定 action key 快照引用。"
+    },
     "inputBindings": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "value"],
-        "properties": {
-          "kind": {"type": "string", "enum": ["BASE_SHA", "CANDIDATE_SHA", "CONTENT_DIGEST"]},
-          "value": {"type": "string", "minLength": 1}
-        },
-        "allOf": [
-          {
-            "if": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["kind", "value"],
-              "properties": {
-                "kind": {"enum": ["BASE_SHA", "CANDIDATE_SHA"]},
-                "value": {"type": "string", "minLength": 1}
-              }
-            },
-            "then": {"properties": {"value": {"pattern": "^[0-9a-f]{40}$"}}}
-          },
-          {
-            "if": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["kind", "value"],
-              "properties": {
-                "kind": {"const": "CONTENT_DIGEST"},
-                "value": {"type": "string", "minLength": 1}
-              }
-            },
-            "then": {"properties": {"value": {"pattern": "^sha256:[0-9a-f]{64}$"}}}
-          }
-        ]
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "baseSha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "开发前已存在的完整 base commit SHA。"},
+        "candidateSha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "已产生且需审核/发布的完整 candidate commit SHA。"},
+        "contentDigest": {
+          "type": "object",
+          "allOf": [
+            {"$ref": "#/$defs/snapshotRef"},
+            {"properties": {"schemaId": {"const": "factory.authorization.execution.input-content.v1"}, "schemaVersion": {"const": "1"}}}
+          ],
+          "xSnapshotRegistryEntry": "ExecutionAuthorization.inputBindings.contentDigest",
+          "description": "已产生的内容寻址 artifact、镜像或发布材料的闭合快照引用。"
+        }
       },
-      "description": "输入身份绑定；不使用自由文本或短 SHA。"
+      "description": "闭合且无歧义的输入身份对象；同一种 SHA/digest 至多一个字段，禁止数组重复绑定或自由文本。"
     },
     "actionCapability": {
       "type": "string",
@@ -126,7 +152,15 @@
       ],
       "description": "本 ExecutionAuthorization 唯一对应的 capability action。"
     },
-    "actionPolicySnapshotDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "selected action 的 key template、completion fact 和消费点内容快照摘要；运行时必须解析并重算。"},
+    "actionPolicySnapshotDigest": {
+      "type": "object",
+      "allOf": [
+        {"$ref": "#/$defs/snapshotRef"},
+        {"properties": {"schemaId": {"const": "factory.authorization.execution.action-policy.v1"}, "schemaVersion": {"const": "1"}}}
+      ],
+      "xSnapshotRegistryEntry": "ExecutionAuthorization.actionPolicySnapshotDigest",
+      "description": "selected action 的 key template、completion fact 与消费点确定性投影的闭合快照引用；payload 必须绑定 nodeCapabilityMapDigest、nodeType 和 actionCapability。"
+    },
     "fencingToken": {"type": "integer", "minimum": 1, "maximum": 9007199254740991, "description": "严格单调 lease fencing token。"},
     "controlEpoch": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "控制权 epoch。"},
     "acceptedControlCommandSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "派生时接受的控制命令序号。"},
@@ -136,6 +170,19 @@
     "expiresAt": {"type": "string", "format": "date-time", "description": "派生授权绝对 TTL。"},
     "revokedAt": {"type": ["string", "null"], "format": "date-time", "description": "撤销时间；未撤销时显式为 null。"},
     "revokeReason": {"type": ["string", "null"], "minLength": 1, "description": "撤销原因；未撤销时显式为 null。"}
+  },
+  "$defs": {
+    "snapshotRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "schemaId", "schemaVersion", "digest"],
+      "properties": {
+        "artifactId": {"type": "string", "minLength": 1},
+        "schemaId": {"type": "string", "minLength": 1},
+        "schemaVersion": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
   },
   "allOf": [
     {
@@ -152,32 +199,136 @@
       "else": {"properties": {"revokeReason": {"type": "string", "minLength": 1}}}
     },
     {
-      "if": {
-        "properties": {
-          "nodeType": {
-            "enum": [
-              "ATTEST_REVIEW", "PUBLISH_PR", "MERGE", "BUILD_ARTIFACT", "DEPLOY_STAGING",
-              "ACCEPT_STAGING", "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
-              "RECONCILE_TARGET", "RESTORE_DRILL"
-            ]
-          }
+      "oneOf": [
+        {
+          "properties": {
+            "nodeType": {"const": "PLAN"},
+            "actionCapability": {"enum": ["repo.read"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "DESIGN_REVIEW"},
+            "actionCapability": {"enum": ["repo.read"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "BOOTSTRAP_REPOSITORY"},
+            "actionCapability": {"enum": ["repo.bootstrap", "git.local_commit"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "IMPLEMENT"},
+            "actionCapability": {"enum": ["repo.read", "worktree.write", "git.local_commit"]},
+            "inputBindings": {"required": ["baseSha"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "VERIFY"},
+            "actionCapability": {"enum": ["repo.read", "test.exec.isolated", "network.egress.scoped"]},
+            "inputBindings": {"required": ["candidateSha"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "CODE_REVIEW"},
+            "actionCapability": {"enum": ["repo.read"]},
+            "inputBindings": {"required": ["candidateSha"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "ATTEST_REVIEW"},
+            "actionCapability": {"enum": ["repo.read", "check.publish"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "PUBLISH_PR"},
+            "actionCapability": {"enum": ["git.push", "pr.create", "pr.update", "forge.observe.scoped"]},
+            "inputBindings": {"required": ["candidateSha"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "MERGE"},
+            "actionCapability": {"enum": ["forge.observe.scoped", "repo.merge"]},
+            "inputBindings": {"required": ["candidateSha"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "BUILD_ARTIFACT"},
+            "actionCapability": {"enum": ["build.exec.isolated", "registry.push", "registry.observe.scoped"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "DEPLOY_STAGING"},
+            "actionCapability": {"enum": ["ssh.exec.scoped", "remote.write.scoped", "db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"]},
+            "inputBindings": {"required": ["candidateSha", "contentDigest"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "ACCEPT_STAGING"},
+            "actionCapability": {"enum": ["http.check.scoped", "network.egress.scoped", "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped", "db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"]},
+            "inputBindings": {"required": ["candidateSha", "contentDigest"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "DEPLOY_PRODUCTION"},
+            "actionCapability": {"enum": ["ssh.exec.scoped", "remote.write.scoped", "db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"]},
+            "inputBindings": {"required": ["candidateSha", "contentDigest"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "ACCEPT_PRODUCTION"},
+            "actionCapability": {"enum": ["http.check.scoped", "network.egress.scoped", "remote.observe.scoped", "container.inspect.scoped", "log.read.scoped", "db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"]},
+            "inputBindings": {"required": ["candidateSha", "contentDigest"]}
+          },
+          "required": ["nodeType", "actionCapability", "inputBindings"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "ROLLBACK"},
+            "actionCapability": {"enum": ["rollback", "ssh.exec.scoped", "remote.write.scoped", "db.restore", "nginx.switch", "traffic.switch.scoped"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "RECONCILE_TARGET"},
+            "actionCapability": {"enum": ["remote.observe.scoped", "container.inspect.scoped", "log.read.scoped", "db.read", "db.check", "registry.observe.scoped", "target.guard.clear"]}
+          },
+          "required": ["nodeType", "actionCapability"]
+        },
+        {
+          "properties": {
+            "nodeType": {"const": "RESTORE_DRILL"},
+            "actionCapability": {"enum": ["db.restore", "restore.validation.instance", "db.check"]}
+          },
+          "required": ["nodeType", "actionCapability"]
         }
-      },
-      "then": {
-        "properties": {
-          "inputBindings": {
-            "contains": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "kind": {"enum": ["CANDIDATE_SHA", "CONTENT_DIGEST"]},
-                "value": {"type": "string", "minLength": 1}
-              },
-              "required": ["kind", "value"]
-            }
-          }
-        }
-      }
+      ]
     }
   ]
 }

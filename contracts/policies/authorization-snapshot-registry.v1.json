@@ -1,0 +1,429 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/contracts/policies/authorization-snapshot-registry.v1.json",
+  "title": "AuthorizationSnapshotRegistryV1",
+  "description": "授权摘要快照的闭合集合。每个引用都先以 artifactId 定位不可变对象，再以固定 schemaId/schemaVersion 和域分离摘要证明其 payload；Task 4 必须按本 registry 解析、校验并重算，不能把裸 digest 当作授权证据。",
+  "version": "1",
+  "canonicalizer": {
+    "unicodeNormalization": "NFC",
+    "serialization": "RFC8785/JCS",
+    "digestAlgorithm": "sha256",
+    "domainSeparatedInput": "[schemaId,schemaVersion,payload]",
+    "digestExpression": "sha256(JCS/NFC([schemaId,schemaVersion,payload]))"
+  },
+  "snapshotRefSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["artifactId", "schemaId", "schemaVersion", "digest"],
+    "properties": {
+      "artifactId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "COMMITTED 不可变 artifact 的稳定定位符；它不参与 payload digest 输入。"
+      },
+      "schemaId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "快照 payload 的固定 schema 身份。"
+      },
+      "schemaVersion": {
+        "type": "string",
+        "minLength": 1,
+        "description": "快照 payload 的固定 schema 版本。"
+      },
+      "digest": {
+        "type": "string",
+        "pattern": "^sha256:[a-f0-9]{64}$",
+        "description": "sha256(JCS/NFC([schemaId,schemaVersion,payload]))。"
+      }
+    }
+  },
+  "artifactResolution": {
+    "requiredState": "COMMITTED",
+    "immutable": true,
+    "mustResolveArtifactId": true,
+    "mustMatch": [
+      "schemaId",
+      "schemaVersion",
+      "validatorSource",
+      "recomputedDigest"
+    ],
+    "rejectOnMismatch": true
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "nodeType": {
+      "type": "string",
+      "enum": [
+        "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+        "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+        "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+        "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+        "RECONCILE_TARGET", "RESTORE_DRILL"
+      ]
+    },
+    "actionCapability": {
+      "type": "string",
+      "enum": [
+        "acceptance.fixture.write", "build.exec.isolated", "check.publish", "container.inspect.scoped",
+        "db.backup", "db.check", "db.migrate", "db.read", "db.restore", "forge.observe.scoped",
+        "git.local_commit", "git.push", "http.check.scoped", "log.read.scoped", "network.egress.scoped",
+        "nginx.switch", "pr.create", "pr.update", "registry.observe.scoped", "registry.push",
+        "remote.observe.scoped", "remote.write.scoped", "repo.bootstrap", "repo.merge", "repo.read",
+        "restore.validation.instance", "rollback", "service.restart.scoped", "ssh.exec.scoped",
+        "target.guard.clear", "test.exec.isolated", "traffic.switch.scoped", "worktree.write"
+      ]
+    },
+    "targetStage": {
+      "type": "string",
+      "enum": [
+        "DESIGN_APPROVED", "CODEX_APPROVED", "PR_READY", "MERGED",
+        "STAGING_ACCEPTED", "PRODUCTION_ACCEPTED"
+      ]
+    },
+    "intentRequirementPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirementText", "normalizationVersion"],
+      "properties": {
+        "requirementText": {"$ref": "#/$defs/nonEmptyString"},
+        "normalizationVersion": {"const": "nfc-jcs-v1"},
+        "attachmentsDigest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "repositoryBindingPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryId", "canonicalRemote", "physicalRootIdentity", "mode"],
+      "properties": {
+        "repositoryId": {"$ref": "#/$defs/nonEmptyString"},
+        "canonicalRemote": {"$ref": "#/$defs/nonEmptyString"},
+        "physicalRootIdentity": {"$ref": "#/$defs/nonEmptyString"},
+        "mode": {"enum": ["existing", "new"]},
+        "baseBranch": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "baselinePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseBranch", "baseSha", "bootstrapState"],
+      "properties": {
+        "baseBranch": {"$ref": "#/$defs/nonEmptyString"},
+        "baseSha": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "bootstrapState": {"enum": ["EXISTS", "BOOTSTRAP_REQUIRED"]},
+        "bootstrapReceiptId": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "allowedCapabilitySetPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetStage", "capabilities"],
+      "properties": {
+        "targetStage": {"$ref": "#/$defs/targetStage"},
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/actionCapability"}
+        }
+      }
+    },
+    "targetBindingPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetKind", "projectId"],
+      "properties": {
+        "targetKind": {"enum": ["repository", "environment", "deployment-target"]},
+        "projectId": {"$ref": "#/$defs/nonEmptyString"},
+        "environment": {"enum": ["STAGING", "PRODUCTION"]},
+        "serverProfileId": {"$ref": "#/$defs/nonEmptyString"},
+        "databaseProfileId": {"$ref": "#/$defs/nonEmptyString"},
+        "registryProfileId": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "estimatedCostAlertPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["currency", "alertThreshold", "hardStopThreshold"],
+      "properties": {
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "alertThreshold": {"type": "number", "minimum": 0},
+        "hardStopThreshold": {"type": "number", "minimum": 0},
+        "billingScope": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "semanticPlanPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "goal", "targetStage", "nodeCapabilityMapVersion", "stageCapabilityMapVersion"],
+      "properties": {
+        "schemaVersion": {"const": "1"},
+        "goal": {"$ref": "#/$defs/nonEmptyString"},
+        "targetStage": {"$ref": "#/$defs/targetStage"},
+        "nodeCapabilityMapVersion": {"$ref": "#/$defs/nonEmptyString"},
+        "stageCapabilityMapVersion": {"$ref": "#/$defs/nonEmptyString"},
+        "constraints": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "planRevisionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash"],
+      "properties": {
+        "planRevisionId": {"$ref": "#/$defs/nonEmptyString"},
+        "taskId": {"$ref": "#/$defs/nonEmptyString"},
+        "specRevision": {"type": "integer", "minimum": 1},
+        "intentAuthorizationId": {"$ref": "#/$defs/nonEmptyString"},
+        "semanticPlanHash": {"$ref": "#/$defs/sha256Digest"},
+        "parentRevisionId": {"$ref": "#/$defs/nonEmptyString"}
+      }
+    },
+    "stageCapabilityMapPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mapVersion", "targetStage", "capabilities"],
+      "properties": {
+        "mapVersion": {"$ref": "#/$defs/nonEmptyString"},
+        "targetStage": {"$ref": "#/$defs/targetStage"},
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/actionCapability"}
+        }
+      }
+    },
+    "nodeCapabilityMapPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mapVersion", "rawFileDigest"],
+      "properties": {
+        "mapVersion": {"$ref": "#/$defs/nonEmptyString"},
+        "rawFileDigest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "resourceFingerprintPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeType", "fingerprint"],
+      "properties": {
+        "nodeType": {"$ref": "#/$defs/nodeType"},
+        "fingerprint": {
+          "description": "实际对象必须由 node-capability-map.v1.json 对应 nodeType 的内嵌 resourceFingerprintSchema 校验；该嵌入 schema 自己拒绝未知键。"
+        }
+      }
+    },
+    "capabilityScopePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capabilities", "resourceFingerprintDigest"],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/actionCapability"}
+        },
+        "resourceFingerprintDigest": {"$ref": "#/$defs/sha256Digest"},
+        "targetBindingDigest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "idempotencyKeyPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeType", "actionCapability", "inputBindingsDigest"],
+      "properties": {
+        "nodeType": {"$ref": "#/$defs/nodeType"},
+        "actionCapability": {"$ref": "#/$defs/actionCapability"},
+        "inputBindingsDigest": {"$ref": "#/$defs/sha256Digest"}
+      }
+    },
+    "actionPolicySnapshotPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeCapabilityMapDigest", "nodeType", "actionCapability", "idempotencyKeyTemplate",
+        "completionFact", "authorizationConsumptionPoint", "retryClass"
+      ],
+      "properties": {
+        "nodeCapabilityMapDigest": {"$ref": "#/$defs/sha256Digest"},
+        "nodeType": {"$ref": "#/$defs/nodeType"},
+        "actionCapability": {"$ref": "#/$defs/actionCapability"},
+        "idempotencyKeyTemplate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "hashAlgorithm", "jcsInputFields"],
+          "properties": {
+            "version": {"const": "factory-action-v1"},
+            "hashAlgorithm": {"const": "sha256-jcs-nfc"},
+            "jcsInputFields": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/nonEmptyString"}
+            }
+          }
+        },
+        "completionFact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["predicateId", "requiredEvidence"],
+          "properties": {
+            "predicateId": {"$ref": "#/$defs/nonEmptyString"},
+            "requiredEvidence": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/nonEmptyString"}
+            }
+          }
+        },
+        "authorizationConsumptionPoint": {
+          "enum": ["before-capability-dispatch", "with-action-started-transaction"]
+        },
+        "retryClass": {
+          "enum": [
+            "bounded-no-external-side-effect", "local-fact-before-retry",
+            "external-fact-before-retry", "one-shot-cas-reconcile-only"
+          ]
+        }
+      }
+    },
+    "inputContentPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contentKind", "mediaType", "byteLength"],
+      "properties": {
+        "contentKind": {"enum": ["artifact", "evidence", "release-material"]},
+        "mediaType": {"$ref": "#/$defs/nonEmptyString"},
+        "byteLength": {"type": "integer", "minimum": 0},
+        "candidateSha": {"type": "string", "pattern": "^[a-f0-9]{40}$"}
+      }
+    }
+  },
+  "snapshotBindings": {
+    "IntentAuthorization.requirementDigest": {
+      "schemaId": "factory.authorization.intent.requirement.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/intentRequirementPayload"},
+      "payloadSchema": {"$ref": "#/$defs/intentRequirementPayload"},
+      "payloadKeys": {"required": ["requirementText", "normalizationVersion"], "optional": ["attachmentsDigest"]}
+    },
+    "IntentAuthorization.repositoryBindingDigest": {
+      "schemaId": "factory.authorization.intent.repository-binding.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/repositoryBindingPayload"},
+      "payloadSchema": {"$ref": "#/$defs/repositoryBindingPayload"},
+      "payloadKeys": {"required": ["repositoryId", "canonicalRemote", "physicalRootIdentity", "mode"], "optional": ["baseBranch"]}
+    },
+    "IntentAuthorization.baselineDigest": {
+      "schemaId": "factory.authorization.intent.baseline.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/baselinePayload"},
+      "payloadSchema": {"$ref": "#/$defs/baselinePayload"},
+      "payloadKeys": {"required": ["baseBranch", "baseSha", "bootstrapState"], "optional": ["bootstrapReceiptId"]}
+    },
+    "IntentAuthorization.allowedCapabilitySetDigest": {
+      "schemaId": "factory.authorization.intent.allowed-capability-set.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/allowedCapabilitySetPayload"},
+      "payloadSchema": {"$ref": "#/$defs/allowedCapabilitySetPayload"},
+      "payloadKeys": {"required": ["targetStage", "capabilities"], "optional": []}
+    },
+    "IntentAuthorization.targetBindingDigest": {
+      "schemaId": "factory.authorization.intent.target-binding.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/targetBindingPayload"},
+      "payloadSchema": {"$ref": "#/$defs/targetBindingPayload"},
+      "payloadKeys": {"required": ["targetKind", "projectId"], "optional": ["environment", "serverProfileId", "databaseProfileId", "registryProfileId"]}
+    },
+    "IntentAuthorization.estimatedCostAlertDigest": {
+      "schemaId": "factory.authorization.intent.estimated-cost-alert.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/estimatedCostAlertPayload"},
+      "payloadSchema": {"$ref": "#/$defs/estimatedCostAlertPayload"},
+      "payloadKeys": {"required": ["currency", "alertThreshold", "hardStopThreshold"], "optional": ["billingScope"]}
+    },
+    "ExecutionAuthorization.semanticPlanHash": {
+      "schemaId": "factory.authorization.execution.semantic-plan.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/semanticPlanPayload"},
+      "payloadSchema": {"$ref": "#/$defs/semanticPlanPayload"},
+      "payloadKeys": {"required": ["schemaVersion", "goal", "targetStage", "nodeCapabilityMapVersion", "stageCapabilityMapVersion"], "optional": ["constraints"]}
+    },
+    "ExecutionAuthorization.planRevisionDigest": {
+      "schemaId": "factory.authorization.execution.plan-revision.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/planRevisionPayload"},
+      "payloadSchema": {"$ref": "#/$defs/planRevisionPayload"},
+      "payloadKeys": {"required": ["planRevisionId", "taskId", "specRevision", "intentAuthorizationId", "semanticPlanHash"], "optional": ["parentRevisionId"]}
+    },
+    "ExecutionAuthorization.stageCapabilityMapDigest": {
+      "schemaId": "factory.authorization.execution.stage-capability-map.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/stageCapabilityMapPayload"},
+      "payloadSchema": {"$ref": "#/$defs/stageCapabilityMapPayload"},
+      "payloadKeys": {"required": ["mapVersion", "targetStage", "capabilities"], "optional": []}
+    },
+    "ExecutionAuthorization.nodeCapabilityMapDigest": {
+      "schemaId": "factory.authorization.execution.node-capability-map.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "raw-file-sha256", "source": "contracts/policies/node-capability-map.v1.json"},
+      "payloadSchema": {"$ref": "#/$defs/nodeCapabilityMapPayload"},
+      "payloadKeys": {"required": ["mapVersion", "rawFileDigest"], "optional": []}
+    },
+    "ExecutionAuthorization.resourceFingerprint": {
+      "schemaId": "factory.authorization.execution.resource-fingerprint.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "node-capability-map-embedded", "source": "contracts/policies/node-capability-map.v1.json#/nodeTypes/{nodeType}/resourceFingerprintSchema", "nodeTypeFrom": "ExecutionAuthorization.nodeType"},
+      "payloadSchema": {"$ref": "#/$defs/resourceFingerprintPayload"},
+      "payloadKeys": {"required": ["nodeType", "fingerprint"], "optional": []}
+    },
+    "ExecutionAuthorization.capabilityScopeDigest": {
+      "schemaId": "factory.authorization.execution.capability-scope.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/capabilityScopePayload"},
+      "payloadSchema": {"$ref": "#/$defs/capabilityScopePayload"},
+      "payloadKeys": {"required": ["capabilities", "resourceFingerprintDigest"], "optional": ["targetBindingDigest"]}
+    },
+    "ExecutionAuthorization.idempotencyKey": {
+      "schemaId": "factory.authorization.execution.idempotency-key.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/idempotencyKeyPayload"},
+      "payloadSchema": {"$ref": "#/$defs/idempotencyKeyPayload"},
+      "payloadKeys": {"required": ["nodeType", "actionCapability", "inputBindingsDigest"], "optional": []}
+    },
+    "ExecutionAuthorization.actionPolicySnapshotDigest": {
+      "schemaId": "factory.authorization.execution.action-policy.v1",
+      "schemaVersion": "1",
+      "validator": {
+        "kind": "deterministic-action-projection",
+        "source": "contracts/policies/node-capability-map.v1.json",
+        "nodeTypeFrom": "ExecutionAuthorization.nodeType",
+        "actionCapabilityFrom": "ExecutionAuthorization.actionCapability",
+        "projectionFields": [
+          "idempotencyKeyTemplate.actions.byCapability[{actionCapability}]",
+          "completionFact.actions.byCapability[{actionCapability}]",
+          "authorizationConsumptionPoint",
+          "retryClass"
+        ]
+      },
+      "payloadSchema": {"$ref": "#/$defs/actionPolicySnapshotPayload"},
+      "payloadKeys": {"required": ["nodeCapabilityMapDigest", "nodeType", "actionCapability", "idempotencyKeyTemplate", "completionFact", "authorizationConsumptionPoint", "retryClass"], "optional": []}
+    },
+    "ExecutionAuthorization.inputBindings.contentDigest": {
+      "schemaId": "factory.authorization.execution.input-content.v1",
+      "schemaVersion": "1",
+      "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/inputContentPayload"},
+      "payloadSchema": {"$ref": "#/$defs/inputContentPayload"},
+      "payloadKeys": {"required": ["contentKind", "mediaType", "byteLength"], "optional": ["candidateSha"]}
+    }
+  }
+}
