@@ -6,7 +6,10 @@ import ast
 import copy
 import hashlib
 import importlib.util
+import io
 import json
+import logging
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +34,7 @@ SNAPSHOT_REGISTRY_PATH = REPO_ROOT / "contracts" / "policies" / "authorization-s
 RUN_SPEC_SCHEMA_PATH = SCHEMAS_DIR / "run-spec.v1.schema.json"
 PLAN_REVISION_SCHEMA_PATH = SCHEMAS_DIR / "plan-revision.v1.schema.json"
 PLAN_HASH_GOLDEN_PATH = REPO_ROOT / "contracts" / "golden" / "plan-hash.v1.json"
+MASTER_SPEC_PATH = REPO_ROOT / "docs" / "superpowers" / "specs" / "2026-08-03-ai-coding-factory-master-design.md"
 MANIFEST_SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
 EMIT_MANIFEST_PATH = REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py"
 CODEGEN_PATH = REPO_ROOT / "contracts" / "codegen" / "generate.py"
@@ -43,6 +47,27 @@ FACTORY_RFC3339_DATE_TIME_PATTERN = (
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-5][0-9]"
     r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
 )
+
+
+def _post_bootstrap_business_phases_from_master_spec() -> tuple[str, ...]:
+    """机械提取 Master Spec §7.1 的 Run.phase，再排除明确的 pre-plan 状态。"""
+    master_spec = MASTER_SPEC_PATH.read_text(encoding="utf-8")
+    phase_block = re.search(
+        r"`Run\.phase` 使用以下业务枚举：\s*```text\s*(?P<phases>.*?)\s*```",
+        master_spec,
+        flags=re.DOTALL,
+    )
+    assert phase_block is not None, "Master Spec §7.1 Run.phase 枚举块缺失"
+    all_phases = tuple(
+        phase.strip()
+        for phase in phase_block.group("phases").splitlines()
+        if phase.strip()
+    )
+    return tuple(
+        phase
+        for phase in all_phases
+        if phase not in {"CREATED", "PREFLIGHT", "BOOTSTRAPPING_REPOSITORY"}
+    )
 
 AUTHORIZATION_SCHEMA_FILES = {
     "IntentAuthorization": "intent-authorization.v1.schema.json",
@@ -1454,6 +1479,137 @@ def test_snapshot_registry_payload_validators_are_executable_and_fail_closed() -
     resource_extra["unapprovedOverlay"] = "blocked"
     assert _validate_fingerprint_schema_with_local_defs(policy_map, resource_schema, resource_extra)
 
+    # baseline 的条件字段由同一 registry schema 约束：EXISTS 绑定真实 SHA，待 bootstrap 禁止伪造 SHA/receipt。
+    baseline_key = "IntentAuthorization.baselineDigest"
+    baseline_binding = registry["snapshotBindings"][baseline_key]
+    baseline_validator = _registry_payload_validator(registry, baseline_binding)
+    assert baseline_binding["payloadKeys"] == {
+        "required": ["baseBranch", "bootstrapState"],
+        "optional": ["baseSha", "bootstrapReceiptId"],
+    }
+    valid_baselines = (
+        ("existing-no-receipt", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS"}),
+        (
+            "existing-with-receipt",
+            {
+                "baseBranch": "main",
+                "baseSha": "a" * 40,
+                "bootstrapState": "EXISTS",
+                "bootstrapReceiptId": "receipt-001",
+            },
+        ),
+        ("bootstrap-required", {"baseBranch": "main", "bootstrapState": "BOOTSTRAP_REQUIRED"}),
+    )
+    for name, baseline in valid_baselines:
+        assert not list(baseline_validator.iter_errors(baseline)), name
+
+    invalid_baselines = (
+        ("missing-branch", {"baseSha": "a" * 40, "bootstrapState": "EXISTS"}),
+        ("missing-state", {"baseBranch": "main", "baseSha": "a" * 40}),
+        ("unknown-state", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "UNKNOWN"}),
+        ("unknown-field", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "forged": True}),
+        ("exists-missing-sha", {"baseBranch": "main", "bootstrapState": "EXISTS"}),
+        ("exists-null-sha", {"baseBranch": "main", "baseSha": None, "bootstrapState": "EXISTS"}),
+        ("exists-empty-sha", {"baseBranch": "main", "baseSha": "", "bootstrapState": "EXISTS"}),
+        ("exists-short-sha", {"baseBranch": "main", "baseSha": "a" * 39, "bootstrapState": "EXISTS"}),
+        ("exists-long-sha", {"baseBranch": "main", "baseSha": "a" * 41, "bootstrapState": "EXISTS"}),
+        ("exists-uppercase-sha", {"baseBranch": "main", "baseSha": "A" * 40, "bootstrapState": "EXISTS"}),
+        ("exists-nonhex-sha", {"baseBranch": "main", "baseSha": "g" * 40, "bootstrapState": "EXISTS"}),
+        ("exists-zero-sentinel", {"baseBranch": "main", "baseSha": "0" * 40, "bootstrapState": "EXISTS"}),
+        ("bootstrap-real-sha", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "BOOTSTRAP_REQUIRED"}),
+        (
+            "bootstrap-zero-sentinel",
+            {"baseBranch": "main", "baseSha": "0" * 40, "bootstrapState": "BOOTSTRAP_REQUIRED"},
+        ),
+        (
+            "bootstrap-receipt",
+            {"baseBranch": "main", "bootstrapState": "BOOTSTRAP_REQUIRED", "bootstrapReceiptId": "receipt-001"},
+        ),
+        (
+            "bootstrap-sha-and-receipt",
+            {
+                "baseBranch": "main",
+                "baseSha": "a" * 40,
+                "bootstrapState": "BOOTSTRAP_REQUIRED",
+                "bootstrapReceiptId": "receipt-001",
+            },
+        ),
+        (
+            "receipt-empty",
+            {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "bootstrapReceiptId": ""},
+        ),
+        (
+            "receipt-nonstring",
+            {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "bootstrapReceiptId": 1},
+        ),
+    )
+    for name, baseline in invalid_baselines:
+        assert list(baseline_validator.iter_errors(baseline)), name
+
+    for name, baseline in valid_baselines:
+        ref = _snapshot_ref(baseline_key, name)
+        ref["digest"] = _snapshot_payload_digest(
+            baseline_binding["schemaId"], baseline_binding["schemaVersion"], baseline
+        )
+        for field in sorted(baseline):
+            changed = copy.deepcopy(baseline)
+            if field == "baseBranch":
+                changed[field] = "release"
+            elif field == "baseSha":
+                changed[field] = "b" * 40
+            elif field == "bootstrapReceiptId":
+                changed[field] = "receipt-002"
+            else:
+                # 改变 state 时同时切换条件字段，证明每个实际字段都参与 baseline 快照而不伪造中间态。
+                if baseline[field] == "EXISTS":
+                    changed = {"baseBranch": baseline["baseBranch"], "bootstrapState": "BOOTSTRAP_REQUIRED"}
+                else:
+                    changed = {"baseBranch": baseline["baseBranch"], "baseSha": "b" * 40, "bootstrapState": "EXISTS"}
+            assert not list(baseline_validator.iter_errors(changed)), f"{name}:{field}"
+            with pytest.raises(AssertionError, match="重算值不一致"):
+                _assert_snapshot_ref_matches_payload(ref, changed)
+
+    # Master §7.1 是业务阶段真源：去掉三个 pre-plan 状态后必须精确剩余 15 项，并镜像到四个结构化位置。
+    post_bootstrap_phases = _post_bootstrap_business_phases_from_master_spec()
+    assert post_bootstrap_phases == (
+        "PLANNING",
+        "DESIGN_REVIEWING",
+        "PREPARING_WORKSPACE",
+        "IMPLEMENTING",
+        "VERIFYING",
+        "CODE_REVIEWING",
+        "PUBLISHING_PR",
+        "MERGING",
+        "BUILDING_ARTIFACT",
+        "DEPLOYING_STAGING",
+        "ACCEPTING_STAGING",
+        "DEPLOYING_PRODUCTION",
+        "ACCEPTING_PRODUCTION",
+        "ROLLING_BACK",
+        "FINALIZING",
+    )
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    semantic_payload_schema = _registry_payload_schema(
+        registry, registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    )
+    revision_payload_schema = _registry_payload_schema(
+        registry, registry["snapshotBindings"]["ExecutionAuthorization.planRevisionDigest"]
+    )
+    phase_schemas = (
+        run_spec_schema["properties"]["workPlan"]["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        run_spec_schema["properties"]["workPlan"]["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        plan_revision_schema["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        plan_revision_schema["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        semantic_payload_schema["properties"]["workPlan"]["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        semantic_payload_schema["properties"]["workPlan"]["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        revision_payload_schema["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        revision_payload_schema["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+    )
+    for phase_schema in phase_schemas:
+        assert phase_schema["type"] == "string"
+        assert tuple(phase_schema["enum"]) == post_bootstrap_phases
+
 
 def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_field() -> None:
     """真实 RunSpec 投影必须完整入 registry，逐字段删改都不能复用旧摘要。"""
@@ -1666,6 +1822,12 @@ def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_fi
     assert plan_revision_schema["properties"]["signature"] == {"type": "string", "minLength": 1}
     assert "signature" not in plan_revision_schema["required"]
     assert "planRevisionDigest" in plan_revision_schema["required"]
+    sha256_digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    assert plan_revision_schema["$defs"]["sha256Digest"] == sha256_digest
+    for digest_field in ("semanticPlanHash", "planRevisionDigest"):
+        digest_property = plan_revision_schema["properties"][digest_field]
+        assert digest_property["type"] == "string"
+        assert digest_property["allOf"] == [{"$ref": "#/$defs/sha256Digest"}]
 
     # 排除集直接来自运行时摘要实现；PlanRevision schema 是 payload 字段和类型的唯一合同来源。
     excluded_fields = set(plan_hash._DIGEST_EXCLUDED_FIELDS)
@@ -1681,6 +1843,9 @@ def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_fi
     assert set(binding["payloadKeys"]["optional"]) == expected_optional
     for field in expected_properties:
         assert payload_schema["properties"][field] == plan_revision_schema["properties"][field], field
+
+    # semanticPlanHash 进入 material，planRevisionDigest 仍只在完整 wire 校验阶段出现，二者均复用同一格式定义。
+    assert payload_schema["properties"]["semanticPlanHash"] == plan_revision_schema["properties"]["semanticPlanHash"]
 
     material = {field: value for field, value in revision.items() if field not in excluded_fields}
     assert set(material) == expected_properties
@@ -1720,6 +1885,12 @@ def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_fi
 
     signed_revision = {**revision, "signature": "signature-001"}
     rewritten_digest = {**revision, "planRevisionDigest": "sha256:" + "0" * 64}
+    zero_digest_wire = {
+        **revision,
+        "semanticPlanHash": "sha256:" + "0" * 64,
+        "planRevisionDigest": "sha256:" + "0" * 64,
+    }
+    _assert_accepted(plan_revision_schema, zero_digest_wire)
     assert plan_hash.plan_revision_digest(signed_revision) == baseline_digest
     assert plan_hash.plan_revision_digest(rewritten_digest) == baseline_digest
 
@@ -2805,10 +2976,582 @@ def test_codegen_validator_schema_parser_is_fail_closed() -> None:
 
 def test_codegen_validator_schema_missing_file_and_partial_write_are_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """缺失 schema 必须在三份输出写入前停止，不能留下部分生成树。"""
+    """缺失 schema 或批次写入中断时，都不得留下部分生成树。"""
     codegen = _load_codegen_module()
     writes: list[object] = []
+    caplog.set_level(logging.INFO, logger="factory.contracts.codegen")
+
+    def _assert_no_temporary_residue(directory: Path) -> None:
+        """批次失败、补偿或清理后，同目录不得遗留本次 stage/rollback 文件。"""
+        residue = [
+            path
+            for path in directory.rglob("*")
+            if path.is_file()
+            and (path.name.endswith(".stage") or path.name.endswith(".rollback"))
+        ]
+        assert residue == [], f"不得遗留 stage/rollback 临时文件: {residue}"
+
+    def _make_batch_targets(
+        directory: Path,
+        originals: tuple[bytes | None, bytes | None, bytes | None],
+    ) -> tuple[Path, Path, Path]:
+        """建立三目标快照；None 精确表示该目标在提交前不存在。"""
+        directory.mkdir()
+        targets = tuple(directory / name for name in ("contracts.ts", "models.py", "contracts.rs"))
+        for target, original in zip(targets, originals, strict=True):
+            if original is not None:
+                target.write_bytes(original)
+        return targets
+
+    def _parse_cli_codegen_logs(stdout: str) -> tuple[list[dict[str, str]], list[str]]:
+        """从 CLI stdout 拆出固定 ASCII 日志与用户消息，并对每条日志做完整形状校验。"""
+        pattern = re.compile(
+            r"^CODEGEN event=(?P<event>[a-z_]+) "
+            r"correlation_id=(?P<correlation_id>[0-9a-f]{32}) "
+            r"elapsed_ms=(?P<elapsed_ms>[0-9]+) "
+            r"target_count=(?P<target_count>[0-9]+) "
+            r"commit_status=(?P<commit_status>[a-z_]+) "
+            r"rollback_status=(?P<rollback_status>[a-z_]+) "
+            r"cleanup_status=(?P<cleanup_status>[a-z_]+) "
+            r"error_code=(?P<error_code>NONE|CODEGEN_[A-Z_]+)$"
+        )
+        parsed: list[dict[str, str]] = []
+        user_lines: list[str] = []
+        for line in stdout.splitlines():
+            if not line.startswith("CODEGEN "):
+                user_lines.append(line)
+                continue
+            match = pattern.fullmatch(line)
+            assert match is not None, f"CLI 日志必须匹配固定 ASCII 形状: {line!r}"
+            parsed.append(match.groupdict())
+        return parsed, user_lines
+
+    # 正式日志先冻结成功批次的关联性与固定字段；禁止 message 或格式化输出携带目标路径。
+    logged_success_directory = tmp_path / "logged-success-SECRET"
+    logged_success_targets = _make_batch_targets(
+        logged_success_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    caplog.clear()
+    codegen.write_batch(
+        tuple((target, f"new-{index}\n") for index, target in enumerate(logged_success_targets))
+    )
+    success_log_records = [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ]
+    assert [getattr(record, "event", None) for record in success_log_records] == [
+        "batch_start",
+        "batch_end",
+    ]
+    correlation_ids = {getattr(record, "correlation_id", None) for record in success_log_records}
+    assert len(correlation_ids) == 1
+    correlation_id = correlation_ids.pop()
+    assert isinstance(correlation_id, str) and re.fullmatch(r"[0-9a-f]{32}", correlation_id)
+    start_log, end_log = success_log_records
+    assert start_log.target_count == end_log.target_count == 3
+    assert start_log.elapsed_ms == 0
+    assert isinstance(end_log.elapsed_ms, int) and end_log.elapsed_ms >= 0
+    assert (start_log.commit_status, start_log.rollback_status, start_log.cleanup_status) == (
+        "pending",
+        "not_required",
+        "pending",
+    )
+    assert (end_log.commit_status, end_log.rollback_status, end_log.cleanup_status) == (
+        "completed",
+        "not_required",
+        "completed",
+    )
+    assert start_log.error_code == end_log.error_code == "NONE"
+    rendered_logs = "\n".join(
+        logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record)
+        for record in success_log_records
+    )
+    assert rendered_logs.isascii()
+    assert "SECRET" not in rendered_logs
+    assert str(logged_success_directory) not in rendered_logs
+    _assert_no_temporary_residue(logged_success_directory)
+
+    # 嵌入调用方传入的关联 ID 也属于不可信输入；非法值必须替换，绝不能直接进入日志。
+    untrusted_correlation_directory = tmp_path / "untrusted-correlation"
+    untrusted_correlation_targets = _make_batch_targets(
+        untrusted_correlation_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    untrusted_correlation_id = r"D:\codex项目\SECRET\caller-correlation"
+    caplog.clear()
+    codegen.write_batch(
+        tuple(
+            (target, f"new-{index}\n")
+            for index, target in enumerate(untrusted_correlation_targets)
+        ),
+        correlation_id=untrusted_correlation_id,
+    )
+    untrusted_id_records = [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ]
+    assert len({record.correlation_id for record in untrusted_id_records}) == 1
+    assert all(
+        re.fullmatch(r"[0-9a-f]{32}", record.correlation_id) for record in untrusted_id_records
+    )
+    untrusted_id_rendered = "\n".join(
+        logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record)
+        for record in untrusted_id_records
+    )
+    assert "SECRET" not in untrusted_id_rendered
+    assert untrusted_correlation_id not in untrusted_id_rendered
+    _assert_no_temporary_residue(untrusted_correlation_directory)
+
+    # CLI 日志只能在命名 logger 的作用域内接管；root/宿主和外部日志必须完全不受影响。
+    cli_logged_directory = tmp_path / "cli-logged-success-SECRET"
+    cli_logged_targets = tuple(
+        cli_logged_directory / name for name in ("contracts.ts", "models.py", "contracts.rs")
+    )
+    first_stdout = io.StringIO()
+    second_stdout = io.StringIO()
+    exception_stdout = io.StringIO()
+    host_stdout = io.StringIO()
+    prior_codegen_stdout = io.StringIO()
+    root_logger = logging.getLogger()
+    named_logger = codegen._LOGGER
+    foreign_logger = logging.getLogger("foreign.component")
+    child_logger = logging.getLogger("factory.contracts.codegen.child")
+    saved_root_handlers = list(root_logger.handlers)
+    saved_root_level = root_logger.level
+    saved_root_filters = list(root_logger.filters)
+    saved_named_handlers = list(named_logger.handlers)
+    saved_named_level = named_logger.level
+    saved_named_propagate = named_logger.propagate
+    saved_foreign_handlers = list(foreign_logger.handlers)
+    saved_foreign_level = foreign_logger.level
+    saved_foreign_propagate = foreign_logger.propagate
+    saved_child_handlers = list(child_logger.handlers)
+    saved_child_level = child_logger.level
+    saved_child_propagate = child_logger.propagate
+
+    host_handler = logging.StreamHandler(host_stdout)
+    host_handler.setFormatter(logging.Formatter("HOST %(name)s %(levelname)s %(message)s"))
+    root_filter = logging.Filter("root-snapshot")
+    prior_codegen_handler = logging.StreamHandler(prior_codegen_stdout)
+    root_logger.handlers = [host_handler]
+    root_logger.filters = [root_filter]
+    root_logger.setLevel(logging.WARNING)
+    named_logger.handlers = [prior_codegen_handler]
+    named_logger.setLevel(logging.ERROR)
+    named_logger.propagate = True
+    foreign_logger.handlers = []
+    foreign_logger.setLevel(logging.INFO)
+    foreign_logger.propagate = True
+    child_logger.handlers = []
+    child_logger.setLevel(logging.NOTSET)
+    child_logger.propagate = True
+
+    root_snapshot = (
+        tuple(root_logger.handlers),
+        root_logger.level,
+        tuple(root_logger.filters),
+    )
+    named_snapshot = (
+        tuple(named_logger.handlers),
+        named_logger.level,
+        named_logger.propagate,
+    )
+    root_states_during_batch: list[tuple[tuple[logging.Handler, ...], int, tuple[logging.Filter, ...]]] = []
+    named_handlers_during_batch: list[logging.Handler] = []
+    original_write_batch = codegen.write_batch
+
+    def _forbid_basic_config(*args: object, **kwargs: object) -> None:
+        """basicConfig 会污染 root logger，CLI 任何路径都不得调用。"""
+        del args, kwargs
+        raise AssertionError("CLI 不得调用 logging.basicConfig")
+
+    def _write_batch_with_foreign_logs(
+        outputs: tuple[tuple[Path, str], ...],
+        *,
+        correlation_id: str,
+    ) -> None:
+        """在 CLI 作用域内发出外部/子 logger 记录，验证精确名称过滤与 root 隔离。"""
+        root_states_during_batch.append(
+            (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters))
+        )
+        assert named_logger.level == logging.INFO
+        assert named_logger.propagate is False
+        assert len(named_logger.handlers) == 1
+        named_handlers_during_batch.append(named_logger.handlers[0])
+        foreign_logger.info("FOREIGN_INFO")
+        foreign_logger.warning("FOREIGN_WARNING")
+        child_logger.warning("CHILD_WARNING")
+        original_write_batch(outputs, correlation_id=correlation_id)
+
+    def _raise_inside_cli_scope(check_mode: bool) -> int:
+        """在 CLI logger 已接管后抛出未捕获异常，锁定 finally 恢复与句柄关闭。"""
+        del check_mode
+        assert named_logger.level == logging.INFO
+        assert named_logger.propagate is False
+        assert len(named_logger.handlers) == 1
+        named_handlers_during_batch.append(named_logger.handlers[0])
+        raise RuntimeError("CLI_SCOPE_TEST_FAILURE")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen.logging, "basicConfig", _forbid_basic_config)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(codegen, "TS_OUT", cli_logged_targets[0])
+            patch.setattr(codegen, "PY_OUT", cli_logged_targets[1])
+            patch.setattr(codegen, "RS_OUT", cli_logged_targets[2])
+            patch.setattr(codegen, "write_batch", _write_batch_with_foreign_logs)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            patch.setattr(codegen.sys, "stdout", first_stdout)
+            assert codegen.main() == 0
+            first_run_output = first_stdout.getvalue()
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+
+            patch.setattr(codegen.sys, "stdout", second_stdout)
+            assert codegen.main() == 0
+            assert first_stdout.getvalue() == first_run_output
+            second_run_output = second_stdout.getvalue()
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+
+            # 未捕获异常也必须执行作用域 finally，且不能让前两次 handler 重新写入旧 sink。
+            patch.setattr(codegen, "_run_codegen_cli", _raise_inside_cli_scope)
+            patch.setattr(codegen.sys, "stdout", exception_stdout)
+            with pytest.raises(RuntimeError, match="^CLI_SCOPE_TEST_FAILURE$"):
+                codegen.main()
+            assert first_stdout.getvalue() == first_run_output
+            assert second_stdout.getvalue() == second_run_output
+            assert exception_stdout.getvalue() == ""
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+    finally:
+        root_logger.handlers = saved_root_handlers
+        root_logger.setLevel(saved_root_level)
+        root_logger.filters = saved_root_filters
+        named_logger.handlers = saved_named_handlers
+        named_logger.setLevel(saved_named_level)
+        named_logger.propagate = saved_named_propagate
+        foreign_logger.handlers = saved_foreign_handlers
+        foreign_logger.setLevel(saved_foreign_level)
+        foreign_logger.propagate = saved_foreign_propagate
+        child_logger.handlers = saved_child_handlers
+        child_logger.setLevel(saved_child_level)
+        child_logger.propagate = saved_child_propagate
+        host_handler.close()
+        prior_codegen_handler.close()
+
+    assert root_states_during_batch == [root_snapshot, root_snapshot]
+    assert len(named_handlers_during_batch) == 3
+    assert named_handlers_during_batch[0] is not named_handlers_during_batch[1]
+    assert named_handlers_during_batch[1] is not named_handlers_during_batch[2]
+    for cli_handler in named_handlers_during_batch:
+        assert isinstance(cli_handler, logging.StreamHandler)
+        assert cli_handler.formatter is not None
+        assert cli_handler.formatter._fmt == "%(message)s"
+        assert len(cli_handler.filters) == 1
+        assert cli_handler._closed is True
+    for rendered_run in (first_run_output, second_run_output):
+        assert rendered_run.count("CODEGEN event=cli_start") == 1
+        assert rendered_run.count("CODEGEN event=batch_start") == 1
+        assert rendered_run.count("CODEGEN event=batch_end") == 1
+        assert rendered_run.count("CODEGEN event=cli_end") == 1
+        assert rendered_run.count("[DONE] 三语言类型文件生成完成。") == 1
+        codegen_lines = [line for line in rendered_run.splitlines() if line.startswith("CODEGEN ")]
+        assert len(codegen_lines) == 4
+        assert all(line.isascii() for line in codegen_lines)
+        assert "FOREIGN" not in rendered_run
+        assert "CHILD" not in rendered_run
+        assert "SECRET" not in rendered_run
+    host_output = host_stdout.getvalue()
+    assert host_output.count("HOST foreign.component INFO FOREIGN_INFO") == 2
+    assert host_output.count("HOST foreign.component WARNING FOREIGN_WARNING") == 2
+    assert "factory.contracts.codegen" not in host_output
+    assert "CHILD_WARNING" not in host_output
+    assert prior_codegen_stdout.getvalue() == ""
+    assert capsys.readouterr().err == ""
+    _assert_no_temporary_residue(cli_logged_directory)
+
+    # 非法 argv 不得由 argparse 输出 usage 或回显参数正文；help 也不得留下孤立 cli_start。
+    invalid_argument = r"--SECRET-D:\codex项目\private-argument"
+    capsys.readouterr()
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen.sys, "argv", ["generate.py", invalid_argument])
+        patch.setattr(
+            codegen,
+            "load_catalog",
+            lambda: (_ for _ in ()).throw(AssertionError("非法参数后不得加载 catalog")),
+        )
+        assert codegen.main() == 2
+    invalid_argument_output = capsys.readouterr()
+    invalid_argument_logs, invalid_argument_user_lines = _parse_cli_codegen_logs(
+        invalid_argument_output.out
+    )
+    assert invalid_argument_user_lines == []
+    assert invalid_argument_output.err == "[ERROR] CODEGEN_ARGUMENT_INVALID\n"
+    assert "SECRET" not in invalid_argument_output.out + invalid_argument_output.err
+    assert invalid_argument not in invalid_argument_output.out + invalid_argument_output.err
+    assert [record["event"] for record in invalid_argument_logs] == ["cli_start", "cli_end"]
+    assert len({record["correlation_id"] for record in invalid_argument_logs}) == 1
+    assert invalid_argument_logs[-1]["error_code"] == "CODEGEN_ARGUMENT_INVALID"
+
+    capsys.readouterr()
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen.sys, "argv", ["generate.py", "--help"])
+        with pytest.raises(SystemExit) as help_exit:
+            codegen.main()
+    assert help_exit.value.code == 0
+    assert [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ] == []
+    capsys.readouterr()
+
+    # mode 合同通过 seam 使用合成值，避免把 Windows chmod 行为误当成 POSIX 验证。
+    mode_success_directory = tmp_path / "mode-success"
+    mode_success_targets = _make_batch_targets(
+        mode_success_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    synthetic_modes = dict(zip(mode_success_targets, (0o640, 0o600, 0o664), strict=True))
+    mode_success_chmods: list[tuple[str, int]] = []
+
+    def _read_synthetic_mode(path: Path) -> int:
+        return synthetic_modes[Path(path)]
+
+    def _record_mode_chmod(path: Path, mode: int) -> None:
+        mode_success_chmods.append((Path(path).suffix, mode))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", _read_synthetic_mode)
+        patch.setattr(codegen, "_chmod_file", _record_mode_chmod)
+        codegen.write_batch(
+            tuple((target, f"new-{index}\n") for index, target in enumerate(mode_success_targets))
+        )
+    assert mode_success_chmods == [
+        (".stage", 0o640),
+        (".stage", 0o600),
+        (".stage", 0o664),
+    ]
+    _assert_no_temporary_residue(mode_success_directory)
+
+    mode_absent_directory = tmp_path / "mode-absent"
+    mode_absent_targets = _make_batch_targets(
+        mode_absent_directory,
+        (None, b"old-python", b"old-rust"),
+    )
+    absent_modes = {mode_absent_targets[1]: 0o600, mode_absent_targets[2]: 0o640}
+    mode_absent_chmods: list[tuple[str, int]] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: absent_modes[Path(path)])
+        patch.setattr(
+            codegen,
+            "_chmod_file",
+            lambda path, mode: mode_absent_chmods.append((Path(path).suffix, mode)),
+        )
+        codegen.write_batch(
+            tuple((target, f"new-{index}\n") for index, target in enumerate(mode_absent_targets))
+        )
+    assert mode_absent_chmods == [(".stage", 0o644), (".stage", 0o600), (".stage", 0o640)]
+    _assert_no_temporary_residue(mode_absent_directory)
+
+    mode_rollback_directory = tmp_path / "mode-rollback"
+    mode_rollback_targets = _make_batch_targets(
+        mode_rollback_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    mode_rollback_originals = tuple(target.read_bytes() for target in mode_rollback_targets)
+    rollback_modes = dict(zip(mode_rollback_targets, (0o640, 0o600, 0o664), strict=True))
+    mode_rollback_operations: list[tuple[str, str, int]] = []
+    mode_commit_attempts: list[Path] = []
+
+    def _record_rollback_mode_chmod(path: Path, mode: int) -> None:
+        """与 replace 共用顺序台账，确认 stage/rollback 都先 chmod 再替换。"""
+        mode_rollback_operations.append(("chmod", Path(path).suffix, mode))
+
+    def _fail_second_mode_commit(source: Path, destination: Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in mode_rollback_targets:
+            mode_commit_attempts.append(destination_path)
+            mode_rollback_operations.append(
+                ("replace", source_path.suffix, mode_rollback_targets.index(destination_path))
+            )
+            if len(mode_commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\mode-second-commit")
+        elif source_path.suffix == ".rollback" and destination_path in mode_rollback_targets:
+            mode_rollback_operations.append(
+                ("replace", source_path.suffix, mode_rollback_targets.index(destination_path))
+            )
+        os.replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: rollback_modes[Path(path)])
+        patch.setattr(codegen, "_chmod_file", _record_rollback_mode_chmod)
+        patch.setattr(codegen, "_replace_file", _fail_second_mode_commit)
+        with pytest.raises(codegen.CodegenWriteError, match="^CODEGEN_WRITE_FAILED$"):
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(mode_rollback_targets)
+                )
+            )
+    assert mode_rollback_operations == [
+        ("chmod", ".stage", 0o640),
+        ("replace", ".stage", 0),
+        ("chmod", ".stage", 0o600),
+        ("replace", ".stage", 1),
+        ("chmod", ".rollback", 0o640),
+        ("replace", ".rollback", 0),
+    ]
+    assert tuple(target.read_bytes() for target in mode_rollback_targets) == mode_rollback_originals
+    _assert_no_temporary_residue(mode_rollback_directory)
+
+    mode_chmod_failure_directory = tmp_path / "mode-chmod-failure"
+    mode_chmod_failure_targets = _make_batch_targets(
+        mode_chmod_failure_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    mode_chmod_failure_originals = tuple(
+        target.read_bytes() for target in mode_chmod_failure_targets
+    )
+    chmod_failure_modes = dict(
+        zip(mode_chmod_failure_targets, (0o640, 0o600, 0o664), strict=True)
+    )
+    chmod_stage_attempts = 0
+
+    def _fail_second_stage_chmod(path: Path, mode: int) -> None:
+        nonlocal chmod_stage_attempts
+        if Path(path).suffix == ".stage":
+            chmod_stage_attempts += 1
+            if chmod_stage_attempts == 2:
+                raise OSError(r"D:\codex项目\SECRET\mode-chmod-failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            codegen,
+            "_read_file_mode",
+            lambda path: chmod_failure_modes[Path(path)],
+        )
+        patch.setattr(codegen, "_chmod_file", _fail_second_stage_chmod)
+        with pytest.raises(codegen.CodegenWriteError, match="^CODEGEN_WRITE_FAILED$"):
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(mode_chmod_failure_targets)
+                )
+            )
+    assert chmod_stage_attempts == 2
+    assert (
+        tuple(target.read_bytes() for target in mode_chmod_failure_targets)
+        == mode_chmod_failure_originals
+    )
+    _assert_no_temporary_residue(mode_chmod_failure_directory)
+
+    def _assert_failed_batch_log(
+        error_code: str,
+        commit_status: str,
+        rollback_status: str,
+        cleanup_status: str,
+    ) -> None:
+        """失败批次也必须完整闭合日志，且只含固定字段与脱敏错误码。"""
+        records = [
+            record for record in caplog.records if record.name == "factory.contracts.codegen"
+        ]
+        assert [getattr(record, "event", None) for record in records] == [
+            "batch_start",
+            "batch_end",
+        ]
+        assert len({record.correlation_id for record in records}) == 1
+        assert re.fullmatch(r"[0-9a-f]{32}", records[0].correlation_id)
+        end_record = records[-1]
+        assert end_record.levelno == logging.ERROR
+        assert end_record.target_count == 3
+        assert isinstance(end_record.elapsed_ms, int) and end_record.elapsed_ms >= 0
+        assert (
+            end_record.commit_status,
+            end_record.rollback_status,
+            end_record.cleanup_status,
+            end_record.error_code,
+        ) == (commit_status, rollback_status, cleanup_status, error_code)
+        rendered = "\n".join(
+            logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record) for record in records
+        )
+        assert rendered.isascii()
+        assert "SECRET" not in rendered
+        assert str(tmp_path) not in rendered
+        assert all(record.getMessage().startswith("CODEGEN event=") for record in records)
+        assert all(record.getMessage().isascii() for record in records)
+
+    # rollback 副本的 chmod 本身失败也是恢复失败，必须返回最高优先级的固定码。
+    rollback_chmod_directory = tmp_path / "rollback-chmod-failure"
+    rollback_chmod_targets = _make_batch_targets(
+        rollback_chmod_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    rollback_chmod_modes = dict(
+        zip(rollback_chmod_targets, (0o640, 0o600, 0o664), strict=True)
+    )
+    rollback_chmod_commits: list[Path] = []
+    rollback_chmod_attempts: list[Path] = []
+
+    def _fail_second_commit_before_rollback_chmod(source: Path, destination: Path) -> None:
+        """首个目标提交后让第二个失败，从而进入首个目标的 mode 恢复。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in rollback_chmod_targets:
+            rollback_chmod_commits.append(destination_path)
+            if len(rollback_chmod_commits) == 2:
+                raise OSError(r"D:\codex项目\SECRET\rollback-chmod-commit")
+        os.replace(source, destination)
+
+    def _fail_rollback_chmod(path: Path, mode: int) -> None:
+        """只拒绝 rollback mode 恢复；stage chmod 保持成功以隔离故障原因。"""
+        del mode
+        candidate = Path(path)
+        if candidate.suffix == ".rollback":
+            rollback_chmod_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\rollback-chmod-failure")
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: rollback_chmod_modes[Path(path)])
+        patch.setattr(codegen, "_chmod_file", _fail_rollback_chmod)
+        patch.setattr(codegen, "_replace_file", _fail_second_commit_before_rollback_chmod)
+        with pytest.raises(
+            codegen.CodegenWriteError,
+            match="^CODEGEN_ROLLBACK_FAILED$",
+        ) as rollback_chmod_error:
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(rollback_chmod_targets)
+                )
+            )
+    assert rollback_chmod_commits == list(rollback_chmod_targets[:2])
+    assert len(rollback_chmod_attempts) == 1
+    assert (
+        rollback_chmod_error.value.commit_status,
+        rollback_chmod_error.value.rollback_status,
+        rollback_chmod_error.value.cleanup_status,
+    ) == ("partial", "failed", "completed")
+    _assert_no_temporary_residue(rollback_chmod_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_ROLLBACK_FAILED",
+        "partial",
+        "failed",
+        "completed",
+    )
 
     with monkeypatch.context() as patch:
         patch.setattr(codegen, "REPO_ROOT", Path(r"D:\codex项目\missing-validator-schema-root"))
@@ -2822,9 +3565,114 @@ def test_codegen_validator_schema_missing_file_and_partial_write_are_fail_closed
         patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
         patch.setattr(codegen, "load_required_validator_schemas", _fail_required_schemas)
         patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
         patch.setattr(codegen.sys, "argv", ["generate.py"])
         assert codegen.main() == 1
     assert writes == [], "validator schema 失败时不得写入任一生成目标"
+
+    # catalog/validator 的底层异常正文可能含绝对路径；CLI 只能暴露固定 ASCII 分类码。
+    sensitive_error = r"D:\codex项目\SECRET\catalog-or-validator-detail"
+    sanitized_cli_outputs: list[tuple[str, str]] = []
+    sanitized_cli_log_groups: list[list[dict[str, str]]] = []
+    sanitized_failure_cases: tuple[tuple[str, object | None, str], ...] = (
+        ("catalog", None, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-root-shape", [sensitive_error], "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-missing-schemas", {"SECRET": sensitive_error}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-schemas-shape", {"schemas": sensitive_error}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-entry-shape", {"schemas": [sensitive_error]}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("validator", None, "CODEGEN_VALIDATOR_SCHEMA_FAILED"),
+    )
+    for failure_kind, malformed_catalog, _ in sanitized_failure_cases:
+        capsys.readouterr()
+        caplog.clear()
+        writes.clear()
+
+        def _raise_sensitive_catalog() -> object:
+            raise RuntimeError(sensitive_error)
+
+        def _raise_sensitive_validator() -> object:
+            raise codegen.ValidatorSchemaError(sensitive_error)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            patch.setattr(
+                codegen,
+                "write_or_check",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+            )
+            patch.setattr(
+                codegen,
+                "write_batch",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or None,
+            )
+            if failure_kind == "catalog":
+                patch.setattr(codegen, "load_catalog", _raise_sensitive_catalog)
+            elif failure_kind.startswith("catalog-"):
+                patch.setattr(
+                    codegen,
+                    "load_catalog",
+                    lambda catalog_payload=malformed_catalog: catalog_payload,
+                )
+            else:
+                patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+                patch.setattr(codegen, "load_required_validator_schemas", _raise_sensitive_validator)
+            assert codegen.main() == 1
+        captured = capsys.readouterr()
+        sanitized_cli_outputs.append((captured.out, captured.err))
+        parsed_logs, user_lines = _parse_cli_codegen_logs(captured.out)
+        assert user_lines == []
+        sanitized_cli_log_groups.append(parsed_logs)
+        assert writes == [], f"{failure_kind} 失败时不得进入任何写入边界"
+
+    # --check 的缺失与漂移报告同样不得回显目标路径或文件正文，且不得修改输入文件。
+    missing_check_target = tmp_path / "SECRET-missing-contracts.ts"
+    capsys.readouterr()
+    assert not codegen.write_or_check(missing_check_target, "expected", True)
+    missing_check_output = capsys.readouterr()
+    drift_check_target = tmp_path / "SECRET-drift-contracts.ts"
+    drift_check_target.write_text("actual-secret-content", encoding="utf-8")
+    drift_original = drift_check_target.read_bytes()
+    assert not codegen.write_or_check(drift_check_target, "expected", True)
+    drift_check_output = capsys.readouterr()
+    assert drift_check_target.read_bytes() == drift_original
+
+    assert [stderr for _, stderr in sanitized_cli_outputs] == [
+        f"[ERROR] {expected_error_code}\n"
+        for _, _, expected_error_code in sanitized_failure_cases
+    ]
+    for records, expected_error_code in zip(
+        sanitized_cli_log_groups,
+        (case[2] for case in sanitized_failure_cases),
+        strict=True,
+    ):
+        assert [record["event"] for record in records] == ["cli_start", "cli_end"]
+        assert len({record["correlation_id"] for record in records}) == 1
+        assert (
+            records[-1]["commit_status"],
+            records[-1]["rollback_status"],
+            records[-1]["cleanup_status"],
+            records[-1]["error_code"],
+        ) == ("not_started", "not_required", "not_started", expected_error_code)
+        rendered = "\n".join(
+            f"{key}={value}" for record in records for key, value in record.items()
+        )
+        assert rendered.isascii()
+        assert "SECRET" not in rendered
+        assert sensitive_error not in rendered
+    assert (missing_check_output.out, missing_check_output.err) == (
+        "",
+        "[DRIFT] CODEGEN_OUTPUT_MISSING\n",
+    )
+    assert (drift_check_output.out, drift_check_output.err) == (
+        "",
+        "[DRIFT] CODEGEN_OUTPUT_DRIFT\n",
+    )
+    combined_sanitized_output = "".join(
+        stdout + stderr for stdout, stderr in sanitized_cli_outputs
+    ) + "".join((missing_check_output.out, missing_check_output.err, drift_check_output.out, drift_check_output.err))
+    assert "SECRET" not in combined_sanitized_output
+    assert sensitive_error not in combined_sanitized_output
 
     # 非标准 JSON 常量必须沿真实 main 路径在首次 write_or_check 前稳定停止。
     non_finite_documents = (
@@ -2851,9 +3699,481 @@ def test_codegen_validator_schema_missing_file_and_partial_write_are_fail_closed
                 "write_or_check",
                 lambda *args, **kwargs: writes.append((args, kwargs)) or True,
             )
+            patch.setattr(
+                codegen,
+                "write_batch",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or None,
+            )
             patch.setattr(codegen.sys, "argv", ["generate.py"])
             assert codegen.main() == 1
         assert writes == [], "非有限 JSON 常量不得越过内存生成边界进入任何写入"
+
+    # 第二个目标替换失败时，首个已替换目标必须恢复原始字节；异常消息也不能泄露底层路径。
+    targets = tuple(tmp_path / name for name in ("contracts.ts", "models.py", "contracts.rs"))
+    original_bytes = {
+        target: f"original-{index}".encode("ascii") for index, target in enumerate(targets)
+    }
+    for target, content in original_bytes.items():
+        target.write_bytes(content)
+
+    commit_attempts: list[Path] = []
+    original_replace = os.replace
+
+    def _fail_second_commit_replace(source: Path, destination: Path) -> None:
+        """模拟第二个 stage replace 失败，后续 rollback replace 仍允许执行。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in targets:
+            commit_attempts.append(destination_path)
+            if len(commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\second-replace-failure")
+        original_replace(source, destination)
+
+    expected_write_error = codegen.CodegenWriteError
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        # 先声明目标 seam：旧顺序 write_or_check 实现不会调用它，因此此处应当 RED。
+        patch.setattr(codegen, "_replace_file", _fail_second_commit_replace)
+        with pytest.raises(expected_write_error, match="CODEGEN_WRITE_FAILED") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(targets))
+            )
+
+    assert len(commit_attempts) == 2, "必须实际发生首成功、第二次失败的 replace 注入"
+    assert [target.read_bytes() for target in targets] == [original_bytes[target] for target in targets]
+    assert "SECRET" not in str(error.value)
+    residue = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.endswith(".stage") or path.name.endswith(".rollback")
+    ]
+    assert residue == [], f"失败补偿后不得留下 stage/rollback 临时文件: {residue}"
+    _assert_failed_batch_log(
+        "CODEGEN_WRITE_FAILED",
+        "partial",
+        "completed",
+        "completed",
+    )
+
+
+    # stage 文件即便写入调用返回，也必须通过关闭后的精确回读防止截断内容进入提交阶段。
+    truncated_directory = tmp_path / "truncated-stage"
+    truncated_targets = _make_batch_targets(
+        truncated_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    truncated_originals = tuple(target.read_bytes() for target in truncated_targets)
+    original_fdopen = os.fdopen
+
+    class _TruncatedStageFile:
+        """只截断 stage 写入，保留真实文件描述符关闭与 fsync 行为。"""
+
+        def __init__(self, wrapped: object) -> None:
+            self._wrapped = wrapped
+
+        def __enter__(self) -> _TruncatedStageFile:
+            self._wrapped.__enter__()  # type: ignore[union-attr]
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._wrapped.__exit__(*args)  # type: ignore[union-attr]
+
+        def write(self, data: bytes) -> object:
+            return self._wrapped.write(data[:-1])  # type: ignore[union-attr]
+
+        def flush(self) -> None:
+            self._wrapped.flush()  # type: ignore[union-attr]
+
+        def fileno(self) -> int:
+            return self._wrapped.fileno()  # type: ignore[union-attr,no-any-return]
+
+    def _open_truncated_stage(*args: object, **kwargs: object) -> _TruncatedStageFile:
+        """模拟首个 stage 的短写，但不伪造 flush/close 成功。"""
+        return _TruncatedStageFile(original_fdopen(*args, **kwargs))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.os, "fdopen", _open_truncated_stage)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(truncated_targets))
+            )
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert tuple(target.read_bytes() for target in truncated_targets) == truncated_originals
+    _assert_no_temporary_residue(truncated_directory)
+
+    # mkstemp 成功但 fdopen 本身失败时，描述符仍归生成器所有，必须先关闭才可可靠清理临时文件。
+    fdopen_directory = tmp_path / "fdopen-failure"
+    fdopen_targets = _make_batch_targets(fdopen_directory, (None, None, None))
+    fdopen_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+    original_close = os.close
+
+    def _fdopen_failed(descriptor: int, mode: str) -> object:
+        """模拟 os.fdopen 在接管句柄前失败，保留 descriptor 的所有权给调用方。"""
+        assert mode == "wb"
+        fdopen_descriptors.append(descriptor)
+        raise OSError(r"D:\codex项目\SECRET\fdopen-failure")
+
+    def _record_descriptor_close(descriptor: int) -> None:
+        """记录并执行真实 close，证明失败路径没有遗留 Windows 句柄。"""
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.os, "fdopen", _fdopen_failed)
+        patch.setattr(codegen.os, "close", _record_descriptor_close)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(fdopen_targets))
+            )
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert closed_descriptors == fdopen_descriptors
+    assert all(not target.exists() for target in fdopen_targets)
+    _assert_no_temporary_residue(fdopen_directory)
+
+    # 即使 descriptor close 也失败，仍必须继续尝试临时文件清理，不能因首错短路。
+    close_failure_directory = tmp_path / "close-failure-cleanup"
+    close_failure_directory.mkdir()
+    close_failure_stage = close_failure_directory / ".contracts.ts.synthetic.stage"
+    cleanup_after_close_failure: list[tuple[Path, ...]] = []
+
+    def _fake_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        """避免制造真实未关闭 descriptor，只提供 fdopen 失败路径所需的受控占位。"""
+        return 713, str(close_failure_stage)
+
+    def _close_failed(_: int) -> None:
+        """模拟 close 本身失败，验证外层仍会调用 cleanup。"""
+        raise OSError(r"D:\codex项目\SECRET\close-failure")
+
+    def _record_cleanup(paths: list[Path]) -> bool:
+        """记录 cleanup 调用而不依赖宿主文件锁行为。"""
+        cleanup_after_close_failure.append(tuple(paths))
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.tempfile, "mkstemp", _fake_mkstemp)
+        patch.setattr(codegen.os, "fdopen", _fdopen_failed)
+        patch.setattr(codegen.os, "close", _close_failed)
+        patch.setattr(codegen, "_cleanup_temporary_files", _record_cleanup)
+        with pytest.raises(codegen._CodegenTemporaryCleanupError):
+            codegen._stage_bytes(close_failure_directory / "contracts.ts", b"new", ".stage")
+    assert cleanup_after_close_failure == [(close_failure_stage,)]
+
+    # 第二个 NEW stage 失败时，第一个 stage 必须清理，三个正式目标完全不可见地保持原值。
+    second_stage_directory = tmp_path / "second-stage-failure"
+    second_stage_targets = _make_batch_targets(
+        second_stage_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    second_stage_originals = tuple(target.read_bytes() for target in second_stage_targets)
+    stage_attempts: list[Path] = []
+    original_stage_bytes = codegen._stage_bytes
+
+    def _fail_second_stage(target: Path, data: bytes, suffix: str) -> Path:
+        """第二个 stage 创建失败，验证此前 stage 的 finally 清理边界。"""
+        stage_attempts.append(target)
+        if len(stage_attempts) == 2:
+            raise OSError(r"D:\codex项目\SECRET\second-stage-failure")
+        return original_stage_bytes(target, data, suffix)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_stage_bytes", _fail_second_stage)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(second_stage_targets))
+            )
+    assert len(stage_attempts) == 2
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert "SECRET" not in str(error.value)
+    assert tuple(target.read_bytes() for target in second_stage_targets) == second_stage_originals
+    _assert_no_temporary_residue(second_stage_directory)
+
+    # 第三个 commit 失败且第一个 reverse restore 失败时，仍需继续尝试其余恢复，且 rollback 码优先。
+    rollback_directory = tmp_path / "rollback-priority"
+    rollback_targets = _make_batch_targets(
+        rollback_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    rollback_originals = tuple(target.read_bytes() for target in rollback_targets)
+    rollback_commits: list[Path] = []
+    rollback_restores: list[Path] = []
+    rollback_cleanup_attempts: list[Path] = []
+    rollback_original_unlink = codegen._unlink_file
+
+    def _fail_commit_and_first_restore(source: Path, destination: Path) -> None:
+        """让第三次提交失败、首次逆序恢复失败，确认其余恢复不会被短路。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in rollback_targets:
+            rollback_commits.append(destination_path)
+            if len(rollback_commits) == 3:
+                raise OSError(r"D:\codex项目\SECRET\third-commit-failure")
+        if source_path.suffix == ".rollback" and destination_path in rollback_targets:
+            rollback_restores.append(destination_path)
+            if destination_path == rollback_targets[1]:
+                raise OSError(r"D:\codex项目\SECRET\rollback-failure")
+        original_replace(source, destination)
+
+    def _fail_first_rollback_cleanup(path: Path) -> None:
+        """让 rollback 已失败时的首次临时清理也失败，验证错误优先级不会反转。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not rollback_cleanup_attempts:
+            rollback_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\rollback-cleanup-failure")
+        rollback_original_unlink(candidate)
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_commit_and_first_restore)
+        patch.setattr(codegen, "_unlink_file", _fail_first_rollback_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_ROLLBACK_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(rollback_targets))
+            )
+    assert rollback_commits == list(rollback_targets)
+    assert rollback_restores == [rollback_targets[1], rollback_targets[0]]
+    assert len(rollback_cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_ROLLBACK_FAILED"
+    assert rollback_targets[0].read_bytes() == rollback_originals[0]
+    _assert_no_temporary_residue(rollback_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_ROLLBACK_FAILED",
+        "partial",
+        "failed",
+        "failed",
+    )
+
+    # 原本不存在的第一目标在首提交成功、第二提交失败后必须恢复为不存在，而不是留下新文件。
+    absent_directory = tmp_path / "absent-target"
+    absent_targets = _make_batch_targets(absent_directory, (None, b"old-python", b"old-rust"))
+    absent_commit_attempts: list[Path] = []
+
+    def _fail_second_absent_commit(source: Path, destination: Path) -> None:
+        """在首个原不存在目标提交后注入第二次提交失败。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in absent_targets:
+            absent_commit_attempts.append(destination_path)
+            if len(absent_commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\absent-target-failure")
+        original_replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_second_absent_commit)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(absent_targets))
+            )
+    assert absent_commit_attempts == list(absent_targets[:2])
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert not absent_targets[0].exists()
+    assert absent_targets[1].read_bytes() == b"old-python"
+    assert absent_targets[2].read_bytes() == b"old-rust"
+    _assert_no_temporary_residue(absent_directory)
+
+    # 原始写失败叠加 cleanup 瞬时失败时，cleanup 码必须高于 write 码且仍恢复全部旧字节。
+    write_cleanup_directory = tmp_path / "write-cleanup-priority"
+    write_cleanup_targets = _make_batch_targets(
+        write_cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    write_cleanup_originals = tuple(target.read_bytes() for target in write_cleanup_targets)
+    write_cleanup_commits: list[Path] = []
+    write_cleanup_attempts: list[Path] = []
+    write_cleanup_original_unlink = codegen._unlink_file
+
+    def _fail_second_write_cleanup_commit(source: Path, destination: Path) -> None:
+        """制造普通写入失败，使最终错误只能由 cleanup 优先级改变。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in write_cleanup_targets:
+            write_cleanup_commits.append(destination_path)
+            if len(write_cleanup_commits) == 2:
+                raise OSError(r"D:\codex项目\SECRET\write-cleanup-failure")
+        original_replace(source, destination)
+
+    def _fail_first_write_cleanup(path: Path) -> None:
+        """仅让 cleanup 的首次 rollback 删除失败，第二次真实删除必须成功。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not write_cleanup_attempts:
+            write_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\write-cleanup-delete-failure")
+        write_cleanup_original_unlink(candidate)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_second_write_cleanup_commit)
+        patch.setattr(codegen, "_unlink_file", _fail_first_write_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_CLEANUP_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(write_cleanup_targets))
+            )
+    assert write_cleanup_commits == list(write_cleanup_targets[:2])
+    assert len(write_cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_CLEANUP_FAILED"
+    assert tuple(target.read_bytes() for target in write_cleanup_targets) == write_cleanup_originals
+    _assert_no_temporary_residue(write_cleanup_directory)
+
+    # 清理首次失败即使重试成功、临时文件最终为零，也必须 fail-closed 并保持 cleanup 码优先。
+    cleanup_directory = tmp_path / "cleanup-priority"
+    cleanup_targets = _make_batch_targets(
+        cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    cleanup_attempts: list[Path] = []
+    original_unlink = codegen._unlink_file
+
+    def _fail_first_rollback_cleanup(path: Path) -> None:
+        """仅让第一个 rollback 清理瞬时失败，后续重试必须继续并成功。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not cleanup_attempts:
+            cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\cleanup-failure")
+        original_unlink(candidate)
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_unlink_file", _fail_first_rollback_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_CLEANUP_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(cleanup_targets))
+            )
+    assert len(cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_CLEANUP_FAILED"
+    assert tuple(target.read_text(encoding="utf-8") for target in cleanup_targets) == (
+        "new-0\n",
+        "new-1\n",
+        "new-2\n",
+    )
+    _assert_no_temporary_residue(cleanup_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_CLEANUP_FAILED",
+        "completed",
+        "not_required",
+        "failed",
+    )
+
+    # 真实 main 调用必须把 batch 的精确终态传到 cli_end，不得用含混占位值。
+    cli_cleanup_directory = tmp_path / "cli-cleanup-status"
+    cli_cleanup_targets = _make_batch_targets(
+        cli_cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    cli_cleanup_attempts: list[Path] = []
+    cli_cleanup_original_unlink = codegen._unlink_file
+
+    def _fail_first_cli_cleanup(path: Path) -> None:
+        """在真实 CLI 批次已全部提交后制造 cleanup 故障，第二次重试仍完成清理。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not cli_cleanup_attempts:
+            cli_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\cli-cleanup-failure")
+        cli_cleanup_original_unlink(candidate)
+
+    caplog.clear()
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+        patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+        patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+        patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+        patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+        patch.setattr(codegen, "TS_OUT", cli_cleanup_targets[0])
+        patch.setattr(codegen, "PY_OUT", cli_cleanup_targets[1])
+        patch.setattr(codegen, "RS_OUT", cli_cleanup_targets[2])
+        patch.setattr(codegen, "_unlink_file", _fail_first_cli_cleanup)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    cli_cleanup_output = capsys.readouterr()
+    assert cli_cleanup_output.err == "[ERROR] CODEGEN_CLEANUP_FAILED\n"
+    cli_cleanup_records, cli_cleanup_user_lines = _parse_cli_codegen_logs(cli_cleanup_output.out)
+    assert cli_cleanup_user_lines == []
+    assert [record["event"] for record in cli_cleanup_records] == [
+        "cli_start",
+        "batch_start",
+        "batch_end",
+        "cli_end",
+    ]
+    batch_end_record, cli_end_record = cli_cleanup_records[-2:]
+    assert (
+        cli_end_record["commit_status"],
+        cli_end_record["rollback_status"],
+        cli_end_record["cleanup_status"],
+        cli_end_record["error_code"],
+    ) == (
+        batch_end_record["commit_status"],
+        batch_end_record["rollback_status"],
+        batch_end_record["cleanup_status"],
+        batch_end_record["error_code"],
+    ) == ("completed", "not_required", "failed", "CODEGEN_CLEANUP_FAILED")
+    assert len(cli_cleanup_attempts) == 1
+    _assert_no_temporary_residue(cli_cleanup_directory)
+
+    # CLI 仅接收稳定 ASCII 码；底层 OSError 中的路径和 errno 均不得穿透到 stderr，也不得误报 DONE。
+    for raised_error, expected_code in (
+        ("CODEGEN_WRITE_FAILED", "CODEGEN_WRITE_FAILED"),
+        ("CODEGEN_CLEANUP_FAILED", "CODEGEN_CLEANUP_FAILED"),
+        ("CODEGEN_ROLLBACK_FAILED", "CODEGEN_ROLLBACK_FAILED"),
+        (r"D:\codex项目\SECRET\unexpected-codegen-error", "CODEGEN_WRITE_FAILED"),
+    ):
+        capsys.readouterr()
+
+        def _raise_stable_write_error(
+            _: object,
+            *,
+            correlation_id: str,
+            error_text: str = raised_error,
+        ) -> None:
+            assert re.fullmatch(r"[0-9a-f]{32}", correlation_id)
+            raise codegen.CodegenWriteError(error_text)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(codegen, "write_batch", _raise_stable_write_error)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            assert codegen.main() == 1
+        captured = capsys.readouterr()
+        assert captured.err.strip() == f"[ERROR] {expected_code}"
+        assert "SECRET" not in captured.err
+        assert "[DONE]" not in captured.out + captured.err
+
+    # --check 的三次读取不得触碰 mkdir/mkstemp/stage/fsync/replace/unlink 等任何写路径。
+    check_calls: list[bool] = []
+
+    def _read_only_check(*args: object, **kwargs: object) -> bool:
+        """记录 --check 调用；只有显式 True 才是允许的只读边界。"""
+        check_mode = kwargs.get("check_mode")
+        if check_mode is None and len(args) >= 3:
+            check_mode = args[2]
+        assert check_mode is True
+        check_calls.append(True)
+        return True
+
+    def _unexpected_write_path(*args: object, **kwargs: object) -> None:
+        """任何写入 seam 被 --check 触发即立即使测试失败。"""
+        raise AssertionError("--check 不得进入写入路径")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "write_or_check", _read_only_check)
+        patch.setattr(codegen, "write_batch", _unexpected_write_path)
+        patch.setattr(codegen, "_stage_bytes", _unexpected_write_path)
+        patch.setattr(codegen, "_chmod_file", _unexpected_write_path)
+        patch.setattr(codegen, "_replace_file", _unexpected_write_path)
+        patch.setattr(codegen, "_unlink_file", _unexpected_write_path)
+        patch.setattr(codegen.tempfile, "mkstemp", _unexpected_write_path)
+        patch.setattr(codegen.os, "fdopen", _unexpected_write_path)
+        patch.setattr(codegen.os, "fsync", _unexpected_write_path)
+        patch.setattr(codegen.os, "close", _unexpected_write_path)
+        patch.setattr(codegen.Path, "mkdir", _unexpected_write_path)
+        patch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
+        assert codegen.main() == 0
+    assert check_calls == [True, True, True]
 
 
 def test_codegen_raw_schema_sha_and_digest_material_preconditions(
@@ -2917,6 +4237,7 @@ def test_codegen_ordinary_entry_failure_prevents_all_writes(
             },
         )
         patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
         patch.setattr(codegen.sys, "argv", ["generate.py"])
         assert codegen.main() == 1
     assert writes == [], "普通 schema 失败时不得写入任一生成目标"
@@ -2938,6 +4259,7 @@ def test_codegen_ordinary_entry_failure_prevents_all_writes(
         patch.setattr(codegen, "generate_typescript", _typescript_generated)
         patch.setattr(codegen, "generate_python", _python_failed)
         patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
         patch.setattr(codegen.sys, "argv", ["generate.py"])
         assert codegen.main() == 1
     assert calls == ["typescript", "python"]

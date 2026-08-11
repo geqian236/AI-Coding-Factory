@@ -352,8 +352,7 @@ def semantic_plan_hash(plan: object) -> str:
         形如 "sha256:<64 位小写十六进制>" 的摘要。
 
     Raises:
-        PlanHashError:      语义字段缺失或结构非法。
-        CanonicalJsonError: 字段值含非法数字/类型/重复键。
+        PlanHashError: 语义字段缺失、结构非法或字段值无法规范化。
     """
     projection = build_semantic_projection(plan)
     try:
@@ -377,8 +376,7 @@ def plan_revision_digest(revision: object) -> str:
         形如 "sha256:<64 位小写十六进制>" 的摘要。
 
     Raises:
-        PlanHashError:      revision 非对象。
-        CanonicalJsonError: 字段值含非法数字/类型/重复键。
+        PlanHashError: revision 非对象、结构非法或字段值无法规范化。
     """
     _validate_plan_revision(revision)
     revision_mapping = _require_mapping(revision)
@@ -414,8 +412,7 @@ def barrier_id(
         形如 "bar_<64 位小写十六进制>" 的身份。
 
     Raises:
-        PlanHashError:      参数类型非法。
-        CanonicalJsonError: 参数值无法规范化。
+        PlanHashError: 参数类型非法或参数值无法规范化。
     """
     if not isinstance(run_id, str) or not run_id:
         raise PlanHashError("run_id 必须为非空字符串")

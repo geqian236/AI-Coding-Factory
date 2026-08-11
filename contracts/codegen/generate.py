@@ -14,8 +14,15 @@ import copy
 import hashlib
 import io
 import json
+import logging
+import os
+import stat
 import sys
-from collections.abc import Callable
+import tempfile
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -53,6 +60,151 @@ _SINGLE_SCHEMA_KEYWORDS = frozenset(
 )
 _SCHEMA_MAP_KEYWORDS = frozenset({"properties", "patternProperties", "definitions", "$defs"})
 _SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+_DEFAULT_NEW_FILE_MODE = 0o644
+
+# 纯 schema/hash/类型渲染帮助函数保持无日志；只有 CLI 与 write_batch 副作用边界发出脱敏记录。
+_LOGGER = logging.getLogger("factory.contracts.codegen")
+_CODEGEN_LOG_FORMAT = (
+    "CODEGEN event=%(event)s correlation_id=%(correlation_id)s elapsed_ms=%(elapsed_ms)d "
+    "target_count=%(target_count)d commit_status=%(commit_status)s "
+    "rollback_status=%(rollback_status)s cleanup_status=%(cleanup_status)s "
+    "error_code=%(error_code)s"
+)
+_CODEGEN_LOG_STATUS_VALUES = frozenset(
+    {
+        "pending",
+        "completed",
+        "partial",
+        "failed",
+        "not_started",
+        "not_required",
+        "not_applicable",
+        "unknown",
+    }
+)
+
+
+def _new_correlation_id() -> str:
+    """为一次 CLI/批次生成仅含小写十六进制的关联 ID，不携带宿主或目标身份。"""
+    return uuid.uuid4().hex
+
+
+def _safe_correlation_id(candidate: str | None) -> str:
+    """仅复用合法 lowerhex ID；任何外来文本都替换为新 ID，禁止路径或 secret 进入日志。"""
+    if (
+        isinstance(candidate, str)
+        and len(candidate) == 32
+        and all(character in "0123456789abcdef" for character in candidate)
+    ):
+        return candidate
+    return _new_correlation_id()
+
+
+def _log_codegen_event(
+    event: str,
+    correlation_id: str,
+    elapsed_ms: int,
+    target_count: int,
+    commit_status: str,
+    rollback_status: str,
+    cleanup_status: str,
+    error_code: str,
+    *,
+    level: int = logging.INFO,
+) -> None:
+    """先构造完整固定 ASCII message，再发送记录，不让 formatter 依赖外加字段。"""
+    fields: dict[str, str | int] = {
+        "event": event,
+        "correlation_id": correlation_id,
+        "elapsed_ms": elapsed_ms,
+        "target_count": target_count,
+        "commit_status": commit_status,
+        "rollback_status": rollback_status,
+        "cleanup_status": cleanup_status,
+        "error_code": error_code,
+    }
+    message = _CODEGEN_LOG_FORMAT % fields
+    _LOGGER.log(
+        level,
+        message,
+        # 库式直接调用仍保留结构化属性供宿主检索，CLI formatter 只读 message。
+        extra=fields,
+    )
+
+
+class _ExactLoggerNameFilter(logging.Filter):
+    """仅接受生成器命名 logger 本身，阻止子 logger/外部记录进入 CLI sink。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """精确比较 logger name，不使用前缀或层级匹配。"""
+        return record.name == _LOGGER.name
+
+
+@contextmanager
+def _cli_logging_scope() -> Iterator[None]:
+    """CLI 期间仅临时接管命名 logger，退出时完整恢复宿主状态。"""
+    previous_handlers = list(_LOGGER.handlers)
+    previous_level = _LOGGER.level
+    previous_propagate = _LOGGER.propagate
+    cli_handler = logging.StreamHandler(sys.stdout)
+    cli_handler.setFormatter(logging.Formatter("%(message)s"))
+    cli_handler.addFilter(_ExactLoggerNameFilter())
+
+    # 不触碰 root logger；仅在作用域内替换本 logger 的三项可变配置。
+    _LOGGER.handlers = [cli_handler]
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+    try:
+        yield
+    finally:
+        _LOGGER.handlers = []
+        try:
+            cli_handler.close()
+        finally:
+            _LOGGER.handlers = previous_handlers
+            _LOGGER.setLevel(previous_level)
+            _LOGGER.propagate = previous_propagate
+
+
+def _start_cli_logging() -> tuple[str, int]:
+    """在参数已安全解析后建立 CLI 日志生命周期，并返回同一关联 ID/起点。"""
+    correlation_id = _new_correlation_id()
+    started_ns = time.monotonic_ns()
+    _log_codegen_event(
+        "cli_start",
+        correlation_id,
+        0,
+        3,
+        "pending",
+        "not_required",
+        "pending",
+        "NONE",
+    )
+    return correlation_id, started_ns
+
+
+def _finish_cli(
+    correlation_id: str,
+    started_ns: int,
+    exit_code: int,
+    error_code: str,
+    commit_status: str,
+    rollback_status: str,
+    cleanup_status: str,
+) -> int:
+    """以固定字段闭合 CLI 日志并返回原退出码，不接收路径或异常对象。"""
+    _log_codegen_event(
+        "cli_end",
+        correlation_id,
+        (time.monotonic_ns() - started_ns) // 1_000_000,
+        3,
+        commit_status,
+        rollback_status,
+        cleanup_status,
+        error_code,
+        level=logging.ERROR if exit_code else logging.INFO,
+    )
+    return exit_code
 
 
 class ValidatorSchemaError(RuntimeError):
@@ -61,6 +213,78 @@ class ValidatorSchemaError(RuntimeError):
 
 class CodegenGenerationError(RuntimeError):
     """普通 catalog 类型生成失败时的稳定失败分类，禁止生成 ERROR 注释占位。"""
+
+
+class CodegenArgumentError(RuntimeError):
+    """CLI 参数非法时的稳定分类，不携带 argv 或 argparse 正文。"""
+
+
+class _CodegenArgumentParser(argparse.ArgumentParser):
+    """将 argparse 默认 usage/argv 回显收敛为固定异常；--help 仍保持标准成功退出。"""
+
+    def error(self, message: str) -> NoReturn:
+        """忽略可能包含敏感 argv 的正文，仅抛出稳定 ASCII 错误码。"""
+        del message
+        raise CodegenArgumentError("CODEGEN_ARGUMENT_INVALID")
+
+
+class CodegenWriteError(RuntimeError):
+    """三语言批次失败的脱敏结果，仅携带 CLI 可安全记录的固定状态。"""
+
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        commit_status: str = "unknown",
+        rollback_status: str = "unknown",
+        cleanup_status: str = "unknown",
+    ) -> None:
+        """保留错误码供白名单映射，并将外来状态限制在固定 ASCII 闭集。"""
+        super().__init__(error_code)
+        self.commit_status = _stable_codegen_log_status(commit_status)
+        self.rollback_status = _stable_codegen_log_status(rollback_status)
+        self.cleanup_status = _stable_codegen_log_status(cleanup_status)
+
+
+_CODEGEN_WRITE_ERROR_CODES = frozenset(
+    {
+        "CODEGEN_WRITE_FAILED",
+        "CODEGEN_CLEANUP_FAILED",
+        "CODEGEN_ROLLBACK_FAILED",
+    }
+)
+_CLI_ERROR_CODES = _CODEGEN_WRITE_ERROR_CODES | frozenset(
+    {
+        "CODEGEN_CATALOG_LOAD_FAILED",
+        "CODEGEN_CATALOG_EMPTY",
+        "CODEGEN_VALIDATOR_SCHEMA_FAILED",
+        "CODEGEN_GENERATION_FAILED",
+        "CODEGEN_ARGUMENT_INVALID",
+    }
+)
+
+
+def _emit_cli_error(error_code: str) -> None:
+    """只向 CLI 暴露固定 ASCII 白名单码，禁止异常正文或路径跨越入口边界。"""
+    stable_code = error_code if error_code in _CLI_ERROR_CODES else "CODEGEN_GENERATION_FAILED"
+    print(f"[ERROR] {stable_code}", file=sys.stderr)
+
+
+def _stable_codegen_write_error_code(error: CodegenWriteError) -> str:
+    """CLI 只允许白名单错误码跨越入口边界，未知异常文本一律脱敏为写入失败。"""
+    error_code = str(error)
+    if error_code in _CODEGEN_WRITE_ERROR_CODES:
+        return error_code
+    return "CODEGEN_WRITE_FAILED"
+
+
+def _stable_codegen_log_status(candidate: str) -> str:
+    """日志状态只允许固定闭集，任何外来正文都脱敏为 unknown。"""
+    return candidate if candidate in _CODEGEN_LOG_STATUS_VALUES else "unknown"
+
+
+class _CodegenTemporaryCleanupError(RuntimeError):
+    """同目录临时文件清理失败时的内部分类，供外层选择稳定错误码。"""
 
 # JSON Schema → TypeScript 类型映射
 TS_TYPE_MAP: dict[str, str] = {
@@ -764,6 +988,200 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _replace_file(source: Path, destination: Path) -> None:
+    """封装可注入的原子替换边界，测试可在指定 replace 次序制造 I/O 故障。"""
+    os.replace(source, destination)
+
+
+def _read_file_mode(path: Path) -> int:
+    """只保留目标的 POSIX permission bits，避免文件类型位被复制到 stage。"""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _chmod_file(path: Path, mode: int) -> None:
+    """封装可注入的 mode 恢复边界；失败必须进入同一批次补偿状态机。"""
+    os.chmod(path, mode)
+
+
+def _unlink_file(path: Path) -> None:
+    """删除未消费的同目录临时文件；已被 replace 消费时视为正常无副作用。"""
+    path.unlink(missing_ok=True)
+
+
+def _cleanup_temporary_files(paths: list[Path]) -> bool:
+    """尽力清理全部临时文件；首次失败即使重试成功也必须向调用方报告。"""
+    cleanup_failed = False
+    for path in paths:
+        for attempt in range(2):
+            try:
+                _unlink_file(path)
+                break
+            except Exception:  # noqa: BLE001 - 清理时必须继续尝试其他临时文件。
+                cleanup_failed = True
+                if attempt == 1:
+                    break
+    return cleanup_failed
+
+
+def _stage_bytes(target: Path, data: bytes, suffix: str) -> Path:
+    """在目标同目录完成 flush、关闭和回读校验，避免未完成文件参与 replace。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=suffix,
+    )
+    staged_path = Path(raw_path)
+    descriptor_owned = True
+    try:
+        # fdopen 成功后句柄所有权转移给文件对象；若 fdopen 自身失败则仍需显式 close 原 descriptor。
+        staged_file = os.fdopen(descriptor, "wb")
+        descriptor_owned = False
+        # Windows 不能 replace 仍被本进程打开的文件，因此 with 结束后才进行回读和后续替换。
+        with staged_file:
+            staged_file.write(data)
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+        if staged_path.read_bytes() != data:
+            raise OSError("staged file readback mismatch")
+        return staged_path
+    except Exception as exc:  # noqa: BLE001 - 临时文件失败必须先补偿后再向上层归类。
+        close_failed = False
+        if descriptor_owned:
+            try:
+                # mkstemp 成功、fdopen 失败时必须先释放 Windows 句柄，否则 unlink 不能作为可靠补偿。
+                os.close(descriptor)
+            except Exception:  # noqa: BLE001 - 关闭失败与临时文件清理同属 fail-closed 的 cleanup 失败。
+                close_failed = True
+        # close 已失败也不能短路 cleanup；所有已登记临时路径都必须继续 best-effort 补偿。
+        cleanup_failed = _cleanup_temporary_files([staged_path])
+        if close_failed or cleanup_failed:
+            raise _CodegenTemporaryCleanupError from exc
+        raise
+
+
+def write_batch(
+    outputs: tuple[tuple[Path, str], ...],
+    *,
+    correlation_id: str | None = None,
+) -> None:
+    """以同目录 stage/rollback 补偿方式写入三语言生成物，绝不接受部分成功。"""
+    batch_correlation_id = _safe_correlation_id(correlation_id)
+    started_ns = time.monotonic_ns()
+    _log_codegen_event(
+        "batch_start",
+        batch_correlation_id,
+        0,
+        len(outputs),
+        "pending",
+        "not_required",
+        "pending",
+        "NONE",
+    )
+    staged_paths: list[Path] = []
+    rollback_paths: list[Path] = []
+    snapshots: dict[Path, tuple[bool, Path | None, int]] = {}
+    committed_targets: list[Path] = []
+    failure_code: str | None = None
+    rollback_attempted = False
+    rollback_failed = False
+
+    try:
+        # 所有新内容先独立落盘并 fsync/readback；任何失败都还未触碰正式生成物。
+        for target, content in outputs:
+            staged_paths.append(_stage_bytes(target, content.encode("utf-8"), ".stage"))
+
+        # 仅当所有新文件均已就绪后，才为原存在目标创建可恢复的同目录 rollback 副本。
+        for target, _ in outputs:
+            try:
+                original_bytes = target.read_bytes()
+            except FileNotFoundError:
+                snapshots[target] = (False, None, _DEFAULT_NEW_FILE_MODE)
+            else:
+                original_mode = _read_file_mode(target)
+                rollback_path = _stage_bytes(target, original_bytes, ".rollback")
+                rollback_paths.append(rollback_path)
+                snapshots[target] = (True, rollback_path, original_mode)
+
+        # 固定 TS→Python→Rust 的调用顺序；replace 失败时下面只补偿已经成功的目标。
+        for (target, _), staged_path in zip(outputs, staged_paths, strict=True):
+            # mkstemp 固定从 0600 起步；replace 前恢复旧 mode，新目标则采用明确的安全默认 0644。
+            _, _, target_mode = snapshots[target]
+            _chmod_file(staged_path, target_mode)
+            _replace_file(staged_path, target)
+            committed_targets.append(target)
+    except _CodegenTemporaryCleanupError:
+        failure_code = "CODEGEN_CLEANUP_FAILED"
+    except Exception:  # noqa: BLE001 - 不暴露 errno、路径或底层异常正文。
+        rollback_attempted = bool(committed_targets)
+        for target in reversed(committed_targets):
+            existed, snapshot_rollback_path, original_mode = snapshots[target]
+            try:
+                if existed:
+                    if snapshot_rollback_path is None:
+                        raise OSError("missing rollback snapshot")
+                    # rollback 副本同样由 mkstemp 创建，恢复前必须先还原原目标 mode。
+                    _chmod_file(snapshot_rollback_path, original_mode)
+                    _replace_file(snapshot_rollback_path, target)
+                else:
+                    _unlink_file(target)
+            except Exception:  # noqa: BLE001 - 一个回滚失败不能阻止其余目标继续补偿。
+                rollback_failed = True
+        failure_code = "CODEGEN_ROLLBACK_FAILED" if rollback_failed else "CODEGEN_WRITE_FAILED"
+
+    cleanup_failed = _cleanup_temporary_files(staged_paths + rollback_paths)
+    # 错误优先级固定为 rollback > cleanup > 原始写入，调用方只能收到稳定、脱敏的代码。
+    final_error_code: str | None
+    if failure_code == "CODEGEN_ROLLBACK_FAILED":
+        final_error_code = failure_code
+    elif failure_code == "CODEGEN_CLEANUP_FAILED" or cleanup_failed:
+        final_error_code = "CODEGEN_CLEANUP_FAILED"
+    else:
+        final_error_code = failure_code
+    if final_error_code is not None:
+        if len(committed_targets) == len(outputs):
+            commit_status = "completed"
+        elif committed_targets:
+            commit_status = "partial"
+        else:
+            commit_status = "not_started"
+        rollback_status = (
+            "failed" if rollback_failed else "completed" if rollback_attempted else "not_required"
+        )
+        cleanup_status = (
+            "failed"
+            if failure_code == "CODEGEN_CLEANUP_FAILED" or cleanup_failed
+            else "completed"
+        )
+        _log_codegen_event(
+            "batch_end",
+            batch_correlation_id,
+            (time.monotonic_ns() - started_ns) // 1_000_000,
+            len(outputs),
+            commit_status,
+            rollback_status,
+            cleanup_status,
+            final_error_code,
+            level=logging.ERROR,
+        )
+        raise CodegenWriteError(
+            final_error_code,
+            commit_status=commit_status,
+            rollback_status=rollback_status,
+            cleanup_status=cleanup_status,
+        )
+    _log_codegen_event(
+        "batch_end",
+        batch_correlation_id,
+        (time.monotonic_ns() - started_ns) // 1_000_000,
+        len(outputs),
+        "completed",
+        "not_required",
+        "completed",
+        "NONE",
+    )
+
+
 def write_or_check(path: Path, content: str, check_mode: bool) -> bool:
     """
     check_mode=False 时写入文件并返回 True。
@@ -771,20 +1189,182 @@ def write_or_check(path: Path, content: str, check_mode: bool) -> bool:
     """
     if check_mode:
         if not path.exists():
-            print(f"[DRIFT] 文件不存在: {path}", file=sys.stderr)
+            print("[DRIFT] CODEGEN_OUTPUT_MISSING", file=sys.stderr)
             return False
         existing = path.read_text(encoding="utf-8")
         if existing != content:
-            print(f"[DRIFT] 文件内容已漂移: {path}", file=sys.stderr)
-            print(f"  期望 SHA-256: {content_hash(content)}", file=sys.stderr)
-            print(f"  实际 SHA-256: {content_hash(existing)}", file=sys.stderr)
+            print("[DRIFT] CODEGEN_OUTPUT_DRIFT", file=sys.stderr)
             return False
         return True
-    # 写入模式：确保父目录存在，写入内容
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8", newline="\n")
-    print(f"[OK] 已写入: {path}")
+    # 兼容单文件调用，但仍走同一补偿写入边界，避免产生另一条非原子写路径。
+    write_batch(((path, content),))
     return True
+
+
+def _run_codegen_cli(check_mode: bool) -> int:
+    """在已建立的命名 logger 作用域内执行生成/检查流程并闭合 CLI 日志。"""
+    cli_correlation_id, cli_started_ns = _start_cli_logging()
+
+    # 加载并筛选 catalog；JSON 可解析不代表 wire 形状可信，任何结构异常都收敛到同一码。
+    try:
+        catalog = load_catalog()
+        if not isinstance(catalog, dict):
+            raise TypeError("catalog root must be object")
+        if "schemas" not in catalog:
+            raise TypeError("catalog schemas key is required")
+        catalog_schemas = catalog["schemas"]
+        if not isinstance(catalog_schemas, list):
+            raise TypeError("catalog schemas must be array")
+        codegen_entries: list[dict[str, Any]] = []
+        for schema_entry in catalog_schemas:
+            if not isinstance(schema_entry, dict):
+                raise TypeError("catalog schema entry must be object")
+            if schema_entry.get("codegen") is True:
+                codegen_entries.append(schema_entry)
+    except Exception:
+        _emit_cli_error("CODEGEN_CATALOG_LOAD_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_CATALOG_LOAD_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    if not codegen_entries:
+        _emit_cli_error("CODEGEN_CATALOG_EMPTY")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_CATALOG_EMPTY",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    # 先在内存中严格加载 schema 并生成三语言完整内容；任一 validator 失败时绝不进入写入阶段。
+    try:
+        validator_schemas = load_required_validator_schemas()
+        ts_content = generate_typescript(codegen_entries, validator_schemas)
+        py_content = generate_python(codegen_entries, validator_schemas)
+        rs_content = generate_rust(codegen_entries, validator_schemas)
+    except ValidatorSchemaError:
+        _emit_cli_error("CODEGEN_VALIDATOR_SCHEMA_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_VALIDATOR_SCHEMA_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+    except CodegenGenerationError:
+        _emit_cli_error("CODEGEN_GENERATION_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_GENERATION_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+    except Exception:  # noqa: BLE001 - 内存生成阶段不能把未分类异常降级成部分写入。
+        _emit_cli_error("CODEGEN_GENERATION_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_GENERATION_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    # --check 只读逐文件比较；写入模式必须作为一个可补偿的三目标批次执行。
+    try:
+        if check_mode:
+            results = (
+                write_or_check(TS_OUT, ts_content, True),
+                write_or_check(PY_OUT, py_content, True),
+                write_or_check(RS_OUT, rs_content, True),
+            )
+        else:
+            write_batch(
+                (
+                    (TS_OUT, ts_content),
+                    (PY_OUT, py_content),
+                    (RS_OUT, rs_content),
+                ),
+                correlation_id=cli_correlation_id,
+            )
+            results = (True, True, True)
+    except CodegenWriteError as exc:
+        error_code = _stable_codegen_write_error_code(exc)
+        _emit_cli_error(error_code)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            error_code,
+            exc.commit_status,
+            exc.rollback_status,
+            exc.cleanup_status,
+        )
+    except Exception:  # noqa: BLE001 - I/O 中途失败不得输出 [DONE] 或泄露内部路径。
+        _emit_cli_error("CODEGEN_WRITE_FAILED")
+        boundary_status = "not_applicable" if check_mode else "unknown"
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_WRITE_FAILED",
+            boundary_status,
+            boundary_status,
+            boundary_status,
+        )
+    ok = all(results)
+
+    if check_mode:
+        if ok:
+            print("[OK] 三语言生成树无漂移。")
+        else:
+            print("[FAIL] CODEGEN_DRIFT_DETECTED", file=sys.stderr)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            0 if ok else 1,
+            "NONE" if ok else "CODEGEN_DRIFT_DETECTED",
+            "not_applicable",
+            "not_applicable",
+            "not_applicable",
+        )
+
+    if not ok:
+        print("[FAIL] CODEGEN_WRITE_INCOMPLETE", file=sys.stderr)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_WRITE_INCOMPLETE",
+            "unknown",
+            "unknown",
+            "unknown",
+        )
+    print("[DONE] 三语言类型文件生成完成。")
+    return _finish_cli(
+        cli_correlation_id,
+        cli_started_ns,
+        0,
+        "NONE",
+        "completed",
+        "not_required",
+        "completed",
+    )
 
 
 def main() -> int:
@@ -796,7 +1376,7 @@ def main() -> int:
         _emit_cli_text_encoding_failure()
         return 2
 
-    parser = argparse.ArgumentParser(
+    parser = _CodegenArgumentParser(
         description="确定性代码生成器：从 catalog.v1.json 生成三语言类型定义。"
     )
     parser.add_argument(
@@ -804,62 +1384,26 @@ def main() -> int:
         action="store_true",
         help="检查模式：校验输出是否与磁盘一致，不一致则失败且不修改文件。",
     )
-    args = parser.parse_args()
-    check_mode: bool = args.check
-
-    # 加载 catalog
     try:
-        catalog = load_catalog()
-    except Exception as exc:
-        print(f"[ERROR] 无法加载 catalog: {exc}", file=sys.stderr)
-        return 1
+        args = parser.parse_args()
+    except CodegenArgumentError:
+        # 非法 argv 也需要成对 CLI 日志，但作用域不得泄漏到 root/宿主。
+        with _cli_logging_scope():
+            cli_correlation_id, cli_started_ns = _start_cli_logging()
+            _emit_cli_error("CODEGEN_ARGUMENT_INVALID")
+            return _finish_cli(
+                cli_correlation_id,
+                cli_started_ns,
+                2,
+                "CODEGEN_ARGUMENT_INVALID",
+                "not_started",
+                "not_required",
+                "not_started",
+            )
 
-    # 筛选 codegen=true 的条目
-    codegen_entries = [s for s in catalog.get("schemas", []) if s.get("codegen") is True]
-    if not codegen_entries:
-        print("[ERROR] catalog 中没有 codegen=true 的条目", file=sys.stderr)
-        return 1
-
-    # 先在内存中严格加载 schema 并生成三语言完整内容；任一 validator 失败时绝不进入写入阶段。
-    try:
-        validator_schemas = load_required_validator_schemas()
-        ts_content = generate_typescript(codegen_entries, validator_schemas)
-        py_content = generate_python(codegen_entries, validator_schemas)
-        rs_content = generate_rust(codegen_entries, validator_schemas)
-    except ValidatorSchemaError as exc:
-        print(f"[ERROR] 运行时 validator schema 生成失败: {exc}", file=sys.stderr)
-        return 1
-    except CodegenGenerationError:
-        print("[ERROR] CODEGEN_GENERATION_FAILED", file=sys.stderr)
-        return 1
-    except Exception:  # noqa: BLE001 - 内存生成阶段不能把未分类异常降级成部分写入。
-        print("[ERROR] CODEGEN_GENERATION_FAILED", file=sys.stderr)
-        return 1
-
-    # 写入或检查
-    try:
-        results = (
-            write_or_check(TS_OUT, ts_content, check_mode),
-            write_or_check(PY_OUT, py_content, check_mode),
-            write_or_check(RS_OUT, rs_content, check_mode),
-        )
-    except Exception:  # noqa: BLE001 - I/O 中途失败不得输出 [DONE]；后续 --check 会报告剩余漂移。
-        print("[ERROR] CODEGEN_WRITE_FAILED", file=sys.stderr)
-        return 1
-    ok = all(results)
-
-    if check_mode:
-        if ok:
-            print("[OK] 三语言生成树无漂移。")
-        else:
-            print("[FAIL] 检测到漂移，请重新运行 generate.py 更新输出。", file=sys.stderr)
-        return 0 if ok else 1
-
-    if not ok:
-        print("[FAIL] 生成写入未完整完成，请使用 --check 定位漂移。", file=sys.stderr)
-        return 1
-    print("[DONE] 三语言类型文件生成完成。")
-    return 0
+    # --help 会在此前以 SystemExit(0) 返回，因此不会留下孤立 cli_start。
+    with _cli_logging_scope():
+        return _run_codegen_cli(args.check)
 
 
 if __name__ == "__main__":

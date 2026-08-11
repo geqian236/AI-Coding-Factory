@@ -68,6 +68,9 @@ contracts/
 - 每个 registry binding 固定 schemaId/schemaVersion、真实 validator 来源、闭合 payload schema 以及 required/optional 键。资源指纹 payload 按 `node-capability-map.v1.json` 对应 `nodeType` 的内嵌 `resourceFingerprintSchema` 校验；action policy payload 必须是 selected action 的确定性投影，并绑定 `nodeCapabilityMapDigest + nodeType + actionCapability`。
 - `ExecutionAuthorization.semanticPlanHash` 的 payload 不是简化摘要样本，而是 `factory_agent.policy.plan_hash.build_semantic_projection` 对完整、**post-bootstrap** RunSpec 的精确投影：`schemaVersion` 保持整数，`constraints` 保持字符串数组，并同时冻结 assumptions、scope、acceptanceCriteria、repository（mode/root/baseBranch/baseCommit）、workPlan（dagVersion/nodes/barriers）与 riskProfile。bootstrap 必须先完成并取得可信 base commit，随后才可生成首个 v1 RunSpec；`repository.mode` 保留用户来源的 `existing|new`，两种模式的 `repository.baseCommit` 都必须是 40 位小写完整 SHA，绝不接受 `null`、短 SHA 或额外 repository 字段。RunSpec/PlanRevision 的结构化 `nodeType` 字段拒绝 `BOOTSTRAP_REPOSITORY`，结构化 `businessPhase` 字段拒绝真实 `BOOTSTRAPPING_REPOSITORY`（并兼容拒绝旧误拼 `BOOTSTRAPPING`）；这不是对 logicalNodeId/gate 等自由 ID 字符串做递归禁词。首个工作计划从 `PLAN`/`PLANNING` 开始。顶层及嵌套对象均 fail-closed；三语言 hash API 在投影/摘要前用 codegen 机械嵌入的权威 schema 校验完整 wire，合同测试从运行时投影直接取得字段集合并逐字段验证删改不能复用旧摘要。
 - `ExecutionAuthorization.planRevisionDigest` 的 payload 是完整不可变 PlanRevision 的 digest material：字段/类型和 required 集合逐项跟随 `plan-revision.v1.schema.json`，仅排除 `planRevisionDigest` 自身值与 signature。`parentRevisionId` 保留权威 schema 的可选性，其余必填字段（含 DAG、映射、nodes、barriers、stageMaps、createdAt）缺失即拒绝；合同测试从 schema 和运行时排除集机械比较，防止新增或遗漏字段静默漂移。
+- `semanticPlanHash` 与 `planRevisionDigest` 都必须精确匹配 `^sha256:[0-9a-f]{64}$`，并共同引用 PlanRevision 权威 schema 的同一 `sha256Digest` 定义；`sha256:` 后 64 个 `0` 仍是格式合法的摘要值。Git 的全零 sentinel 禁止规则只适用于本轮的 `baselinePayload.baseSha` 与 RunSpec `repository.baseCommit`，不得错误外推为“所有 sha256 摘要均禁止全零”。
+- `businessPhase` 的闭集由 Master Spec §7.1 的 `Run.phase` 机械取得，再排除 pre-plan 的 `CREATED`、`PREFLIGHT`、`BOOTSTRAPPING_REPOSITORY`；v1 接受的 15 个 post-bootstrap 值精确为 `PLANNING`、`DESIGN_REVIEWING`、`PREPARING_WORKSPACE`、`IMPLEMENTING`、`VERIFYING`、`CODE_REVIEWING`、`PUBLISHING_PR`、`MERGING`、`BUILDING_ARTIFACT`、`DEPLOYING_STAGING`、`ACCEPTING_STAGING`、`DEPLOYING_PRODUCTION`、`ACCEPTING_PRODUCTION`、`ROLLING_BACK`、`FINALIZING`。**v1 设计决定**：每一份 post-bootstrap RunSpec/PlanRevision（包括带 parent revision 的 child replan）均要求非空 `nodes`/`barriers`，且 `nodes[0]` 为 `PLAN`/`PLANNING`、`barriers[0]` 为 `PLANNING`；这是一项保守的 v1 收紧，而不是把“首个工作计划”的原文误称为所有重规划的唯一既有结论。该闭集不递归限制 `logicalNodeId`、`gate` 等自由 ID 字符串。
+- registry 的 `baselinePayload` 顶层固定 `required=[baseBranch,bootstrapState]`、`optional=[baseSha,bootstrapReceiptId]`：`EXISTS` 必须带非零、40 位小写完整 `baseSha`，`bootstrapReceiptId` 可选；`BOOTSTRAP_REQUIRED` 只能带 `baseBranch + bootstrapState`，并禁止 `baseSha` 与 `bootstrapReceiptId`。repository ID、mode 与物理目录事实仍由 Intent 顶层 `repositoryId + repositoryBindingDigest` 绑定，不在 baseline payload 重复建模。新仓库 `baseBranch` 的默认/选择策略与 TaskIntakeAccepted 的 `bootstrapPending` 显式化策略尚未冻结，后续只能以明确的服务端规范化设计决定补入，不能倒推为本版本已唯一规定。
 - pre-plan bootstrap 目前只冻结 Task intake、Intent 的 `repo.bootstrap` 包络、目录合同与 action receipt 边界；它不伪造 PlanRevision-bound `ExecutionAuthorization`。bootstrap 专用 permit、消费和事务仍属于 Task 4/5 与后续 runtime，当前未实现，调用方必须 fail closed；本协议不得把该运行时能力表述为已交付。
 - Task 4 消费边界：只能解析状态为 `COMMITTED` 且不可变的 artifact；`artifactId` 解析、schema/version、validator 来源和重算 digest 必须全部匹配，否则拒绝。此处只冻结合同，尚未实现数据库状态或运行时消费逻辑。
 - `ExecutionAuthorization` 使用正确拼写 `stageCapabilityMapDigest`；历史 v1 的 `stageCapeabilityMapDigest` 不在本 schema 双拼写放行范围，后续版本必须经显式 adapter/migration 映射。
@@ -104,6 +107,30 @@ Python 生成目标采用 `TypedDict(total=False)`：仅 JSON Schema `required` 
 `Required[T]`，未列入 `required` 的字段保持可省略；schema 已声明 `null` 时才额外生成
 `Optional[T]`。生成文件不启用 postponed annotations，以便 Python 运行时的
 `__required_keys__` / `__optional_keys__` 继续成为可机械核验的合同证据。
+
+写入模式把 TypeScript、Python、Rust 三个目标作为一个进程内补偿批次：每个新内容先在目标同目录创建
+`.stage`，完成 UTF-8 写入、`flush`、`fsync`、关闭句柄和精确回读；三个 stage 与现有目标的 `.rollback`
+快照都准备完成后，才按固定顺序 replace。任一 replace 失败会逆序恢复原字节或原“不存在”状态，并尽力
+清理全部临时文件；错误优先级固定为 rollback、cleanup、write。该机制不宣称断电、进程崩溃或并发写入的
+事务保证。既有目标的 permission bits 由 `stat.S_IMODE` 保存，stage 在 replace 前恢复原 mode，rollback
+副本也在恢复 replace 前还原原 mode；原不存在目标采用明确的 `0644` 默认。`chmod` 失败进入同一补偿状态机，
+不得绕过 rollback、cleanup、write 的既有优先级。
+
+生成器 CLI 的错误与 `--check` 漂移提示仅暴露固定 ASCII 分类码，不拼接路径、errno、底层异常正文或生成内容。
+catalog 读取、根/数组/条目形状异常统一为 `CODEGEN_CATALOG_LOAD_FAILED`；非法 CLI 参数由自定义
+`ArgumentParser.error` 收敛为 `CODEGEN_ARGUMENT_INVALID`，不输出 usage 或回显 argv。`--help` 是解析层成功退出，
+不启动一次不完整的 CLI 日志生命周期。
+
+模块 logger `factory.contracts.codegen` 在库式 `write_batch` 直接调用时保持原有命名 logger 配置与 `propagate`，由宿主
+决定 sink。CLI 绝不调用 `logging.basicConfig`，也不读写 root logger 的 level、handlers 或 filters；每次运行只在
+`factory.contracts.codegen` 上建立一个作用域内 **stdout** handler，临时设为 `INFO + propagate=False`。该 handler
+的 formatter 只是 `%(message)s`，并以精确 logger name filter 拒绝子 logger/外部记录；退出时 close 自有 handler，
+并完整恢复该命名 logger 原 handlers、level 与 propagate。因此重复 `main` 既不累加 handler，也不会继续写旧 stdout sink。CLI 与批次的
+start/end 日志共享同一次 32 位小写十六进制 `correlation_id`，且只输出固定 ASCII 的 `event`、
+`elapsed_ms`、`target_count`、commit/rollback/cleanup 状态与 `error_code`。批次失败的三类终态会以闭集字段传到
+`cli_end`，禁止使用含混占位值。日志 message 在发送前已组装为完整固定 ASCII，不依赖 formatter 的自定义 extra 字段，
+也不含目标路径或异常 message payload；纯 schema/hash/类型渲染 API 不发日志，
+CLI/write batch 才是日志出口。
 
 ### 4.3 catalog.v1.json 字段说明
 

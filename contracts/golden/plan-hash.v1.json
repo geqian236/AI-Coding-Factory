@@ -53,6 +53,19 @@
               "successPredicateId": "plan-created",
               "timeoutMs": 30000,
               "retryPolicyId": "no-retry"
+            },
+            {
+              "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
+              "businessPhase": "DESIGN_REVIEWING",
+              "barrierOrdinal": 1,
+              "nodeType": "DESIGN_REVIEW",
+              "required": true,
+              "dependsOn": ["node-plan"],
+              "sideEffectClass": "read-only",
+              "requiredArtifacts": [],
+              "successPredicateId": "design-reviewed",
+              "timeoutMs": 30000,
+              "retryPolicyId": "no-retry"
             }
           ],
           "barriers": [
@@ -62,6 +75,13 @@
               "requiredNodeIds": ["node-plan"],
               "settleTimeoutMs": 30000,
               "passPredicateId": "plan-complete"
+            },
+            {
+              "businessPhase": "DESIGN_REVIEWING",
+              "barrierOrdinal": 1,
+              "requiredNodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"],
+              "settleTimeoutMs": 30000,
+              "passPredicateId": "gate-BOOTSTRAP_REPOSITORY-free-text"
             }
           ]
         },
@@ -75,7 +95,7 @@
         "planRevisionDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "createdAt": "2026-08-11T00:00:00Z"
       },
-      "expected": "sha256:476debc91e5ee8d880b755e59ff650c78b7517ab3e0c5c442eabc074fc823511"
+      "expected": "sha256:70ae1d759ca34a04eaa4099fcc5e1bc847b4deffb49c3848135e06aae77253b1"
     },
     {
       "name": "same-semantics-different-excluded",
@@ -109,6 +129,19 @@
               "successPredicateId": "plan-created",
               "timeoutMs": 30000,
               "retryPolicyId": "no-retry"
+            },
+            {
+              "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
+              "businessPhase": "DESIGN_REVIEWING",
+              "barrierOrdinal": 1,
+              "nodeType": "DESIGN_REVIEW",
+              "required": true,
+              "dependsOn": ["node-plan"],
+              "sideEffectClass": "read-only",
+              "requiredArtifacts": [],
+              "successPredicateId": "design-reviewed",
+              "timeoutMs": 30000,
+              "retryPolicyId": "no-retry"
             }
           ],
           "barriers": [
@@ -118,6 +151,13 @@
               "requiredNodeIds": ["node-plan"],
               "settleTimeoutMs": 30000,
               "passPredicateId": "plan-complete"
+            },
+            {
+              "businessPhase": "DESIGN_REVIEWING",
+              "barrierOrdinal": 1,
+              "requiredNodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"],
+              "settleTimeoutMs": 30000,
+              "passPredicateId": "gate-BOOTSTRAP_REPOSITORY-free-text"
             }
           ]
         },
@@ -131,7 +171,7 @@
         "planRevisionDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "createdAt": "2026-08-12T00:00:00Z"
       },
-      "expected": "sha256:476debc91e5ee8d880b755e59ff650c78b7517ab3e0c5c442eabc074fc823511"
+      "expected": "sha256:70ae1d759ca34a04eaa4099fcc5e1bc847b4deffb49c3848135e06aae77253b1"
     },
     {
       "name": "existing-full-sha",
@@ -205,9 +245,12 @@
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "empty-base-commit",
+      "name": "invalid-base-commit-or-zero-sentinel",
       "base": "post-bootstrap-new-full-sha",
-      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": ""},
+      "mutations": [
+        {"name": "empty", "op": "replace", "path": ["repository", "baseCommit"], "value": ""},
+        {"name": "zero-sentinel", "op": "replace", "path": ["repository", "baseCommit"], "value": "0000000000000000000000000000000000000000"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
@@ -253,21 +296,44 @@
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-node-is-pre-plan-only",
+      "name": "post-bootstrap-run-spec-must-start-with-planning",
       "base": "post-bootstrap-new-full-sha",
-      "mutation": {"op": "replace", "path": ["workPlan", "nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"},
+      "mutations": [
+        {"name": "nodes-empty", "op": "replace", "path": ["workPlan", "nodes"], "value": []},
+        {"name": "barriers-empty", "op": "replace", "path": ["workPlan", "barriers"], "value": []},
+        {"name": "first-node-implement", "op": "replace", "path": ["workPlan", "nodes", "0", "nodeType"], "value": "IMPLEMENT"},
+        {"name": "first-node-implementing", "op": "replace", "path": ["workPlan", "nodes", "0", "businessPhase"], "value": "IMPLEMENTING"},
+        {"name": "first-barrier-implementing", "op": "replace", "path": ["workPlan", "barriers", "0", "businessPhase"], "value": "IMPLEMENTING"},
+        {"name": "bootstrap-node-type", "op": "replace", "path": ["workPlan", "nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-node-phase-is-pre-plan-only",
+      "name": "run-spec-node-business-phase-closed-set",
       "base": "post-bootstrap-new-full-sha",
-      "mutation": {"op": "replace", "path": ["workPlan", "nodes", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "mutations": [
+        {"name": "created", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "CREATED"},
+        {"name": "preflight", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "PREFLIGHT"},
+        {"name": "bootstrap-repository", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+        {"name": "legacy-bootstrap", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "BOOTSTRAPPING"},
+        {"name": "unknown", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "UNKNOWN_PHASE"},
+        {"name": "trailing-space", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "PLANNING "},
+        {"name": "lowercase", "op": "replace", "path": ["workPlan", "nodes", "1", "businessPhase"], "value": "planning"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-barrier-phase-is-pre-plan-only",
+      "name": "run-spec-barrier-business-phase-closed-set",
       "base": "post-bootstrap-new-full-sha",
-      "mutation": {"op": "replace", "path": ["workPlan", "barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "mutations": [
+        {"name": "created", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "CREATED"},
+        {"name": "preflight", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "PREFLIGHT"},
+        {"name": "bootstrap-repository", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+        {"name": "legacy-bootstrap", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "BOOTSTRAPPING"},
+        {"name": "unknown", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "UNKNOWN_PHASE"},
+        {"name": "trailing-space", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "PLANNING "},
+        {"name": "lowercase", "op": "replace", "path": ["workPlan", "barriers", "1", "businessPhase"], "value": "planning"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
@@ -299,6 +365,15 @@
             "dependencies": [],
             "hasSideEffect": false,
             "requiredArtifacts": ["runspec"]
+          },
+          {
+            "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
+            "nodeType": "DESIGN_REVIEW",
+            "businessPhase": "DESIGN_REVIEWING",
+            "dependencies": ["node-plan"],
+            "hasSideEffect": false,
+            "requiredArtifacts": [],
+            "gate": "gate-BOOTSTRAP_REPOSITORY-free-text"
           }
         ],
         "barriers": [
@@ -306,13 +381,18 @@
             "barrierId": "barrier-plan",
             "businessPhase": "PLANNING",
             "nodeIds": ["node-plan"]
+          },
+          {
+            "barrierId": "barrier-design",
+            "businessPhase": "DESIGN_REVIEWING",
+            "nodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"]
           }
         ],
         "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
         "createdAt": "2026-08-11T00:00:00Z",
         "signature": "signature-not-hashed"
       },
-      "expected": "sha256:62fc9360861af5911c4c1a81a1ed3b005f3243c92b244c09262f5b08fe23dce6"
+      "expected": "sha256:0310fe3775f0ab3e69fde320fdb2627652796f11b08e9023a58b51e5a668f48b"
     },
     {
       "name": "revision-planning-2-different-lineage",
@@ -335,6 +415,15 @@
             "dependencies": [],
             "hasSideEffect": false,
             "requiredArtifacts": ["runspec"]
+          },
+          {
+            "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
+            "nodeType": "DESIGN_REVIEW",
+            "businessPhase": "DESIGN_REVIEWING",
+            "dependencies": ["node-plan"],
+            "hasSideEffect": false,
+            "requiredArtifacts": [],
+            "gate": "gate-BOOTSTRAP_REPOSITORY-free-text"
           }
         ],
         "barriers": [
@@ -342,12 +431,17 @@
             "barrierId": "barrier-plan",
             "businessPhase": "PLANNING",
             "nodeIds": ["node-plan"]
+          },
+          {
+            "barrierId": "barrier-design",
+            "businessPhase": "DESIGN_REVIEWING",
+            "nodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"]
           }
         ],
         "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
         "createdAt": "2026-08-11T00:01:00Z"
       },
-      "expected": "sha256:ce8ad252b6c9552f36d6108f5d9fdcc3653a2373372e59598ac79d6b57dc9dcf"
+      "expected": "sha256:a4f4b286af6be3e7d95addfd7630d7530bc372d2d58a7be3711d42f566124388"
     }
   ],
   "invalidPlanRevision": [
@@ -369,9 +463,30 @@
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "null-plan-revision-digest",
+      "name": "semantic-and-revision-digests-must-use-strict-sha256-format",
       "base": "revision-planning-1",
-      "mutation": {"op": "replace", "path": ["planRevisionDigest"], "value": null},
+      "mutations": [
+        {"name": "semantic-null", "op": "replace", "path": ["semanticPlanHash"], "value": null},
+        {"name": "semantic-number", "op": "replace", "path": ["semanticPlanHash"], "value": 7},
+        {"name": "semantic-object", "op": "replace", "path": ["semanticPlanHash"], "value": {}},
+        {"name": "semantic-empty", "op": "replace", "path": ["semanticPlanHash"], "value": ""},
+        {"name": "semantic-missing-prefix", "op": "replace", "path": ["semanticPlanHash"], "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "semantic-short-63", "op": "replace", "path": ["semanticPlanHash"], "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "semantic-long-65", "op": "replace", "path": ["semanticPlanHash"], "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "semantic-uppercase", "op": "replace", "path": ["semanticPlanHash"], "value": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+        {"name": "semantic-nonhex", "op": "replace", "path": ["semanticPlanHash"], "value": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"},
+        {"name": "semantic-wrong-prefix", "op": "replace", "path": ["semanticPlanHash"], "value": "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "revision-null", "op": "replace", "path": ["planRevisionDigest"], "value": null},
+        {"name": "revision-number", "op": "replace", "path": ["planRevisionDigest"], "value": 7},
+        {"name": "revision-object", "op": "replace", "path": ["planRevisionDigest"], "value": {}},
+        {"name": "revision-empty", "op": "replace", "path": ["planRevisionDigest"], "value": ""},
+        {"name": "revision-missing-prefix", "op": "replace", "path": ["planRevisionDigest"], "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "revision-short-63", "op": "replace", "path": ["planRevisionDigest"], "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "revision-long-65", "op": "replace", "path": ["planRevisionDigest"], "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        {"name": "revision-uppercase", "op": "replace", "path": ["planRevisionDigest"], "value": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+        {"name": "revision-nonhex", "op": "replace", "path": ["planRevisionDigest"], "value": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"},
+        {"name": "revision-wrong-prefix", "op": "replace", "path": ["planRevisionDigest"], "value": "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
@@ -441,21 +556,44 @@
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-node-is-pre-plan-only",
+      "name": "post-bootstrap-plan-revision-must-start-with-planning",
       "base": "revision-planning-1",
-      "mutation": {"op": "replace", "path": ["nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"},
+      "mutations": [
+        {"name": "nodes-empty", "op": "replace", "path": ["nodes"], "value": []},
+        {"name": "barriers-empty", "op": "replace", "path": ["barriers"], "value": []},
+        {"name": "first-node-implement", "op": "replace", "path": ["nodes", "0", "nodeType"], "value": "IMPLEMENT"},
+        {"name": "first-node-implementing", "op": "replace", "path": ["nodes", "0", "businessPhase"], "value": "IMPLEMENTING"},
+        {"name": "first-barrier-implementing", "op": "replace", "path": ["barriers", "0", "businessPhase"], "value": "IMPLEMENTING"},
+        {"name": "bootstrap-node-type", "op": "replace", "path": ["nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-node-phase-is-pre-plan-only",
+      "name": "plan-revision-node-business-phase-closed-set",
       "base": "revision-planning-1",
-      "mutation": {"op": "replace", "path": ["nodes", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "mutations": [
+        {"name": "created", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "CREATED"},
+        {"name": "preflight", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "PREFLIGHT"},
+        {"name": "bootstrap-repository", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+        {"name": "legacy-bootstrap", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "BOOTSTRAPPING"},
+        {"name": "unknown", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "UNKNOWN_PHASE"},
+        {"name": "trailing-space", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "PLANNING "},
+        {"name": "lowercase", "op": "replace", "path": ["nodes", "1", "businessPhase"], "value": "planning"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {
-      "name": "bootstrap-repository-barrier-phase-is-pre-plan-only",
+      "name": "plan-revision-barrier-business-phase-closed-set",
       "base": "revision-planning-1",
-      "mutation": {"op": "replace", "path": ["barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "mutations": [
+        {"name": "created", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "CREATED"},
+        {"name": "preflight", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "PREFLIGHT"},
+        {"name": "bootstrap-repository", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+        {"name": "legacy-bootstrap", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "BOOTSTRAPPING"},
+        {"name": "unknown", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "UNKNOWN_PHASE"},
+        {"name": "trailing-space", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "PLANNING "},
+        {"name": "lowercase", "op": "replace", "path": ["barriers", "1", "businessPhase"], "value": "planning"}
+      ],
       "expectedErrorCode": "plan-hash-error"
     },
     {

@@ -225,8 +225,11 @@ function compileValidator(schemaJson: unknown, expectedSha256: unknown): Validat
     verifyEmbeddedSchemaIntegrity(schemaJson, expectedSha256);
     const schema: unknown = JSON.parse(schemaJson);
     assertValidGeneratedSchema(schema);
+    // v1 用 Draft7 tuple 在 allOf 内只约束 index 0，外层通用 items 仍校验后续节点；
+    // 因此关闭 Ajv 的“完整 tuple”静态告警，不能把 additionalItems:false 加到该断言而误杀后续计划节点。
     const ajv = new Ajv({
       strict: true,
+      strictTuples: false,
       validateSchema: true,
       validateFormats: true,
       coerceTypes: false,
@@ -338,8 +341,7 @@ function sha256Prefixed(bytes: Uint8Array): string {
 
 /**
  * 计算 semanticPlanHash（跨修订版本稳定的计划语义身份）。
- * @throws PlanHashError 语义字段缺失或结构非法。
- * @throws CanonicalJsonError 字段值含非法数字/类型/重复键。
+ * @throws PlanHashError 语义字段缺失、结构非法或字段值无法规范化。
  */
 export function semanticPlanHash(plan: unknown): string {
   const projection = buildSemanticProjection(plan);
@@ -354,8 +356,7 @@ export function semanticPlanHash(plan: unknown): string {
  * 计算 planRevisionDigest（完整不可变修订记录身份）。
  * 排除 planRevisionDigest 与 signature，其余字段（含谱系、授权关联、
  * semanticPlanHash、生成时间）全部纳入。
- * @throws PlanHashError revision 非对象。
- * @throws CanonicalJsonError 字段值含非法数字/类型/重复键。
+ * @throws PlanHashError revision 非对象、结构非法或字段值无法规范化。
  */
 export function planRevisionDigest(revision: unknown): string {
   validateWire(revision, getPlanRevisionValidator());
@@ -377,8 +378,7 @@ export function planRevisionDigest(revision: unknown): string {
 
 /**
  * 计算 barrierId（稳定 barrier 身份，使用域分离数组）。
- * @throws PlanHashError 参数类型非法。
- * @throws CanonicalJsonError 参数值无法规范化。
+ * @throws PlanHashError 参数类型非法或参数值无法规范化。
  */
 export function barrierId(
   runId: string,

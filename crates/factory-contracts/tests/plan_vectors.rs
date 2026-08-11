@@ -39,15 +39,8 @@ fn find_named_case<'a>(cases: &'a [Value], name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing golden base case: {name}"))
 }
 
-/// 根据共享声明式变异构造原始输入，三端不得分别手写非法 RunSpec/PlanRevision。
-fn materialize_mutation_case(case: &Value, source_cases: &[Value], payload_key: &str) -> Value {
-    if let Some(input) = case.get("input") {
-        return input.clone();
-    }
-
-    let base_name = case["base"].as_str().expect("base name must be string");
-    let mut payload = find_named_case(source_cases, base_name)[payload_key].clone();
-    let mutation = &case["mutation"];
+/// 在独立 payload 副本上应用一条 golden 变异，避免同组反例互相污染。
+fn apply_golden_mutation(mut payload: Value, mutation: &Value) -> Value {
     let path = mutation["path"]
         .as_array()
         .expect("mutation path must be array");
@@ -104,6 +97,50 @@ fn materialize_mutation_case(case: &Value, source_cases: &[Value], payload_key: 
         op => panic!("unsupported golden mutation: {op}"),
     }
     payload
+}
+
+/// 根据共享声明式变异构造原始输入；单个黄金用例可含多条变异而不新增测试节点。
+fn materialize_mutation_cases(
+    case: &Value,
+    source_cases: &[Value],
+    payload_key: &str,
+) -> Vec<(String, Value)> {
+    if let Some(input) = case.get("input") {
+        return vec![(
+            (case["name"].as_str().expect("case name must be string")).to_owned(),
+            input.clone(),
+        )];
+    }
+
+    let base_name = case["base"].as_str().expect("base name must be string");
+    let base_payload = &find_named_case(source_cases, base_name)[payload_key];
+    let mutations = match case.get("mutations") {
+        Some(Value::Array(items)) if !items.is_empty() => items.iter().collect::<Vec<_>>(),
+        Some(_) => panic!("golden mutations must be a non-empty array"),
+        None => vec![&case["mutation"]],
+    };
+    let case_name = case["name"].as_str().expect("case name must be string");
+    mutations
+        .into_iter()
+        .enumerate()
+        .map(|(index, mutation)| {
+            // legacy 单 mutation 允许省略子名称并回退到序号；显式提供的值仍必须是非空字符串。
+            let label = match mutation.get("name") {
+                None => index.to_string(),
+                Some(value) => value
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("golden mutation {case_name}:{index} name must be a string")
+                    })
+                    .to_owned(),
+            };
+            assert!(!label.is_empty(), "golden mutation name must be non-empty");
+            (
+                format!("{case_name}:{label}"),
+                apply_golden_mutation(base_payload.clone(), mutation),
+            )
+        })
+        .collect()
 }
 
 /// 只断言稳定分类，避免把输入正文或第三方校验器细节固定进错误输出。
@@ -198,16 +235,32 @@ fn run_spec_invalid_vectors_reject_before_projection_and_hash() {
     let source_cases = golden["semanticPlanHash"].as_array().unwrap();
     let invalid_cases = golden["invalidRunSpec"].as_array().unwrap();
     assert!(!invalid_cases.is_empty());
+
+    // legacy 单 mutation 可省略子名称并稳定回退到序号；显式空名仍是损坏的 golden 元数据。
+    let legacy_case = find_named_case(invalid_cases, "missing-base-commit");
+    let legacy_materialized = materialize_mutation_cases(legacy_case, source_cases, "plan");
+    assert_eq!(legacy_materialized[0].0, "missing-base-commit:0");
+    let mut empty_name_case =
+        find_named_case(invalid_cases, "invalid-base-commit-or-zero-sentinel").clone();
+    empty_name_case["mutations"][0]["name"] = Value::String(String::new());
+    let empty_name_rejected = std::panic::catch_unwind(|| {
+        materialize_mutation_cases(&empty_name_case, source_cases, "plan")
+    });
+    assert!(
+        empty_name_rejected.is_err(),
+        "显式空 mutation name 必须 fail closed"
+    );
+
     let mut unexpectedly_accepted = Vec::new();
     for case in invalid_cases {
-        let input = materialize_mutation_case(case, source_cases, "plan");
         let expected = case["expectedErrorCode"].as_str().unwrap();
-        let name = case["name"].as_str().unwrap();
-        if !is_stable_plan_hash_error(build_semantic_projection(&input), expected) {
-            unexpectedly_accepted.push(format!("{name}:projection"));
-        }
-        if !is_stable_plan_hash_error(semantic_plan_hash(&input), expected) {
-            unexpectedly_accepted.push(format!("{name}:hash"));
+        for (name, input) in materialize_mutation_cases(case, source_cases, "plan") {
+            if !is_stable_plan_hash_error(build_semantic_projection(&input), expected) {
+                unexpectedly_accepted.push(format!("{name}:projection"));
+            }
+            if !is_stable_plan_hash_error(semantic_plan_hash(&input), expected) {
+                unexpectedly_accepted.push(format!("{name}:hash"));
+            }
         }
     }
     assert!(
@@ -321,11 +374,11 @@ fn plan_revision_invalid_vectors_reject_before_digest() {
     assert!(!invalid_cases.is_empty());
     let mut unexpectedly_accepted = Vec::new();
     for case in invalid_cases {
-        let input = materialize_mutation_case(case, source_cases, "revision");
         let expected = case["expectedErrorCode"].as_str().unwrap();
-        let name = case["name"].as_str().unwrap();
-        if !is_stable_plan_hash_error(plan_revision_digest(&input), expected) {
-            unexpectedly_accepted.push(name.to_owned());
+        for (name, input) in materialize_mutation_cases(case, source_cases, "revision") {
+            if !is_stable_plan_hash_error(plan_revision_digest(&input), expected) {
+                unexpectedly_accepted.push(name);
+            }
         }
     }
     assert!(

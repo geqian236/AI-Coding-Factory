@@ -94,6 +94,15 @@
   `plan-revision.v1.schema.json`，仅排除自身 digest 与签名，仍包含 DAG、map 版本、nodes、barriers、
   stageMaps 与 createdAt。合同测试从权威投影/schema 派生 exact-set 断言，并对每个纳入字段的变更
   重算摘要，防止静态 registry 与后续运行时实现分叉。
+  本轮收紧为机械闭集：`semanticPlanHash`/`planRevisionDigest` 共同采用 `^sha256:[0-9a-f]{64}$`，摘要全零
+  仍格式合法；Git 全零 sentinel 只在 baseline/RunSpec 路径拒绝。`businessPhase` 从 Master Spec §7.1 去除
+  `CREATED`/`PREFLIGHT`/`BOOTSTRAPPING_REPOSITORY` 后精确保留 15 个 post-bootstrap 值。**v1 设计决定**：
+  所有 RunSpec/PlanRevision（含 child replan）均有非空 nodes/barriers，且首 node 为 `PLAN`/`PLANNING`、首
+  barrier 为 `PLANNING`；自由 logicalNodeId/gate 文本不递归禁词。registry baseline metadata 固定为
+  `required=[baseBranch,bootstrapState]`、`optional=[baseSha,bootstrapReceiptId]`：`EXISTS` 必须 non-zero full
+  `baseSha`（receipt 可选），`BOOTSTRAP_REQUIRED` 禁止 sha/receipt。新仓库 baseBranch 默认策略和
+  `bootstrapPending` 显式策略未冻结，不宣称当前合同已唯一规定。生成器写三语言文件时采用同目录
+  stage/rollback 的进程内补偿批次，稳定脱敏错误码优先级为 rollback > cleanup > write；不宣称断电或并发事务。
 - **后续 Task 4/5**：pre-plan bootstrap 目前仅冻结 Task intake、Intent `repo.bootstrap` 包络、目录合同与
   action receipt 边界，不伪造 PlanRevision-bound ExecutionAuthorization；bootstrap 专用 permit、消费/事务
   尚未实现且必须 fail closed。授权签发、从 `COMMITTED` 不可变 artifact 解析 ref、核验 artifact ID、

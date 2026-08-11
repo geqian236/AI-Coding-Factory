@@ -113,13 +113,36 @@
     "baselinePayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["baseBranch", "baseSha", "bootstrapState"],
+      "required": ["baseBranch", "bootstrapState"],
       "properties": {
         "baseBranch": {"$ref": "#/$defs/nonEmptyString"},
-        "baseSha": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "baseSha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$",
+          "allOf": [
+            {"not": {"const": "0000000000000000000000000000000000000000"}}
+          ]
+        },
         "bootstrapState": {"enum": ["EXISTS", "BOOTSTRAP_REQUIRED"]},
         "bootstrapReceiptId": {"$ref": "#/$defs/nonEmptyString"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"bootstrapState": {"const": "EXISTS"}}, "required": ["bootstrapState"]},
+          "then": {"required": ["baseSha"]}
+        },
+        {
+          "if": {"properties": {"bootstrapState": {"const": "BOOTSTRAP_REQUIRED"}}, "required": ["bootstrapState"]},
+          "then": {
+            "not": {
+              "anyOf": [
+                {"required": ["baseSha"]},
+                {"required": ["bootstrapReceiptId"]}
+              ]
+            }
+          }
+        }
+      ]
     },
     "allowedCapabilitySetPayload": {
       "type": "object",
@@ -303,6 +326,9 @@
             "baseCommit": {
               "type": "string",
               "pattern": "^[0-9a-f]{40}$",
+              "allOf": [
+                {"not": {"const": "0000000000000000000000000000000000000000"}}
+              ],
               "description": "bootstrap 完成后可信 base commit 的 40 位小写完整 SHA"
             }
           }
@@ -320,7 +346,22 @@
             },
             "nodes": {
               "type": "array",
+              "minItems": 1,
               "description": "DAG 工作节点列表",
+              "allOf": [
+                {
+                  "items": [
+                    {
+                      "type": "object",
+                      "required": ["nodeType", "businessPhase"],
+                      "properties": {
+                        "nodeType": {"const": "PLAN"},
+                        "businessPhase": {"const": "PLANNING"}
+                      }
+                    }
+                  ]
+                }
+              ],
               "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -343,7 +384,16 @@
                 ],
                 "properties": {
                   "logicalNodeId": {"type": "string", "minLength": 1},
-                  "businessPhase": {"type": "string", "minLength": 1},
+                  "businessPhase": {
+                    "type": "string",
+                    "enum": [
+                      "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                      "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                      "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                      "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                      "ROLLING_BACK", "FINALIZING"
+                    ]
+                  },
                   "barrierOrdinal": {"type": "integer", "minimum": 0},
                   "nodeType": {
                     "type": "string",
@@ -373,7 +423,19 @@
             },
             "barriers": {
               "type": "array",
+              "minItems": 1,
               "description": "阶段屏障列表",
+              "allOf": [
+                {
+                  "items": [
+                    {
+                      "type": "object",
+                      "required": ["businessPhase"],
+                      "properties": {"businessPhase": {"const": "PLANNING"}}
+                    }
+                  ]
+                }
+              ],
               "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -386,7 +448,16 @@
                 ],
                 "not": {"properties": {"businessPhase": {"enum": ["BOOTSTRAPPING", "BOOTSTRAPPING_REPOSITORY"]}}, "required": ["businessPhase"]},
                 "properties": {
-                  "businessPhase": {"type": "string", "minLength": 1},
+                  "businessPhase": {
+                    "type": "string",
+                    "enum": [
+                      "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                      "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                      "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                      "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                      "ROLLING_BACK", "FINALIZING"
+                    ]
+                  },
                   "barrierOrdinal": {"type": "integer", "minimum": 0},
                   "requiredNodeIds": {
                     "type": "array",
@@ -462,12 +533,27 @@
         },
         "semanticPlanHash": {
           "type": "string",
-          "minLength": 1,
+          "allOf": [{"$ref": "#/$defs/sha256Digest"}],
           "description": "语义计划哈希，跨修订版本稳定"
         },
         "nodes": {
           "type": "array",
+          "minItems": 1,
           "description": "DAG 节点列表",
+          "allOf": [
+            {
+              "items": [
+                {
+                  "type": "object",
+                  "required": ["nodeType", "businessPhase"],
+                  "properties": {
+                    "nodeType": {"const": "PLAN"},
+                    "businessPhase": {"const": "PLANNING"}
+                  }
+                }
+              ]
+            }
+          ],
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -495,7 +581,16 @@
                   "RECONCILE_TARGET", "RESTORE_DRILL"
                 ]
               },
-              "businessPhase": {"type": "string", "minLength": 1},
+              "businessPhase": {
+                "type": "string",
+                "enum": [
+                  "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                  "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                  "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                  "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                  "ROLLING_BACK", "FINALIZING"
+                ]
+              },
               "dependencies": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
@@ -511,7 +606,19 @@
         },
         "barriers": {
           "type": "array",
+          "minItems": 1,
           "description": "阶段屏障列表",
+          "allOf": [
+            {
+              "items": [
+                {
+                  "type": "object",
+                  "required": ["businessPhase"],
+                  "properties": {"businessPhase": {"const": "PLANNING"}}
+                }
+              ]
+            }
+          ],
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -519,7 +626,16 @@
             "not": {"properties": {"businessPhase": {"enum": ["BOOTSTRAPPING", "BOOTSTRAPPING_REPOSITORY"]}}, "required": ["businessPhase"]},
             "properties": {
               "barrierId": {"type": "string", "minLength": 1},
-              "businessPhase": {"type": "string", "minLength": 1},
+              "businessPhase": {
+                "type": "string",
+                "enum": [
+                  "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                  "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                  "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                  "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                  "ROLLING_BACK", "FINALIZING"
+                ]
+              },
               "nodeIds": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
@@ -690,7 +806,7 @@
       "schemaVersion": "1",
       "validator": {"kind": "json-schema", "source": "authorization-snapshot-registry.v1.json#/$defs/baselinePayload"},
       "payloadSchema": {"$ref": "#/$defs/baselinePayload"},
-      "payloadKeys": {"required": ["baseBranch", "baseSha", "bootstrapState"], "optional": ["bootstrapReceiptId"]}
+      "payloadKeys": {"required": ["baseBranch", "bootstrapState"], "optional": ["baseSha", "bootstrapReceiptId"]}
     },
     "IntentAuthorization.allowedCapabilitySetDigest": {
       "schemaId": "factory.authorization.intent.allowed-capability-set.v1",

@@ -44,14 +44,8 @@ function findNamedCase(cases: any[], name: string): any {
   return found;
 }
 
-function materializeMutationCase(caseItem: any, sourceCases: any[], payloadKey: string): unknown {
-  // 共享 golden 只描述变异；三语言测试以同一声明式反例驱动，禁止各自手抄非法 wire。
-  if (Object.hasOwn(caseItem, "input")) {
-    return structuredClone(caseItem.input);
-  }
-
-  const payload = structuredClone(findNamedCase(sourceCases, caseItem.base)[payloadKey]);
-  const mutation = caseItem.mutation;
+function applyGoldenMutation(payload: unknown, mutation: any): unknown {
+  // 单条变异只操作独立 payload 副本，避免同组负例之间相互污染。
   const path = mutation.path as string[];
   if (!Array.isArray(path) || path.length === 0) {
     throw new Error("golden mutation path must be non-empty");
@@ -84,6 +78,36 @@ function materializeMutationCase(caseItem: any, sourceCases: any[], payloadKey: 
     throw new Error(`unsupported golden mutation: ${mutation.op}`);
   }
   return payload;
+}
+
+function materializeMutationCases(
+  caseItem: any,
+  sourceCases: any[],
+  payloadKey: string,
+): Array<{ name: string; payload: unknown }> {
+  // 共享 golden 只描述变异；同一 pytest/Vitest 节点内逐项执行多变异，冻结计数不漂移。
+  if (Object.hasOwn(caseItem, "input")) {
+    return [{ name: caseItem.name, payload: structuredClone(caseItem.input) }];
+  }
+
+  const mutations = caseItem.mutations ?? [caseItem.mutation];
+  if (!Array.isArray(mutations) || mutations.length === 0) {
+    throw new Error("golden mutations must be a non-empty array");
+  }
+  return mutations.map((mutation: any, index: number) => {
+    // 仅“字段缺失”可回退到序号；显式 null、非字符串或空字符串都是损坏的 golden 元数据。
+    const label = Object.hasOwn(mutation, "name") ? mutation.name : String(index);
+    if (typeof label !== "string" || label.length === 0) {
+      throw new Error("golden mutation name must be non-empty");
+    }
+    return {
+      name: `${caseItem.name}:${label}`,
+      payload: applyGoldenMutation(
+        structuredClone(findNamedCase(sourceCases, caseItem.base)[payloadKey]),
+        mutation,
+      ),
+    };
+  });
 }
 
 function expectStablePlanHashError(action: () => unknown, expectedErrorCode: string): void {
@@ -136,9 +160,21 @@ describe("semanticPlanHash vectors", () => {
 describe("RunSpec semantic validation", () => {
   for (const c of planGolden.invalidRunSpec) {
     it(`rejects before projection and hash: ${c.name}`, async () => {
-      const plan = materializeMutationCase(c, planGolden.semanticPlanHash, "plan");
-      expectStablePlanHashError(() => buildSemanticProjection(plan), c.expectedErrorCode);
-      expectStablePlanHashError(() => semanticPlanHash(plan), c.expectedErrorCode);
+      const materialized = materializeMutationCases(c, planGolden.semanticPlanHash, "plan");
+      if (c.name === "missing-base-commit") {
+        expect(materialized.map(({ name }) => name)).toEqual(["missing-base-commit:0"]);
+      }
+      if (c.name === "invalid-base-commit-or-zero-sentinel") {
+        const emptyNameCase = structuredClone(c);
+        emptyNameCase.mutations[0].name = "";
+        expect(() => materializeMutationCases(emptyNameCase, planGolden.semanticPlanHash, "plan"))
+          .toThrow("golden mutation name must be non-empty");
+      }
+      for (const { name, payload } of materialized) {
+        expectStablePlanHashError(() => buildSemanticProjection(payload), c.expectedErrorCode);
+        expectStablePlanHashError(() => semanticPlanHash(payload), c.expectedErrorCode);
+        expect(name).toContain(c.name);
+      }
 
       // 只在已有首个反例节点篡改 module cache：生成常量损坏不得泄露 Ajv 异常或产出 hash。
       if (c.name !== "non-object") {
@@ -244,8 +280,10 @@ describe("planRevisionDigest vectors", () => {
 describe("PlanRevision digest-material validation", () => {
   for (const c of planGolden.invalidPlanRevision) {
     it(`rejects non-excluded malformed material: ${c.name}`, () => {
-      const revision = materializeMutationCase(c, planGolden.planRevisionDigest, "revision");
-      expectStablePlanHashError(() => planRevisionDigest(revision), c.expectedErrorCode);
+      for (const { name, payload } of materializeMutationCases(c, planGolden.planRevisionDigest, "revision")) {
+        expectStablePlanHashError(() => planRevisionDigest(payload), c.expectedErrorCode);
+        expect(name).toContain(c.name);
+      }
     });
   }
 });

@@ -94,22 +94,8 @@ def _find_named_case(cases: list[dict[str, Any]], name: str) -> dict[str, Any]:
     raise AssertionError(f"missing golden base case: {name}")
 
 
-def _materialize_mutation_case(
-    case: dict[str, Any],
-    source_cases: list[dict[str, Any]],
-    payload_key: str,
-) -> object:
-    """从共享 golden 的声明式变异生成原始输入，不在各语言测试手抄反例。
-
-    golden 只声明基准、路径和替换值；本帮助函数保证 Python、TypeScript、Rust 都消费
-    同一组非法 wire。它只服务测试，运行时仍必须由权威 JSON Schema 拒绝输入。
-    """
-    if "input" in case:
-        return deepcopy(case["input"])
-
-    base = _find_named_case(source_cases, case["base"])
-    payload = deepcopy(base[payload_key])
-    mutation = case["mutation"]
+def _apply_golden_mutation(payload: object, mutation: dict[str, Any]) -> object:
+    """对单份基准 payload 应用一条声明式变异，调用方必须每次传入独立副本。"""
     path = mutation["path"]
     assert isinstance(path, list) and path
 
@@ -137,6 +123,36 @@ def _materialize_mutation_case(
     else:
         raise AssertionError(f"unsupported golden mutation: {mutation['op']}")
     return payload
+
+
+def _materialize_mutation_cases(
+    case: dict[str, Any],
+    source_cases: list[dict[str, Any]],
+    payload_key: str,
+) -> list[tuple[str, object]]:
+    """从共享 golden 的声明式变异生成原始输入，不在各语言测试手抄反例。
+
+    golden 只声明基准、路径和替换值；本帮助函数保证 Python、TypeScript、Rust 都消费
+    同一组非法 wire。它只服务测试，运行时仍必须由权威 JSON Schema 拒绝输入。
+    """
+    if "input" in case:
+        return [(case["name"], deepcopy(case["input"]))]
+
+    base = _find_named_case(source_cases, case["base"])
+    mutations = case.get("mutations")
+    if mutations is None:
+        mutations = [case["mutation"]]
+    assert isinstance(mutations, list) and mutations
+    materialized: list[tuple[str, object]] = []
+    for ordinal, mutation in enumerate(mutations):
+        assert isinstance(mutation, dict)
+        label = mutation.get("name", str(ordinal))
+        assert isinstance(label, str) and label
+        # 一个 golden case 可以承载多个同类反例，维持冻结 pytest 节点数仍逐项执行。
+        materialized.append(
+            (f"{case['name']}:{label}", _apply_golden_mutation(deepcopy(base[payload_key]), mutation))
+        )
+    return materialized
 
 
 class TestSemanticPlanHashVectors:
@@ -168,15 +184,22 @@ class TestRunSpecSemanticValidation:
     )
     def test_projection_and_hash_reject_shared_invalid_vectors(self, case: dict[str, Any]) -> None:
         """投影入口和哈希入口都必须在 canonicalize 前 fail closed。"""
-        plan = _materialize_mutation_case(case, _PLAN["semanticPlanHash"], "plan")
+        materialized = _materialize_mutation_cases(case, _PLAN["semanticPlanHash"], "plan")
+        if case["name"] == "missing-base-commit":
+            assert [name for name, _ in materialized] == ["missing-base-commit:0"]
+        if case["name"] == "invalid-base-commit-or-zero-sentinel":
+            empty_name_case = deepcopy(case)
+            empty_name_case["mutations"][0]["name"] = ""
+            with pytest.raises(AssertionError):
+                _materialize_mutation_cases(empty_name_case, _PLAN["semanticPlanHash"], "plan")
+        for name, plan in materialized:
+            with pytest.raises(PlanHashError) as projection_error:
+                build_semantic_projection(plan)
+            assert projection_error.value.error_code == case["expectedErrorCode"], name
 
-        with pytest.raises(PlanHashError) as projection_error:
-            build_semantic_projection(plan)
-        assert projection_error.value.error_code == case["expectedErrorCode"]
-
-        with pytest.raises(PlanHashError) as hash_error:
-            semantic_plan_hash(plan)
-        assert hash_error.value.error_code == case["expectedErrorCode"]
+            with pytest.raises(PlanHashError) as hash_error:
+                semantic_plan_hash(plan)
+            assert hash_error.value.error_code == case["expectedErrorCode"], name
 
     def test_generated_schema_is_runtime_source_independent_and_corruption_is_stable(
         self,
@@ -317,11 +340,10 @@ class TestPlanRevisionDigestValidation:
     )
     def test_digest_rejects_shared_invalid_vectors(self, case: dict[str, Any]) -> None:
         """缺字段、未知字段和类型错误都不能被排除规则掩盖。"""
-        revision = _materialize_mutation_case(case, _PLAN["planRevisionDigest"], "revision")
-
-        with pytest.raises(PlanHashError) as error:
-            plan_revision_digest(revision)
-        assert error.value.error_code == case["expectedErrorCode"]
+        for name, revision in _materialize_mutation_cases(case, _PLAN["planRevisionDigest"], "revision"):
+            with pytest.raises(PlanHashError) as error:
+                plan_revision_digest(revision)
+            assert error.value.error_code == case["expectedErrorCode"], name
 
 
 # ── barrier-id 向量 ────────────────────────────────────────────────────────────

@@ -116,6 +116,9 @@
         "baseCommit": {
           "type": "string",
           "pattern": "^[0-9a-f]{40}$",
+          "allOf": [
+            {"not": {"const": "0000000000000000000000000000000000000000"}}
+          ],
           "description": "bootstrap 完成后可信 base commit 的 40 位小写完整 SHA"
         }
       }
@@ -133,7 +136,22 @@
         },
         "nodes": {
           "type": "array",
+          "minItems": 1,
           "description": "DAG 工作节点列表",
+          "allOf": [
+            {
+              "items": [
+                {
+                  "type": "object",
+                  "required": ["nodeType", "businessPhase"],
+                  "properties": {
+                    "nodeType": {"const": "PLAN"},
+                    "businessPhase": {"const": "PLANNING"}
+                  }
+                }
+              ]
+            }
+          ],
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -156,7 +174,16 @@
             ],
             "properties": {
               "logicalNodeId": {"type": "string", "minLength": 1},
-              "businessPhase": {"type": "string", "minLength": 1},
+              "businessPhase": {
+                "type": "string",
+                "enum": [
+                  "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                  "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                  "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                  "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                  "ROLLING_BACK", "FINALIZING"
+                ]
+              },
               "barrierOrdinal": {"type": "integer", "minimum": 0},
               "nodeType": {
                 "type": "string",
@@ -186,7 +213,19 @@
         },
         "barriers": {
           "type": "array",
+          "minItems": 1,
           "description": "阶段屏障列表",
+          "allOf": [
+            {
+              "items": [
+                {
+                  "type": "object",
+                  "required": ["businessPhase"],
+                  "properties": {"businessPhase": {"const": "PLANNING"}}
+                }
+              ]
+            }
+          ],
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -199,7 +238,16 @@
             ],
             "not": {"properties": {"businessPhase": {"enum": ["BOOTSTRAPPING", "BOOTSTRAPPING_REPOSITORY"]}}, "required": ["businessPhase"]},
             "properties": {
-              "businessPhase": {"type": "string", "minLength": 1},
+              "businessPhase": {
+                "type": "string",
+                "enum": [
+                  "PLANNING", "DESIGN_REVIEWING", "PREPARING_WORKSPACE",
+                  "IMPLEMENTING", "VERIFYING", "CODE_REVIEWING", "PUBLISHING_PR",
+                  "MERGING", "BUILDING_ARTIFACT", "DEPLOYING_STAGING",
+                  "ACCEPTING_STAGING", "DEPLOYING_PRODUCTION", "ACCEPTING_PRODUCTION",
+                  "ROLLING_BACK", "FINALIZING"
+                ]
+              },
               "barrierOrdinal": {"type": "integer", "minimum": 0},
               "requiredNodeIds": {
                 "type": "array",
