@@ -41,6 +41,13 @@ RS_OUT = REPO_ROOT / "crates" / "factory-contracts" / "src" / "generated" / "con
 # per-entry ERROR 注释降级路径。任一读取/解析/结构检查失败都必须阻断三语言生成。
 RUN_SPEC_VALIDATOR_SCHEMA_PATH = "contracts/schemas/run-spec.v1.schema.json"
 PLAN_REVISION_VALIDATOR_SCHEMA_PATH = "contracts/schemas/plan-revision.v1.schema.json"
+# 事件物化器在输入与输出边界都必须使用权威 schema，而不是手写字段表替代。
+PREPARED_EVENT_VALIDATOR_SCHEMA_PATH = "contracts/schemas/prepared-event.v2.schema.json"
+DURABLE_EVENT_VALIDATOR_SCHEMA_PATH = "contracts/schemas/durable-event.v2.schema.json"
+PREPARED_BATCH_VALIDATOR_SCHEMA_PATH = "contracts/schemas/prepared-batch.v2.schema.json"
+AUTHORITATIVE_STATE_EVENT_VALIDATOR_SCHEMA_PATH = (
+    "contracts/schemas/authoritative-state-event.v1.schema.json"
+)
 KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
 _DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
 
@@ -531,6 +538,18 @@ def load_required_validator_schemas() -> dict[str, tuple[dict[str, Any], str]]:
     plan_revision_schema, plan_revision_sha256 = load_required_validator_schema(
         PLAN_REVISION_VALIDATOR_SCHEMA_PATH
     )
+    prepared_event_schema, prepared_event_sha256 = load_required_validator_schema(
+        PREPARED_EVENT_VALIDATOR_SCHEMA_PATH
+    )
+    durable_event_schema, durable_event_sha256 = load_required_validator_schema(
+        DURABLE_EVENT_VALIDATOR_SCHEMA_PATH
+    )
+    prepared_batch_schema, prepared_batch_sha256 = load_required_validator_schema(
+        PREPARED_BATCH_VALIDATOR_SCHEMA_PATH
+    )
+    authoritative_state_event_schema, authoritative_state_event_sha256 = (
+        load_required_validator_schema(AUTHORITATIVE_STATE_EVENT_VALIDATOR_SCHEMA_PATH)
+    )
     digest_material_schema = build_plan_revision_digest_material_schema(plan_revision_schema)
     try:
         _validate_validator_schema_object(digest_material_schema)
@@ -540,6 +559,13 @@ def load_required_validator_schemas() -> dict[str, tuple[dict[str, Any], str]]:
         "runSpec": (run_spec_schema, run_spec_sha256),
         "planRevision": (plan_revision_schema, plan_revision_sha256),
         "planRevisionDigestMaterial": (digest_material_schema, plan_revision_sha256),
+        "preparedEvent": (prepared_event_schema, prepared_event_sha256),
+        "durableEvent": (durable_event_schema, durable_event_sha256),
+        "preparedBatch": (prepared_batch_schema, prepared_batch_sha256),
+        "authoritativeStateEvent": (
+            authoritative_state_event_schema,
+            authoritative_state_event_sha256,
+        ),
     }
 
 
@@ -663,6 +689,14 @@ def prop_py_type(prop: dict[str, Any]) -> str:
 def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
     """将 schema property 定义转换为 Rust 类型字符串。"""
     if "const" in prop:
+        const_value = prop["const"]
+        # Rust 生成类型必须保留 JSON const 的基础类型；schemaVersion=2 不能被降级为 String。
+        if isinstance(const_value, bool):
+            return "bool"
+        if isinstance(const_value, int):
+            return "i64"
+        if isinstance(const_value, float):
+            return "f64"
         return "String"
     if "enum" in prop:
         return "String"
@@ -734,9 +768,19 @@ def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[di
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
     digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
     return [
         "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         f'export const RUN_SPEC_SCHEMA_SOURCE_SHA256 = "{run_spec_sha256}";',
@@ -750,6 +794,22 @@ def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[di
         f"{json.dumps(digest_material_json, ensure_ascii=False)};",
         "export const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256 = "
         f'"{_embedded_schema_sha256(digest_material_json)}";',
+        "// 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        f'export const PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256 = "{prepared_event_sha256}";',
+        f"export const PREPARED_EVENT_V2_SCHEMA_JSON = {json.dumps(prepared_event_json, ensure_ascii=False)};",
+        f'export const PREPARED_EVENT_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(prepared_event_json)}";',
+        f'export const DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256 = "{durable_event_sha256}";',
+        f"export const DURABLE_EVENT_V2_SCHEMA_JSON = {json.dumps(durable_event_json, ensure_ascii=False)};",
+        f'export const DURABLE_EVENT_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(durable_event_json)}";',
+        f'export const PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256 = "{prepared_batch_sha256}";',
+        f"export const PREPARED_BATCH_V2_SCHEMA_JSON = {json.dumps(prepared_batch_json, ensure_ascii=False)};",
+        f'export const PREPARED_BATCH_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(prepared_batch_json)}";',
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256 = "
+        f'"{authoritative_state_event_sha256}";',
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON = "
+        f"{json.dumps(authoritative_state_event_json, ensure_ascii=False)};",
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(authoritative_state_event_json)}";',
         "",
     ]
 
@@ -800,9 +860,19 @@ def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[di
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
     digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
     return [
         "# 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         f'RUN_SPEC_SCHEMA_SOURCE_SHA256: Final[str] = "{run_spec_sha256}"',
@@ -819,6 +889,37 @@ def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[di
         (
             "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: Final[str] = "
             f'"{_embedded_schema_sha256(digest_material_json)}"'
+        ),
+        "# 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        f'PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{prepared_event_sha256}"',
+        f"PREPARED_EVENT_V2_SCHEMA_JSON: Final[str] = {prepared_event_json!r}",
+        (
+            "PREPARED_EVENT_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(prepared_event_json)}"'
+        ),
+        f'DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{durable_event_sha256}"',
+        f"DURABLE_EVENT_V2_SCHEMA_JSON: Final[str] = {durable_event_json!r}",
+        (
+            "DURABLE_EVENT_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(durable_event_json)}"'
+        ),
+        f'PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{prepared_batch_sha256}"',
+        f"PREPARED_BATCH_V2_SCHEMA_JSON: Final[str] = {prepared_batch_json!r}",
+        (
+            "PREPARED_BATCH_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(prepared_batch_json)}"'
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256: Final[str] = "
+            f'"{authoritative_state_event_sha256}"'
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON: Final[str] = "
+            f"{authoritative_state_event_json!r}"
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(authoritative_state_event_json)}"'
         ),
         "",
     ]
@@ -874,6 +975,18 @@ def generate_python(
         "PLAN_REVISION_SCHEMA_JSON_SHA256",
         "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON",
         "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256",
+        "PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256",
+        "PREPARED_EVENT_V2_SCHEMA_JSON",
+        "PREPARED_EVENT_V2_SCHEMA_JSON_SHA256",
+        "DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256",
+        "DURABLE_EVENT_V2_SCHEMA_JSON",
+        "DURABLE_EVENT_V2_SCHEMA_JSON_SHA256",
+        "PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256",
+        "PREPARED_BATCH_V2_SCHEMA_JSON",
+        "PREPARED_BATCH_V2_SCHEMA_JSON_SHA256",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256",
         *names,
     ]
     for n in names:
@@ -896,9 +1009,19 @@ def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[di
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
     digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
     return [
         "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         "pub const RUN_SPEC_SCHEMA_SOURCE_SHA256: &str =\n"
@@ -921,6 +1044,31 @@ def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[di
         ),
         "pub const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: &str =\n"
         f'    "{_embedded_schema_sha256(digest_material_json)}";',
+        "// 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        "pub const PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{prepared_event_sha256}";',
+        "pub const PREPARED_EVENT_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(prepared_event_json)};",
+        "pub const PREPARED_EVENT_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(prepared_event_json)}";',
+        "pub const DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{durable_event_sha256}";',
+        "pub const DURABLE_EVENT_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(durable_event_json)};",
+        "pub const DURABLE_EVENT_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(durable_event_json)}";',
+        "pub const PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{prepared_batch_sha256}";',
+        "pub const PREPARED_BATCH_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(prepared_batch_json)};",
+        "pub const PREPARED_BATCH_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(prepared_batch_json)}";',
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{authoritative_state_event_sha256}";',
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(authoritative_state_event_json)};",
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(authoritative_state_event_json)}";',
         "",
     ]
 

@@ -62,11 +62,14 @@
 - **不再属 Phase 1**：此项已在 Phase 0 验收集 A-3b 认证，从 backlog 移除。
 
 ### B5. 并发实现（Master Spec §11 明确移交）
-- **Phase 0 冻结**：PreparedBatchV2 / DurableEventV2 的**纯函数物化算法** + schema
-  （previousEventDigest 单链、跨批链接续、多 Task manifest 结构、eventDigest 排除自身）。
-- **Phase 1 目标**：SQLite 单写者 coordinator、writer_epoch CAS、多 Task 原子 claim 事务、
-  `ingest_batches` 状态机（CLAIMED→PREPARING→PREPARED→COMMITTED）、竞争批次
-  CAS 落败重建。这些是**有状态运行时**，Phase 0 不实现。
+- **本节点完成的合同前置**：PreparedEventV2 采用 Durable 的六个具体 wire eventType，
+  `MaterializationInput` 明确为非 wire 的单 Task slice，并以独立
+  `CommittedEventAnchor` 逐字段匹配 expected head；三语言 materializer 在输入前/输出后嵌入
+  Prepared/Durable 权威 schema。输入 event 必带 coordinator 派生的 `batchOrdinal`、`runSeq`、
+  `durabilityClass`，无默认值；writer 分配字段一律拒绝。
+- **仍属 Task 7 / 有状态运行时**：SQLite 单写者 coordinator、writer_epoch CAS、多 Task 原子 claim、
+  真实 PreparedBatch manifest/segment 协调、`ingest_batches` 状态机、竞争批次重建与 group commit。
+  本节点没有实现这些存储行为，也不把单 Task 纯函数物化冒充为 PreparedBatchV2 或持久化事务。
 
 ### B6. 授权合同 + 运行时状态机（整体 Phase 1）
 - **本节点已完成的合同前置**：新增 `intent-authorization.v1.schema.json` 与
@@ -111,14 +114,33 @@
   运行时；本节点没有伪测数据库 COMMITTED 逻辑，也不是这些流程已完成的声明。
 
 ### B7. durable-event.v2 §10.1 全字段的**运行时填充**（第三轮 REVISE item 4 要求拆分）
-- **Phase 0 冻结（✅）**：schema 含 §10.1 全 32 字段（执行身份、双 span、脱敏证据、
-  processIdentity 等）；纯函数物化器填充 identity/链/摘要字段，golden vector 字节锚定。
+- **本节点完成的合同前置（✅）**：Prepared/Durable 共享身份字段具有 schema 机械约束：完整
+  processIdentity、source/provider 信息、双 span、时间、redaction 与 `stream.*` 的非空 streamId。
+  三语言纯函数物化器填充 writer identity/链/摘要字段，并以 golden vector 字节锚定；`model.summary`
+  因 Provider frameRef 未冻结而 fail-closed，路由 Provider/Task 7 合同前置，禁止猜测 payload ref。
 - **拆分后 Phase 1 部分（durable writer）**：SQLite 单写者把物化后的 DurableEventV2 落库、
   推进 head、group-commit 事务——事件耐久写入路径。
 - **拆分后 Phase 3 部分（adapter / process identity 采集）**：Adapter 运行时真实采集
   processIdentity（pid/jobObjectId/containerId/imageDigest）、sourceTransportSpan 实际字节
   水位、sanitizedStreamSpan 脱敏字节、redactionManifest 实际脱敏证据。属真实 Provider
   数据源接入，依赖 Phase 3 harness/runner。
+
+### B7a. AuthoritativeStateEventV1 持久化验收与兼容性收口
+- **本节点完成的合同前置（✅）**：`AuthoritativeStateEventV1` 以 scope、aggregate、显式 nullable
+  run/step/attempt identity、previousStateVersion/stateVersion、payloadDigest 表示权威状态变化；它允许
+  pre-step/attempt 聚合但禁止伪造执行身份。Draft7 只能校验 const/nullability，不能取代跨字段或
+  跨记录约束。`payloadDigest == sha256(JCS(payload))` 必须由构造器/UoW 重算，schema 的 digest
+  pattern 不能证明 payload 与摘要相等。
+- **Task 1 持久化验收**：`0002_event_store.sql` 必须在同一 UoW 中建立并执行唯一键
+  `(aggregateType, aggregateId, stateVersion)`；同时逐路验证
+  `TASK -> aggregateId == taskId`、`RUN -> aggregateId == runId`、
+  `PHASE_BARRIER -> aggregateId == phase_barriers.barrier_id` 且
+  `phase_barriers.run_id == runId`、`STEP -> aggregateId == stepId`、
+  `ATTEMPT -> aggregateId == attemptId`，并验证 `stateVersion = previousStateVersion + 1`。
+  这些跨字段相等与外表 FK 只能在 Task 1 UoW 执行；不得以 Python-only validator 或 Draft7
+  schema 测试伪称已实现 DB/CAS。
+- **Task 10**：`eventContractSetDigest` 属于 Compatibility Manifest/receipt 的兼容性收口；本节点只
+  登记该后续项，不修改 manifest、receipt 或 Master。
 
 ### B8. node-capability-map 5 字段的**策略引擎消费**
 - **本节点已完成的合同前置**：17 种 nodeType 均冻结既有 `requiredCapabilities`/

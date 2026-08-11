@@ -1,6 +1,6 @@
 # AI Coding Factory — Contracts v1 Protocol Reference
 
-> **状态**：Phase 0 基线已冻结；本次补入 Phase 1 授权合同前置（schema、catalog、策略映射与确定性测试），不实现运行时服务。SQLite 真实 ENOSPC 仍是 Phase 1 待认证实证项，故不得声称全部 spike 已认证完毕。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
+> **状态**：Phase 0 基线已冻结；本次补入 Phase 1 授权与事件合同前置（schema、catalog、策略映射与确定性测试），不实现运行时服务。SQLite 真实 ENOSPC 仍是 Phase 1 待认证实证项，故不得声称全部 spike 已认证完毕。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
 >
 > **版本**：v1（2026-08-05）
 
@@ -32,14 +32,14 @@ contracts/
     node-pause-policy.v1.json   — 每种 nodeType 的暂停安全点策略
     stage-capability-map.v1.json — 6 个 target_stage 的渐进式 capability 集合
   schemas/
-    *.schema.json               — 15 个 JSON Schema 定义（见第 3 节）
+    *.schema.json               — 16 个 JSON Schema 定义（见第 3 节）
   testing/
     required-test-catalog.v1.json — Phase 0 冻结的 47 个必须通过的测试 ID
 ```
 
 ---
 
-## 3. 15 个 JSON Schema
+## 3. 16 个 JSON Schema
 
 | 文件 | 用途 | 生成代码 |
 |------|------|---------|
@@ -52,6 +52,7 @@ contracts/
 | `prepared-event.v2.schema.json` | Adapter 预备事件 | 是 |
 | `prepared-batch.v2.schema.json` | 事件批次（含 batchOrdinal） | 是 |
 | `durable-event.v2.schema.json` | 物化后的耐久事件（含 head 链） | 是 |
+| `authoritative-state-event.v1.schema.json` | 同一 UoW 写入的权威 `state.changed` 事件 | 是 |
 | `ipc-envelope.v1.schema.json` | Named Pipe IPC 信封（含 nonce） | 是 |
 | `runner-protocol.v1.schema.json` | Runner 生命周期协议消息 | 是 |
 | `test-receipt.v1.schema.json` | 机器可读测试回执 | 否（runtime-only） |
@@ -220,12 +221,55 @@ DESIGN_APPROVED ⊂ CODEX_APPROVED ⊂ PR_READY ⊂ MERGED ⊂ STAGING_ACCEPTED 
 
 ---
 
-## 8. PreparedBatchV2 / DurableEventV2 身份链
+## 8. Prepared / Durable / State 事件合同边界
 
-- 物化器按 `batchOrdinal` 生成稳定 identity，逐 Task 连接 predecessor。
-- `head` 字段链式验证批次完整性。
-- 并发 CAS 和数据库事务留到 Phase 1，Phase 0 只冻结纯输入/输出与拒绝规则。
-- Adapter 输入含 `ingestEventId`，但不得预填 `taskSeq/eventId/eventDigest/head`。
+- `PreparedEventV2` 是 Adapter 提供的自描述 wire，固定 `schemaVersion=2`。其 `eventType` 只能为
+  `process.started`、`stream.segment.committed`、`stream.terminated`、`orchestrator.objective`、
+  `tool.call`、`tool.result` 六个 Durable 具体类型；benchmark/loadgen 的 coarse 类型不进入 wire。
+  `state.changed` 仅由 `AuthoritativeStateEventV1` 表示，不能伪装为 PreparedEvent。
+- PreparedEvent 必须携带 run/step/attempt、source/providerEventId、streamId、双 span、wall/monotonic
+  时间、ingestedAt、provider/adapter 版本、完整 processIdentity、frame digest、redactions 与 source
+  transport 证据。`stream.*` 必须有非空 streamId；writer 分配的 `eventId`、`taskSeq`、`runSeq`、
+  `preparedBatchId`、`batchOrdinal`、前后 event digest、payload digest、durabilityClass 与
+  redactionManifestDigest 不得出现在 PreparedEvent。
+- 事件 hash 的全部整数输入固定为 I-JSON `0..2^53-1`，boolean 不得冒充整数；writer 对
+  `taskSeq`、`batchOrdinal`、`runSeq` 使用 checked arithmetic。`processIdentity.runtime` v1 只允许
+  `local-windows|wsl-docker`：local 必须有非空 `jobObjectId` 且 WSL/container 字段为 null；
+  wsl-docker 必须有非空 `wslDistro/containerId/imageDigest` 且 `jobObjectId=null`。
+- v1 source span 的 `coordinate` 与 `mappingPrecision` 是独立维度：coordinate 仅允许
+  `provider_transport_bytes|provider_transport_chars|none`。`coordinate=none` 时 precision 必须为 `none`
+  且 start/end 为 null；transport coordinate 配 `mappingPrecision=byte` 时必须有非负且严格递增的
+  `start < endExclusive`，配 `field|frame|none` 时 start/end 必须为 null。Master 的显式正例
+  `coordinate=provider_transport_bytes, mappingPrecision=frame, start=null, endExclusive=null` 必须通过。
+  PreparedBatch segment 没有 coordinate，仍仅 byte 可携带非空递增 `sourceSpan`，field/frame/none 必须为
+  null。sanitized span 与每个 redaction byte range 同样严格递增。replacement 仅允许
+  不可逆标记 `^\[REDACTED(?::[a-z0-9._-]+)?\]$`，禁止携带原始敏感值。
+- Provider 的 `model.summary.frameRef` 形状尚未冻结；本轮 Adapter/materializer 对该类型 fail-closed，
+  不编造 ref 字段。该合同前置路由给 Provider/Task 7 后续评审。
+- `MaterializationInput` 是**非 wire** 的单 Task slice，而不是 `PreparedBatchV2`。根对象精确为
+  `{preparedBatchId, taskId, expectedTaskSeq, expectedEventDigest, events}`，并单独传入
+  `CommittedEventAnchor={committedTaskSeq, committedEventDigest}`；两组 expected/committed head 必须
+  完全相等，genesis 明确为两个 `null`。slice 内 `batchOrdinal` 唯一且严格递增（允许间隔），每个
+  event 还必须由 coordinator 显式给出 `batchOrdinal`、`runSeq`、`durabilityClass`，不允许默认值。
+- materializer 在输入前嵌入权威 Prepared schema 校验，在输出后嵌入 Durable schema 校验；它只做
+  确定性单 Task 物化与链摘要，不实现 claim、CAS、group commit 或跨 Task 存储。真实
+  PreparedBatch manifest/segments 到输入 slice 的协调属于 Task 7。Prepared lane 只允许
+  `side_effect_receipt|provider_source|derived`，必须拒绝 `state.changed` 与
+  `durabilityClass=authoritative_state`；权威状态事件只走 Task 1 独立 UoW lane。
+- `PreparedBatchV2` 是不可变 manifest：无可变 `state`，`orderedIngestIds` 唯一，genesis 的
+  `expectedTaskSeq` 显式为 `null`，`expectedEventDigest` 显式可空且只能为 `null` 或 sha256。golden
+  必须使用同一 preparedBatchId 的真实多 Task manifest 并先经 Draft7 + FormatChecker 校验。
+- `AuthoritativeStateEventV1` 固定 `eventType=state.changed`、`durabilityClass=authoritative_state`，并以
+  `scope={TASK,RUN,STEP,ATTEMPT}` 和
+  `aggregateType={TASK,RUN,PHASE_BARRIER,STEP,ATTEMPT}` 描述聚合。`runId`、`stepId`、`attemptId` 始终
+  required 且可为 `string|null`；schema 机械约束 scope 下的 const/nullability。跨字段的
+  aggregate identity 五路规则为：`TASK -> aggregateId == taskId`；`RUN -> aggregateId == runId`；
+  `PHASE_BARRIER -> aggregateId == phase_barriers.barrier_id` 且对应行
+  `phase_barriers.run_id == runId`；`STEP -> aggregateId == stepId`；
+  `ATTEMPT -> aggregateId == attemptId`。这些跨字段相等和外表 FK、
+  `stateVersion = previousStateVersion + 1` 与跨记录唯一性不能伪称为 Draft7 能力，必须在
+  Task 1 持久化 UoW 中验收。`payloadDigest == sha256(JCS(payload))` 也必须由
+  构造器/UoW 每次重算后再写入，不能把 digest pattern 校验误称为内容相等证明。
 
 ---
 
@@ -242,6 +286,8 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 - SQLite spike receipt 必须绑定参数 tuple、manifest schema digest、`benchmarkProfileDigest` 和环境 digest。
 - emitter、Phase 1 consumer 与 Phase 6 validator 都重算 tuple digest 并核对 receipt 输入，禁止只比较 receipt 文件名。
 - v1 `CompatibilityManifest` 已经要求 `nodeCapabilityMapDigest`。其唯一算法真源是 `tools/compat-probes/emit_manifest.py` 的 raw-file SHA-256：语义内容或纯格式字节任一变化都会改变摘要，不能用 compact/sorted JSON 私有 hash 替代。ExecutionAuthorization 与 Manifest 的实际 node map 值比对仍由 Task 4 在消费时完成。
+- `eventContractSetDigest` 的兼容性收口属于 Phase 1 Task 10；本节点只在 backlog 登记，不修改
+  CompatibilityManifest、receipt 或 Master。
 
 ---
 
@@ -262,7 +308,7 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 提交前必须通过 `scripts/check.ps1` 的 15 项检查：
 
 1. Codegen drift 检测
-2. 15 个 JSON Schema 有效性
+2. 16 个 JSON Schema 有效性
 3. Golden vectors（plan_hash + event_hash）
 4. 中文注释覆盖
 5. 无裸 print/console.log
@@ -281,4 +327,4 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 
 ---
 
-*本文档保留 Phase 0 冻结合同，并记录本节点新增的 Phase 1 授权合同前置。授权签发、撤销、消费、动态 scope/lease/时间比较及策略引擎执行仍属于后续 Task 4/5；如需修改合同，请通过标准评审流程并更新相关测试与兼容性绑定。*
+*本文档保留 Phase 0 冻结合同，并记录本节点新增的 Phase 1 授权与事件合同前置。授权签发、撤销、消费、动态 scope/lease/时间比较及策略引擎执行仍属于后续 Task 4/5；如需修改合同，请通过标准评审流程并更新相关测试与兼容性绑定。*

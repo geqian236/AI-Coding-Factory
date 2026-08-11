@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://factory.local/contracts/schemas/authoritative-state-event.v1.schema.json",
+  "title": "AuthoritativeStateEventV1",
+  "description": "内部权威 state.changed 事件。它绑定真实工作流 aggregate 与显式可空执行身份；不得由 Adapter PreparedEventV2 伪造。跨字段身份、外表 FK、跨记录 CAS 与唯一键由 Task 1 SQLite 同一 UoW 实施。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "stateEventId",
+    "eventType",
+    "durabilityClass",
+    "taskId",
+    "scope",
+    "aggregateType",
+    "aggregateId",
+    "runId",
+    "stepId",
+    "attemptId",
+    "previousStateVersion",
+    "stateVersion",
+    "payload",
+    "payloadDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "权威状态事件 schema 版本。"
+    },
+    "stateEventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "追加型状态事件的稳定身份。"
+    },
+    "eventType": {
+      "type": "string",
+      "const": "state.changed",
+      "description": "仅承载内部权威状态变化。"
+    },
+    "durabilityClass": {
+      "type": "string",
+      "const": "authoritative_state",
+      "description": "必须与领域投影在同一事务提交。"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所有 aggregate 均归属一个真实 Task。"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["TASK", "RUN", "STEP", "ATTEMPT"],
+      "description": "工作流身份范围；PHASE_BARRIER 使用 RUN scope。"
+    },
+    "aggregateType": {
+      "type": "string",
+      "enum": ["TASK", "RUN", "PHASE_BARRIER", "STEP", "ATTEMPT"],
+      "description": "被更新的领域 aggregate 类型。"
+    },
+    "aggregateId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Task 1 UoW 的五路身份合同：TASK -> aggregateId == taskId；RUN -> aggregateId == runId；PHASE_BARRIER -> aggregateId == phase_barriers.barrier_id，且 phase_barriers.run_id == runId；STEP -> aggregateId == stepId；ATTEMPT -> aggregateId == attemptId。Draft7 不能验证该外表 FK 与跨字段相等关系。"
+    },
+    "runId": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "真实 Run 身份；Task aggregate 时为 null。"
+    },
+    "stepId": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "真实 Step 身份；Task/Run/Barrier aggregate 时为 null。"
+    },
+    "attemptId": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "真实 Attempt 身份；非 Attempt aggregate 时为 null。"
+    },
+    "previousStateVersion": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "本次转换读取到的旧版本。"
+    },
+    "stateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "本次转换写入的新版本；必须由 Task 1 同一 UoW 验证为 previousStateVersion + 1。"
+    },
+    "payload": {
+      "type": "object",
+      "description": "已脱敏的权威状态变化载荷。"
+    },
+    "payloadDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "payload 的规范化 SHA-256 摘要。"
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"aggregateType": {"const": "TASK"}}, "required": ["aggregateType"]},
+      "then": {
+        "properties": {
+          "scope": {"const": "TASK"},
+          "runId": {"type": "null"},
+          "stepId": {"type": "null"},
+          "attemptId": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"aggregateType": {"const": "RUN"}}, "required": ["aggregateType"]},
+      "then": {
+        "properties": {
+          "scope": {"const": "RUN"},
+          "runId": {"type": "string", "minLength": 1},
+          "stepId": {"type": "null"},
+          "attemptId": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"aggregateType": {"const": "PHASE_BARRIER"}}, "required": ["aggregateType"]},
+      "then": {
+        "properties": {
+          "scope": {"const": "RUN"},
+          "runId": {"type": "string", "minLength": 1},
+          "stepId": {"type": "null"},
+          "attemptId": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"aggregateType": {"const": "STEP"}}, "required": ["aggregateType"]},
+      "then": {
+        "properties": {
+          "scope": {"const": "STEP"},
+          "runId": {"type": "string", "minLength": 1},
+          "stepId": {"type": "string", "minLength": 1},
+          "attemptId": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"aggregateType": {"const": "ATTEMPT"}}, "required": ["aggregateType"]},
+      "then": {
+        "properties": {
+          "scope": {"const": "ATTEMPT"},
+          "runId": {"type": "string", "minLength": 1},
+          "stepId": {"type": "string", "minLength": 1},
+          "attemptId": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ],
+  "x-persistence": {
+    "uniqueKey": ["aggregateType", "aggregateId", "stateVersion"],
+    "enforcedBy": "Task 1 0002_event_store.sql UoW"
+  }
+}

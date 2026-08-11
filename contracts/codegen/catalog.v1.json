@@ -109,6 +109,14 @@
       "description": "耐久化后事件（含 taskSeq/eventId/eventDigest/head）"
     },
     {
+      "name": "AuthoritativeStateEventV1",
+      "schemaPath": "contracts/schemas/authoritative-state-event.v1.schema.json",
+      "schemaId": "authoritative-state-event.v1",
+      "codegen": true,
+      "category": "generated",
+      "description": "与领域状态同一 UoW 提交的权威 state.changed 事件"
+    },
+    {
       "name": "IpcEnvelope",
       "schemaPath": "contracts/schemas/ipc-envelope.v1.schema.json",
       "schemaId": "ipc-envelope.v1",

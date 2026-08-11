@@ -32,6 +32,12 @@ EXPECTED_NODE_POLICY_RAW_FILE_SHA256 = (
 )
 SNAPSHOT_REGISTRY_PATH = REPO_ROOT / "contracts" / "policies" / "authorization-snapshot-registry.v1.json"
 RUN_SPEC_SCHEMA_PATH = SCHEMAS_DIR / "run-spec.v1.schema.json"
+PREPARED_EVENT_SCHEMA_PATH = SCHEMAS_DIR / "prepared-event.v2.schema.json"
+DURABLE_EVENT_SCHEMA_PATH = SCHEMAS_DIR / "durable-event.v2.schema.json"
+PREPARED_BATCH_SCHEMA_PATH = SCHEMAS_DIR / "prepared-batch.v2.schema.json"
+AUTHORITATIVE_STATE_EVENT_SCHEMA_PATH = (
+    SCHEMAS_DIR / "authoritative-state-event.v1.schema.json"
+)
 PLAN_REVISION_SCHEMA_PATH = SCHEMAS_DIR / "plan-revision.v1.schema.json"
 PLAN_HASH_GOLDEN_PATH = REPO_ROOT / "contracts" / "golden" / "plan-hash.v1.json"
 MASTER_SPEC_PATH = REPO_ROOT / "docs" / "superpowers" / "specs" / "2026-08-03-ai-coding-factory-master-design.md"
@@ -40,6 +46,29 @@ EMIT_MANIFEST_PATH = REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py"
 CODEGEN_PATH = REPO_ROOT / "contracts" / "codegen" / "generate.py"
 GENERATED_PYTHON_MODELS_PATH = (
     REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py"
+)
+EVENT_CONTRACT_TOUCHED_TEXT_PATHS = (
+    "apps/agent/src/factory_agent/contracts/generated/models.py",
+    "apps/agent/src/factory_agent/domain/events.py",
+    "contracts/codegen/catalog.v1.json",
+    "contracts/codegen/generate.py",
+    "contracts/golden/event-hash.v2.json",
+    "contracts/golden/prepared-batch.v2.json",
+    "contracts/schemas/authoritative-state-event.v1.schema.json",
+    "contracts/schemas/durable-event.v2.schema.json",
+    "contracts/schemas/prepared-batch.v2.schema.json",
+    "contracts/schemas/prepared-event.v2.schema.json",
+    "crates/factory-contracts/src/event.rs",
+    "crates/factory-contracts/src/generated/contracts.rs",
+    "crates/factory-contracts/tests/event_vectors.rs",
+    "docs/operations/PHASE_1_BACKLOG.md",
+    "docs/protocols/contracts-v1.md",
+    "packages/factory-contracts/src/event.test.ts",
+    "packages/factory-contracts/src/event.ts",
+    "packages/factory-contracts/src/generated/contracts.ts",
+    "tests/contract/test_event_hash_vectors.py",
+    "tests/contract/test_phase1_authorization_contracts.py",
+    "tests/contract/test_schema_catalog.py",
 )
 
 # 跨语言只接受可移植的 RFC3339 子集；完整日历与 offset 语义由各端同名 format 检查器复核。
@@ -4266,13 +4295,57 @@ def test_codegen_ordinary_entry_failure_prevents_all_writes(
     assert writes == [], "任一后续语言内容失败时不得写入已生成的前序内容"
 
 
+def test_event_contract_text_is_lf_and_clean_filter_identity() -> None:
+    """所有触达文本必须 LF；raw blob 与 Git index clean-filter 后字节完全等价。"""
+    for relative_path in EVENT_CONTRACT_TOUCHED_TEXT_PATHS:
+        path = REPO_ROOT / relative_path
+        raw = path.read_bytes()
+        assert b"\r" not in raw, f"事件合同文本仍含 CR/CRLF: {relative_path}"
+        raw_blob = subprocess.run(
+            ["git", "hash-object", "--stdin"],
+            cwd=REPO_ROOT,
+            input=raw,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        clean_blob = subprocess.run(
+            ["git", "hash-object", f"--path={relative_path}", "--stdin"],
+            cwd=REPO_ROOT,
+            input=raw,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        assert clean_blob == raw_blob, f"Git clean filter 改写事件合同字节: {relative_path}"
+        attributes = subprocess.run(
+            ["git", "check-attr", "eol", "--", relative_path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        ).stdout
+        assert attributes.rstrip().endswith(": lf"), f"事件合同缺少 eol=lf: {relative_path}"
+
+
 def test_codegen_embeds_raw_schema_sha_and_check_detects_drift() -> None:
-    """三语言均嵌入两份权威原文件 SHA；每个目标的一字节漂移都要被 --check 拒绝。"""
+    """三语言嵌入全部运行时事件 schema；source/content 任一漂移都被 --check 拒绝。"""
     codegen = _load_codegen_module()
     entries = [entry for entry in codegen.load_catalog()["schemas"] if entry.get("codegen") is True]
     source_markers = {
         "RUN_SPEC_SCHEMA_SOURCE_SHA256": _raw_file_sha256(RUN_SPEC_SCHEMA_PATH),
         "PLAN_REVISION_SCHEMA_SOURCE_SHA256": _raw_file_sha256(PLAN_REVISION_SCHEMA_PATH),
+        "PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            PREPARED_EVENT_SCHEMA_PATH
+        ),
+        "DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            DURABLE_EVENT_SCHEMA_PATH
+        ),
+        "PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            PREPARED_BATCH_SCHEMA_PATH
+        ),
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            AUTHORITATIVE_STATE_EVENT_SCHEMA_PATH
+        ),
     }
     generated_contents = {
         "TypeScript": codegen.generate_typescript(entries),
@@ -4280,10 +4353,25 @@ def test_codegen_embeds_raw_schema_sha_and_check_detects_drift() -> None:
         "Rust": codegen.generate_rust(entries),
     }
     validator_schemas = codegen.load_required_validator_schemas()
+    assert set(validator_schemas) == {
+        "runSpec",
+        "planRevision",
+        "planRevisionDigestMaterial",
+        "preparedEvent",
+        "durableEvent",
+        "preparedBatch",
+        "authoritativeStateEvent",
+    }
     embedded_structures = {
         "RUN_SPEC_SCHEMA_JSON": validator_schemas["runSpec"][0],
         "PLAN_REVISION_SCHEMA_JSON": validator_schemas["planRevision"][0],
         "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON": validator_schemas["planRevisionDigestMaterial"][0],
+        "PREPARED_EVENT_V2_SCHEMA_JSON": validator_schemas["preparedEvent"][0],
+        "DURABLE_EVENT_V2_SCHEMA_JSON": validator_schemas["durableEvent"][0],
+        "PREPARED_BATCH_V2_SCHEMA_JSON": validator_schemas["preparedBatch"][0],
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON": validator_schemas[
+            "authoritativeStateEvent"
+        ][0],
     }
     embedded_sha_markers = {
         name + "_SHA256": "sha256:"

@@ -1,57 +1,338 @@
 {
   "version": "prepared-batch-v2",
-  "description": "PreparedBatchV2 canonical 字节向量（NFC + RFC 8785 JCS）。",
+  "description": "PreparedBatchV2 immutable manifest vectors. These are wire manifests, not MaterializationInput.",
   "cases": [
     {
-      "name": "genesis-batch",
+      "name": "genesis-single-task-manifest",
       "batch": {
-        "batchId": "batch-a-0",
-        "taskId": "task-a",
-        "batchOrdinal": 0,
-        "previousHead": null,
-        "events": [
+        "preparedBatchId": "batch-a-0",
+        "writerEpoch": 1,
+        "orderedIngestIds": [
+          "ingest-a-0",
+          "ingest-a-1"
+        ],
+        "perTaskExpectedHeads": [
           {
-            "ingestEventId": "ingest-genesis-1",
-            "eventType": "stream",
-            "sourceSeq": 0,
-            "payload": {
-              "seg": 1
-            }
-          },
-          {
-            "ingestEventId": "ingest-genesis-2",
-            "eventType": "tool",
-            "sourceSeq": 1,
-            "payload": {
-              "seg": 2
-            }
+            "taskId": "task-a",
+            "expectedTaskSeq": null,
+            "expectedEventDigest": null,
+            "firstBatchOrdinal": 0,
+            "lastBatchOrdinal": 1
           }
         ],
-        "preparedAt": "2026-08-04T00:00:00Z"
+        "segmentDigests": [
+          {
+            "segmentId": "seg-a-0",
+            "taskId": "task-a",
+            "runId": "run-a",
+            "attemptId": "att-a",
+            "streamId": null,
+            "ordinalRange": {
+              "first": 0,
+              "lastExclusive": 2
+            },
+            "mappingPrecision": "frame",
+            "sourceSpan": null,
+            "sanitizedSpan": {
+              "start": 0,
+              "endExclusive": 200
+            },
+            "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "redactionManifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "predecessorDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "completeFooterDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "adapterVersion": "1.0.0"
+          }
+        ],
+        "eventCount": 2,
+        "payloadBytes": 18,
+        "firstBatchOrdinal": 0,
+        "lastBatchOrdinal": 1,
+        "oldestIngestedAt": "2026-08-05T00:00:01Z",
+        "preparedAt": "2026-08-05T00:00:02Z",
+        "schemaVersion": 2,
+        "coordinatorVersion": "coordinator-v1"
       },
-      "expectedCanonical": "{\"batchId\":\"batch-a-0\",\"batchOrdinal\":0,\"events\":[{\"eventType\":\"stream\",\"ingestEventId\":\"ingest-genesis-1\",\"payload\":{\"seg\":1},\"sourceSeq\":0},{\"eventType\":\"tool\",\"ingestEventId\":\"ingest-genesis-2\",\"payload\":{\"seg\":2},\"sourceSeq\":1}],\"preparedAt\":\"2026-08-04T00:00:00Z\",\"previousHead\":null,\"taskId\":\"task-a\"}"
+      "expectedCanonical": "{\"coordinatorVersion\":\"coordinator-v1\",\"eventCount\":2,\"firstBatchOrdinal\":0,\"lastBatchOrdinal\":1,\"oldestIngestedAt\":\"2026-08-05T00:00:01Z\",\"orderedIngestIds\":[\"ingest-a-0\",\"ingest-a-1\"],\"payloadBytes\":18,\"perTaskExpectedHeads\":[{\"expectedEventDigest\":null,\"expectedTaskSeq\":null,\"firstBatchOrdinal\":0,\"lastBatchOrdinal\":1,\"taskId\":\"task-a\"}],\"preparedAt\":\"2026-08-05T00:00:02Z\",\"preparedBatchId\":\"batch-a-0\",\"schemaVersion\":2,\"segmentDigests\":[{\"adapterVersion\":\"1.0.0\",\"attemptId\":\"att-a\",\"completeFooterDigest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"contentDigest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"mappingPrecision\":\"frame\",\"ordinalRange\":{\"first\":0,\"lastExclusive\":2},\"predecessorDigest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"redactionManifestDigest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"runId\":\"run-a\",\"sanitizedSpan\":{\"endExclusive\":200,\"start\":0},\"segmentId\":\"seg-a-0\",\"sourceSpan\":null,\"streamId\":null,\"taskId\":\"task-a\"}],\"writerEpoch\":1}"
     },
     {
-      "name": "non-genesis-with-claim-epoch",
+      "name": "multi-task-interleaved-manifest",
       "batch": {
-        "batchId": "batch-a-1",
-        "taskId": "task-a",
-        "batchOrdinal": 1,
-        "previousHead": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "claimEpoch": 7,
-        "events": [
+        "preparedBatchId": "batch-multi-0",
+        "writerEpoch": 2,
+        "orderedIngestIds": [
+          "ingest-genesis-1",
+          "ingest-b-1",
+          "ingest-genesis-2"
+        ],
+        "perTaskExpectedHeads": [
           {
-            "ingestEventId": "ingest-a-3",
-            "eventType": "state",
-            "sourceSeq": 2,
-            "payload": {
-              "值": "结束"
-            }
+            "taskId": "task-a",
+            "expectedTaskSeq": null,
+            "expectedEventDigest": null,
+            "firstBatchOrdinal": 0,
+            "lastBatchOrdinal": 2
+          },
+          {
+            "taskId": "task-b",
+            "expectedTaskSeq": null,
+            "expectedEventDigest": null,
+            "firstBatchOrdinal": 1,
+            "lastBatchOrdinal": 1
           }
         ],
-        "preparedAt": "2026-08-04T00:01:00Z"
+        "segmentDigests": [
+          {
+            "segmentId": "seg-a-multi",
+            "taskId": "task-a",
+            "runId": "run-a",
+            "attemptId": "att-a",
+            "streamId": null,
+            "ordinalRange": {
+              "first": 0,
+              "lastExclusive": 3
+            },
+            "mappingPrecision": "frame",
+            "sourceSpan": null,
+            "sanitizedSpan": {
+              "start": 0,
+              "endExclusive": 200
+            },
+            "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "redactionManifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "predecessorDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "completeFooterDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "adapterVersion": "1.0.0"
+          },
+          {
+            "segmentId": "seg-b-multi",
+            "taskId": "task-b",
+            "runId": "run-b",
+            "attemptId": "att-b",
+            "streamId": null,
+            "ordinalRange": {
+              "first": 1,
+              "lastExclusive": 2
+            },
+            "mappingPrecision": "frame",
+            "sourceSpan": null,
+            "sanitizedSpan": {
+              "start": 0,
+              "endExclusive": 100
+            },
+            "contentDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "redactionManifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "predecessorDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "completeFooterDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "adapterVersion": "1.0.0"
+          }
+        ],
+        "eventCount": 3,
+        "payloadBytes": 27,
+        "firstBatchOrdinal": 0,
+        "lastBatchOrdinal": 2,
+        "oldestIngestedAt": "2026-08-05T00:00:01Z",
+        "preparedAt": "2026-08-05T00:00:02Z",
+        "schemaVersion": 2,
+        "coordinatorVersion": "coordinator-v1"
       },
-      "expectedCanonical": "{\"batchId\":\"batch-a-1\",\"batchOrdinal\":1,\"claimEpoch\":7,\"events\":[{\"eventType\":\"state\",\"ingestEventId\":\"ingest-a-3\",\"payload\":{\"值\":\"结束\"},\"sourceSeq\":2}],\"preparedAt\":\"2026-08-04T00:01:00Z\",\"previousHead\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"taskId\":\"task-a\"}"
+      "expectedCanonical": "{\"coordinatorVersion\":\"coordinator-v1\",\"eventCount\":3,\"firstBatchOrdinal\":0,\"lastBatchOrdinal\":2,\"oldestIngestedAt\":\"2026-08-05T00:00:01Z\",\"orderedIngestIds\":[\"ingest-genesis-1\",\"ingest-b-1\",\"ingest-genesis-2\"],\"payloadBytes\":27,\"perTaskExpectedHeads\":[{\"expectedEventDigest\":null,\"expectedTaskSeq\":null,\"firstBatchOrdinal\":0,\"lastBatchOrdinal\":2,\"taskId\":\"task-a\"},{\"expectedEventDigest\":null,\"expectedTaskSeq\":null,\"firstBatchOrdinal\":1,\"lastBatchOrdinal\":1,\"taskId\":\"task-b\"}],\"preparedAt\":\"2026-08-05T00:00:02Z\",\"preparedBatchId\":\"batch-multi-0\",\"schemaVersion\":2,\"segmentDigests\":[{\"adapterVersion\":\"1.0.0\",\"attemptId\":\"att-a\",\"completeFooterDigest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"contentDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"mappingPrecision\":\"frame\",\"ordinalRange\":{\"first\":0,\"lastExclusive\":3},\"predecessorDigest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"redactionManifestDigest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"runId\":\"run-a\",\"sanitizedSpan\":{\"endExclusive\":200,\"start\":0},\"segmentId\":\"seg-a-multi\",\"sourceSpan\":null,\"streamId\":null,\"taskId\":\"task-a\"},{\"adapterVersion\":\"1.0.0\",\"attemptId\":\"att-b\",\"completeFooterDigest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"contentDigest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"mappingPrecision\":\"frame\",\"ordinalRange\":{\"first\":1,\"lastExclusive\":2},\"predecessorDigest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"redactionManifestDigest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"runId\":\"run-b\",\"sanitizedSpan\":{\"endExclusive\":100,\"start\":0},\"segmentId\":\"seg-b-multi\",\"sourceSpan\":null,\"streamId\":null,\"taskId\":\"task-b\"}],\"writerEpoch\":2}"
+    }
+  ],
+  "segmentSpanSemantics": [
+    {
+      "name": "segment-byte-range",
+      "mappingPrecision": "byte",
+      "sourceSpan": {"start": 0, "endExclusive": 100},
+      "accepted": true
+    },
+    {
+      "name": "segment-field-null",
+      "mappingPrecision": "field",
+      "sourceSpan": null,
+      "accepted": true
+    },
+    {
+      "name": "segment-frame-null",
+      "mappingPrecision": "frame",
+      "sourceSpan": null,
+      "accepted": true
+    },
+    {
+      "name": "segment-none-null",
+      "mappingPrecision": "none",
+      "sourceSpan": null,
+      "accepted": true
+    },
+    {
+      "name": "segment-byte-null",
+      "mappingPrecision": "byte",
+      "sourceSpan": null,
+      "accepted": false
+    },
+    {
+      "name": "segment-byte-equal",
+      "mappingPrecision": "byte",
+      "sourceSpan": {"start": 1, "endExclusive": 1},
+      "accepted": false
+    },
+    {
+      "name": "segment-field-range",
+      "mappingPrecision": "field",
+      "sourceSpan": {"start": 0, "endExclusive": 1},
+      "accepted": false
+    },
+    {
+      "name": "segment-frame-range",
+      "mappingPrecision": "frame",
+      "sourceSpan": {"start": 0, "endExclusive": 1},
+      "accepted": false
+    },
+    {
+      "name": "segment-none-range",
+      "mappingPrecision": "none",
+      "sourceSpan": {"start": 0, "endExclusive": 1},
+      "accepted": false
+    }
+  ],
+  "rejectBase": {
+    "preparedBatchId": "batch-multi-0",
+    "writerEpoch": 2,
+    "orderedIngestIds": [
+      "ingest-réject-0",
+      "ingest-b-1",
+      "ingest-genesis-2"
+    ],
+    "perTaskExpectedHeads": [
+      {
+        "taskId": "task-a",
+        "expectedTaskSeq": null,
+        "expectedEventDigest": null,
+        "firstBatchOrdinal": 0,
+        "lastBatchOrdinal": 2
+      },
+      {
+        "taskId": "task-b",
+        "expectedTaskSeq": null,
+        "expectedEventDigest": null,
+        "firstBatchOrdinal": 1,
+        "lastBatchOrdinal": 1
+      }
+    ],
+    "segmentDigests": [
+      {
+        "segmentId": "seg-a-multi",
+        "taskId": "task-a",
+        "runId": "run-a",
+        "attemptId": "att-a",
+        "streamId": null,
+        "ordinalRange": {
+          "first": 0,
+          "lastExclusive": 3
+        },
+        "mappingPrecision": "frame",
+        "sourceSpan": null,
+        "sanitizedSpan": {
+          "start": 0,
+          "endExclusive": 200
+        },
+        "contentDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "redactionManifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "predecessorDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "completeFooterDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "adapterVersion": "1.0.0"
+      },
+      {
+        "segmentId": "seg-b-multi",
+        "taskId": "task-b",
+        "runId": "run-b",
+        "attemptId": "att-b",
+        "streamId": null,
+        "ordinalRange": {
+          "first": 1,
+          "lastExclusive": 2
+        },
+        "mappingPrecision": "frame",
+        "sourceSpan": null,
+        "sanitizedSpan": {
+          "start": 0,
+          "endExclusive": 100
+        },
+        "contentDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "redactionManifestDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "predecessorDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "completeFooterDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "adapterVersion": "1.0.0"
+      }
+    ],
+    "eventCount": 3,
+    "payloadBytes": 27,
+    "firstBatchOrdinal": 0,
+    "lastBatchOrdinal": 2,
+    "oldestIngestedAt": "2026-08-05T00:00:01Z",
+    "preparedAt": "2026-08-05T00:00:02Z",
+    "schemaVersion": 2,
+    "coordinatorVersion": "coordinator-v1"
+  },
+  "rejectMutations": [
+    {
+      "name": "prepared-batch-event-count-mismatch",
+      "operation": "replace",
+      "path": "/eventCount",
+      "value": 2
+    },
+    {
+      "name": "prepared-batch-ordered-ingest-length-mismatch",
+      "operation": "remove",
+      "path": "/orderedIngestIds/2"
+    },
+    {
+      "name": "prepared-batch-global-ordinal-gap",
+      "operation": "replace",
+      "path": "/lastBatchOrdinal",
+      "value": 3
+    },
+    {
+      "name": "prepared-batch-half-null-head",
+      "operation": "replace",
+      "path": "/perTaskExpectedHeads/0/expectedTaskSeq",
+      "value": 0
+    },
+    {
+      "name": "prepared-batch-duplicate-task-head",
+      "operation": "add",
+      "path": "/perTaskExpectedHeads/-",
+      "value": {
+        "taskId": "task-a",
+        "expectedTaskSeq": null,
+        "expectedEventDigest": null,
+        "firstBatchOrdinal": 0,
+        "lastBatchOrdinal": 2
+      }
+    },
+    {
+      "name": "prepared-batch-reversed-task-range",
+      "operation": "replace",
+      "path": "/perTaskExpectedHeads/1/firstBatchOrdinal",
+      "value": 2
+    },
+    {
+      "name": "prepared-batch-event-count-bool",
+      "operation": "replace",
+      "path": "/eventCount",
+      "value": true
+    },
+    {
+      "name": "prepared-batch-writer-epoch-unsafe-integer",
+      "operation": "replace",
+      "path": "/writerEpoch",
+      "value": 9007199254740992
+    },
+    {
+      "name": "prepared-batch-nfc-equivalent-ingest-id",
+      "operation": "replace",
+      "path": "/orderedIngestIds/1",
+      "value": "ingest-réject-0"
     }
   ]
 }

@@ -56,7 +56,7 @@ EXPECTED_TEST_IDS = {
     "DEPLOY-RAM-001", "SCHED-PERF-001", "COMPAT-001",
 }
 
-# 必须存在的 15 个 schema 文件
+# 必须存在的 16 个 schema 文件
 EXPECTED_SCHEMA_FILES = {
     "run-spec.v1.schema.json",
     "plan-revision.v1.schema.json",
@@ -67,6 +67,7 @@ EXPECTED_SCHEMA_FILES = {
     "prepared-event.v2.schema.json",
     "prepared-batch.v2.schema.json",
     "durable-event.v2.schema.json",
+    "authoritative-state-event.v1.schema.json",
     "ipc-envelope.v1.schema.json",
     "runner-protocol.v1.schema.json",
     "test-receipt.v1.schema.json",
@@ -140,7 +141,7 @@ def codegen_catalog() -> dict:  # type: ignore[type-arg]
 
 
 def test_all_schema_files_exist() -> None:
-    """所有 15 个 schema 文件必须存在"""
+    """所有 16 个 schema 文件必须存在"""
     missing = []
     for fname in EXPECTED_SCHEMA_FILES:
         if not (SCHEMAS_DIR / fname).exists():
