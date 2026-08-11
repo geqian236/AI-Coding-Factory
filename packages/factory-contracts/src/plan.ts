@@ -29,8 +29,17 @@
  * 失败错误码：plan-hash-error（不记录完整计划正文）。
  */
 
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import Ajv, { type AnySchema, type ValidateFunction } from "ajv";
 import { canonicalize } from "./canonical.js";
+import {
+  PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON,
+  PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256,
+  PLAN_REVISION_SCHEMA_JSON,
+  PLAN_REVISION_SCHEMA_JSON_SHA256,
+  RUN_SPEC_SCHEMA_JSON,
+  RUN_SPEC_SCHEMA_JSON_SHA256,
+} from "./generated/contracts.js";
 
 /** 算法版本：影响输出字节的任何改动都必须同步升级并更新 golden vectors。 */
 export const PLAN_HASH_VERSION = "plan-hash-v1";
@@ -58,11 +67,28 @@ const REPO_FIELDS = ["mode", "root", "baseBranch", "baseCommit"] as const;
 /** workPlan 子对象纳入的字段。 */
 const WORKPLAN_FIELDS = ["dagVersion", "nodes", "barriers"] as const;
 
-/** planRevisionDigest 必须排除的字段（自身摘要值与签名）。 */
-const DIGEST_EXCLUDED_FIELDS = new Set(["planRevisionDigest", "signature"]);
-
 /** 摘要输出前缀。 */
 const SHA256_PREFIX = "sha256:";
+
+/** 不可信 wire 与 validator 初始化失败共用的稳定脱敏错误明细。 */
+const STABLE_VALIDATION_DETAIL = "INVALID_PLAN_HASH_INPUT";
+const DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#";
+const KNOWN_VALIDATOR_FORMATS = new Set(["date-time"]);
+const SINGLE_SCHEMA_KEYWORDS = new Set([
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "if",
+  "then",
+  "else",
+  "not",
+  "propertyNames",
+]);
+const SCHEMA_MAP_KEYWORDS = new Set(["properties", "patternProperties", "definitions", "$defs"]);
+const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf"]);
+
+/** Factory 冻结的可移植 RFC3339 wire 子集；日历和 offset 再由下方函数复核。 */
+const FACTORY_DATE_TIME = /^([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-5][0-9])(?:\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$/;
 
 /** 计划哈希输入非法（缺字段、类型错误等）时抛出。 */
 export class PlanHashError extends Error {
@@ -76,28 +102,208 @@ export class PlanHashError extends Error {
 /** 任意 JSON 对象别名。 */
 type JsonObject = Record<string, unknown>;
 
+/** 返回给定年月的天数，避免 Date 对 0..99 年份的隐式 1900 偏移。 */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leapYear ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+/** 与 Python/Rust 共享的 date-time format：拒绝 leap second、year 0000、非法日历和 offset。 */
+function isFactoryDateTime(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return true;
+  }
+  const match = FACTORY_DATE_TIME.exec(value);
+  if (match === null) {
+    return false;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const zone = match[7];
+  if (year === 0 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) || hour > 23 || minute > 59) {
+    return false;
+  }
+  if (zone.toLowerCase() === "z") {
+    return true;
+  }
+  const offsetHour = Number(zone.slice(1, 3));
+  const offsetMinute = Number(zone.slice(4, 6));
+  return offsetHour <= 23 && offsetMinute <= 59;
+}
+
+/** 按 Draft7 schema keyword 遍历，避免把 properties 内的用户字段名误判成 keyword。 */
+function walkValidatorSubschema(value: unknown): void {
+  if (typeof value === "boolean" || value === null || typeof value !== "object" || Array.isArray(value)) {
+    return;
+  }
+  const object = value as JsonObject;
+  if ("$ref" in object && (typeof object.$ref !== "string" || !object.$ref.startsWith("#"))) {
+    throw new Error("external schema reference");
+  }
+  if ("format" in object && (
+    typeof object.format !== "string" || !KNOWN_VALIDATOR_FORMATS.has(object.format)
+  )) {
+    throw new Error("unknown schema format");
+  }
+
+  for (const keyword of SINGLE_SCHEMA_KEYWORDS) {
+    if (keyword in object) {
+      walkValidatorSubschema(object[keyword]);
+    }
+  }
+  for (const keyword of SCHEMA_MAP_KEYWORDS) {
+    const schemaMap = object[keyword];
+    if (schemaMap !== null && typeof schemaMap === "object" && !Array.isArray(schemaMap)) {
+      for (const childSchema of Object.values(schemaMap)) {
+        walkValidatorSubschema(childSchema);
+      }
+    }
+  }
+  const items = object.items;
+  if (Array.isArray(items)) {
+    for (const childSchema of items) {
+      walkValidatorSubschema(childSchema);
+    }
+  } else if (items !== undefined) {
+    walkValidatorSubschema(items);
+  }
+  for (const keyword of SCHEMA_ARRAY_KEYWORDS) {
+    const schemas = object[keyword];
+    if (Array.isArray(schemas)) {
+      for (const childSchema of schemas) {
+        walkValidatorSubschema(childSchema);
+      }
+    }
+  }
+  const dependencies = object.dependencies;
+  if (dependencies !== null && typeof dependencies === "object" && !Array.isArray(dependencies)) {
+    for (const dependency of Object.values(dependencies)) {
+      if (typeof dependency === "boolean" || (dependency !== null && typeof dependency === "object" && !Array.isArray(dependency))) {
+        walkValidatorSubschema(dependency);
+      }
+    }
+  }
+}
+
+/** 运行时只能编译完整 Draft7 生成常量；外部 ref、未知 format 和元 schema 失败均 fail closed。 */
+function assertValidGeneratedSchema(schema: unknown): asserts schema is AnySchema {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error("invalid schema root");
+  }
+  const root = schema as JsonObject;
+  if (root.$schema !== DRAFT7_SCHEMA_URI) {
+    throw new Error("unsupported schema draft");
+  }
+  walkValidatorSubschema(schema);
+}
+
+/** 在 JSON.parse 前验证嵌入字符串的 UTF-8 内容身份，任意字节漂移均 fail closed。 */
+function verifyEmbeddedSchemaIntegrity(schemaJson: unknown, expectedSha256: unknown): asserts schemaJson is string {
+  if (typeof schemaJson !== "string" || typeof expectedSha256 !== "string") {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
+  const match = /^sha256:([0-9a-f]{64})$/.exec(expectedSha256);
+  if (match === null) {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
+  const actualDigest = createHash("sha256").update(schemaJson, "utf8").digest();
+  const expectedDigest = Buffer.from(match[1], "hex");
+  if (actualDigest.length !== expectedDigest.length || !timingSafeEqual(actualDigest, expectedDigest)) {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
+}
+
+/** 在 hash 调用路径中严格解析并编译权威 schema；任何初始化细节都归一化为稳定错误。 */
+function compileValidator(schemaJson: unknown, expectedSha256: unknown): ValidateFunction {
+  try {
+    verifyEmbeddedSchemaIntegrity(schemaJson, expectedSha256);
+    const schema: unknown = JSON.parse(schemaJson);
+    assertValidGeneratedSchema(schema);
+    const ajv = new Ajv({
+      strict: true,
+      validateSchema: true,
+      validateFormats: true,
+      coerceTypes: false,
+      useDefaults: false,
+      removeAdditional: false,
+      ownProperties: true,
+    });
+    ajv.addFormat("date-time", { type: "string", validate: isFactoryDateTime });
+    return ajv.compile(schema);
+  } catch {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
+}
+
+let runSpecValidator: ValidateFunction | undefined;
+let planRevisionValidator: ValidateFunction | undefined;
+let planRevisionDigestMaterialValidator: ValidateFunction | undefined;
+
+/** 惰性构建 RunSpec validator，避免 generated 常量在 import 时直接影响应用入口。 */
+function getRunSpecValidator(): ValidateFunction {
+  runSpecValidator ??= compileValidator(RUN_SPEC_SCHEMA_JSON, RUN_SPEC_SCHEMA_JSON_SHA256);
+  return runSpecValidator;
+}
+
+/** 惰性构建完整 PlanRevision validator，摘要字段剥离前先校验原始 wire。 */
+function getPlanRevisionValidator(): ValidateFunction {
+  planRevisionValidator ??= compileValidator(
+    PLAN_REVISION_SCHEMA_JSON,
+    PLAN_REVISION_SCHEMA_JSON_SHA256,
+  );
+  return planRevisionValidator;
+}
+
+/** 惰性构建摘要 material validator，确保只有两项排除字段可绕过摘要输入。 */
+function getPlanRevisionDigestMaterialValidator(): ValidateFunction {
+  planRevisionDigestMaterialValidator ??= compileValidator(
+    PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON,
+    PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256,
+  );
+  return planRevisionDigestMaterialValidator;
+}
+
+/** 执行完整 schema；Ajv error 或异常均不得把 payload/内部错误带出 hash API。 */
+function validateWire(value: unknown, validator: ValidateFunction): void {
+  try {
+    if (!validator(value)) {
+      throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+    }
+  } catch (error) {
+    if (error instanceof PlanHashError) {
+      throw error;
+    }
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
+}
+
 /** 校验 value 为对象，否则 fail closed。 */
-function requireObject(value: unknown, label: string): JsonObject {
+function requireObject(value: unknown): JsonObject {
   if (
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value)
   ) {
-    throw new PlanHashError(`字段 '${label}' 必须为对象`);
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
   }
   return value as JsonObject;
 }
 
 /** 从 source 提取 fields 指定的字段子集，缺字段即 fail closed。 */
 function projectSubset(
-  source: JsonObject,
-  fields: readonly string[],
-  label: string,
+    source: JsonObject,
+    fields: readonly string[],
 ): JsonObject {
   const projected: JsonObject = {};
   for (const name of fields) {
     if (!(name in source)) {
-      throw new PlanHashError(`${label} 缺少语义字段 '${name}'（${PLAN_HASH_VERSION}）`);
+      throw new PlanHashError(STABLE_VALIDATION_DETAIL);
     }
     projected[name] = source[name];
   }
@@ -109,16 +315,17 @@ function projectSubset(
  * @throws PlanHashError 缺少必需语义字段或子对象结构非法。
  */
 export function buildSemanticProjection(plan: unknown): JsonObject {
-  const obj = requireObject(plan, "plan");
-  const projection = projectSubset(obj, SEMANTIC_TOP_FIELDS, "plan");
+  validateWire(plan, getRunSpecValidator());
+  const obj = requireObject(plan);
+  const projection = projectSubset(obj, SEMANTIC_TOP_FIELDS);
 
   // repository：仅纳入 mode/root/baseBranch/baseCommit。
-  const repository = requireObject(obj["repository"], "repository");
-  projection["repository"] = projectSubset(repository, REPO_FIELDS, "repository");
+  const repository = requireObject(obj["repository"]);
+  projection["repository"] = projectSubset(repository, REPO_FIELDS);
 
   // workPlan：仅纳入 dagVersion/nodes/barriers。
-  const workPlan = requireObject(obj["workPlan"], "workPlan");
-  projection["workPlan"] = projectSubset(workPlan, WORKPLAN_FIELDS, "workPlan");
+  const workPlan = requireObject(obj["workPlan"]);
+  projection["workPlan"] = projectSubset(workPlan, WORKPLAN_FIELDS);
 
   return projection;
 }
@@ -136,7 +343,11 @@ function sha256Prefixed(bytes: Uint8Array): string {
  */
 export function semanticPlanHash(plan: unknown): string {
   const projection = buildSemanticProjection(plan);
-  return sha256Prefixed(canonicalize(projection));
+  try {
+    return sha256Prefixed(canonicalize(projection));
+  } catch {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
 }
 
 /**
@@ -147,14 +358,21 @@ export function semanticPlanHash(plan: unknown): string {
  * @throws CanonicalJsonError 字段值含非法数字/类型/重复键。
  */
 export function planRevisionDigest(revision: unknown): string {
-  const obj = requireObject(revision, "revision");
-  const material: JsonObject = {};
-  for (const key of Object.keys(obj)) {
-    if (!DIGEST_EXCLUDED_FIELDS.has(key)) {
-      material[key] = obj[key];
-    }
+  validateWire(revision, getPlanRevisionValidator());
+  const obj = requireObject(revision);
+  // full schema 已保证摘要必填、签名可选；精确剥离后再校验机械派生的 material。
+  const material: JsonObject = { ...obj };
+  delete material.planRevisionDigest;
+  if ("signature" in material) {
+    delete material.signature;
   }
-  return sha256Prefixed(canonicalize(material));
+  validateWire(material, getPlanRevisionDigestMaterialValidator());
+  // 纯函数没有日志出口；稳定错误由后续应用入口脱敏记录，本层不声称已实现 runtime 日志。
+  try {
+    return sha256Prefixed(canonicalize(material));
+  } catch {
+    throw new PlanHashError(STABLE_VALIDATION_DETAIL);
+  }
 }
 
 /**

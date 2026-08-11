@@ -10,12 +10,16 @@ contracts/codegen/generate.py
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
+
+import jsonschema
 
 # 仓库根目录（相对于本脚本所在 contracts/codegen/）
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +29,38 @@ CATALOG_PATH = REPO_ROOT / "contracts" / "codegen" / "catalog.v1.json"
 TS_OUT = REPO_ROOT / "packages" / "factory-contracts" / "src" / "generated" / "contracts.ts"
 PY_OUT = REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py"
 RS_OUT = REPO_ROOT / "crates" / "factory-contracts" / "src" / "generated" / "contracts.rs"
+
+# 计划哈希的运行时 validator 只能从这两份权威 schema 机械生成，不能复用普通类型生成的
+# per-entry ERROR 注释降级路径。任一读取/解析/结构检查失败都必须阻断三语言生成。
+RUN_SPEC_VALIDATOR_SCHEMA_PATH = "contracts/schemas/run-spec.v1.schema.json"
+PLAN_REVISION_VALIDATOR_SCHEMA_PATH = "contracts/schemas/plan-revision.v1.schema.json"
+KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
+_DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
+
+# Draft7 中每类子 schema 的位置。按关键字感知地遍历，避免把 `properties` 中用户
+# 自定义的 `format`、`$ref` 字段名误认为 schema keyword。
+_SINGLE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "if",
+        "then",
+        "else",
+        "not",
+        "propertyNames",
+    }
+)
+_SCHEMA_MAP_KEYWORDS = frozenset({"properties", "patternProperties", "definitions", "$defs"})
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+
+
+class ValidatorSchemaError(RuntimeError):
+    """运行时 validator schema 不能安全嵌入生成物时的稳定失败分类。"""
+
+
+class CodegenGenerationError(RuntimeError):
+    """普通 catalog 类型生成失败时的稳定失败分类，禁止生成 ERROR 注释占位。"""
 
 # JSON Schema → TypeScript 类型映射
 TS_TYPE_MAP: dict[str, str] = {
@@ -123,6 +159,191 @@ def load_schema(schema_path_str: str) -> dict[str, Any]:
         raise FileNotFoundError(f"Schema 文件不存在: {schema_path}")
     with schema_path.open(encoding="utf-8") as f:
         return json.load(f)  # type: ignore[no-any-return]
+
+
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """JSON object hook：任何层级重复 key 都必须在 schema 编译前稳定失败。"""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_DUPLICATE_KEY")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_json_constant(_constant: str) -> NoReturn:
+    """拒绝 Python JSON 扩展常量，确保权威 schema 只接受标准 JSON 数字。"""
+    raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON")
+
+
+def _walk_validator_subschema(value: object) -> None:
+    """按 Draft7 schema keyword 遍历子 schema，拒绝外部 ref 与未知 format。
+
+    不通用递归 dict 的全部 value：`properties`/`definitions` 是名称到 schema 的映射，
+    其中的名称可合法地叫 `format` 或 `$ref`，不能被错当成 keyword。
+    """
+    if isinstance(value, bool):
+        return
+    if not isinstance(value, dict):
+        # 子 schema 的非 object/bool 形态再交给 Draft7 meta-schema 分类，不能静默跳过。
+        return
+
+    reference = value.get("$ref")
+    if reference is not None and (not isinstance(reference, str) or not reference.startswith("#")):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_EXTERNAL_REF")
+
+    format_name = value.get("format")
+    if format_name is not None and (
+        not isinstance(format_name, str) or format_name not in KNOWN_VALIDATOR_FORMATS
+    ):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_UNKNOWN_FORMAT")
+
+    for keyword in _SINGLE_SCHEMA_KEYWORDS:
+        if keyword in value:
+            _walk_validator_subschema(value[keyword])
+
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        schema_map = value.get(keyword)
+        if isinstance(schema_map, dict):
+            for child_schema in schema_map.values():
+                _walk_validator_subschema(child_schema)
+
+    items = value.get("items")
+    if isinstance(items, list):
+        for child_schema in items:
+            _walk_validator_subschema(child_schema)
+    elif items is not None:
+        _walk_validator_subschema(items)
+
+    for keyword in _SCHEMA_ARRAY_KEYWORDS:
+        schemas = value.get(keyword)
+        if isinstance(schemas, list):
+            for child_schema in schemas:
+                _walk_validator_subschema(child_schema)
+
+    dependencies = value.get("dependencies")
+    if isinstance(dependencies, dict):
+        for dependency in dependencies.values():
+            # Draft7 dependency 可以是 string 数组；只有 schema 形态才继续遍历。
+            if isinstance(dependency, (bool, dict)):
+                _walk_validator_subschema(dependency)
+
+
+def _validate_validator_schema_object(schema: dict[str, Any]) -> None:
+    """验证权威/派生 schema 是精确 Draft7 且不含运行时可解析的外部资源。"""
+    if schema.get("$schema") != _DRAFT7_SCHEMA_URI:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7")
+    _walk_validator_subschema(schema)
+    try:
+        jsonschema.Draft7Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_DRAFT7") from exc
+
+
+def parse_validator_schema(raw: bytes) -> dict[str, Any]:
+    """严格按无 BOM UTF-8→无重复键 JSON→精确 Draft7 解析 validator schema。"""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_UTF8")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_UTF8") from exc
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except ValidatorSchemaError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_ROOT_NOT_OBJECT")
+
+    _validate_validator_schema_object(parsed)
+    return parsed
+
+
+def load_required_validator_schema(schema_path_str: str) -> tuple[dict[str, Any], str]:
+    """读取一个权威 validator schema，并返回对象与原始字节 SHA-256。"""
+    schema_path = REPO_ROOT / schema_path_str
+    try:
+        raw = schema_path.read_bytes()
+    except OSError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_READ_FAILED") from exc
+    schema = parse_validator_schema(raw)
+    return schema, "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def build_plan_revision_digest_material_schema(plan_revision_schema: dict[str, Any]) -> dict[str, Any]:
+    """从权威 PlanRevision schema 机械删除仅摘要排除的字段，得到 digest material schema。"""
+    material = copy.deepcopy(plan_revision_schema)
+    properties = material.get("properties")
+    required = material.get("required")
+    # 摘要派生不能把权威 digest 字段本身缺失误当作「已排除」：它必须原本同时受
+    # properties 与 required 约束，之后才允许仅删除 digest/signature 两项。
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(required, list)
+        or "planRevisionDigest" not in properties
+        or "signature" not in properties
+        or "planRevisionDigest" not in required
+        or "signature" in required
+        or required.count("planRevisionDigest") != 1
+    ):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED")
+
+    # 两个排除字段必须先由 full schema 明确定义；这里精确删除，禁止 silent pop 掩盖源合同漂移。
+    del properties["planRevisionDigest"]
+    del properties["signature"]
+    required.remove("planRevisionDigest")
+    return material
+
+
+def load_required_validator_schemas() -> dict[str, tuple[dict[str, Any], str]]:
+    """一次性加载并派生所有运行时 validator schema；任一步失败均不返回半份 bundle。"""
+    run_spec_schema, run_spec_sha256 = load_required_validator_schema(RUN_SPEC_VALIDATOR_SCHEMA_PATH)
+    plan_revision_schema, plan_revision_sha256 = load_required_validator_schema(
+        PLAN_REVISION_VALIDATOR_SCHEMA_PATH
+    )
+    digest_material_schema = build_plan_revision_digest_material_schema(plan_revision_schema)
+    try:
+        _validate_validator_schema_object(digest_material_schema)
+    except ValidatorSchemaError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED") from exc
+    return {
+        "runSpec": (run_spec_schema, run_spec_sha256),
+        "planRevision": (plan_revision_schema, plan_revision_sha256),
+        "planRevisionDigestMaterial": (digest_material_schema, plan_revision_sha256),
+    }
+
+
+def _embedded_schema_json(schema: dict[str, Any]) -> str:
+    """生成标准且稳定的 JSON；任何不可序列化值都归一为无敏感信息的稳定错误。"""
+    try:
+        return json.dumps(
+            schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON") from exc
+
+
+def _embedded_schema_sha256(schema_json: str) -> str:
+    """计算嵌入 JSON 字符串的 UTF-8 内容身份；它与权威原文件 SHA 各司其职。"""
+    return "sha256:" + hashlib.sha256(schema_json.encode("utf-8")).hexdigest()
+
+
+def _rust_raw_string(text: str) -> str:
+    """选择不会与 schema 文本冲突的 Rust raw-string 定界符。"""
+    hashes = "#"
+    while f'"{hashes}' in text:
+        hashes += "#"
+    return f'r{hashes}"{text}"{hashes}'
 
 
 def get_schema_properties(
@@ -249,7 +470,64 @@ def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
     return f"Option<{rs}>" if optional else rs
 
 
+def load_codegen_entry_definition(entry: dict[str, Any]) -> tuple[str, dict[str, Any], list[str]]:
+    """加载一个普通 catalog entry；任何失败都上抛稳定错误而非生成 ERROR 注释。"""
+    try:
+        name = entry["name"]
+        schema_path = entry["schemaPath"]
+        if not isinstance(name, str) or not isinstance(schema_path, str):
+            raise TypeError("catalog entry name/schemaPath must be strings")
+        schema = load_schema(schema_path)
+        definition_key = entry.get("definitionKey")
+        if definition_key is not None and not isinstance(definition_key, str):
+            raise TypeError("catalog entry definitionKey must be string")
+        props, required = get_schema_properties(schema, definition_key)
+        return name, props, required
+    except CodegenGenerationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 普通生成失败不能泄露路径/底层正文，也不能降级。
+        raise CodegenGenerationError("CODEGEN_GENERATION_FAILED") from exc
+
+
+def render_codegen_entry(
+    entry: dict[str, Any], renderer: Callable[[str, dict[str, Any], list[str]], str]
+) -> str:
+    """将单一普通 entry 渲染为目标语言文本；渲染细节异常也必须 fail-closed。"""
+    try:
+        name, props, required = load_codegen_entry_definition(entry)
+        return renderer(name, props, required)
+    except CodegenGenerationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 不输出 schema/path/第三方异常正文。
+        raise CodegenGenerationError("CODEGEN_GENERATION_FAILED") from exc
+
+
 # ────────────────────────────── TypeScript ──────────────────────────────
+
+
+def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+    """生成 TypeScript 运行时 validator 常量；原始 SHA 与派生 material 同时被冻结。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    return [
+        "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        f'export const RUN_SPEC_SCHEMA_SOURCE_SHA256 = "{run_spec_sha256}";',
+        f"export const RUN_SPEC_SCHEMA_JSON = {json.dumps(run_spec_json, ensure_ascii=False)};",
+        f'export const RUN_SPEC_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(run_spec_json)}";',
+        f'export const PLAN_REVISION_SCHEMA_SOURCE_SHA256 = "{plan_revision_sha256}";',
+        f"export const PLAN_REVISION_SCHEMA_JSON = {json.dumps(plan_revision_json, ensure_ascii=False)};",
+        f'export const PLAN_REVISION_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(plan_revision_json)}";',
+        "// 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        "export const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON = "
+        f"{json.dumps(digest_material_json, ensure_ascii=False)};",
+        "export const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(digest_material_json)}";',
+        "",
+    ]
 
 
 def generate_ts_interface(name: str, props: dict[str, Any], required: list[str]) -> str:
@@ -267,8 +545,12 @@ def generate_ts_interface(name: str, props: dict[str, Any], required: list[str])
     return "\n".join(lines)
 
 
-def generate_typescript(entries: list[dict[str, Any]]) -> str:
+def generate_typescript(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+) -> str:
     """生成完整 TypeScript 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
     sections = [
         "// 此文件由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "// 源 schema: contracts/schemas/*.schema.json",
@@ -278,21 +560,44 @@ def generate_typescript(entries: list[dict[str, Any]]) -> str:
         "// @ts-nocheck",
         "",
     ]
+    sections.extend(generate_ts_validator_schema_constants(validator_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            iface = generate_ts_interface(entry["name"], props, required)
-            sections.append(iface)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"// ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        iface = render_codegen_entry(entry, generate_ts_interface)
+        sections.append(iface)
+        sections.append("")
     return "\n".join(sections)
 
 
 # ────────────────────────────── Python ──────────────────────────────
+
+
+def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+    """生成 Python 原始 schema JSON；计划模块惰性解析，避免 import-time 逃逸。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    return [
+        "# 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        f'RUN_SPEC_SCHEMA_SOURCE_SHA256: Final[str] = "{run_spec_sha256}"',
+        f"RUN_SPEC_SCHEMA_JSON: Final[str] = {run_spec_json!r}",
+        f'RUN_SPEC_SCHEMA_JSON_SHA256: Final[str] = "{_embedded_schema_sha256(run_spec_json)}"',
+        f'PLAN_REVISION_SCHEMA_SOURCE_SHA256: Final[str] = "{plan_revision_sha256}"',
+        f"PLAN_REVISION_SCHEMA_JSON: Final[str] = {plan_revision_json!r}",
+        f'PLAN_REVISION_SCHEMA_JSON_SHA256: Final[str] = "{_embedded_schema_sha256(plan_revision_json)}"',
+        "# 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        (
+            "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON: Final[str] = "
+            f"{digest_material_json!r}"
+        ),
+        (
+            "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(digest_material_json)}"'
+        ),
+        "",
+    ]
 
 
 def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> str:
@@ -318,38 +623,82 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
     return "\n".join(lines)
 
 
-def generate_python(entries: list[dict[str, Any]]) -> str:
+def generate_python(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+) -> str:
     """生成完整 Python 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
     sections = [
         '"""',
         "此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "源 schema: contracts/schemas/*.schema.json",
         "算法版本: v1",
         '"""',
-        "from typing import Any, Literal, Optional, Required, TypedDict, Union",
+        "from typing import Any, Final, Literal, Optional, Required, TypedDict, Union",
         "",
         "__all__ = [",
     ]
-    names = [e["name"] for e in entries]
+    # 先验证全部普通 entry；若其中一个失败，不能先构造部分 Python 文件再落盘。
+    names = [load_codegen_entry_definition(entry)[0] for entry in entries]
+    names = [
+        "RUN_SPEC_SCHEMA_SOURCE_SHA256",
+        "RUN_SPEC_SCHEMA_JSON",
+        "RUN_SPEC_SCHEMA_JSON_SHA256",
+        "PLAN_REVISION_SCHEMA_SOURCE_SHA256",
+        "PLAN_REVISION_SCHEMA_JSON",
+        "PLAN_REVISION_SCHEMA_JSON_SHA256",
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON",
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256",
+        *names,
+    ]
     for n in names:
         sections.append(f'    "{n}",')
     sections.append("]")
     sections.append("")
+    sections.extend(generate_py_validator_schema_constants(validator_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            cls = generate_py_class(entry["name"], props, required)
-            sections.append(cls)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"# ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        cls = render_codegen_entry(entry, generate_py_class)
+        sections.append(cls)
+        sections.append("")
     return "\n".join(sections)
 
 
 # ────────────────────────────── Rust ──────────────────────────────
+
+
+def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+    """生成 Rust 运行时 validator 常量；JSON 保持原始 schema 结构并在运行时解析。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    return [
+        "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        "pub const RUN_SPEC_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{run_spec_sha256}";',
+        f"pub const RUN_SPEC_SCHEMA_JSON: &str = {_rust_raw_string(run_spec_json)};",
+        "pub const RUN_SPEC_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(run_spec_json)}";',
+        "pub const PLAN_REVISION_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{plan_revision_sha256}";',
+        (
+            "pub const PLAN_REVISION_SCHEMA_JSON: &str = "
+            f"{_rust_raw_string(plan_revision_json)};"
+        ),
+        "pub const PLAN_REVISION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(plan_revision_json)}";',
+        "// 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        (
+            "pub const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON: &str = "
+            f"{_rust_raw_string(digest_material_json)};"
+        ),
+        "pub const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(digest_material_json)}";',
+        "",
+    ]
 
 
 def to_snake_case(name: str) -> str:
@@ -384,8 +733,12 @@ def generate_rs_struct(name: str, props: dict[str, Any], required: list[str]) ->
     return "\n".join(lines)
 
 
-def generate_rust(entries: list[dict[str, Any]]) -> str:
+def generate_rust(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+) -> str:
     """生成完整 Rust 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
     sections = [
         "//! 此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "//! 源 schema: contracts/schemas/*.schema.json",
@@ -395,17 +748,11 @@ def generate_rust(entries: list[dict[str, Any]]) -> str:
         "#![allow(unused_imports)]",
         "",
     ]
+    sections.extend(generate_rs_validator_schema_constants(validator_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            struct_def = generate_rs_struct(entry["name"], props, required)
-            sections.append(struct_def)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"// ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        struct_def = render_codegen_entry(entry, generate_rs_struct)
+        sections.append(struct_def)
+        sections.append("")
     return "\n".join(sections)
 
 
@@ -473,16 +820,33 @@ def main() -> int:
         print("[ERROR] catalog 中没有 codegen=true 的条目", file=sys.stderr)
         return 1
 
-    # 生成各语言内容
-    ts_content = generate_typescript(codegen_entries)
-    py_content = generate_python(codegen_entries)
-    rs_content = generate_rust(codegen_entries)
+    # 先在内存中严格加载 schema 并生成三语言完整内容；任一 validator 失败时绝不进入写入阶段。
+    try:
+        validator_schemas = load_required_validator_schemas()
+        ts_content = generate_typescript(codegen_entries, validator_schemas)
+        py_content = generate_python(codegen_entries, validator_schemas)
+        rs_content = generate_rust(codegen_entries, validator_schemas)
+    except ValidatorSchemaError as exc:
+        print(f"[ERROR] 运行时 validator schema 生成失败: {exc}", file=sys.stderr)
+        return 1
+    except CodegenGenerationError:
+        print("[ERROR] CODEGEN_GENERATION_FAILED", file=sys.stderr)
+        return 1
+    except Exception:  # noqa: BLE001 - 内存生成阶段不能把未分类异常降级成部分写入。
+        print("[ERROR] CODEGEN_GENERATION_FAILED", file=sys.stderr)
+        return 1
 
     # 写入或检查
-    ok = True
-    ok = write_or_check(TS_OUT, ts_content, check_mode) and ok
-    ok = write_or_check(PY_OUT, py_content, check_mode) and ok
-    ok = write_or_check(RS_OUT, rs_content, check_mode) and ok
+    try:
+        results = (
+            write_or_check(TS_OUT, ts_content, check_mode),
+            write_or_check(PY_OUT, py_content, check_mode),
+            write_or_check(RS_OUT, rs_content, check_mode),
+        )
+    except Exception:  # noqa: BLE001 - I/O 中途失败不得输出 [DONE]；后续 --check 会报告剩余漂移。
+        print("[ERROR] CODEGEN_WRITE_FAILED", file=sys.stderr)
+        return 1
+    ok = all(results)
 
     if check_mode:
         if ok:
@@ -491,6 +855,9 @@ def main() -> int:
             print("[FAIL] 检测到漂移，请重新运行 generate.py 更新输出。", file=sys.stderr)
         return 0 if ok else 1
 
+    if not ok:
+        print("[FAIL] 生成写入未完整完成，请使用 --check 定位漂移。", file=sys.stderr)
+        return 1
     print("[DONE] 三语言类型文件生成完成。")
     return 0
 

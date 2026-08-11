@@ -1,176 +1,478 @@
 {
   "version": "plan-hash-v1",
-  "description": "semanticPlanHash / planRevisionDigest 跨语言 golden vectors。",
+  "description": "Cross-language RunSpec and PlanRevision digest vectors. All RunSpec cases represent post-bootstrap repository state.",
+  "rfc3339DateTime": {
+    "valid": [
+      {"name": "leap-year", "value": "2024-02-29T23:59:59Z"},
+      {"name": "fraction-with-colon-offset", "value": "2024-02-29T23:59:59.123+05:30"},
+      {"name": "negative-colon-offset", "value": "2024-02-29T23:59:59-05:30"},
+      {"name": "lowercase-t-z", "value": "2024-02-29t23:59:59z"}
+    ],
+    "invalid": [
+      {"name": "calendar-date", "value": "2026-02-30T00:00:00Z"},
+      {"name": "missing-offset", "value": "2026-01-01T00:00:00"},
+      {"name": "leap-second", "value": "2024-12-31T23:59:60Z"},
+      {"name": "space-separator", "value": "2024-02-29 23:59:59Z"},
+      {"name": "compact-offset", "value": "2024-02-29T23:59:59+0530"},
+      {"name": "hour-24", "value": "2024-02-29T24:00:00Z"},
+      {"name": "offset-24-hours", "value": "2024-02-29T23:59:59+24:00"},
+      {"name": "non-leap-february-29", "value": "2023-02-29T23:59:59Z"},
+      {"name": "year-zero", "value": "0000-01-01T00:00:00Z"}
+    ]
+  },
   "semanticPlanHash": [
     {
-      "name": "baseline",
+      "name": "post-bootstrap-new-full-sha",
       "plan": {
         "schemaVersion": 1,
-        "goal": "构建 AI Coding Factory Phase 0 基线",
-        "assumptions": [
-          "D 盘可写",
-          "Windows 平台"
-        ],
-        "scope": {
-          "included": [
-            "contracts"
-          ],
-          "excluded": [
-            "deploy"
-          ]
-        },
-        "constraints": [
-          "test-first"
-        ],
-        "acceptanceCriteria": [
-          "all tests pass"
-        ],
-        "targetStage": "MERGED",
+        "taskId": "task-new-repository-planning",
+        "goal": "post-bootstrap planning",
+        "assumptions": ["D drive available"],
+        "scope": {"include": ["contracts"], "exclude": ["deploy"]},
+        "constraints": ["fail closed"],
+        "acceptanceCriteria": ["all contract tests pass"],
+        "targetStage": "CODEX_APPROVED",
         "repository": {
-          "mode": "existing",
-          "root": "D:/codex项目",
+          "mode": "new",
+          "root": "D:/codex-projects/factory-new",
           "baseBranch": "main",
-          "baseCommit": "b1e3524",
-          "extraIgnored": "must-not-affect-hash"
+          "baseCommit": "0123456789abcdef0123456789abcdef01234567"
         },
         "workPlan": {
           "dagVersion": 1,
           "nodes": [
             {
-              "logicalNodeId": "n1",
-              "nodeType": "IMPLEMENT"
+              "logicalNodeId": "node-plan",
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "nodeType": "PLAN",
+              "required": true,
+              "dependsOn": [],
+              "sideEffectClass": "read-only",
+              "requiredArtifacts": ["runspec"],
+              "successPredicateId": "plan-created",
+              "timeoutMs": 30000,
+              "retryPolicyId": "no-retry"
             }
           ],
           "barriers": [
             {
-              "businessPhase": "IMPLEMENTING",
-              "barrierOrdinal": 1
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "requiredNodeIds": ["node-plan"],
+              "settleTimeoutMs": 30000,
+              "passPredicateId": "plan-complete"
             }
-          ],
-          "extraIgnored": "must-not-affect-hash"
+          ]
         },
-        "riskProfile": {
-          "level": "medium"
-        },
+        "riskProfile": {"level": "low", "reasons": ["post-bootstrap repository"]},
         "nodeCapabilityMapVersion": "1",
         "stageCapabilityMapVersion": "1",
-        "taskId": "task-abc",
-        "specRevision": 3,
-        "parentRevisionId": "rev-parent",
-        "intentAuthorizationId": "intent-1",
-        "createdAt": "2026-08-04T00:00:00Z",
-        "planRevisionDigest": "sha256:should-not-matter"
+        "intentAuthorizationId": "intent-new-repository-planning",
+        "semanticPlanHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "specRevision": 2,
+        "parentRevisionId": "revision-parent",
+        "planRevisionDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "createdAt": "2026-08-11T00:00:00Z"
       },
-      "expected": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3"
+      "expected": "sha256:476debc91e5ee8d880b755e59ff650c78b7517ab3e0c5c442eabc074fc823511"
     },
     {
-      "name": "same-semantics-diff-excluded",
+      "name": "same-semantics-different-excluded",
       "plan": {
         "schemaVersion": 1,
-        "goal": "构建 AI Coding Factory Phase 0 基线",
-        "assumptions": [
-          "D 盘可写",
-          "Windows 平台"
-        ],
-        "scope": {
-          "included": [
-            "contracts"
-          ],
-          "excluded": [
-            "deploy"
-          ]
-        },
-        "constraints": [
-          "test-first"
-        ],
-        "acceptanceCriteria": [
-          "all tests pass"
-        ],
-        "targetStage": "MERGED",
+        "taskId": "task-new-repository-planning-other",
+        "goal": "post-bootstrap planning",
+        "assumptions": ["D drive available"],
+        "scope": {"include": ["contracts"], "exclude": ["deploy"]},
+        "constraints": ["fail closed"],
+        "acceptanceCriteria": ["all contract tests pass"],
+        "targetStage": "CODEX_APPROVED",
         "repository": {
-          "mode": "existing",
-          "root": "D:/codex项目",
+          "mode": "new",
+          "root": "D:/codex-projects/factory-new",
           "baseBranch": "main",
-          "baseCommit": "b1e3524",
-          "extraIgnored": "must-not-affect-hash"
+          "baseCommit": "0123456789abcdef0123456789abcdef01234567"
         },
         "workPlan": {
           "dagVersion": 1,
           "nodes": [
             {
-              "logicalNodeId": "n1",
-              "nodeType": "IMPLEMENT"
+              "logicalNodeId": "node-plan",
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "nodeType": "PLAN",
+              "required": true,
+              "dependsOn": [],
+              "sideEffectClass": "read-only",
+              "requiredArtifacts": ["runspec"],
+              "successPredicateId": "plan-created",
+              "timeoutMs": 30000,
+              "retryPolicyId": "no-retry"
             }
           ],
           "barriers": [
             {
-              "businessPhase": "IMPLEMENTING",
-              "barrierOrdinal": 1
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "requiredNodeIds": ["node-plan"],
+              "settleTimeoutMs": 30000,
+              "passPredicateId": "plan-complete"
             }
-          ],
-          "extraIgnored": "must-not-affect-hash"
+          ]
         },
-        "riskProfile": {
-          "level": "medium"
-        },
+        "riskProfile": {"level": "low", "reasons": ["post-bootstrap repository"]},
         "nodeCapabilityMapVersion": "1",
         "stageCapabilityMapVersion": "1",
-        "taskId": "task-DIFFERENT",
+        "intentAuthorizationId": "intent-new-repository-planning-other",
+        "semanticPlanHash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "specRevision": 3,
-        "parentRevisionId": "rev-OTHER",
-        "intentAuthorizationId": "intent-1",
-        "createdAt": "2099-01-01T00:00:00Z",
-        "planRevisionDigest": "sha256:should-not-matter"
+        "parentRevisionId": "revision-other",
+        "planRevisionDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "createdAt": "2026-08-12T00:00:00Z"
       },
-      "expected": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3"
+      "expected": "sha256:476debc91e5ee8d880b755e59ff650c78b7517ab3e0c5c442eabc074fc823511"
+    },
+    {
+      "name": "existing-full-sha",
+      "plan": {
+        "schemaVersion": 1,
+        "taskId": "task-existing",
+        "goal": "existing repository planning",
+        "assumptions": ["D drive available"],
+        "scope": {"include": ["contracts"], "exclude": ["deploy"]},
+        "constraints": ["fail closed"],
+        "acceptanceCriteria": ["all contract tests pass"],
+        "targetStage": "CODEX_APPROVED",
+        "repository": {
+          "mode": "existing",
+          "root": "D:/codex-projects/factory-existing",
+          "baseBranch": "main",
+          "baseCommit": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        },
+        "workPlan": {
+          "dagVersion": 1,
+          "nodes": [
+            {
+              "logicalNodeId": "node-plan",
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "nodeType": "PLAN",
+              "required": true,
+              "dependsOn": [],
+              "sideEffectClass": "read-only",
+              "requiredArtifacts": ["runspec"],
+              "successPredicateId": "plan-created",
+              "timeoutMs": 30000,
+              "retryPolicyId": "no-retry"
+            }
+          ],
+          "barriers": [
+            {
+              "businessPhase": "PLANNING",
+              "barrierOrdinal": 0,
+              "requiredNodeIds": ["node-plan"],
+              "settleTimeoutMs": 30000,
+              "passPredicateId": "plan-complete"
+            }
+          ]
+        },
+        "riskProfile": {"level": "low", "reasons": ["existing repository"]},
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "intentAuthorizationId": "intent-existing",
+        "semanticPlanHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": "sha256:c9dc7c90f7f523821127a9f5abc80c86b647452632df7411ea994b2eecdfef81"
+    }
+  ],
+  "invalidRunSpec": [
+    {
+      "name": "non-object",
+      "input": null,
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "missing-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "remove", "path": ["repository", "baseCommit"]},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "null-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": null},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "empty-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": ""},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "short-39-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "long-41-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "uppercase-base-commit",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "baseCommit"], "value": "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "wrong-repository-mode",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "mode"], "value": "bootstrap"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "repository-extra",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["repository", "forged"], "value": "must-reject"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "invalid-created-at-calendar-date",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["createdAt"], "value": "2026-02-30T00:00:00Z"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "missing-created-at-offset",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["createdAt"], "value": "2026-01-01T00:00:00"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-node-is-pre-plan-only",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["workPlan", "nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-node-phase-is-pre-plan-only",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["workPlan", "nodes", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-barrier-phase-is-pre-plan-only",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["workPlan", "barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrapping-phase-is-pre-plan-only",
+      "base": "post-bootstrap-new-full-sha",
+      "mutation": {"op": "replace", "path": ["workPlan", "barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING"},
+      "expectedErrorCode": "plan-hash-error"
     }
   ],
   "planRevisionDigest": [
     {
-      "name": "revision-a",
+      "name": "revision-planning-1",
       "revision": {
-        "planRevisionId": "rev-A",
-        "parentRevisionId": null,
-        "semanticPlanHash": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3",
-        "intentAuthorizationId": "intent-1",
-        "createdAt": "2026-08-04T00:00:00Z",
+        "planRevisionId": "revision-planning-1",
+        "parentRevisionId": "revision-parent",
+        "taskId": "task-new-repository-planning",
+        "specRevision": 2,
+        "intentAuthorizationId": "intent-new-repository-planning",
+        "semanticPlanHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "planRevisionDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "dagVersion": 1,
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
         "nodes": [
           {
-            "logicalNodeId": "n1",
-            "nodeType": "IMPLEMENT"
+            "logicalNodeId": "node-plan",
+            "nodeType": "PLAN",
+            "businessPhase": "PLANNING",
+            "dependencies": [],
+            "hasSideEffect": false,
+            "requiredArtifacts": ["runspec"]
           }
         ],
-        "signature": "sig-should-be-excluded"
+        "barriers": [
+          {
+            "barrierId": "barrier-plan",
+            "businessPhase": "PLANNING",
+            "nodeIds": ["node-plan"]
+          }
+        ],
+        "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
+        "createdAt": "2026-08-11T00:00:00Z",
+        "signature": "signature-not-hashed"
       },
-      "expected": "sha256:01b00514031d8287a336d93bbf97e901148cb748c29d7a0146067f508bf7277e"
+      "expected": "sha256:62fc9360861af5911c4c1a81a1ed3b005f3243c92b244c09262f5b08fe23dce6"
     },
     {
-      "name": "revision-b-diff-lineage",
+      "name": "revision-planning-2-different-lineage",
       "revision": {
-        "planRevisionId": "rev-B",
-        "parentRevisionId": "rev-A",
-        "semanticPlanHash": "sha256:e9135392c76529f91f25954b5d6c676c60d9ed7968e1fa1165b3fc162240f8d3",
-        "intentAuthorizationId": "intent-1",
-        "createdAt": "2026-08-04T00:00:00Z",
+        "planRevisionId": "revision-planning-2",
+        "parentRevisionId": "revision-planning-1",
+        "taskId": "task-new-repository-planning",
+        "specRevision": 3,
+        "intentAuthorizationId": "intent-new-repository-planning-next",
+        "semanticPlanHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "planRevisionDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "dagVersion": 1,
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
         "nodes": [
           {
-            "logicalNodeId": "n1",
-            "nodeType": "IMPLEMENT"
+            "logicalNodeId": "node-plan",
+            "nodeType": "PLAN",
+            "businessPhase": "PLANNING",
+            "dependencies": [],
+            "hasSideEffect": false,
+            "requiredArtifacts": ["runspec"]
           }
         ],
-        "signature": "sig-should-be-excluded"
+        "barriers": [
+          {
+            "barrierId": "barrier-plan",
+            "businessPhase": "PLANNING",
+            "nodeIds": ["node-plan"]
+          }
+        ],
+        "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
+        "createdAt": "2026-08-11T00:01:00Z"
       },
-      "expected": "sha256:2b5f33ba5bd7de30a4ec3e76f4845ec8ab39a3574992f506dcec4021c0493a58"
+      "expected": "sha256:ce8ad252b6c9552f36d6108f5d9fdcc3653a2373372e59598ac79d6b57dc9dcf"
+    }
+  ],
+  "invalidPlanRevision": [
+    {
+      "name": "non-object",
+      "input": [],
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "missing-task-id",
+      "base": "revision-planning-1",
+      "mutation": {"op": "remove", "path": ["taskId"]},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "missing-plan-revision-digest",
+      "base": "revision-planning-1",
+      "mutation": {"op": "remove", "path": ["planRevisionDigest"]},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "null-plan-revision-digest",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["planRevisionDigest"], "value": null},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "number-plan-revision-digest",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["planRevisionDigest"], "value": 7},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "object-plan-revision-digest",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["planRevisionDigest"], "value": {}},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "empty-plan-revision-digest",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["planRevisionDigest"], "value": ""},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "null-signature",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["signature"], "value": null},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "number-signature",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["signature"], "value": 7},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "array-signature",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["signature"], "value": []},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "object-signature",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["signature"], "value": {}},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "extra-field",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["forged"], "value": "must-reject"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "wrong-spec-revision-type",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["specRevision"], "value": "2"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "invalid-created-at-calendar-date",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["createdAt"], "value": "2026-02-30T00:00:00Z"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "missing-created-at-offset",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["createdAt"], "value": "2026-01-01T00:00:00"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-node-is-pre-plan-only",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["nodes", "0", "nodeType"], "value": "BOOTSTRAP_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-node-phase-is-pre-plan-only",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["nodes", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrap-repository-barrier-phase-is-pre-plan-only",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING_REPOSITORY"},
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
+      "name": "bootstrapping-phase-is-pre-plan-only",
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["barriers", "0", "businessPhase"], "value": "BOOTSTRAPPING"},
+      "expectedErrorCode": "plan-hash-error"
     }
   ],
   "invariants": {
     "sameSemanticsShareHash": {
-      "a": "baseline",
-      "b": "same-semantics-diff-excluded"
+      "a": "post-bootstrap-new-full-sha",
+      "b": "same-semantics-different-excluded"
     },
     "differentLineageDiffersDigest": {
-      "a": "revision-a",
-      "b": "revision-b-diff-lineage"
+      "a": "revision-planning-1",
+      "b": "revision-planning-2-different-lineage"
     }
   }
 }

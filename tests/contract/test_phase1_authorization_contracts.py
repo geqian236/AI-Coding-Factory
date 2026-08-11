@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -9,7 +10,6 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -30,11 +30,18 @@ EXPECTED_NODE_POLICY_RAW_FILE_SHA256 = (
 SNAPSHOT_REGISTRY_PATH = REPO_ROOT / "contracts" / "policies" / "authorization-snapshot-registry.v1.json"
 RUN_SPEC_SCHEMA_PATH = SCHEMAS_DIR / "run-spec.v1.schema.json"
 PLAN_REVISION_SCHEMA_PATH = SCHEMAS_DIR / "plan-revision.v1.schema.json"
+PLAN_HASH_GOLDEN_PATH = REPO_ROOT / "contracts" / "golden" / "plan-hash.v1.json"
 MANIFEST_SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
 EMIT_MANIFEST_PATH = REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py"
 CODEGEN_PATH = REPO_ROOT / "contracts" / "codegen" / "generate.py"
 GENERATED_PYTHON_MODELS_PATH = (
     REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py"
+)
+
+# 跨语言只接受可移植的 RFC3339 子集；完整日历与 offset 语义由各端同名 format 检查器复核。
+FACTORY_RFC3339_DATE_TIME_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-5][0-9]"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
 )
 
 AUTHORIZATION_SCHEMA_FILES = {
@@ -848,30 +855,14 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.load(source)
 
 
-_RFC3339_DATE_TIME = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$"
-)
-
-
 def _is_rfc3339_date_time(value: object) -> bool:
-    """用标准库确定性校验 RFC3339，避免依赖 jsonschema 未锁定的 format extras。"""
-    if not isinstance(value, str):
-        return True
-    if _RFC3339_DATE_TIME.fullmatch(value) is None:
-        return False
-    normalized = value[:-1] + "+00:00" if value[-1] in {"Z", "z"} else value
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return False
-    return parsed.utcoffset() is not None
+    """复用生产标准库 RFC3339 checker，测试不得私自复制一套日期语义。"""
+    return plan_hash.is_factory_rfc3339_date_time(value)
 
 
 def _authorization_format_checker() -> jsonschema.FormatChecker:
-    """为授权合同显式注册 date-time checker；锁定环境未安装可选 RFC3339 包。"""
-    checker = jsonschema.FormatChecker()
-    checker.checks("date-time")(_is_rfc3339_date_time)
-    return checker
+    """复用生产 format checker，确保 schema 合同测试与 hash API 日期语义一致。"""
+    return plan_hash.factory_format_checker()
 
 
 def _snapshot_ref(binding_key: str, digest_character: str) -> dict[str, str]:
@@ -908,6 +899,15 @@ def _assert_raw_file_digest_matches(actual_digest: str, path: Path) -> None:
 def _load_emit_manifest_module() -> ModuleType:
     """加载既有 emitter，以真实 v1 实现作为 raw-file SHA-256 的唯一算法真源。"""
     spec = importlib.util.spec_from_file_location("phase1_emit_manifest", EMIT_MANIFEST_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_codegen_module() -> ModuleType:
+    """按真实脚本路径加载 codegen，直接验证 validator schema 失败不会被注释吞没。"""
+    spec = importlib.util.spec_from_file_location("phase1_contract_codegen", CODEGEN_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -1065,7 +1065,7 @@ def _registry_payload_validator(registry: dict[str, Any], binding: dict[str, Any
         "$defs": registry["$defs"],
         "allOf": [binding["payloadSchema"]],
     }
-    return jsonschema.Draft7Validator(wrapper)
+    return jsonschema.Draft7Validator(wrapper, format_checker=_authorization_format_checker())
 
 
 def _registry_payload_schema(registry: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
@@ -1168,20 +1168,19 @@ def _complete_plan_revision_for_snapshot() -> dict[str, Any]:
     }
 
 
-def _run_spec_for_new_repository_bootstrap() -> dict[str, Any]:
-    """构造 bootstrap 前的 RunSpec：new 模式只能冻结 null baseCommit。
+def _run_spec_for_new_repository_post_bootstrap() -> dict[str, Any]:
+    """构造 bootstrap 完成后的首个 RunSpec：new 保留用户来源，baseCommit 已可信固定。
 
-    BOOTSTRAP_REPOSITORY 尚未产生可信 Git 提交时，不能以空串、占位 SHA 或原位回填
-    绕过不可变计划边界；后续可信 SHA 只能写入新的子修订。
+    bootstrap 前只有 Task intake 与 Intent 的 repo.bootstrap 包络；它不是 RunSpec，
+    也不得被投影或进入任何 PlanRevision 摘要。此纯合同样本只覆盖已有可信提交后的
+    PLANNING 起点，运行时 permit/消费事务仍由后续任务 fail closed 实现。
     """
     run_spec = _complete_run_spec_for_semantic_snapshot()
-    run_spec["specRevision"] = 1
-    run_spec["parentRevisionId"] = None
     run_spec["repository"] = {
         "mode": "new",
         "root": "D:/codex项目/new-factory",
         "baseBranch": "main",
-        "baseCommit": None,
+        "baseCommit": "b" * 40,
     }
     return run_spec
 
@@ -1411,6 +1410,21 @@ def test_snapshot_registry_payload_validators_are_executable_and_fail_closed() -
         unknown["unapproved"] = "blocked"
         assert list(validator.iter_errors(unknown)), binding_key
 
+        if binding_key == "ExecutionAuthorization.semanticPlanHash":
+            for collection in ("nodes", "barriers"):
+                bootstrap_phase = copy.deepcopy(sample)
+                bootstrap_phase["workPlan"][collection][0]["businessPhase"] = "BOOTSTRAPPING_REPOSITORY"
+                assert list(validator.iter_errors(bootstrap_phase)), f"{binding_key}:{collection}"
+        if binding_key == "ExecutionAuthorization.planRevisionDigest":
+            for collection in ("nodes", "barriers"):
+                bootstrap_phase = copy.deepcopy(sample)
+                bootstrap_phase[collection][0]["businessPhase"] = "BOOTSTRAPPING_REPOSITORY"
+                assert list(validator.iter_errors(bootstrap_phase)), f"{binding_key}:{collection}"
+            for invalid_created_at in ("2026-02-30T00:00:00Z", "2026-01-01T00:00:00"):
+                invalid_date = copy.deepcopy(sample)
+                invalid_date["createdAt"] = invalid_created_at
+                assert list(validator.iter_errors(invalid_date)), invalid_created_at
+
         payload_schema = _registry_payload_schema(registry, binding)
         assert set(binding["payloadKeys"]["required"]) == set(payload_schema.get("required", [])), binding_key
         assert set(binding["payloadKeys"]["optional"]) == (
@@ -1488,11 +1502,11 @@ def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_fie
 
         changed_run_spec = copy.deepcopy(run_spec)
         if field == "repository":
-            # repository.mode 与 baseCommit 是成对状态；不能把 existing/SHA 撕裂成 new/SHA。
+            # new 是用户来源，不是无可信提交的中间态；两种来源都必须绑定 full SHA。
             changed_run_spec[field] = {
                 **changed_run_spec[field],
                 "mode": "new",
-                "baseCommit": None,
+                "baseCommit": "b" * 40,
             }
         else:
             changed_run_spec[field] = _mutate_schema_valid_value(
@@ -1510,8 +1524,8 @@ def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_fie
     assert list(validator.iter_errors(nested_extra))
 
 
-def test_repository_base_commit_wire_is_mode_conditioned_and_registry_is_same_source() -> None:
-    """RunSpec、运行时投影与 registry 必须一致区分 existing SHA 和 bootstrap 前 new/null。"""
+def test_repository_base_commit_requires_full_sha_for_both_modes_and_registry_is_same_source() -> None:
+    """首个 RunSpec 只能在 bootstrap 后产生，existing/new 都必须携带 full SHA。"""
     run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
     registry = _load_json(SNAPSHOT_REGISTRY_PATH)
     binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
@@ -1519,10 +1533,10 @@ def test_repository_base_commit_wire_is_mode_conditioned_and_registry_is_same_so
     registry_validator = _registry_payload_validator(registry, binding)
 
     existing = _complete_run_spec_for_semantic_snapshot()
-    bootstrap = _run_spec_for_new_repository_bootstrap()
+    new = _run_spec_for_new_repository_post_bootstrap()
 
-    # 两种合法时态必须同时被 RunSpec、真实 projection 和 registry 接受。
-    for valid_run_spec in (existing, bootstrap):
+    # mode 是用户来源，两个来源的首个 RunSpec 都已处在 bootstrap 后的可信 SHA 状态。
+    for valid_run_spec in (existing, new):
         _assert_accepted(run_spec_schema, valid_run_spec)
         projection = plan_hash.build_semantic_projection(valid_run_spec)
         assert not list(registry_validator.iter_errors(projection))
@@ -1530,98 +1544,113 @@ def test_repository_base_commit_wire_is_mode_conditioned_and_registry_is_same_so
     # registry 不能复制一份近似字段表；repository 子合同必须和 RunSpec 精确同源。
     assert payload_schema["properties"]["repository"] == run_spec_schema["properties"]["repository"]
 
-    missing_base_commit = copy.deepcopy(bootstrap)
+    missing_base_commit = copy.deepcopy(new)
     missing_base_commit["repository"].pop("baseCommit")
     existing_null = copy.deepcopy(existing)
     existing_null["repository"]["baseCommit"] = None
-    existing_short_sha = copy.deepcopy(existing)
-    existing_short_sha["repository"]["baseCommit"] = "a" * 7
-    new_with_sha = copy.deepcopy(bootstrap)
-    new_with_sha["repository"]["baseCommit"] = "a" * 40
+    empty_base_commit = copy.deepcopy(new)
+    empty_base_commit["repository"]["baseCommit"] = ""
+    short_base_commit = copy.deepcopy(existing)
+    short_base_commit["repository"]["baseCommit"] = "a" * 39
+    long_base_commit = copy.deepcopy(existing)
+    long_base_commit["repository"]["baseCommit"] = "a" * 41
+    uppercase_base_commit = copy.deepcopy(new)
+    uppercase_base_commit["repository"]["baseCommit"] = "A" * 40
+    wrong_mode = copy.deepcopy(new)
+    wrong_mode["repository"]["mode"] = "bootstrap"
+    repository_extra = copy.deepcopy(new)
+    repository_extra["repository"]["unapproved"] = "blocked"
 
     for invalid_run_spec in (
         missing_base_commit,
         existing_null,
-        existing_short_sha,
-        new_with_sha,
+        empty_base_commit,
+        short_base_commit,
+        long_base_commit,
+        uppercase_base_commit,
+        wrong_mode,
+        repository_extra,
     ):
         _assert_rejected(run_spec_schema, invalid_run_spec)
 
 
-def test_bootstrap_repository_uses_immutable_child_revision_with_changed_hash_and_snapshot_ref() -> None:
-    """bootstrap 后必须复制 new/null 计划为 existing/full-SHA 子修订，不能原位回填。"""
+def test_created_at_uses_shared_ascii_pattern_and_rfc3339_golden() -> None:
+    """RunSpec/PlanRevision 的日期 wire 先经同一 pattern 收口，再由 format 校验日历语义。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    golden = _load_json(PLAN_HASH_GOLDEN_PATH)["rfc3339DateTime"]
+
+    for schema in (run_spec_schema, plan_revision_schema):
+        created_at = schema["properties"]["createdAt"]
+        assert created_at["type"] == "string"
+        assert created_at["format"] == "date-time"
+        assert created_at["pattern"] == FACTORY_RFC3339_DATE_TIME_PATTERN
+
+    for case in golden["valid"]:
+        run_spec = _complete_run_spec_for_semantic_snapshot()
+        run_spec["createdAt"] = case["value"]
+        revision = _complete_plan_revision_for_snapshot()
+        revision["createdAt"] = case["value"]
+        _assert_accepted(run_spec_schema, run_spec)
+        _assert_accepted(plan_revision_schema, revision)
+
+    for case in golden["invalid"]:
+        run_spec = _complete_run_spec_for_semantic_snapshot()
+        run_spec["createdAt"] = case["value"]
+        revision = _complete_plan_revision_for_snapshot()
+        revision["createdAt"] = case["value"]
+        _assert_rejected(run_spec_schema, run_spec)
+        _assert_rejected(plan_revision_schema, revision)
+
+
+def test_snapshot_refs_recompute_and_detect_real_post_bootstrap_payload_changes() -> None:
+    """两个摘要 ref 都绑定真实 payload；变化后旧 ref 必须失配，不能伪造 bootstrap 转换。"""
     run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
     plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
     registry = _load_json(SNAPSHOT_REGISTRY_PATH)
     semantic_binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
     semantic_validator = _registry_payload_validator(registry, semantic_binding)
+    revision_binding = registry["snapshotBindings"]["ExecutionAuthorization.planRevisionDigest"]
 
-    bootstrap_run_spec = _run_spec_for_new_repository_bootstrap()
-    frozen_bootstrap_run_spec = copy.deepcopy(bootstrap_run_spec)
-    _assert_accepted(run_spec_schema, bootstrap_run_spec)
-    bootstrap_projection = plan_hash.build_semantic_projection(bootstrap_run_spec)
-    assert not list(semantic_validator.iter_errors(bootstrap_projection))
-    bootstrap_semantic_hash = plan_hash.semantic_plan_hash(bootstrap_run_spec)
-
-    bootstrap_revision = _complete_plan_revision_for_snapshot()
-    bootstrap_revision.update(
-        {
-            "planRevisionId": "plan-bootstrap-001",
-            "specRevision": 1,
-            "semanticPlanHash": bootstrap_semantic_hash,
-        }
+    run_spec = _run_spec_for_new_repository_post_bootstrap()
+    _assert_accepted(run_spec_schema, run_spec)
+    projection = plan_hash.build_semantic_projection(run_spec)
+    assert not list(semantic_validator.iter_errors(projection))
+    semantic_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "planning-001")
+    semantic_ref["digest"] = _snapshot_payload_digest(
+        semantic_binding["schemaId"], semantic_binding["schemaVersion"], projection
     )
-    bootstrap_revision.pop("parentRevisionId")
-    bootstrap_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(bootstrap_revision)
-    frozen_bootstrap_revision = copy.deepcopy(bootstrap_revision)
-    _assert_accepted(plan_revision_schema, bootstrap_revision)
+    _assert_snapshot_ref_matches_payload(semantic_ref, projection)
 
-    # 可信提交产生后复制新对象：旧 RunSpec/PlanRevision 保持字节语义不变。
-    child_run_spec = copy.deepcopy(bootstrap_run_spec)
-    child_run_spec["specRevision"] = 2
-    child_run_spec["parentRevisionId"] = bootstrap_revision["planRevisionId"]
-    child_run_spec["repository"] = {
-        **child_run_spec["repository"],
-        "mode": "existing",
-        "baseCommit": "b" * 40,
+    changed_run_spec = copy.deepcopy(run_spec)
+    changed_run_spec["repository"]["baseCommit"] = "c" * 40
+    _assert_accepted(run_spec_schema, changed_run_spec)
+    changed_projection = plan_hash.build_semantic_projection(changed_run_spec)
+    assert not list(semantic_validator.iter_errors(changed_projection))
+    assert changed_projection != projection
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(semantic_ref, changed_projection)
+
+    revision = _complete_plan_revision_for_snapshot()
+    revision["semanticPlanHash"] = plan_hash.semantic_plan_hash(run_spec)
+    revision["planRevisionDigest"] = plan_hash.plan_revision_digest(revision)
+    _assert_accepted(plan_revision_schema, revision)
+    material = {key: value for key, value in revision.items() if key not in plan_hash._DIGEST_EXCLUDED_FIELDS}
+    revision_ref = _snapshot_ref("ExecutionAuthorization.planRevisionDigest", "planning-001")
+    revision_ref["digest"] = _snapshot_payload_digest(
+        revision_binding["schemaId"], revision_binding["schemaVersion"], material
+    )
+    _assert_snapshot_ref_matches_payload(revision_ref, material)
+
+    changed_revision = copy.deepcopy(revision)
+    changed_revision["semanticPlanHash"] = plan_hash.semantic_plan_hash(changed_run_spec)
+    changed_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(changed_revision)
+    changed_material = {
+        key: value for key, value in changed_revision.items() if key not in plan_hash._DIGEST_EXCLUDED_FIELDS
     }
-    _assert_accepted(run_spec_schema, child_run_spec)
-    child_projection = plan_hash.build_semantic_projection(child_run_spec)
-    assert not list(semantic_validator.iter_errors(child_projection))
-    child_semantic_hash = plan_hash.semantic_plan_hash(child_run_spec)
-
-    child_revision = copy.deepcopy(bootstrap_revision)
-    child_revision.update(
-        {
-            "planRevisionId": "plan-bootstrap-002",
-            "parentRevisionId": bootstrap_revision["planRevisionId"],
-            "specRevision": 2,
-            "semanticPlanHash": child_semantic_hash,
-        }
-    )
-    child_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(child_revision)
-    _assert_accepted(plan_revision_schema, child_revision)
-
-    assert bootstrap_run_spec == frozen_bootstrap_run_spec
-    assert bootstrap_revision == frozen_bootstrap_revision
-    assert child_run_spec is not bootstrap_run_spec
-    assert child_revision is not bootstrap_revision
-    assert child_run_spec["specRevision"] == bootstrap_run_spec["specRevision"] + 1
-    assert child_run_spec["parentRevisionId"] == bootstrap_revision["planRevisionId"]
-    assert child_revision["specRevision"] == bootstrap_revision["specRevision"] + 1
-    assert child_revision["parentRevisionId"] == bootstrap_revision["planRevisionId"]
-    assert child_semantic_hash != bootstrap_semantic_hash
-    assert child_revision["planRevisionDigest"] != bootstrap_revision["planRevisionDigest"]
-
-    bootstrap_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "bootstrap-001")
-    bootstrap_ref["digest"] = _snapshot_payload_digest(
-        semantic_binding["schemaId"], semantic_binding["schemaVersion"], bootstrap_projection
-    )
-    child_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "bootstrap-002")
-    child_ref["digest"] = _snapshot_payload_digest(
-        semantic_binding["schemaId"], semantic_binding["schemaVersion"], child_projection
-    )
-    assert child_ref["digest"] != bootstrap_ref["digest"]
+    assert changed_material != material
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(revision_ref, changed_material)
 
 
 def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_field() -> None:
@@ -1633,6 +1662,10 @@ def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_fi
     plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
     revision = _complete_plan_revision_for_snapshot()
     _assert_accepted(plan_revision_schema, revision)
+
+    assert plan_revision_schema["properties"]["signature"] == {"type": "string", "minLength": 1}
+    assert "signature" not in plan_revision_schema["required"]
+    assert "planRevisionDigest" in plan_revision_schema["required"]
 
     # 排除集直接来自运行时摘要实现；PlanRevision schema 是 payload 字段和类型的唯一合同来源。
     excluded_fields = set(plan_hash._DIGEST_EXCLUDED_FIELDS)
@@ -2696,3 +2729,293 @@ def test_generated_authorization_types_are_current_in_all_languages() -> None:
         content = path.read_text(encoding="utf-8")
         assert "IntentAuthorization" in content, f"{language} 未生成 IntentAuthorization"
         assert "ExecutionAuthorization" in content, f"{language} 未生成 ExecutionAuthorization"
+
+
+def test_codegen_validator_schema_parser_is_fail_closed() -> None:
+    """validator schema 解析不得把任一不可信输入降级成 ERROR 注释或空 schema。"""
+    codegen = _load_codegen_module()
+
+    # 同一节点循环避免 pytest 参数节点数量成为合同测试本身的脆弱耦合。
+    cases = (
+        (b"\xff", "VALIDATOR_SCHEMA_INVALID_UTF8"),
+        (b"\xef\xbb\xbf{}", "VALIDATOR_SCHEMA_INVALID_UTF8"),
+        (b"{", "VALIDATOR_SCHEMA_INVALID_JSON"),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":NaN}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":Infinity}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":-Infinity}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (b"null", "VALIDATOR_SCHEMA_ROOT_NOT_OBJECT"),
+        (b"[]", "VALIDATOR_SCHEMA_ROOT_NOT_OBJECT"),
+        (b'{"$schema":7}', "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7"),
+        (b'{"type":"object"}', "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7"),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}',
+            "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","type":7}',
+            "VALIDATOR_SCHEMA_INVALID_DRAFT7",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","type":"string","type":"number"}',
+            "VALIDATOR_SCHEMA_DUPLICATE_KEY",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","properties":{"nested":{"format":"unknown-format"}}}',
+            "VALIDATOR_SCHEMA_UNKNOWN_FORMAT",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"https://example.invalid/schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"file:///D:/outside/schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"other.schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+    )
+    for raw, expected_error in cases:
+        with pytest.raises(codegen.ValidatorSchemaError) as error:
+            codegen.parse_validator_schema(raw)
+        assert str(error.value) == expected_error
+
+    # 嵌入层是独立的第二道边界；即使上游误传非有限浮点，也不得生成非标准 JSON。
+    for non_finite in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(codegen.ValidatorSchemaError) as error:
+            codegen._embedded_schema_json({"minimum": non_finite})
+        assert str(error.value) == "VALIDATOR_SCHEMA_INVALID_JSON"
+
+    # `properties` 内的字段名不是 schema keyword；不能因用户字段名叫 format/$ref 而误拒绝。
+    property_named_keyword = codegen.parse_validator_schema(
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"format":{"type":"string"},"$ref":{"type":"string"}}}'
+    )
+    assert set(property_named_keyword["properties"]) == {"format", "$ref"}
+
+
+def test_codegen_validator_schema_missing_file_and_partial_write_are_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺失 schema 必须在三份输出写入前停止，不能留下部分生成树。"""
+    codegen = _load_codegen_module()
+    writes: list[object] = []
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "REPO_ROOT", Path(r"D:\codex项目\missing-validator-schema-root"))
+        with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_READ_FAILED"):
+            codegen.load_required_validator_schema("contracts/schemas/run-spec.v1.schema.json")
+
+    def _fail_required_schemas() -> object:
+        raise codegen.ValidatorSchemaError("VALIDATOR_SCHEMA_READ_FAILED")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "load_required_validator_schemas", _fail_required_schemas)
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert writes == [], "validator schema 失败时不得写入任一生成目标"
+
+    # 非标准 JSON 常量必须沿真实 main 路径在首次 write_or_check 前稳定停止。
+    non_finite_documents = (
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":NaN}',
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":Infinity}',
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":-Infinity}',
+    )
+    for raw in non_finite_documents:
+        writes.clear()
+
+        def _load_non_finite_schema(raw_schema: bytes = raw) -> dict[str, object]:
+            codegen.parse_validator_schema(raw_schema)
+            return {}
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", _load_non_finite_schema)
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(
+                codegen,
+                "write_or_check",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+            )
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            assert codegen.main() == 1
+        assert writes == [], "非有限 JSON 常量不得越过内存生成边界进入任何写入"
+
+
+def test_codegen_raw_schema_sha_and_digest_material_preconditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """原始 bytes SHA 必须感知空白漂移；PlanRevision 派生前必须显式保留两项排除字段。"""
+    codegen = _load_codegen_module()
+    schema_relative_path = "contracts/schemas/plan-revision.v1.schema.json"
+    source_bytes = PLAN_REVISION_SCHEMA_PATH.read_bytes()
+    raw_versions = iter((source_bytes, source_bytes + b" \n"))
+
+    # 不创建 pytest 临时目录；严格 loader 必须直接以 read_bytes 返回的原始字节计算 SHA。
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", lambda *args, **kwargs: next(raw_versions))
+        _, original_sha = codegen.load_required_validator_schema(schema_relative_path)
+        _, whitespace_changed_sha = codegen.load_required_validator_schema(schema_relative_path)
+    assert original_sha != whitespace_changed_sha, "权威 schema 原始空白字节变化也必须改变嵌入 SHA"
+
+    missing_digest_property = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    del missing_digest_property["properties"]["planRevisionDigest"]
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_digest_property)
+
+    missing_digest_required = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    missing_digest_required["required"].remove("planRevisionDigest")
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_digest_required)
+
+    missing_signature_property = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    missing_signature_property["properties"].pop("signature", None)
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_signature_property)
+
+    required_signature = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    required_signature["required"].append("signature")
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(required_signature)
+
+
+def test_codegen_ordinary_entry_failure_prevents_all_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通 catalog entry 失败也必须阻断三语言写入，不能遗留 ERROR 注释生成物。"""
+    codegen = _load_codegen_module()
+
+    # 第一轮：普通 entry 读取失败，验证 main 不会把它降级成注释后写入。
+    writes: list[object] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(
+            codegen,
+            "load_catalog",
+            lambda: {
+                "schemas": [
+                    {
+                        "codegen": True,
+                        "schemaPath": "contracts/schemas/absent.schema.json",
+                        "name": "AbsentDefinition",
+                    }
+                ]
+            },
+        )
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert writes == [], "普通 schema 失败时不得写入任一生成目标"
+
+    # 第二轮：TypeScript 内容已在内存生成后 Python 失败，仍必须保持首次写入前失败。
+    calls: list[str] = []
+    writes.clear()
+
+    def _typescript_generated(*args: object, **kwargs: object) -> str:
+        calls.append("typescript")
+        return "// in-memory TypeScript content"
+
+    def _python_failed(*args: object, **kwargs: object) -> str:
+        calls.append("python")
+        raise codegen.CodegenGenerationError("CODEGEN_GENERATION_FAILED")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "generate_typescript", _typescript_generated)
+        patch.setattr(codegen, "generate_python", _python_failed)
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert calls == ["typescript", "python"]
+    assert writes == [], "任一后续语言内容失败时不得写入已生成的前序内容"
+
+
+def test_codegen_embeds_raw_schema_sha_and_check_detects_drift() -> None:
+    """三语言均嵌入两份权威原文件 SHA；每个目标的一字节漂移都要被 --check 拒绝。"""
+    codegen = _load_codegen_module()
+    entries = [entry for entry in codegen.load_catalog()["schemas"] if entry.get("codegen") is True]
+    source_markers = {
+        "RUN_SPEC_SCHEMA_SOURCE_SHA256": _raw_file_sha256(RUN_SPEC_SCHEMA_PATH),
+        "PLAN_REVISION_SCHEMA_SOURCE_SHA256": _raw_file_sha256(PLAN_REVISION_SCHEMA_PATH),
+    }
+    generated_contents = {
+        "TypeScript": codegen.generate_typescript(entries),
+        "Python": codegen.generate_python(entries),
+        "Rust": codegen.generate_rust(entries),
+    }
+    validator_schemas = codegen.load_required_validator_schemas()
+    embedded_structures = {
+        "RUN_SPEC_SCHEMA_JSON": validator_schemas["runSpec"][0],
+        "PLAN_REVISION_SCHEMA_JSON": validator_schemas["planRevision"][0],
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON": validator_schemas["planRevisionDigestMaterial"][0],
+    }
+    embedded_sha_markers = {
+        name + "_SHA256": "sha256:"
+        + hashlib.sha256(codegen._embedded_schema_json(schema).encode("utf-8")).hexdigest()
+        for name, schema in embedded_structures.items()
+    }
+
+    class _DriftedGeneratedOutput:
+        """只读伪输出文件，模拟嵌入 SHA 被手工篡改后的 --check 输入。"""
+
+        def __init__(self, content: str) -> None:
+            self._content = content
+
+        def exists(self) -> bool:
+            return True
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            return self._content
+
+    def _python_embedded_schema_values(content: str) -> dict[str, dict[str, Any]]:
+        """从 Python 源码 AST 读取字符串常量，证明生成物不在 import 时 JSON 解析。"""
+        values: dict[str, dict[str, Any]] = {}
+        for statement in ast.parse(content).body:
+            if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
+                continue
+            if statement.target.id not in embedded_structures:
+                continue
+            raw_json = ast.literal_eval(statement.value)
+            assert isinstance(raw_json, str)
+            values[statement.target.id] = json.loads(raw_json)
+        return values
+
+    for language, content in generated_contents.items():
+        for marker, source_sha in source_markers.items():
+            assert marker in content, f"{language} 未嵌入 {marker}"
+            assert source_sha in content, f"{language} 未嵌入 {marker} 的原文件 SHA"
+            drifted = content.replace(source_sha, "sha256:" + "0" * 64, 1)
+            assert not codegen.write_or_check(_DriftedGeneratedOutput(drifted), content, check_mode=True)
+        for marker, embedded_sha in embedded_sha_markers.items():
+            assert marker in content, f"{language} 未嵌入 {marker}"
+            assert embedded_sha in content, f"{language} 未嵌入 {marker} 的内容 SHA"
+            drifted = content.replace(embedded_sha, "sha256:" + "0" * 64, 1)
+            assert not codegen.write_or_check(_DriftedGeneratedOutput(drifted), content, check_mode=True)
+        if language == "Python":
+            assert _python_embedded_schema_values(content) == embedded_structures
+        elif language == "TypeScript":
+            for embedded_schema in embedded_structures.values():
+                schema_json_literal = json.dumps(
+                    codegen._embedded_schema_json(embedded_schema), ensure_ascii=False
+                )
+                assert schema_json_literal in content, "TypeScript 未机械嵌入 validator schema JSON 字符串"
+        else:
+            for embedded_schema in embedded_structures.values():
+                assert codegen._embedded_schema_json(embedded_schema) in content, (
+                    f"{language} 未机械嵌入权威/派生 validator schema 结构"
+                )
