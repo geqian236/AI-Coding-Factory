@@ -317,10 +317,15 @@ class TestPlanRevisionDigestVectors:
         assert plan_revision_digest(case["revision"]) == case["expected"]
 
     def test_different_lineage_differs(self) -> None:
-        """相同语义、不同谱系（parentRevisionId）的 digest 必须不同。"""
+        """谱系或任一 DAG material 变化都必须改变 digest。"""
         inv = _PLAN["invariants"]["differentLineageDiffersDigest"]
         by_name = {c["name"]: c for c in _PLAN["planRevisionDigest"]}
         assert by_name[inv["a"]]["expected"] != by_name[inv["b"]]["expected"]
+
+        dag_inv = _PLAN["invariants"]["differentDagMaterialDiffersDigest"]
+        baseline = by_name[dag_inv["base"]]["revision"]
+        changed = _apply_golden_mutation(deepcopy(baseline), dag_inv["mutation"])
+        assert plan_revision_digest(baseline) != plan_revision_digest(changed)
 
     def test_signature_excluded_from_digest(self) -> None:
         """signature 字段不得影响 planRevisionDigest。"""

@@ -1202,19 +1202,25 @@ def _complete_plan_revision_for_snapshot() -> dict[str, Any]:
         "nodes": [
             {
                 "logicalNodeId": "node-plan-001",
-                "nodeType": "PLAN",
                 "businessPhase": "PLANNING",
-                "dependencies": [],
-                "hasSideEffect": False,
+                "barrierOrdinal": 0,
+                "nodeType": "PLAN",
+                "required": True,
+                "dependsOn": [],
+                "sideEffectClass": "read-only",
                 "requiredArtifacts": [],
-                "gate": "plan-created-v1",
+                "successPredicateId": "plan-created-v1",
+                "timeoutMs": 1_000,
+                "retryPolicyId": "no-retry",
             }
         ],
         "barriers": [
             {
-                "barrierId": "barrier-plan-001",
                 "businessPhase": "PLANNING",
-                "nodeIds": ["node-plan-001"],
+                "barrierOrdinal": 0,
+                "requiredNodeIds": ["node-plan-001"],
+                "settleTimeoutMs": 1_000,
+                "passPredicateId": "planning-complete-v1",
             }
         ],
         "stageMaps": {"CODEX_APPROVED": ["node-plan-001"]},
@@ -1845,8 +1851,20 @@ def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_fi
     binding = registry["snapshotBindings"][binding_key]
     payload_schema = _registry_payload_schema(registry, binding)
     plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
     revision = _complete_plan_revision_for_snapshot()
     _assert_accepted(plan_revision_schema, revision)
+
+    # PlanRevision 不能再维护一份有损 DAG wire：节点与 barrier 必须逐字机械复用 RunSpec，
+    # registry 的 semantic/revision 两份摘要 material 也必须镜像同一结构。
+    run_work_plan = run_spec_schema["properties"]["workPlan"]["properties"]
+    semantic_payload = registry["$defs"]["semanticPlanPayload"]["properties"]["workPlan"]["properties"]
+    revision_payload = registry["$defs"]["planRevisionPayload"]["properties"]
+    for field in ("nodes", "barriers"):
+        expected_fragment = run_work_plan[field]
+        assert plan_revision_schema["properties"][field] == expected_fragment, field
+        assert semantic_payload[field] == expected_fragment, field
+        assert revision_payload[field] == expected_fragment, field
 
     assert plan_revision_schema["properties"]["signature"] == {"type": "string", "minLength": 1}
     assert "signature" not in plan_revision_schema["required"]

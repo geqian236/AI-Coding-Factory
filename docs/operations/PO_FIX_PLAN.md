@@ -174,7 +174,10 @@ Wave 4 (最终收口)
 7. **prepared-batch.v2**：从单 Task 改成多 Task manifest，含 `perTaskHeads: [{taskId, expectedCommittedHead, firstOrdinal, lastOrdinal}]`、`orderedIngestIds`、`segmentDigests`、`eventCount`、`payloadBytes`、`schemaVersion/coordinatorVersion`、`state` (CLAIMED→PREPARING→PREPARED→COMMITTED)、`writerEpoch`、完整尾标。
 8. **authorization schema**：新建 `intent-authorization.v1.schema.json` + `execution-authorization.v1.schema.json`；承载 §11 L739 详列字段（issued_at/expires_at/revoked_at/stage_capability_map_version/allowed_capability_set_digest/autonomous_execution_budget_ms/...）。
 9. **node-capability-map.v1**：每 nodeType 补 5 字段：`resourceFingerprintSchema`、`idempotencyKeyTemplate`、`completionFact`、`authorizationConsumptionPoint`、`retryClass`。
-10. **plan-revision.v1**：nodes 补齐 `barrierOrdinal/required/sideEffectClass/successPredicateId/timeoutMs/retryPolicyId`（与 RunSpec workPlan 无损对应）。
+10. **plan-revision.v1**：`nodes` 精确复用 RunSpec `workPlan.nodes` 的 11 字段
+    `logicalNodeId/businessPhase/barrierOrdinal/nodeType/required/dependsOn/sideEffectClass/requiredArtifacts/successPredicateId/timeoutMs/retryPolicyId`；
+    `barriers` 精确复用 `businessPhase/barrierOrdinal/requiredNodeIds/settleTimeoutMs/passPredicateId`。
+    删除有损旧别名 `dependencies/hasSideEffect/gate/barrierId/nodeIds`；运行期 `barrierId` 仍按 Master §7.1 域分离算法派生，不进入不可变计划 wire。
 
 **验收**：
 - `generate.py` 重新生成三语言类型

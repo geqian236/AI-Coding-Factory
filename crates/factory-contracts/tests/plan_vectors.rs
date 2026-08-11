@@ -345,7 +345,7 @@ fn plan_revision_digest_vectors() {
 
 #[test]
 fn plan_revision_digest_differs_across_lineage() {
-    // 不变量：语义相同但谱系不同 → planRevisionDigest 必须不同。
+    // 不变量：谱系或任一 DAG material 变化都必须改变 planRevisionDigest。
     let golden = load_golden("plan-hash.v1.json");
     let inv = &golden["invariants"]["differentLineageDiffersDigest"];
     let a_name = inv["a"].as_str().unwrap();
@@ -362,6 +362,20 @@ fn plan_revision_digest_differs_across_lineage() {
         find(a_name),
         find(b_name),
         "不同谱系应得到不同 planRevisionDigest"
+    );
+
+    let dag_inv = &golden["invariants"]["differentDagMaterialDiffersDigest"];
+    let base_name = dag_inv["base"].as_str().unwrap();
+    let baseline = cases
+        .iter()
+        .find(|case| case["name"].as_str() == Some(base_name))
+        .unwrap()["revision"]
+        .clone();
+    let changed = apply_golden_mutation(baseline.clone(), &dag_inv["mutation"]);
+    assert_ne!(
+        plan_revision_digest(&baseline).unwrap(),
+        plan_revision_digest(&changed).unwrap(),
+        "DAG material 变化必须改变 planRevisionDigest"
     );
 }
 

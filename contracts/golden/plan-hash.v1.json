@@ -360,39 +360,52 @@
         "nodes": [
           {
             "logicalNodeId": "node-plan",
-            "nodeType": "PLAN",
             "businessPhase": "PLANNING",
-            "dependencies": [],
-            "hasSideEffect": false,
-            "requiredArtifacts": ["runspec"]
+            "barrierOrdinal": 0,
+            "nodeType": "PLAN",
+            "required": true,
+            "dependsOn": [],
+            "sideEffectClass": "read-only",
+            "requiredArtifacts": ["runspec"],
+            "successPredicateId": "plan-created",
+            "timeoutMs": 30000,
+            "retryPolicyId": "no-retry"
           },
           {
             "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
-            "nodeType": "DESIGN_REVIEW",
             "businessPhase": "DESIGN_REVIEWING",
-            "dependencies": ["node-plan"],
-            "hasSideEffect": false,
+            "barrierOrdinal": 1,
+            "nodeType": "DESIGN_REVIEW",
+            "required": true,
+            "dependsOn": ["node-plan"],
+            "sideEffectClass": "read-only",
             "requiredArtifacts": [],
-            "gate": "gate-BOOTSTRAP_REPOSITORY-free-text"
+            "successPredicateId": "design-reviewed",
+            "timeoutMs": 30000,
+            "retryPolicyId": "no-retry"
           }
         ],
         "barriers": [
           {
-            "barrierId": "barrier-plan",
             "businessPhase": "PLANNING",
-            "nodeIds": ["node-plan"]
+            "barrierOrdinal": 0,
+            "requiredNodeIds": ["node-plan"],
+            "settleTimeoutMs": 30000,
+            "passPredicateId": "plan-complete"
           },
           {
-            "barrierId": "barrier-design",
             "businessPhase": "DESIGN_REVIEWING",
-            "nodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"]
+            "barrierOrdinal": 1,
+            "requiredNodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"],
+            "settleTimeoutMs": 30000,
+            "passPredicateId": "gate-BOOTSTRAP_REPOSITORY-free-text"
           }
         ],
         "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
         "createdAt": "2026-08-11T00:00:00Z",
         "signature": "signature-not-hashed"
       },
-      "expected": "sha256:0310fe3775f0ab3e69fde320fdb2627652796f11b08e9023a58b51e5a668f48b"
+      "expected": "sha256:27f9b4b178bab3941d93460b04efd20522fffe0abba0fae89951dd3e7647c314"
     },
     {
       "name": "revision-planning-2-different-lineage",
@@ -410,38 +423,51 @@
         "nodes": [
           {
             "logicalNodeId": "node-plan",
-            "nodeType": "PLAN",
             "businessPhase": "PLANNING",
-            "dependencies": [],
-            "hasSideEffect": false,
-            "requiredArtifacts": ["runspec"]
+            "barrierOrdinal": 0,
+            "nodeType": "PLAN",
+            "required": true,
+            "dependsOn": [],
+            "sideEffectClass": "read-only",
+            "requiredArtifacts": ["runspec"],
+            "successPredicateId": "plan-created",
+            "timeoutMs": 30000,
+            "retryPolicyId": "no-retry"
           },
           {
             "logicalNodeId": "node-BOOTSTRAP_REPOSITORY-free-id",
-            "nodeType": "DESIGN_REVIEW",
             "businessPhase": "DESIGN_REVIEWING",
-            "dependencies": ["node-plan"],
-            "hasSideEffect": false,
+            "barrierOrdinal": 1,
+            "nodeType": "DESIGN_REVIEW",
+            "required": true,
+            "dependsOn": ["node-plan"],
+            "sideEffectClass": "read-only",
             "requiredArtifacts": [],
-            "gate": "gate-BOOTSTRAP_REPOSITORY-free-text"
+            "successPredicateId": "design-reviewed",
+            "timeoutMs": 30000,
+            "retryPolicyId": "no-retry"
           }
         ],
         "barriers": [
           {
-            "barrierId": "barrier-plan",
             "businessPhase": "PLANNING",
-            "nodeIds": ["node-plan"]
+            "barrierOrdinal": 0,
+            "requiredNodeIds": ["node-plan"],
+            "settleTimeoutMs": 30000,
+            "passPredicateId": "plan-complete"
           },
           {
-            "barrierId": "barrier-design",
             "businessPhase": "DESIGN_REVIEWING",
-            "nodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"]
+            "barrierOrdinal": 1,
+            "requiredNodeIds": ["node-BOOTSTRAP_REPOSITORY-free-id"],
+            "settleTimeoutMs": 30000,
+            "passPredicateId": "gate-BOOTSTRAP_REPOSITORY-free-text"
           }
         ],
         "stageMaps": {"CODEX_APPROVED": ["node-plan"]},
         "createdAt": "2026-08-11T00:01:00Z"
       },
-      "expected": "sha256:a4f4b286af6be3e7d95addfd7630d7530bc372d2d58a7be3711d42f566124388"
+      "expected": "sha256:175b0380cdb17dadf381711b0032980aefc449e6b2189b1403674a40c8cfa9e6"
     }
   ],
   "invalidPlanRevision": [
@@ -556,6 +582,36 @@
       "expectedErrorCode": "plan-hash-error"
     },
     {
+      "name": "plan-revision-dag-wire-is-run-spec-shaped",
+      "base": "revision-planning-1",
+      "mutations": [
+        {"name": "legacy-node-wire", "op": "replace", "path": ["nodes", "0"], "value": {"logicalNodeId": "node-plan", "nodeType": "PLAN", "businessPhase": "PLANNING", "dependencies": [], "hasSideEffect": false, "requiredArtifacts": ["runspec"], "gate": "plan-created"}},
+        {"name": "legacy-barrier-wire", "op": "replace", "path": ["barriers", "0"], "value": {"barrierId": "barrier-plan", "businessPhase": "PLANNING", "nodeIds": ["node-plan"]}},
+        {"name": "missing-node-logical-id", "op": "remove", "path": ["nodes", "0", "logicalNodeId"]},
+        {"name": "missing-node-business-phase", "op": "remove", "path": ["nodes", "0", "businessPhase"]},
+        {"name": "missing-node-barrier-ordinal", "op": "remove", "path": ["nodes", "0", "barrierOrdinal"]},
+        {"name": "missing-node-type", "op": "remove", "path": ["nodes", "0", "nodeType"]},
+        {"name": "missing-node-required", "op": "remove", "path": ["nodes", "0", "required"]},
+        {"name": "missing-node-depends-on", "op": "remove", "path": ["nodes", "0", "dependsOn"]},
+        {"name": "missing-node-side-effect-class", "op": "remove", "path": ["nodes", "0", "sideEffectClass"]},
+        {"name": "missing-node-required-artifacts", "op": "remove", "path": ["nodes", "0", "requiredArtifacts"]},
+        {"name": "missing-node-success-predicate", "op": "remove", "path": ["nodes", "0", "successPredicateId"]},
+        {"name": "missing-node-timeout", "op": "remove", "path": ["nodes", "0", "timeoutMs"]},
+        {"name": "missing-node-retry-policy", "op": "remove", "path": ["nodes", "0", "retryPolicyId"]},
+        {"name": "legacy-node-dependencies-alias", "op": "replace", "path": ["nodes", "0", "dependencies"], "value": []},
+        {"name": "legacy-node-has-side-effect-alias", "op": "replace", "path": ["nodes", "0", "hasSideEffect"], "value": false},
+        {"name": "legacy-node-gate-alias", "op": "replace", "path": ["nodes", "0", "gate"], "value": "plan-created"},
+        {"name": "missing-barrier-business-phase", "op": "remove", "path": ["barriers", "0", "businessPhase"]},
+        {"name": "missing-barrier-ordinal", "op": "remove", "path": ["barriers", "0", "barrierOrdinal"]},
+        {"name": "missing-barrier-required-node-ids", "op": "remove", "path": ["barriers", "0", "requiredNodeIds"]},
+        {"name": "missing-barrier-settle-timeout", "op": "remove", "path": ["barriers", "0", "settleTimeoutMs"]},
+        {"name": "missing-barrier-pass-predicate", "op": "remove", "path": ["barriers", "0", "passPredicateId"]},
+        {"name": "legacy-barrier-id-alias", "op": "replace", "path": ["barriers", "0", "barrierId"], "value": "barrier-plan"},
+        {"name": "legacy-barrier-node-ids-alias", "op": "replace", "path": ["barriers", "0", "nodeIds"], "value": ["node-plan"]}
+      ],
+      "expectedErrorCode": "plan-hash-error"
+    },
+    {
       "name": "post-bootstrap-plan-revision-must-start-with-planning",
       "base": "revision-planning-1",
       "mutations": [
@@ -611,6 +667,10 @@
     "differentLineageDiffersDigest": {
       "a": "revision-planning-1",
       "b": "revision-planning-2-different-lineage"
+    },
+    "differentDagMaterialDiffersDigest": {
+      "base": "revision-planning-1",
+      "mutation": {"op": "replace", "path": ["nodes", "0", "timeoutMs"], "value": 30001}
     }
   }
 }

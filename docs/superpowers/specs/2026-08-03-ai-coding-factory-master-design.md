@@ -357,7 +357,12 @@ FINALIZING
 
 正常路径按该顺序推进；修复循环允许 `CODE_REVIEWING → IMPLEMENTING`，范围内重规划允许当前开发阶段回到 `PLANNING`，回滚允许任何发布/验收阶段进入 `ROLLING_BACK`。每次非顺序跳转必须记录原因、来源 gate 和新 PlanRevision。
 
-`workPlan` 的每个 node 必须冻结 `businessPhase`、`nodeType`、依赖、是否包含外部副作用、必需 Artifact 和 gate。一个 Run 同时只允许派发当前 phase barrier 内的节点；barrier 内可并行，但不得跨 barrier 提前派发后续业务阶段。`Run.phase` 是 active PlanRevision 中“当前尚未通过的 barrier”的物化投影，只能由 barrier 结果或显式重规划、修复、回滚转换更新，不能按“最靠前/最靠后活动 Step”临时猜测。
+`workPlan.nodes` 与 PlanRevision `nodes` 使用同一不可变 wire，每个 node 精确冻结
+`logicalNodeId`、`businessPhase`、`barrierOrdinal`、`nodeType`、`required`、`dependsOn`、
+`sideEffectClass`、`requiredArtifacts`、`successPredicateId`、`timeoutMs`、`retryPolicyId`。
+`workPlan.barriers` 与 PlanRevision `barriers` 同样精确冻结 `businessPhase`、`barrierOrdinal`、
+`requiredNodeIds`、`settleTimeoutMs`、`passPredicateId`；不得使用有损旧别名
+`dependencies/hasSideEffect/gate/barrierId/nodeIds`。一个 Run 同时只允许派发当前 phase barrier 内的节点；barrier 内可并行，但不得跨 barrier 提前派发后续业务阶段。`Run.phase` 是 active PlanRevision 中“当前尚未通过的 barrier”的物化投影，只能由 barrier 结果或显式重规划、修复、回滚转换更新，不能按“最靠前/最靠后活动 Step”临时猜测。
 
 令 `knownTerminalOutcome = {SUCCEEDED, FAILED, INTERRUPTED, SKIPPED, CANCELLED}`：
 
@@ -366,7 +371,7 @@ FINALIZING
 - 同一 barrier 出现 blocking failure 后停止派发尚未开始的兄弟节点，并以明确原因终结为 `SKIPPED/CANCELLED`；已经派发的副作用节点不得因兄弟失败被假定取消，必须取得完成事实或进入 `RECONCILING`。副作用节点默认排在无副作用前置节点通过之后；确需并行时必须冻结独立资源 fencing 和独立完成事实。
 - `UNKNOWN_REMOTE_STATE` 永远不能令 barrier settled。settle deadline 到期只能保持对应 Step 为 `RECONCILING/UNKNOWN_REMOTE_STATE`，将 Run 置为 `BLOCKED` 并显示 `ACTION_REQUIRED`；不得把未知洗成失败、取消、跳过或成功，也不得推进 phase 或派发后续副作用。
 
-每个 barrier 使用 `barrierId = "bar_" + lowercaseHex(SHA-256(JCS(["factory-barrier-v1", runId, planRevisionDigest, businessPhase, barrierOrdinal])))` 作为稳定身份，并持久化到 `phase_barriers`；该编码不得用无长度边界的字符串拼接代替。`barrierPassed`、`Run.phase/active_barrier_id`、`Task.achieved_stage`、可能发生的最终 lifecycle 和对应 `state.changed` 必须在同一 SQLite 事务更新；事务成功谓词还要求目标 barrier 已 passed、无活动 Attempt、无 `UNKNOWN_REMOTE_STATE` 且所有必需 evidence 已 COMMITTED。
+每个 barrier 使用 `barrierId = "bar_" + lowercaseHex(SHA-256(JCS(["factory-barrier-v1", runId, planRevisionDigest, businessPhase, barrierOrdinal])))` 作为稳定身份，并持久化到 `phase_barriers`；`barrierId` 是绑定具体 Run 的派生身份，不是 RunSpec/PlanRevision barrier wire 字段。该编码不得用无长度边界的字符串拼接代替。`barrierPassed`、`Run.phase/active_barrier_id`、`Task.achieved_stage`、可能发生的最终 lifecycle 和对应 `state.changed` 必须在同一 SQLite 事务更新；事务成功谓词还要求目标 barrier 已 passed、无活动 Attempt、无 `UNKNOWN_REMOTE_STATE` 且所有必需 evidence 已 COMMITTED。
 
 通过门禁后，`Task.achieved_stage` 在同一事务中单调更新：
 
@@ -473,7 +478,7 @@ semanticPlanHash: sha256:canonical-plan-semantics
 planRevisionDigest: sha256:complete-immutable-plan-revision
 ```
 
-PlanRevision 写入后不可修改，修复只能新建子版本；当前执行游标始终指向唯一 active PlanRevision。读取时必须同时重算 `semanticPlanHash` 与 `planRevisionDigest`，任一不匹配均 fail closed。
+PlanRevision 写入后不可修改，修复只能新建子版本；当前执行游标始终指向唯一 active PlanRevision。其 `nodes`/`barriers` 与上述 RunSpec `workPlan` 两个片段逐字段同形，顶层 `dagVersion`、`stageMaps` 和谱系字段保持独立；读取时必须同时重算 `semanticPlanHash` 与 `planRevisionDigest`，任一不匹配均 fail closed。
 
 新项目在规划前进入 `BOOTSTRAPPING_REPOSITORY`：只允许在用户选定的 D 盘空目录创建 Git 仓库、默认分支、基础 `.gitignore` 和可审计的初始空提交；该提交成为可信 `baseCommit`。目录非空、已有 Git 元数据或路径归属不明确时 fail closed，不覆盖内容。
 

@@ -539,7 +539,7 @@
         "nodes": {
           "type": "array",
           "minItems": 1,
-          "description": "DAG 节点列表",
+          "description": "DAG 工作节点列表",
           "allOf": [
             {
               "items": [
@@ -559,11 +559,16 @@
             "additionalProperties": false,
             "required": [
               "logicalNodeId",
-              "nodeType",
               "businessPhase",
-              "dependencies",
-              "hasSideEffect",
-              "requiredArtifacts"
+              "barrierOrdinal",
+              "nodeType",
+              "required",
+              "dependsOn",
+              "sideEffectClass",
+              "requiredArtifacts",
+              "successPredicateId",
+              "timeoutMs",
+              "retryPolicyId"
             ],
             "allOf": [
               {"not": {"properties": {"nodeType": {"const": "BOOTSTRAP_REPOSITORY"}}, "required": ["nodeType"]}},
@@ -571,16 +576,6 @@
             ],
             "properties": {
               "logicalNodeId": {"type": "string", "minLength": 1},
-              "nodeType": {
-                "type": "string",
-                "enum": [
-                  "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
-                  "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
-                  "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
-                  "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
-                  "RECONCILE_TARGET", "RESTORE_DRILL"
-                ]
-              },
               "businessPhase": {
                 "type": "string",
                 "enum": [
@@ -591,16 +586,30 @@
                   "ROLLING_BACK", "FINALIZING"
                 ]
               },
-              "dependencies": {
+              "barrierOrdinal": {"type": "integer", "minimum": 0},
+              "nodeType": {
+                "type": "string",
+                "enum": [
+                  "PLAN", "DESIGN_REVIEW", "BOOTSTRAP_REPOSITORY", "IMPLEMENT",
+                  "VERIFY", "CODE_REVIEW", "ATTEST_REVIEW", "PUBLISH_PR", "MERGE",
+                  "BUILD_ARTIFACT", "DEPLOY_STAGING", "ACCEPT_STAGING",
+                  "DEPLOY_PRODUCTION", "ACCEPT_PRODUCTION", "ROLLBACK",
+                  "RECONCILE_TARGET", "RESTORE_DRILL"
+                ]
+              },
+              "required": {"type": "boolean"},
+              "dependsOn": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },
-              "hasSideEffect": {"type": "boolean"},
+              "sideEffectClass": {"type": "string", "minLength": 1},
               "requiredArtifacts": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },
-              "gate": {"type": "string", "minLength": 1}
+              "successPredicateId": {"type": "string", "minLength": 1},
+              "timeoutMs": {"type": "integer", "minimum": 1},
+              "retryPolicyId": {"type": "string", "minLength": 1}
             }
           }
         },
@@ -622,10 +631,15 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["barrierId", "businessPhase", "nodeIds"],
+            "required": [
+              "businessPhase",
+              "barrierOrdinal",
+              "requiredNodeIds",
+              "settleTimeoutMs",
+              "passPredicateId"
+            ],
             "not": {"properties": {"businessPhase": {"enum": ["BOOTSTRAPPING", "BOOTSTRAPPING_REPOSITORY"]}}, "required": ["businessPhase"]},
             "properties": {
-              "barrierId": {"type": "string", "minLength": 1},
               "businessPhase": {
                 "type": "string",
                 "enum": [
@@ -636,10 +650,13 @@
                   "ROLLING_BACK", "FINALIZING"
                 ]
               },
-              "nodeIds": {
+              "barrierOrdinal": {"type": "integer", "minimum": 0},
+              "requiredNodeIds": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
-              }
+              },
+              "settleTimeoutMs": {"type": "integer", "minimum": 1},
+              "passPredicateId": {"type": "string", "minLength": 1}
             }
           }
         },

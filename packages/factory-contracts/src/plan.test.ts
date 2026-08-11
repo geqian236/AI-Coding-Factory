@@ -274,6 +274,11 @@ describe("planRevisionDigest vectors", () => {
     expect(planRevisionDigest(byName(inv.a).revision)).not.toBe(
       planRevisionDigest(byName(inv.b).revision),
     );
+
+    const dagInv = planGolden.invariants.differentDagMaterialDiffersDigest;
+    const baseline = byName(dagInv.base).revision;
+    const changed = applyGoldenMutation(structuredClone(baseline), dagInv.mutation);
+    expect(planRevisionDigest(baseline)).not.toBe(planRevisionDigest(changed));
   });
 });
 
