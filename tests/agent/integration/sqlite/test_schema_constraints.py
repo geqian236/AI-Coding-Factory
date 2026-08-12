@@ -1897,16 +1897,25 @@ def _constraint_bypassed_row(table: str) -> dict[str, object]:
     return row
 
 
-def _insert_for_trigger_probe(connection: sqlite3.Connection, table: str) -> tuple[str, object]:
-    """关闭 FK/CHECK 插入触发器探针，再恢复门禁以单独验证 UPDATE/DELETE 行为。"""
+@contextmanager
+def _insert_for_trigger_probe(
+    connection: sqlite3.Connection,
+    table: str,
+) -> Iterator[tuple[str, object]]:
+    """在完整变更窗口旁路 FK/CHECK，只让 UPDATE/DELETE trigger 决定探针结果。"""
+    previous_foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    previous_ignore_checks = int(connection.execute("PRAGMA ignore_check_constraints").fetchone()[0])
     connection.execute("PRAGMA foreign_keys=OFF")
     connection.execute("PRAGMA ignore_check_constraints=ON")
-    row = _constraint_bypassed_row(table)
-    _insert(connection, table, row)
-    connection.execute("PRAGMA ignore_check_constraints=OFF")
-    connection.execute("PRAGMA foreign_keys=ON")
-    primary_key = EXPECTED_PRIMARY_KEYS[table][0]
-    return primary_key, row[primary_key]
+    try:
+        row = _constraint_bypassed_row(table)
+        _insert(connection, table, row)
+        primary_key = EXPECTED_PRIMARY_KEYS[table][0]
+        yield primary_key, row[primary_key]
+    finally:
+        # 探针允许业务无效行，但离开窗口必须恢复连接原门禁，避免污染后续断言。
+        connection.execute(f"PRAGMA ignore_check_constraints={previous_ignore_checks}")
+        connection.execute(f"PRAGMA foreign_keys={previous_foreign_keys}")
 
 
 def _seed_workflow_graph(connection: sqlite3.Connection) -> None:
@@ -2290,17 +2299,17 @@ def test_deployment_tables_are_not_guessed_in_task1(tmp_path: Path) -> None:
 def test_n05_each_append_only_table_rejects_update_and_delete(tmp_path: Path, table: str) -> None:
     """每个追加表均以真实 UPDATE/DELETE 证明 trigger 有牙齿。"""
     with _migrated_connection(tmp_path) as connection:
-        primary_key, identity = _insert_for_trigger_probe(connection, table)
-        with pytest.raises(sqlite3.IntegrityError, match="append_only"):
-            connection.execute(
-                f'UPDATE "{table}" SET "{primary_key}"="{primary_key}" WHERE "{primary_key}"=?',  # noqa: S608
-                (identity,),
-            )
-        with pytest.raises(sqlite3.IntegrityError, match="append_only"):
-            connection.execute(
-                f'DELETE FROM "{table}" WHERE "{primary_key}"=?',  # noqa: S608
-                (identity,),
-            )
+        with _insert_for_trigger_probe(connection, table) as (primary_key, identity):
+            with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+                connection.execute(
+                    f'UPDATE "{table}" SET "{primary_key}"="{primary_key}" WHERE "{primary_key}"=?',  # noqa: S608
+                    (identity,),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="append_only"):
+                connection.execute(
+                    f'DELETE FROM "{table}" WHERE "{primary_key}"=?',  # noqa: S608
+                    (identity,),
+                )
 
 
 @pytest.mark.parametrize(
@@ -2310,17 +2319,17 @@ def test_n05_each_append_only_table_rejects_update_and_delete(tmp_path: Path, ta
 def test_mutable_tables_do_not_inherit_append_only_triggers(tmp_path: Path, table: str) -> None:
     """非追加表的同值 UPDATE 与 DELETE 均成功，拒绝错误扩大 immutable 边界。"""
     with _migrated_connection(tmp_path) as connection:
-        primary_key, identity = _insert_for_trigger_probe(connection, table)
-        updated = connection.execute(
-            f'UPDATE "{table}" SET "{primary_key}"="{primary_key}" WHERE "{primary_key}"=?',  # noqa: S608
-            (identity,),
-        )
-        assert updated.rowcount == 1
-        deleted = connection.execute(
-            f'DELETE FROM "{table}" WHERE "{primary_key}"=?',  # noqa: S608
-            (identity,),
-        )
-        assert deleted.rowcount == 1
+        with _insert_for_trigger_probe(connection, table) as (primary_key, identity):
+            updated = connection.execute(
+                f'UPDATE "{table}" SET "{primary_key}"="{primary_key}" WHERE "{primary_key}"=?',  # noqa: S608
+                (identity,),
+            )
+            assert updated.rowcount == 1
+            deleted = connection.execute(
+                f'DELETE FROM "{table}" WHERE "{primary_key}"=?',  # noqa: S608
+                (identity,),
+            )
+            assert deleted.rowcount == 1
 
 
 def test_n06_achieved_stage_trigger_rejects_regression_but_not_target_ceiling(tmp_path: Path) -> None:
