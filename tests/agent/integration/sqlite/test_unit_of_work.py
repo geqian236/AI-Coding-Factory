@@ -5,15 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import inspect
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import textwrap
 import threading
+import time
+import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,25 +60,35 @@ import runpy
 import sqlite3
 import sys
 
-test_module_path, database_path, scenario, failure_point = sys.argv[1:]
+test_module_path, database_path, scenario, failure_point, backup_root = sys.argv[1:]
 namespace = runpy.run_path(test_module_path)
 
 async def main():
-    kwargs = {}
+    timeline = []
+    delegate_connect = sqlite3.connect
+    kwargs = {
+        "backup_root": pathlib.Path(backup_root),
+        "timeline": timeline,
+    }
     if scenario == "fault":
         kwargs["failing_points"] = {failure_point}
     elif scenario == "connect_failure":
         def fail_connect(*_args, **_kwargs):
             raise sqlite3.OperationalError("injected-connect-failure")
-        kwargs["connect_factory"] = fail_connect
+        delegate_connect = fail_connect
     elif scenario == "foreign_keys_in_transaction":
         def connect_in_transaction(*args, **kwargs):
             connection = sqlite3.connect(*args, **kwargs)
             connection.execute("BEGIN")
             return connection
-        kwargs["connect_factory"] = connect_in_transaction
+        delegate_connect = connect_in_transaction
     elif scenario != "normal_failure":
         raise AssertionError(f"unknown startup scenario: {scenario}")
+    kwargs["connect_factory"] = namespace["_traced_source_connect_factory"](
+        pathlib.Path(database_path),
+        timeline,
+        delegate=delegate_connect,
+    )
 
     coordinator, mutex, probe = namespace["_new_stack"](pathlib.Path(database_path), **kwargs)
     database_module = namespace["_database_module"]()
@@ -91,6 +106,7 @@ async def main():
     owner_alive = bool(owner_thread is not None and owner_thread.is_alive())
     if owner_alive:
         raise AssertionError("startup failure left owner thread alive")
+    migration_writes = namespace["_migration_write_timeline_items"](timeline)
     print(json.dumps({
         "receiptVersion": 1,
         "kind": "sqlite-startup-failure",
@@ -100,6 +116,11 @@ async def main():
         "ownerThreadAlive": owner_alive,
         "mutexEvents": [name for name, _thread in mutex.events],
         "probePoints": [point for point, _thread in probe.calls],
+        "timeline": timeline,
+        "migrationBeginCount": sum(
+            1 for item in migration_writes if item == "sql:write:BEGIN IMMEDIATE"
+        ),
+        "migrationWriteCount": len(migration_writes),
     }, separators=(",", ":")), flush=True)
 
 asyncio.run(main())
@@ -401,13 +422,15 @@ class _InjectedFailure(RuntimeError):
 class _FailureProbe:
     """记录生产路径经过的故障点，并在指定点确定性抛错。"""
 
-    def __init__(self, failing_points: Iterable[str] = ()) -> None:
+    def __init__(self, failing_points: Iterable[str] = (), *, timeline: list[str] | None = None) -> None:
         self.failing_points = frozenset(failing_points)
         self.calls: list[tuple[str, int]] = []
+        self.timeline = timeline if timeline is not None else []
 
     def __call__(self, point: str) -> None:
         """记录调用线程；命中点时抛出不含业务 payload 的测试异常。"""
         self.calls.append((point, threading.get_ident()))
+        self.timeline.append(f"probe:{point}")
         if point in self.failing_points:
             raise _InjectedFailure(point)
 
@@ -427,47 +450,107 @@ class _RecordingLease:
         assert not self._released
         self._released = True
         self._owner.events.append(("release", threading.get_ident()))
+        self._owner.timeline.append("mutex:release")
 
     def close(self) -> None:
         """模拟 CloseHandle；必须发生在 release 之后。"""
         assert self._released
         self._owner.events.append(("close_handle", threading.get_ident()))
+        self._owner.timeline.append("mutex:close_handle")
 
 
 class _RecordingMutex:
     """跨平台测试 mutex；只验证 coordinator 的线程和启动顺序。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeline: list[str] | None = None) -> None:
         self.owner_thread_id: int | None = None
         self.events: list[tuple[str, int]] = []
+        self.timeline = timeline if timeline is not None else []
 
     def acquire(self) -> _RecordingLease:
         """在 writer owner 线程记录 acquire 并返回 lease。"""
         assert self.owner_thread_id is None
         self.owner_thread_id = threading.get_ident()
         self.events.append(("acquire", self.owner_thread_id))
+        self.timeline.append("mutex:acquire")
         return _RecordingLease(self)
+
+
+def _controlled_backup_root(database_path: Path) -> Path:
+    """为每个测试装配同一受控 D 根下的 backups 目录，禁止可选参数绕过升级前备份。"""
+    return _assert_d_test_path(database_path.parent / "backups")
+
+
+def _sql_timeline_item(statement: str) -> str:
+    """将 trace 脱敏为读写类别与操作类型；不把 literal、表名或 identity 写入 receipt。"""
+    tokens = tuple(token.upper() for token in _trace_key(statement))
+    assert tokens
+    verb = tokens[0]
+    if verb in {"SELECT", "EXPLAIN"}:
+        return f"sql:read:{verb}"
+    if verb == "PRAGMA":
+        pragma_name = tokens[1] if len(tokens) > 1 else "UNKNOWN"
+        access = "write" if "=" in tokens else "read"
+        return f"sql:{access}:PRAGMA {pragma_name}"
+    if verb == "BEGIN":
+        mode = tokens[1] if len(tokens) > 1 else "DEFERRED"
+        return f"sql:write:BEGIN {mode}"
+    return f"sql:write:{verb}"
+
+
+def _traced_source_connect_factory(
+    database_path: Path,
+    timeline: list[str],
+    *,
+    delegate: Callable[..., sqlite3.Connection] = sqlite3.connect,
+) -> Callable[..., sqlite3.Connection]:
+    """仅给真实状态库连接安装 trace；备份目标连接不得混入 migration 顺序证据。"""
+    expected = database_path.resolve()
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = delegate(*args, **kwargs)
+        candidate = Path(os.fspath(args[0])).resolve() if args else None
+        if candidate == expected:
+            connection.set_trace_callback(lambda statement: timeline.append(_sql_timeline_item(statement)))
+        return connection
+
+    return connect
+
+
+def _migration_write_timeline_items(timeline: Iterable[str]) -> tuple[str, ...]:
+    """筛出 migration 全部非只读 SQL，只排除迁移前固定的三项启动 PRAGMA setter。"""
+    startup_setters = {
+        "sql:write:PRAGMA FOREIGN_KEYS",
+        "sql:write:PRAGMA JOURNAL_MODE",
+        "sql:write:PRAGMA SYNCHRONOUS",
+    }
+    return tuple(item for item in timeline if item.startswith("sql:write:") and item not in startup_setters)
 
 
 def _new_stack(
     database_path: Path,
     *,
+    backup_root: Path | None = None,
     failing_points: Iterable[str] = (),
     connect_factory: Callable[..., sqlite3.Connection] | None = None,
+    timeline: list[str] | None = None,
     queue_capacity: int = 8,
 ) -> tuple[Any, _RecordingMutex, _FailureProbe]:
     """装配可注入故障的真实 SQLite database + 单 writer coordinator。"""
     database_module = _database_module()
     coordinator_module = _coordinator_module()
-    probe = _FailureProbe(failing_points)
+    shared_timeline = timeline if timeline is not None else []
+    probe = _FailureProbe(failing_points, timeline=shared_timeline)
     database_kwargs: dict[str, object] = {"failure_probe": probe}
+    if backup_root is not None:
+        database_kwargs["backup_root"] = _assert_d_test_path(backup_root)
     if connect_factory is not None:
         database_kwargs["connect_factory"] = connect_factory
     database = database_module.SqliteDatabase(
         _assert_d_test_path(database_path),
         **database_kwargs,
     )
-    mutex = _RecordingMutex()
+    mutex = _RecordingMutex(timeline=shared_timeline)
     coordinator = coordinator_module.WriteCoordinator(
         database=database,
         mutex=mutex,
@@ -486,8 +569,10 @@ async def _bounded[ResultT](awaitable: Awaitable[ResultT], *, timeout: float = 5
 def _startup_failure_receipt(
     database_path: Path,
     *,
+    backup_root: Path,
     scenario: str,
     failure_point: str = "",
+    sensitive_identities: Iterable[str] = (),
 ) -> dict[str, object]:
     """在可 terminate/kill 的 child 中运行 startup 失败，禁止 non-daemon owner 泄漏挂死 pytest。"""
     environment = dict(os.environ)
@@ -510,6 +595,7 @@ def _startup_failure_receipt(
             str(_assert_d_test_path(database_path)),
             scenario,
             failure_point,
+            str(_assert_d_test_path(backup_root)),
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -539,6 +625,18 @@ def _startup_failure_receipt(
     assert process.poll() is not None
     assert not timed_out, f"startup child timeout; stderr={stderr!r}"
     assert process.returncode == 0, stderr
+    # 失败回执只允许稳定码与阶段，不得把状态库或备份物理 identity 输出到日志。
+    sensitive_paths = (database_path, backup_root)
+    for sensitive_path in sensitive_paths:
+        if sensitive_path is None:
+            continue
+        identity = str(sensitive_path.resolve())
+        assert identity not in stdout
+        assert identity not in stderr
+    normalized_output = unicodedata.normalize("NFC", stdout + stderr).casefold()
+    for identity in (database_path.name, database_path.stem, *sensitive_identities):
+        normalized_identity = unicodedata.normalize("NFC", identity).casefold()
+        assert normalized_identity not in normalized_output
     lines = stdout.splitlines()
     assert len(lines) == 1, f"startup child 必须仅有一条 receipt：{lines!r}"
     receipt = json.loads(lines[0])
@@ -1154,7 +1252,10 @@ def _task_snapshot(database_path: Path) -> tuple[tuple[object, ...], list[tuple[
 
 async def _bootstrap_empty_database(database_path: Path) -> tuple[Any, _RecordingMutex, _FailureProbe]:
     """经真实 coordinator 完成一次 mutex→SQLite→migrate→integrity 启动并关闭。"""
-    coordinator, mutex, probe = _new_stack(database_path)
+    coordinator, mutex, probe = _new_stack(
+        database_path,
+        backup_root=_controlled_backup_root(database_path),
+    )
     await _bounded(coordinator.start())
     await _bounded(coordinator.close())
     return coordinator, mutex, probe
@@ -1348,7 +1449,7 @@ def _schema_snapshot(database_path: Path) -> _DatabaseSnapshot:
     """读取 sqlite_schema 全 SQL、ledger 全行、版本及每张业务表行指纹。"""
     if not database_path.exists():
         return EMPTY_DATABASE_SNAPSHOT
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         schema_sql = tuple(
             connection.execute(
                 "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
@@ -1457,7 +1558,7 @@ def _assert_migration_probe_prefix(
 
 def _create_registered_prefix(database_path: Path, count: int) -> None:
     """仅为升级回滚 oracle 创建已提交的合法 migration 前缀。"""
-    with sqlite3.connect(database_path, isolation_level=None) as connection:
+    with closing(sqlite3.connect(database_path, isolation_level=None)) as connection:
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(SCHEMA_MIGRATIONS_SQL)
         for version, name, checksum in _expected_migration_ledger()[:count]:
@@ -1467,6 +1568,560 @@ def _create_registered_prefix(database_path: Path, count: int) -> None:
                 (version, name, checksum, "2026-08-12T00:00:00Z"),
             )
         connection.execute(f"PRAGMA user_version={count}")
+
+
+def _sqlite_backup_files(backup_root: Path) -> tuple[Path, ...]:
+    """只按 SQLite 文件头发现状态库备份，避免提前冻结命名或 receipt wire。"""
+    if not backup_root.exists():
+        return ()
+
+    def has_sqlite_header(path: Path) -> bool:
+        """仅读固定 16 bytes，不因备份体积放大测试内存。"""
+        if not path.is_file():
+            return False
+        with path.open("rb") as stream:
+            return stream.read(16) == b"SQLite format 3\x00"
+
+    return tuple(sorted(path for path in backup_root.rglob("*") if has_sqlite_header(path)))
+
+
+def _backup_root_inventory(backup_root: Path) -> tuple[tuple[str, str, int], ...]:
+    """冻结备份根内全部目录与文件，失败后任何 provisional/sidecar 残留都会改变投影。"""
+    if not backup_root.exists():
+        return ()
+    inventory: list[tuple[str, str, int]] = []
+    for path in backup_root.rglob("*"):
+        relative = path.relative_to(backup_root).as_posix()
+        if path.is_dir():
+            inventory.append((relative, "directory", 0))
+        else:
+            inventory.append((relative, "file", path.stat().st_size))
+    return tuple(sorted(inventory))
+
+
+def _assert_rename_roundtrip(path: Path) -> None:
+    """用同目录 rename 往返证明测试与生产均未泄漏 Windows 文件句柄。"""
+    renamed = path.with_name(f"{path.name}.handle-check")
+    assert path.exists()
+    assert not renamed.exists()
+    path.rename(renamed)
+    try:
+        renamed.rename(path)
+    finally:
+        if renamed.exists() and not path.exists():
+            renamed.rename(path)
+    assert path.exists()
+
+
+@contextmanager
+def _live_directory_junction(link: Path, target: Path) -> Iterator[Path]:
+    """在同一受限 PowerShell 进程内创建并删除 junction，绝不递归删除目标目录。"""
+    link = _assert_d_test_path(link)
+    target = _assert_d_test_path(target)
+    assert not link.exists()
+    assert not target.exists()
+    target.mkdir()
+    assert target.is_dir()
+    token = uuid.uuid4().hex
+    ready = _assert_d_test_path(link.parent / f".junction-{token}.ready")
+    ready_stage = _assert_d_test_path(link.parent / f".junction-{token}.ready-stage")
+    go = _assert_d_test_path(link.parent / f".junction-{token}.go")
+    assert not any(os.path.lexists(path) for path in (ready, ready_stage, go))
+    script = """
+$ErrorActionPreference = 'Stop'
+$link = $env:R11_JUNCTION_LINK
+$target = $env:R11_JUNCTION_TARGET
+$ready = $env:R11_JUNCTION_READY
+$readyStage = $env:R11_JUNCTION_READY_STAGE
+$go = $env:R11_JUNCTION_GO
+$exitCode = 0
+try {
+    if (-not [IO.Directory]::Exists($target)) { throw 'target-missing-before-create' }
+    New-Item -ItemType Junction -Path $link -Target $target | Out-Null
+    $attributes = [IO.File]::GetAttributes($link)
+    if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'created-path-is-not-reparse-point'
+    }
+    [IO.File]::WriteAllText($readyStage, 'ready')
+    [IO.File]::Move($readyStage, $ready)
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not [IO.File]::Exists($go)) {
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $exitCode = 25
+            break
+        }
+        Start-Sleep -Milliseconds 10
+    }
+    if ($exitCode -eq 0) {
+        if (-not [IO.Directory]::Exists($target)) { throw 'target-missing-before-delete' }
+        $attributes = [IO.File]::GetAttributes($link)
+        if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'link-changed-before-delete'
+        }
+    }
+}
+catch {
+    $exitCode = 26
+}
+finally {
+    if ([IO.Directory]::Exists($link)) {
+        $attributes = [IO.File]::GetAttributes($link)
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) {
+            [IO.Directory]::Delete($link)
+        }
+        else {
+            $exitCode = 27
+        }
+    }
+    if (-not [IO.Directory]::Exists($target)) { $exitCode = 24 }
+    if ([IO.File]::Exists($readyStage)) { [IO.File]::Delete($readyStage) }
+}
+exit $exitCode
+"""
+    environment = dict(os.environ)
+    environment["R11_JUNCTION_LINK"] = str(link)
+    environment["R11_JUNCTION_TARGET"] = str(target)
+    environment["R11_JUNCTION_READY"] = str(ready)
+    environment["R11_JUNCTION_READY_STAGE"] = str(ready_stage)
+    environment["R11_JUNCTION_GO"] = str(go)
+    process = subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 5.0
+    try:
+        while not ready.exists():
+            assert process.poll() is None, "junction helper 在发布 ready 前退出"
+            assert time.monotonic() < deadline, "junction helper 创建超时"
+            time.sleep(0.01)
+        attributes = link.lstat().st_file_attributes
+        assert attributes & 0x400
+        assert target.is_dir()
+        yield link
+    finally:
+        if not go.exists():
+            go.write_bytes(b"go")
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+        returncode = process.returncode
+        if os.path.lexists(link):
+            attributes = link.lstat().st_file_attributes
+            assert attributes & 0x400
+            os.rmdir(link)
+        target_preserved = target.is_dir()
+        for signal in (ready, ready_stage, go):
+            signal.unlink(missing_ok=True)
+        if target_preserved:
+            target.rmdir()
+        assert returncode == 0
+        assert not os.path.lexists(link)
+        assert target_preserved
+
+
+def _assert_backup_precedes_real_migration_sql(timeline: list[str]) -> None:
+    """用真实 sqlite trace 证明 verified 前没有 migration BEGIN、DDL、DML 或 user_version 写。"""
+    verified = "probe:backup:verified"
+    begin = "sql:write:BEGIN IMMEDIATE"
+    writes = _migration_write_timeline_items(timeline)
+    assert verified in timeline
+    assert begin in writes
+    assert writes[0] == begin
+    verified_index = timeline.index(verified)
+    assert verified_index < timeline.index(begin)
+    assert not [item for item in timeline[:verified_index] if item in writes]
+    assert all(verified_index < timeline.index(item) for item in writes)
+
+
+def _sqlite_row_exists(database_path: Path, project_id: str, *, immutable: bool = False) -> bool:
+    """只读重开指定 SQLite 文件并检查 WAL 业务事实，immutable 用于模拟裸主文件副本。"""
+    query = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+    with closing(sqlite3.connect(database_path.resolve().as_uri() + query, uri=True)) as connection:
+        return connection.execute("SELECT 1 FROM projects WHERE project_id=?", (project_id,)).fetchone() == (1,)
+
+
+def _assert_reopenable_backup(backup_path: Path, expected: _DatabaseSnapshot) -> None:
+    """证明备份是可独立只读重开的完整 SQLite 库，而非仅复制了主文件字节。"""
+    actual = _schema_snapshot(backup_path)
+    # SQLite backup 会更新目标库的内部 schema cookie；Master 冻结的是可恢复内容而非该实现计数器。
+    assert actual.schema_sql == expected.schema_sql
+    assert actual.ledger_rows == expected.ledger_rows
+    assert actual.user_version == expected.user_version
+    assert actual.row_fingerprints == expected.row_fingerprints
+    uri = backup_path.resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix_count", [1, 2, 3])
+async def test_schema_upgrade_backs_up_each_legal_prefix_before_migration_transaction(
+    tmp_path: Path,
+    prefix_count: int,
+) -> None:
+    """Master §11 要求本地 schema 升级前备份；Task 8 的远端发布备份不在此处发明。"""
+    path = _assert_d_test_path(tmp_path / f"backup-prefix-{prefix_count}.sqlite3")
+    backup_root = _assert_d_test_path(tmp_path / "backups")
+    project_id = f"project-backup-{prefix_count}"
+    wal_keeper: sqlite3.Connection | None = None
+    bare_main_copy = _assert_d_test_path(tmp_path / "bare-main-without-wal.sqlite3")
+    try:
+        _create_registered_prefix(path, prefix_count)
+        if prefix_count == 1:
+            # WAL keeper 保持存活，业务事实只落 active WAL；裸复制主文件必须读不到它。
+            wal_keeper = sqlite3.connect(path, isolation_level=None)
+            assert wal_keeper.execute("PRAGMA journal_mode=wal").fetchone() == ("wal",)
+            wal_keeper.execute("PRAGMA wal_autocheckpoint=0")
+            _insert(wal_keeper, "projects", {"project_id": project_id})
+            assert path.with_name(path.name + "-wal").stat().st_size > 0
+            shutil.copyfile(path, bare_main_copy)
+            assert not _sqlite_row_exists(bare_main_copy, project_id, immutable=True)
+        else:
+            with _raw_connection(path) as connection:
+                _insert(connection, "projects", {"project_id": project_id})
+        before = _schema_snapshot(path)
+
+        timeline: list[str] = []
+        coordinator, mutex, probe = _new_stack(
+            path,
+            backup_root=backup_root,
+            connect_factory=_traced_source_connect_factory(path, timeline),
+            timeline=timeline,
+        )
+        await _bounded(coordinator.start())
+        await _bounded(coordinator.close())
+
+        backup_files = _sqlite_backup_files(backup_root)
+        assert len(backup_files) == 1
+        backup_path = backup_files[0]
+        _assert_reopenable_backup(backup_path, before)
+        assert _sqlite_row_exists(backup_path, project_id)
+        _assert_rename_roundtrip(backup_path)
+        _assert_reopenable_backup(backup_path, before)
+        assert _schema_snapshot(path).user_version == len(MIGRATION_NAMES)
+
+        expected_backup_points = (
+            "probe:backup:start",
+            "probe:backup:created",
+            "probe:backup:flushed",
+            "probe:backup:verified",
+        )
+        actual_backup_points = tuple(item for item in probe.timeline if item.startswith("probe:backup:"))
+        assert actual_backup_points == expected_backup_points
+        assert probe.timeline.index("mutex:acquire") < probe.timeline.index(expected_backup_points[0])
+        _assert_backup_precedes_real_migration_sql(probe.timeline)
+        assert mutex.timeline is probe.timeline
+    finally:
+        if wal_keeper is not None:
+            wal_keeper.close()
+        for suffix in ("-wal", "-shm", "-journal"):
+            path.with_name(path.name + suffix).unlink(missing_ok=True)
+        bare_main_copy.unlink(missing_ok=True)
+        if path.exists():
+            _assert_rename_roundtrip(path)
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["backup:start", "backup:created", "backup:flushed", "backup:verified"],
+)
+def test_backup_stage_failure_blocks_ready_and_all_migration_writes(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    """备份 create/copy/flush/verify 任一切点失败都必须在 pending migration 写入前闭合。"""
+    path = _assert_d_test_path(tmp_path / f"backup-failure-{failure_point.split(':')[-1]}.sqlite3")
+    backup_root = _assert_d_test_path(tmp_path / "backups")
+    backup_root.mkdir()
+    sentinel = backup_root / "preexisting.keep"
+    sentinel.write_bytes(b"keep")
+    before_inventory = _backup_root_inventory(backup_root)
+    _create_registered_prefix(path, 2)
+    with _raw_connection(path) as connection:
+        _insert(connection, "projects", {"project_id": "project-backup-failure"})
+    before = _schema_snapshot(path)
+
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="fault",
+        failure_point=failure_point,
+        backup_root=backup_root,
+    )
+
+    assert receipt["errorCode"] == "SQLITE_BACKUP_FAILED"
+    assert receipt["coordinatorState"] == "FAILED"
+    assert receipt["mutexEvents"] == ["acquire", "release", "close_handle"]
+    assert receipt["migrationBeginCount"] == receipt["migrationWriteCount"] == 0
+    timeline = receipt["timeline"]
+    assert isinstance(timeline, list)
+    assert _migration_write_timeline_items(timeline) == ()
+    assert _schema_snapshot(path) == before
+    successful_points = ("backup:start", "backup:created", "backup:flushed", "backup:verified")
+    expected_prefix = successful_points[: successful_points.index(failure_point) + 1]
+    probe_points = receipt["probePoints"]
+    assert isinstance(probe_points, list)
+    assert tuple(point for point in probe_points if point.startswith("backup:")) == expected_prefix
+    assert not [point for point in probe_points if point.startswith("migration")]
+    assert _backup_root_inventory(backup_root) == before_inventory
+    assert sentinel.read_bytes() == b"keep"
+    _assert_rename_roundtrip(path)
+
+
+def test_later_migration_failure_preserves_the_verified_pre_upgrade_backup(tmp_path: Path) -> None:
+    """备份成功后 migration 回滚不能删除或改写升级前副本，供 STORE-001 后续恢复使用。"""
+    path = _assert_d_test_path(tmp_path / "backup-survives-migration-failure.sqlite3")
+    backup_root = _assert_d_test_path(tmp_path / "backups")
+    _create_registered_prefix(path, 2)
+    with _raw_connection(path) as connection:
+        _insert(connection, "projects", {"project_id": "project-backup-survives"})
+    before = _schema_snapshot(path)
+    failure_point = "migration:0003_auth_resources.sql:statement:1:after"
+
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="fault",
+        failure_point=failure_point,
+        backup_root=backup_root,
+    )
+
+    assert receipt["errorCode"] == "SQLITE_MIGRATION_FAILED"
+    assert receipt["coordinatorState"] == "FAILED"
+    assert _schema_snapshot(path) == before
+    backup_files = _sqlite_backup_files(backup_root)
+    assert len(backup_files) == 1
+    backup_path = backup_files[0]
+    _assert_reopenable_backup(backup_path, before)
+    _assert_rename_roundtrip(backup_path)
+    _assert_reopenable_backup(backup_path, before)
+    _assert_rename_roundtrip(path)
+    probe_points = receipt["probePoints"]
+    assert isinstance(probe_points, list)
+    backup_points = tuple(point for point in probe_points if point.startswith("backup:"))
+    assert backup_points == ("backup:start", "backup:created", "backup:flushed", "backup:verified")
+    assert probe_points.index("backup:verified") < probe_points.index("migration_transaction:before_begin_immediate")
+    timeline = receipt["timeline"]
+    assert isinstance(timeline, list)
+    _assert_backup_precedes_real_migration_sql(timeline)
+    _assert_migration_probe_prefix(probe_points, failure_point, start_index=2)
+
+
+@pytest.mark.asyncio
+async def test_fresh_nonexistent_database_is_backup_not_applicable(tmp_path: Path) -> None:
+    """首库没有升级前状态可备份；必须显式 not_applicable 且不得制造空备份文件。"""
+    path = _assert_d_test_path(tmp_path / "fresh-no-backup.sqlite3")
+    backup_root = _assert_d_test_path(tmp_path / "backups")
+    assert not path.exists()
+
+    coordinator, _mutex, probe = _new_stack(path, backup_root=backup_root)
+    readiness = await _bounded(coordinator.start())
+    await _bounded(coordinator.close())
+
+    assert readiness.schema_version == len(MIGRATION_NAMES)
+    assert _sqlite_backup_files(backup_root) == ()
+    assert not backup_root.exists() or not tuple(backup_root.rglob("*"))
+    backup_points = tuple(point for point, _thread in probe.calls if point.startswith("backup:"))
+    assert backup_points == ("backup:not_applicable",)
+    assert probe.timeline.index("probe:backup:not_applicable") < probe.timeline.index(
+        "probe:migration_transaction:before_begin_immediate"
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    [
+        "c_drive",
+        "relative",
+        "dotdot",
+        "source_directory",
+        "same_drive_cross_root",
+        "prefix_confusion",
+        "leaf_junction",
+        "ancestor_junction",
+        "omitted_prefix",
+    ],
+)
+@pytest.mark.asyncio
+async def test_backup_root_api_and_storage_location_fail_closed_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+) -> None:
+    """backup_root 可省略但不能绕过既有库备份；显式根仍须满足受控 D StorageLocation。"""
+    database_module = _database_module()
+    constructor = inspect.signature(database_module.SqliteDatabase.__init__)
+    backup_root_parameter = constructor.parameters.get("backup_root")
+    assert backup_root_parameter is not None
+    assert backup_root_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert backup_root_parameter.default is not inspect.Parameter.empty
+    assert "backup_factory" not in constructor.parameters
+
+    source_path = _assert_d_test_path(tmp_path / "path-contract-source.sqlite3")
+    if invalid_kind == "omitted_prefix":
+        _create_registered_prefix(source_path, 1)
+        project_id = "project-omitted-backup-root"
+        with _raw_connection(source_path) as connection:
+            _insert(connection, "projects", {"project_id": project_id})
+        before = _schema_snapshot(source_path)
+        derived_backup_root = _controlled_backup_root(source_path)
+        assert derived_backup_root == _assert_d_test_path(source_path.parent / "backups")
+        timeline: list[str] = []
+        coordinator, mutex, probe = _new_stack(
+            source_path,
+            connect_factory=_traced_source_connect_factory(source_path, timeline),
+            timeline=timeline,
+        )
+        await _bounded(coordinator.start())
+        await _bounded(coordinator.close())
+
+        backup_files = _sqlite_backup_files(derived_backup_root)
+        assert len(backup_files) == 1
+        backup_path = backup_files[0]
+        backup_path.resolve().relative_to(derived_backup_root.resolve())
+        _assert_reopenable_backup(backup_path, before)
+        assert _sqlite_row_exists(backup_path, project_id)
+        _assert_rename_roundtrip(backup_path)
+        _assert_reopenable_backup(backup_path, before)
+        expected_backup_points = (
+            "probe:backup:start",
+            "probe:backup:created",
+            "probe:backup:flushed",
+            "probe:backup:verified",
+        )
+        assert tuple(item for item in probe.timeline if item.startswith("probe:backup:")) == (expected_backup_points)
+        assert probe.timeline.index("mutex:acquire") < probe.timeline.index(expected_backup_points[0])
+        _assert_backup_precedes_real_migration_sql(probe.timeline)
+        assert mutex.timeline is probe.timeline
+        assert _schema_snapshot(source_path).user_version == len(MIGRATION_NAMES)
+        _assert_rename_roundtrip(source_path)
+        return
+
+    project_root = Path("D:/codex项目")
+    reparse_target = _assert_d_test_path(tmp_path / "junction-target")
+    if invalid_kind not in {"leaf_junction", "ancestor_junction"}:
+        reparse_target.mkdir()
+    if invalid_kind == "leaf_junction":
+        junction = _assert_d_test_path(tmp_path / "backups-junction")
+        invalid_root = junction
+    elif invalid_kind == "ancestor_junction":
+        junction = _assert_d_test_path(tmp_path / "ancestor-junction")
+        invalid_root = junction / "backups"
+    else:
+        junction = None
+        invalid_root = {
+            "c_drive": Path("C:/CodexForbidden/factory-state-backups"),
+            "relative": Path("relative-backups"),
+            "dotdot": tmp_path / "backups" / ".." / "escaped",
+            "source_directory": source_path.parent,
+            "same_drive_cross_root": Path("D:/factory-backups-outside-codex-project"),
+            "prefix_confusion": Path("D:/codex项目-evil/backups"),
+        }[invalid_kind]
+    before_children = tuple(sorted(str(path) for path in tmp_path.rglob("*")))
+    write_attempts: list[str] = []
+    connect_attempts: list[object] = []
+
+    def deny_directory_write(path: object, *_args: object, **_kwargs: object) -> None:
+        write_attempts.append(str(path))
+        raise AssertionError("backup_root 校验前不得创建目录")
+
+    def deny_connect(*args: object, **_kwargs: object) -> sqlite3.Connection:
+        connect_attempts.append(args[0] if args else None)
+        raise AssertionError("backup_root 校验前不得连接或创建状态库")
+
+    junction_context = _live_directory_junction(junction, reparse_target) if junction is not None else nullcontext()
+    with junction_context:
+        if junction is not None:
+            assert junction.lstat().st_file_attributes & 0x400
+            before_children = tuple(sorted(str(path) for path in tmp_path.rglob("*")))
+        monkeypatch.setattr(os, "mkdir", deny_directory_write)
+        monkeypatch.setattr(os, "makedirs", deny_directory_write)
+        probe = _FailureProbe()
+        with pytest.raises(database_module.DatabaseStartupError) as caught:
+            database = database_module.SqliteDatabase(
+                source_path,
+                backup_root=invalid_root,
+                connect_factory=deny_connect,
+                failure_probe=probe,
+            )
+            database.open()
+
+        assert caught.value.error_code == "SQLITE_BACKUP_PATH_INVALID"
+        assert str(source_path) not in str(caught.value)
+        assert str(invalid_root) not in str(caught.value)
+        assert write_attempts == connect_attempts == []
+        assert probe.calls == []
+        assert not source_path.exists()
+        assert tuple(sorted(str(path) for path in tmp_path.rglob("*"))) == before_children
+    if junction is None:
+        reparse_target.rmdir()
+    assert project_root == Path("D:/codex项目")
+
+
+@pytest.mark.asyncio
+async def test_each_upgrade_creates_one_opaque_noncolliding_backup_under_root(tmp_path: Path) -> None:
+    """同一 startup 最多一份；跨升级不碰撞且文件名不暴露 source/业务 identity。"""
+    identity_parent = _assert_d_test_path(tmp_path / "Source-Secret-Ålpha" / "nested")
+    identity_parent.mkdir(parents=True)
+    backup_root = _assert_d_test_path(identity_parent / "backups")
+    sources = (
+        (_assert_d_test_path(tmp_path / "source-secret-alpha.sqlite3"), 1, "project-secret-alpha"),
+        (_assert_d_test_path(tmp_path / "source-secret-beta.sqlite3"), 3, "project-secret-beta"),
+    )
+    previous_files: tuple[Path, ...] = ()
+    expected_snapshots: dict[Path, _DatabaseSnapshot] = {}
+
+    for source_path, prefix_count, project_id in sources:
+        _create_registered_prefix(source_path, prefix_count)
+        with _raw_connection(source_path) as connection:
+            _insert(connection, "projects", {"project_id": project_id})
+        expected = _schema_snapshot(source_path)
+
+        coordinator, _mutex, _probe = _new_stack(source_path, backup_root=backup_root)
+        await _bounded(coordinator.start())
+        await _bounded(coordinator.close())
+
+        current_files = _sqlite_backup_files(backup_root)
+        new_files = tuple(path for path in current_files if path not in previous_files)
+        assert len(new_files) == 1
+        backup_path = new_files[0]
+        backup_path.resolve().relative_to(backup_root.resolve())
+        relative = unicodedata.normalize("NFC", backup_path.relative_to(backup_root).as_posix()).casefold()
+        forbidden_identities = (
+            source_path.name,
+            source_path.stem,
+            project_id,
+            *source_path.parts,
+        )
+        for identity in forbidden_identities:
+            normalized_identity = unicodedata.normalize("NFC", identity).casefold()
+            assert normalized_identity not in relative
+        _assert_reopenable_backup(backup_path, expected)
+        _assert_rename_roundtrip(backup_path)
+        _assert_reopenable_backup(backup_path, expected)
+        expected_snapshots[backup_path] = _schema_snapshot(backup_path)
+        for previous_path in previous_files:
+            assert _schema_snapshot(previous_path) == expected_snapshots[previous_path]
+        previous_files = current_files
+
+    assert len(previous_files) == len(sources)
+    assert len({path.resolve() for path in previous_files}) == len(sources)
 
 
 @pytest.mark.asyncio
@@ -1479,7 +2134,11 @@ async def test_bootstrap_order_owner_thread_and_pragma_readback(tmp_path: Path) 
         connect_calls.append((threading.get_ident(), dict(kwargs)))
         return sqlite3.connect(*args, **kwargs)
 
-    coordinator, mutex, probe = _new_stack(path, connect_factory=recording_connect)
+    coordinator, mutex, probe = _new_stack(
+        path,
+        backup_root=_controlled_backup_root(path),
+        connect_factory=recording_connect,
+    )
     readiness = await _bounded(coordinator.start())
     try:
         assert mutex.events[0][0] == "acquire"
@@ -1567,6 +2226,7 @@ async def test_import_time_audit_sees_one_owner_connection_and_real_cas_sql_thre
         async def main():
             database = SqliteDatabase(
                 pathlib.Path(sys.argv[1]),
+                backup_root=pathlib.Path(sys.argv[1]).parent / "backups",
                 connect_factory=traced_connect,
                 failure_probe=lambda _point: None,
             )
@@ -1702,7 +2362,11 @@ async def test_each_legal_prefix_runs_exact_pending_trace_in_one_immediate_trans
         connection.set_trace_callback(trace.append)
         return connection
 
-    coordinator, _mutex, _probe = _new_stack(path, connect_factory=traced_connect)
+    coordinator, _mutex, _probe = _new_stack(
+        path,
+        backup_root=_controlled_backup_root(path),
+        connect_factory=traced_connect,
+    )
     await _bounded(coordinator.start())
     await _bounded(coordinator.close())
 
@@ -1727,11 +2391,11 @@ async def test_each_legal_prefix_runs_exact_pending_trace_in_one_immediate_trans
 async def test_p02_reopen_is_idempotent_and_does_not_rerun_migrations(tmp_path: Path) -> None:
     """第二次打开同库只核验版本/完整性，不重复执行 0001→0004。"""
     path = _assert_d_test_path(tmp_path / "reopen.sqlite3")
-    first, _mutex, _probe = _new_stack(path)
+    first, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     first_readiness = await _bounded(first.start())
     await _bounded(first.close())
 
-    second, _mutex2, _probe2 = _new_stack(path)
+    second, _mutex2, _probe2 = _new_stack(path, backup_root=_controlled_backup_root(path))
     second_readiness = await _bounded(second.start())
     await _bounded(second.close())
 
@@ -1754,7 +2418,11 @@ async def test_reopen_real_trace_has_no_ddl_or_migration_ledger_insert(tmp_path:
         connection.set_trace_callback(trace.append)
         return connection
 
-    coordinator, _mutex, _probe = _new_stack(path, connect_factory=traced_connect)
+    coordinator, _mutex, _probe = _new_stack(
+        path,
+        backup_root=_controlled_backup_root(path),
+        connect_factory=traced_connect,
+    )
     await _bounded(coordinator.start())
     await _bounded(coordinator.close())
     normalized = [" ".join(statement.upper().split()) for statement in trace]
@@ -1801,7 +2469,11 @@ async def test_migration_ledger_and_unregistered_schema_drift_fail_closed(
             connection.execute("CREATE TABLE unregistered_task1_table(id TEXT PRIMARY KEY NOT NULL)")
 
     before = _schema_snapshot(path)
-    receipt = _startup_failure_receipt(path, scenario="normal_failure")
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="normal_failure",
+        backup_root=_controlled_backup_root(path),
+    )
     assert receipt["errorCode"] == error_code
     assert _schema_snapshot(path) == before
 
@@ -1820,7 +2492,12 @@ def test_every_pending_statement_and_finalization_failure_restores_exact_legal_p
         if prefix_count:
             _create_registered_prefix(path, prefix_count)
         before = _schema_snapshot(path)
-        receipt = _startup_failure_receipt(path, scenario="fault", failure_point=failure_point)
+        receipt = _startup_failure_receipt(
+            path,
+            scenario="fault",
+            failure_point=failure_point,
+            backup_root=_controlled_backup_root(path),
+        )
         assert receipt["errorCode"] == "SQLITE_MIGRATION_FAILED"
         probe_points = receipt["probePoints"]
         assert isinstance(probe_points, list)
@@ -1841,7 +2518,11 @@ def test_every_pending_statement_and_finalization_failure_restores_exact_legal_p
 def test_n11_foreign_keys_setter_inside_transaction_fails_readback_and_blocks_ready(tmp_path: Path) -> None:
     """PRAGMA foreign_keys 在事务内静默无效时必须因 readback!=1 fail closed。"""
     path = _assert_d_test_path(tmp_path / "pragma-in-txn.sqlite3")
-    receipt = _startup_failure_receipt(path, scenario="foreign_keys_in_transaction")
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="foreign_keys_in_transaction",
+        backup_root=_controlled_backup_root(path),
+    )
     assert receipt["errorCode"] == "SQLITE_PRAGMA_READBACK_FAILED"
     assert receipt["coordinatorState"] == "FAILED"
     assert receipt["mutexEvents"] == ["acquire", "release", "close_handle"]
@@ -1857,7 +2538,11 @@ def test_n11_foreign_keys_setter_inside_transaction_fails_readback_and_blocks_re
 def test_f01_connect_failure_is_stable_and_releases_mutex_without_ready(tmp_path: Path) -> None:
     """connect 失败时不得迁移/发布 ready；已取得 mutex 必须在 owner 线程闭合。"""
     path = _assert_d_test_path(tmp_path / "connect-failure.sqlite3")
-    receipt = _startup_failure_receipt(path, scenario="connect_failure")
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="connect_failure",
+        backup_root=_controlled_backup_root(path),
+    )
     assert receipt["errorCode"] == "SQLITE_CONNECT_FAILED"
     assert receipt["probePoints"] == ["sqlite_connect"]
     assert receipt["mutexEvents"] == ["acquire", "release", "close_handle"]
@@ -1883,7 +2568,12 @@ def test_f02_f04_bootstrap_failure_points_never_publish_ready(
 ) -> None:
     """每个 PRAGMA/migration/integrity 切点都关闭连接并保持 coordinator FAILED。"""
     path = _assert_d_test_path(tmp_path / f"{failure_point.replace(':', '-')}.sqlite3")
-    receipt = _startup_failure_receipt(path, scenario="fault", failure_point=failure_point)
+    receipt = _startup_failure_receipt(
+        path,
+        scenario="fault",
+        failure_point=failure_point,
+        backup_root=_controlled_backup_root(path),
+    )
     assert receipt["coordinatorState"] == "FAILED"
     assert receipt["mutexEvents"] == ["acquire", "release", "close_handle"]
 
@@ -1892,7 +2582,7 @@ def test_f02_f04_bootstrap_failure_points_never_publish_ready(
 async def test_all_uow_repositories_share_the_owner_connection(tmp_path: Path) -> None:
     """workflow/events/auth/resources stores 必须共享同一连接与显式事务。"""
     path = _assert_d_test_path(tmp_path / "one-connection.sqlite3")
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     await _bounded(coordinator.start())
     try:
         identities = await _bounded(
@@ -1919,7 +2609,7 @@ async def test_p05_p06_task_cas_and_authoritative_state_event_commit_together(tm
     path = _assert_d_test_path(tmp_path / "atomic-success.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     await _bounded(coordinator.start())
     event = _task_state_event()
     try:
@@ -1965,7 +2655,7 @@ async def test_five_authoritative_aggregate_cas_paths_pair_one_to_one_with_state
     path = _assert_d_test_path(tmp_path / f"five-cas-{aggregate_type.casefold()}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path, include_phase_barrier=True, include_execution_graph=True)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     await _bounded(coordinator.start())
     event = _aggregate_state_event(aggregate_type)
 
@@ -2057,7 +2747,7 @@ async def test_precommit_rejects_unpaired_duplicate_or_drifting_authoritative_ev
         include_execution_graph=True,
         include_identity_alternates=True,
     )
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     uow_module = _uow_module()
     event = _drifting_state_event(aggregate_type, mutation)
 
@@ -2109,7 +2799,7 @@ async def test_precommit_rejects_non_bijective_cas_event_cardinality(tmp_path: P
     path = _assert_d_test_path(tmp_path / f"pair-cardinality-{ratio}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path, include_phase_barrier=True)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     uow_module = _uow_module()
 
     def non_bijective(uow: _AtomicUnitOfWorkPort) -> None:
@@ -2159,7 +2849,7 @@ async def test_p07_callback_failure_explicitly_rolls_back_state_and_event(tmp_pa
     path = _assert_d_test_path(tmp_path / "explicit-rollback.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     await _bounded(coordinator.start())
 
     def fail_after_both_writes(uow: _AtomicUnitOfWorkPort) -> None:
@@ -2204,7 +2894,7 @@ async def test_n09_each_authoritative_aggregate_stale_cas_persists_no_event(
     path = _assert_d_test_path(tmp_path / f"stale-{aggregate_type.casefold()}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path, include_phase_barrier=True, include_execution_graph=True)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     uow_module = _uow_module()
     stale_changes = dict(changes)
     stale_changes["expected_state_version"] = 9
@@ -2247,7 +2937,11 @@ async def test_f06_f08_injected_precommit_failures_restore_exact_before_snapshot
     path = _assert_d_test_path(tmp_path / f"{failure_point}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path)
-    coordinator, _mutex, _probe = _new_stack(path, failing_points={failure_point})
+    coordinator, _mutex, _probe = _new_stack(
+        path,
+        backup_root=_controlled_backup_root(path),
+        failing_points={failure_point},
+    )
     await _bounded(coordinator.start())
     try:
         with pytest.raises(_InjectedFailure):
@@ -2281,7 +2975,7 @@ async def test_n08_authoritative_event_is_schema_validated_and_payload_digest_re
     path = _assert_d_test_path(tmp_path / f"invalid-event-{mutation}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     uow_module = _uow_module()
     event = _task_state_event()
     if mutation == "digest":
@@ -2326,7 +3020,7 @@ async def test_phase_barrier_state_event_checks_aggregate_id_and_row_run_id(
     path = _assert_d_test_path(tmp_path / f"barrier-{aggregate_id}-{run_id}.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path, include_phase_barrier=True)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     uow_module = _uow_module()
     await _bounded(coordinator.start())
     try:
@@ -2366,7 +3060,7 @@ async def test_valid_phase_barrier_event_commits_without_task7_materialization(t
     path = _assert_d_test_path(tmp_path / "barrier-valid.sqlite3")
     await _bootstrap_empty_database(path)
     _seed_task(path, include_phase_barrier=True)
-    coordinator, _mutex, _probe = _new_stack(path)
+    coordinator, _mutex, _probe = _new_stack(path, backup_root=_controlled_backup_root(path))
     await _bounded(coordinator.start())
     try:
         await _bounded(
