@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -1648,6 +1649,15 @@ def _digest_blob(blob: bytes) -> str:
     return "sha256:" + hashlib.sha256(blob).hexdigest()
 
 
+def _canonical_digest_selector(blob: bytes) -> bytes:
+    """将 primitive digest 封装为闭合 JCS selector，避免向 canonical_* 列写入 TEXT。"""
+    selector = {"digest": _digest_blob(blob)}
+    canonical_selector = _canonical_blob(selector)
+    assert isinstance(canonical_selector, bytes)
+    assert json.loads(canonical_selector.decode("utf-8")) == selector
+    return canonical_selector
+
+
 def _migration_paths() -> tuple[Path, ...]:
     """冻结迁移集合与顺序，不允许吞入 Task 2+ 或 Deployment 表。"""
     paths = tuple(MIGRATIONS_DIR / name for name in MIGRATION_NAMES)
@@ -1971,7 +1981,7 @@ def _seed_workflow_graph(connection: sqlite3.Connection) -> None:
             "contract_schema_id": "intent-authorization.v1",
             "contract_schema_version": 1,
             "canonical_contract": auth_blob,
-            "canonical_contract_digest": _digest_blob(auth_blob),
+            "canonical_contract_digest": _canonical_digest_selector(auth_blob),
         },
     )
     run_spec_blob = _canonical_blob(
