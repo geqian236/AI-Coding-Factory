@@ -137,10 +137,13 @@ def _snapshot_ref(schema_id: str, character: str) -> dict[str, str]:
     }
 
 
-def _valid_intent_authorization() -> dict[str, object]:
+def _valid_intent_authorization(
+    *,
+    authorization_id: str = "intent-uow-1",
+) -> dict[str, object]:
     """返回完整通过 intent-authorization.v1 的真实合同，不使用 ID-only 伪 blob。"""
     return {
-        "intentAuthorizationId": "intent-uow-1",
+        "intentAuthorizationId": authorization_id,
         "taskId": "task-uow-1",
         "userId": "user-uow-1",
         "requirementDigest": _snapshot_ref("factory.authorization.intent.requirement.v1", "1"),
@@ -165,12 +168,17 @@ def _valid_intent_authorization() -> dict[str, object]:
     }
 
 
-def _valid_execution_authorization() -> dict[str, object]:
+def _valid_execution_authorization(
+    *,
+    authorization_id: str = "execution-uow-1",
+    intent_authorization_id: str = "intent-uow-1",
+    plan_revision_id: str = "plan-uow-1",
+) -> dict[str, object]:
     """返回完整通过 execution-authorization.v1 的真实 IMPLEMENT/worktree.write 合同。"""
     return {
-        "executionAuthorizationId": "execution-uow-1",
-        "intentAuthorizationId": "intent-uow-1",
-        "planRevisionId": "plan-uow-1",
+        "executionAuthorizationId": authorization_id,
+        "intentAuthorizationId": intent_authorization_id,
+        "planRevisionId": plan_revision_id,
         "semanticPlanHash": _snapshot_ref("factory.authorization.execution.semantic-plan.v1", "1"),
         "planRevisionDigest": _snapshot_ref("factory.authorization.execution.plan-revision.v1", "2"),
         "stageCapabilityMapVersion": "stage-capability-map.v1",
@@ -206,6 +214,92 @@ def _assert_authorization_fixture_is_real(contract: dict[str, object], schema_na
     jsonschema.Draft7Validator(schema, format_checker=jsonschema.FormatChecker()).validate(contract)
     canonical = canonicalize(contract)
     assert canonicalize(json.loads(canonical.decode("utf-8"))) == canonical
+
+
+def _authorization_contract_digest_blob(contract: dict[str, object], *, kind: str) -> bytes:
+    """把 parser 产生的文档摘要冻结为 JCS BLOB selector，不向 STRICT BLOB 列写 TEXT。"""
+    authorization = _authorization_module()
+    parser = {
+        "intent": authorization.parse_intent_authorization,
+        "execution": authorization.parse_execution_authorization,
+    }[kind]
+    parsed = parser(contract)
+    return canonicalize({"digest": parsed.contract_digest})
+
+
+def _intent_authorization_record(contract: dict[str, object]) -> dict[str, object]:
+    """把完整 IntentAuthorization 映射为 selector + 独立 JCS BLOB 持久记录。"""
+    authorization = _authorization_module()
+    parsed = authorization.parse_intent_authorization(contract)
+    return {
+        "intent_authorization_id": contract["intentAuthorizationId"],
+        "task_id": contract["taskId"],
+        "user_id": contract["userId"],
+        "requirement_digest": canonicalize(contract["requirementDigest"]),
+        "project_id": contract["projectId"],
+        "repository_id": contract["repositoryId"],
+        "repository_binding_digest": canonicalize(contract["repositoryBindingDigest"]),
+        "baseline_digest": canonicalize(contract["baselineDigest"]),
+        "target_stage": contract["targetStage"],
+        "stage_capability_map_version": contract["stageCapabilityMapVersion"],
+        "allowed_capability_set_digest": canonicalize(contract["allowedCapabilitySetDigest"]),
+        "target_binding_digest": canonicalize(contract["targetBindingDigest"]),
+        "risk_ceiling": contract["riskCeiling"],
+        "estimated_cost_alert_digest": canonicalize(contract["estimatedCostAlertDigest"]),
+        "autonomous_execution_budget_ms": contract["autonomousExecutionBudgetMs"],
+        "repair_loop_limit": contract["repairLoopLimit"],
+        "auto_replan_limit": contract["autoReplanLimit"],
+        "attempt_limit": contract["attemptLimit"],
+        "issued_at": contract["issuedAt"],
+        "expires_at": contract["expiresAt"],
+        "revoked_at": contract["revokedAt"],
+        "revoke_reason": contract["revokeReason"],
+        "contract_schema_id": parsed.schema_id,
+        "contract_schema_version": parsed.schema_version,
+        "canonical_contract": parsed.canonical_bytes,
+        "canonical_contract_digest": canonicalize({"digest": parsed.contract_digest}),
+    }
+
+
+def _execution_authorization_record(contract: dict[str, object]) -> dict[str, object]:
+    """把完整 ExecutionAuthorization 映射为 selector + 独立 JCS BLOB 持久记录。"""
+    authorization = _authorization_module()
+    parsed = authorization.parse_execution_authorization(contract)
+    return {
+        "execution_authorization_id": contract["executionAuthorizationId"],
+        "intent_authorization_id": contract["intentAuthorizationId"],
+        "plan_revision_id": contract["planRevisionId"],
+        "semantic_plan_hash": canonicalize(contract["semanticPlanHash"]),
+        "plan_revision_digest": canonicalize(contract["planRevisionDigest"]),
+        "stage_capability_map_version": contract["stageCapabilityMapVersion"],
+        "stage_capability_map_digest": canonicalize(contract["stageCapabilityMapDigest"]),
+        "node_capability_map_version": contract["nodeCapabilityMapVersion"],
+        "node_capability_map_digest": canonicalize(contract["nodeCapabilityMapDigest"]),
+        "run_id": contract["runId"],
+        "step_id": contract["stepId"],
+        "attempt_id": contract["attemptId"],
+        "node_type": contract["nodeType"],
+        "executor_id": contract["executorId"],
+        "resource_fingerprint": canonicalize(contract["resourceFingerprint"]),
+        "capability_scope_digest": canonicalize(contract["capabilityScopeDigest"]),
+        "idempotency_key": canonicalize(contract["idempotencyKey"]),
+        "input_bindings": canonicalize(contract["inputBindings"]),
+        "action_capability": contract["actionCapability"],
+        "action_policy_snapshot_digest": canonicalize(contract["actionPolicySnapshotDigest"]),
+        "fencing_token": contract["fencingToken"],
+        "control_epoch": contract["controlEpoch"],
+        "accepted_control_command_seq": contract["acceptedControlCommandSeq"],
+        "max_uses": contract["maxUses"],
+        "consumption_state": contract["consumptionState"],
+        "issued_at": contract["issuedAt"],
+        "expires_at": contract["expiresAt"],
+        "revoked_at": contract["revokedAt"],
+        "revoke_reason": contract["revokeReason"],
+        "contract_schema_id": parsed.schema_id,
+        "contract_schema_version": parsed.schema_version,
+        "canonical_contract": parsed.canonical_bytes,
+        "canonical_contract_digest": canonicalize({"digest": parsed.contract_digest}),
+    }
 
 
 def _contract_schema(schema_name: str) -> dict[str, Any]:
@@ -395,6 +489,16 @@ def _database_module() -> ModuleType:
     return importlib.import_module("factory_agent.storage.sqlite.database")
 
 
+def _plans_module() -> ModuleType:
+    """延迟导入 PlanRevision 持久化 hydrator 与稳定错误。"""
+    return importlib.import_module("factory_agent.domain.plans")
+
+
+def _authorization_module() -> ModuleType:
+    """延迟导入 Intent/Execution authorization 领域 parser。"""
+    return importlib.import_module("factory_agent.domain.authorization")
+
+
 def _coordinator_module() -> ModuleType:
     """延迟导入唯一 write coordinator。"""
     return importlib.import_module("factory_agent.scheduler.write_coordinator")
@@ -417,6 +521,23 @@ def _assert_d_test_path(path: Path) -> Path:
 
 class _InjectedFailure(RuntimeError):
     """测试故障点异常；生产层必须归一为稳定错误码且不得记录正文。"""
+
+
+class _CommitOutcomeUnknownConnection(sqlite3.Connection):
+    """仅在业务 COMMIT 执行前模拟 ack 通道断开，保留真实活动事务供 close 检查。"""
+
+    fail_commit = False
+
+    def execute(
+        self,
+        sql: str,
+        parameters: Iterable[object] = (),
+        /,
+    ) -> sqlite3.Cursor:
+        """只拦截显式 COMMIT；其余 SQL 仍由真实 SQLite 执行。"""
+        if self.fail_commit and _trace_key(sql) == ("commit",):
+            raise sqlite3.OperationalError("injected-commit-outcome-unknown")
+        return super().execute(sql, parameters)
 
 
 class _FailureProbe:
@@ -810,7 +931,7 @@ def _seed_task(
                 "contract_schema_id": "intent-authorization.v1",
                 "contract_schema_version": 1,
                 "canonical_contract": auth_blob,
-                "canonical_contract_digest": payload_digest(intent_contract),
+                "canonical_contract_digest": _authorization_contract_digest_blob(intent_contract, kind="intent"),
             },
         )
         parent_run_spec, parent_revision = _valid_plan_bundle(
@@ -982,7 +1103,10 @@ def _seed_task(
                 "contract_schema_id": "execution-authorization.v1",
                 "contract_schema_version": 1,
                 "canonical_contract": execution_blob,
-                "canonical_contract_digest": payload_digest(execution_contract),
+                "canonical_contract_digest": _authorization_contract_digest_blob(
+                    execution_contract,
+                    kind="execution",
+                ),
             },
         )
         if include_identity_alternates:
@@ -1036,9 +1160,116 @@ def _seed_task(
             )
 
 
+def _bootstrap_and_seed_repository_graph(database_path: Path) -> None:
+    """不依赖 G3 coordinator，用真实 Database 完成迁移后建立完整 FK 图。"""
+    database_module = _database_module()
+    database = database_module.SqliteDatabase(
+        database_path,
+        backup_root=_controlled_backup_root(database_path),
+    )
+    database.open()
+    database.close()
+    _seed_task(
+        database_path,
+        include_phase_barrier=True,
+        include_execution_graph=True,
+    )
+
+
+def _repository_contract_case(
+    kind: str,
+) -> tuple[dict[str, object], str, str, str, str]:
+    """构造三类仓储的合法记录、方法名与稳定身份。"""
+    if kind == "plan_revision":
+        run_spec, revision = _valid_plan_bundle(
+            plan_revision_id="plan-uow-2",
+            spec_revision=3,
+            parent_revision_id="plan-uow-1",
+        )
+        return (
+            _plan_revision_record(run_spec, revision),
+            "workflow",
+            "append_plan_revision",
+            "get_plan_revision",
+            "plan-uow-2",
+        )
+    if kind == "intent_authorization":
+        contract = _valid_intent_authorization(authorization_id="intent-uow-2")
+        _assert_authorization_fixture_is_real(contract, "intent-authorization.v1.schema.json")
+        return (
+            _intent_authorization_record(contract),
+            "authorization",
+            "append_intent_authorization",
+            "get_intent_authorization",
+            "intent-uow-2",
+        )
+    assert kind == "execution_authorization"
+    contract = _valid_execution_authorization(authorization_id="execution-uow-2")
+    _assert_authorization_fixture_is_real(contract, "execution-authorization.v1.schema.json")
+    return (
+        _execution_authorization_record(contract),
+        "authorization",
+        "append_execution_authorization",
+        "get_execution_authorization",
+        "execution-uow-2",
+    )
+
+
+def _corrupt_repository_contract_record(
+    kind: str,
+    record: Mapping[str, object],
+    mutation: str,
+) -> dict[str, object]:
+    """只漂移一个 JCS/selector/digest 维度，同时保持 STRICT 类型和 FK 合法。"""
+    corrupted = dict(record)
+    if mutation == "noncanonical_blob":
+        column = "canonical_plan_revision" if kind == "plan_revision" else "canonical_contract"
+        blob = corrupted[column]
+        assert isinstance(blob, bytes)
+        assert blob.startswith(b"{")
+        corrupted[column] = b"[" + blob[1:]
+    elif mutation == "selector_drift":
+        column = {
+            "plan_revision": "created_at",
+            "intent_authorization": "user_id",
+            "execution_authorization": "executor_id",
+        }[kind]
+        corrupted[column] = {
+            "plan_revision": "2026-08-12T00:00:01Z",
+            "intent_authorization": "user-uow-X",
+            "execution_authorization": "executor-uow-X",
+        }[kind]
+    else:
+        assert mutation == "digest_drift"
+        if kind == "plan_revision":
+            corrupted["plan_revision_digest"] = "sha256:" + "f" * 64
+        else:
+            corrupted["canonical_contract_digest"] = canonicalize({"digest": "sha256:" + "f" * 64})
+    return corrupted
+
+
+def _repository_contract_error(kind: str) -> tuple[type[Exception], str]:
+    """返回仓储边界应保留的领域错误类与稳定错误码。"""
+    if kind == "plan_revision":
+        return _plans_module().PlanPersistenceError, "PLAN_REVISION_PERSISTENCE_MISMATCH"
+    return _authorization_module().AuthorizationContractError, "INVALID_AUTHORIZATION_CONTRACT"
+
+
+def _repository_contract_error_for_mutation(
+    kind: str,
+    mutation: str,
+) -> tuple[type[Exception], str]:
+    """精确区分 Plan canonical 字节错误与 selector/digest 不一致。"""
+    error_type, error_code = _repository_contract_error(kind)
+    if kind == "plan_revision" and mutation == "noncanonical_blob":
+        return error_type, "NONCANONICAL_PLAN_BLOB"
+    return error_type, error_code
+
+
 def _task_state_event(
     *,
     state_event_id: str = "state-event-task-1",
+    task_id: str = "task-uow-1",
     previous_version: int = 0,
     state_version: int = 1,
     payload: dict[str, object] | None = None,
@@ -1050,10 +1281,10 @@ def _task_state_event(
         "stateEventId": state_event_id,
         "eventType": "state.changed",
         "durabilityClass": "authoritative_state",
-        "taskId": "task-uow-1",
+        "taskId": task_id,
         "scope": "TASK",
         "aggregateType": "TASK",
-        "aggregateId": "task-uow-1",
+        "aggregateId": task_id,
         "runId": None,
         "stepId": None,
         "attemptId": None,
@@ -1950,6 +2181,7 @@ async def test_fresh_nonexistent_database_is_backup_not_applicable(tmp_path: Pat
         "c_drive",
         "relative",
         "dotdot",
+        "database_file",
         "source_directory",
         "same_drive_cross_root",
         "prefix_confusion",
@@ -2029,6 +2261,7 @@ async def test_backup_root_api_and_storage_location_fail_closed_before_any_write
             "c_drive": Path("C:/CodexForbidden/factory-state-backups"),
             "relative": Path("relative-backups"),
             "dotdot": tmp_path / "backups" / ".." / "escaped",
+            "database_file": source_path,
             "source_directory": source_path.parent,
             "same_drive_cross_root": Path("D:/factory-backups-outside-codex-project"),
             "prefix_confusion": Path("D:/codex项目-evil/backups"),
@@ -2603,6 +2836,118 @@ async def test_all_uow_repositories_share_the_owner_connection(tmp_path: Path) -
     assert len(set(identities)) == 1
 
 
+@pytest.mark.parametrize(
+    ("kind", "mutation"),
+    [
+        ("plan_revision", "noncanonical_blob"),
+        ("intent_authorization", "selector_drift"),
+        ("execution_authorization", "digest_drift"),
+    ],
+)
+def test_repository_append_validates_canonical_contract_and_selectors_before_insert(
+    tmp_path: Path,
+    kind: str,
+    mutation: str,
+) -> None:
+    """Plan/Authorization append 必须调用领域 hydrator/parser，不能依赖 SQLite 形状。"""
+    path = _assert_d_test_path(tmp_path / f"append-boundary-{kind}-{mutation}.sqlite3")
+    _bootstrap_and_seed_repository_graph(path)
+    record, repository_name, append_name, get_name, identity = _repository_contract_case(kind)
+    invalid = _corrupt_repository_contract_record(kind, record, mutation)
+    error_type, error_code = _repository_contract_error_for_mutation(kind, mutation)
+    database = _database_module().SqliteDatabase(path, backup_root=_controlled_backup_root(path))
+    database.open()
+    try:
+        unit_of_work = database.new_unit_of_work()
+        unit_of_work.begin_immediate()
+        repository = getattr(unit_of_work, repository_name)
+        with pytest.raises(error_type) as caught:
+            getattr(repository, append_name)(invalid)
+        assert caught.value.error_code == error_code
+        assert getattr(repository, get_name)(identity) is None
+        unit_of_work.rollback()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "mutation"),
+    [
+        ("plan_revision", "noncanonical_blob"),
+        ("intent_authorization", "selector_drift"),
+        ("execution_authorization", "digest_drift"),
+    ],
+)
+def test_repository_get_rehydrates_and_rejects_raw_persistence_corruption(
+    tmp_path: Path,
+    kind: str,
+    mutation: str,
+) -> None:
+    """raw SQLite 绕过 append 后，get 自身仍须重验 JCS、digest 和 selector。"""
+    path = _assert_d_test_path(tmp_path / f"get-boundary-{kind}-{mutation}.sqlite3")
+    _bootstrap_and_seed_repository_graph(path)
+    record, repository_name, append_name, get_name, identity = _repository_contract_case(kind)
+    table, identity_column = {
+        "plan_revision": ("plan_revisions", "plan_revision_id"),
+        "intent_authorization": ("intent_authorizations", "intent_authorization_id"),
+        "execution_authorization": ("execution_authorizations", "execution_authorization_id"),
+    }[kind]
+    database = _database_module().SqliteDatabase(path, backup_root=_controlled_backup_root(path))
+    database.open()
+    try:
+        unit_of_work = database.new_unit_of_work()
+        unit_of_work.begin_immediate()
+        repository = getattr(unit_of_work, repository_name)
+        getattr(repository, append_name)(record)
+        assert getattr(repository, get_name)(identity) is not None
+        unit_of_work.precommit()
+        unit_of_work.commit()
+    finally:
+        database.close()
+
+    corrupted = _corrupt_repository_contract_record(kind, record, mutation)
+    changed = [column for column in record if corrupted[column] != record[column]]
+    assert len(changed) == 1
+    column = changed[0]
+    with _raw_connection(path) as connection:
+        row = connection.execute(
+            f'SELECT rowid, "{column}" FROM "{table}" WHERE "{identity_column}"=?',  # noqa: S608
+            (identity,),
+        ).fetchone()
+        assert row is not None
+        rowid, stored = row
+        replacement = corrupted[column]
+        stored_bytes = stored if isinstance(stored, bytes) else str(stored).encode("utf-8")
+        replacement_bytes = replacement if isinstance(replacement, bytes) else str(replacement).encode("utf-8")
+        assert len(stored_bytes) == len(replacement_bytes)
+        # blobopen 绕过 append-only UPDATE trigger，模拟同长存储字节腐化。
+        with connection.blobopen(table, column, rowid, readonly=False) as blob:
+            blob.write(replacement_bytes)
+        persisted = connection.execute(
+            f'SELECT "{column}" FROM "{table}" WHERE "{identity_column}"=?',  # noqa: S608
+            (identity,),
+        ).fetchone()
+        assert persisted is not None
+        persisted_value = persisted[0]
+        if isinstance(persisted_value, bytes):
+            persisted_bytes = persisted_value
+        else:
+            persisted_bytes = str(persisted_value).encode("utf-8")
+        assert persisted_bytes == replacement_bytes
+        assert persisted_bytes != stored_bytes
+
+    error_type, error_code = _repository_contract_error_for_mutation(kind, mutation)
+    reopened = _database_module().SqliteDatabase(path, backup_root=_controlled_backup_root(path))
+    reopened.open()
+    try:
+        repository = getattr(reopened.new_unit_of_work(), repository_name)
+        with pytest.raises(error_type) as caught:
+            getattr(repository, get_name)(identity)
+        assert caught.value.error_code == error_code
+    finally:
+        reopened.close()
+
+
 @pytest.mark.asyncio
 async def test_p05_p06_task_cas_and_authoritative_state_event_commit_together(tmp_path: Path) -> None:
     """CAS n→n+1、outcomeVersion 与 state.changed 必须同事务可见。"""
@@ -2636,6 +2981,59 @@ async def test_p05_p06_task_cas_and_authoritative_state_event_commit_together(tm
     assert task == ("DESIGN_APPROVED", 1, 1)
     assert state_events == [("state-event-task-1", 0, 1, event["payloadDigest"])]
     assert task7_counts == (0, 0, 0)
+
+
+def test_same_type_multi_task_cas_pairs_by_identity_when_events_arrive_out_of_order(tmp_path: Path) -> None:
+    """同事务两个 TASK CAS 必须按 identity 与乱序 event 2↔2 配对，不能只按 type。"""
+    path = _assert_d_test_path(tmp_path / "same-type-two-task-pairing.sqlite3")
+    _bootstrap_and_seed_repository_graph(path)
+    with _raw_connection(path) as connection:
+        _clone_seed_row(
+            connection,
+            "tasks",
+            "task_id",
+            "task-uow-1",
+            task_id="task-uow-2",
+            active_plan_revision_id=None,
+            active_run_id=None,
+        )
+    events = (
+        _task_state_event(state_event_id="state-event-task-2", task_id="task-uow-2"),
+        _task_state_event(state_event_id="state-event-task-1", task_id="task-uow-1"),
+    )
+    database = _database_module().SqliteDatabase(path, backup_root=_controlled_backup_root(path))
+    database.open()
+    try:
+        unit_of_work = database.new_unit_of_work()
+        unit_of_work.begin_immediate()
+        for task_id in ("task-uow-1", "task-uow-2"):
+            unit_of_work.workflow.compare_and_set_task(
+                task_id=task_id,
+                expected_state_version=0,
+                achieved_stage="DESIGN_APPROVED",
+                outcome_version=1,
+            )
+        for event in events:
+            unit_of_work.events.append_authoritative_state_event(event)
+        unit_of_work.precommit()
+        unit_of_work.commit()
+    finally:
+        database.close()
+
+    with _raw_connection(path) as connection:
+        assert connection.execute(
+            "SELECT task_id,achieved_stage,state_version,outcome_version FROM tasks "
+            "WHERE task_id IN ('task-uow-1','task-uow-2') ORDER BY task_id"
+        ).fetchall() == [
+            ("task-uow-1", "DESIGN_APPROVED", 1, 1),
+            ("task-uow-2", "DESIGN_APPROVED", 1, 1),
+        ]
+        assert connection.execute(
+            "SELECT state_event_id,task_id,aggregate_id FROM authoritative_state_events ORDER BY state_event_id"
+        ).fetchall() == [
+            ("state-event-task-1", "task-uow-1", "task-uow-1"),
+            ("state-event-task-2", "task-uow-2", "task-uow-2"),
+        ]
 
 
 @pytest.mark.asyncio
@@ -2875,6 +3273,49 @@ async def test_p07_callback_failure_explicitly_rolls_back_state_and_event(tmp_pa
     finally:
         await _bounded(coordinator.close())
     assert _task_snapshot(path) == (("NONE", 0, 0), [], (0, 0, 0))
+
+
+def test_poisoned_commit_outcome_unknown_close_discards_connection_without_rollback(tmp_path: Path) -> None:
+    """COMMIT outcome unknown 后只能废弃连接；close 不得伪称显式 ROLLBACK。"""
+    path = _assert_d_test_path(tmp_path / "commit-outcome-unknown.sqlite3")
+    database_module = _database_module()
+    statements: list[str] = []
+    connections: list[_CommitOutcomeUnknownConnection] = []
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        """创建可拦截 COMMIT 的真实 SQLite Connection 子类并保留 trace。"""
+        kwargs["factory"] = _CommitOutcomeUnknownConnection
+        connection = sqlite3.connect(*args, **kwargs)
+        assert isinstance(connection, _CommitOutcomeUnknownConnection)
+        connection.set_trace_callback(statements.append)
+        connections.append(connection)
+        return connection
+
+    database = database_module.SqliteDatabase(
+        path,
+        backup_root=_controlled_backup_root(path),
+        connect_factory=connect,
+    )
+    database.open()
+    assert len(connections) == 1
+    connection = connections[0]
+    unit_of_work = database.new_unit_of_work()
+    unit_of_work.begin_immediate()
+    connection.fail_commit = True
+
+    with pytest.raises(sqlite3.OperationalError, match="injected-commit-outcome-unknown"):
+        unit_of_work.commit()
+    assert connection.in_transaction is True
+
+    database.poison()
+    database.close()
+
+    # outcome unknown 绝不允许用 ROLLBACK 日志把不确定事实改写成已回滚。
+    assert not any(_trace_key(statement) == ("rollback",) for statement in statements)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
+    with pytest.raises(RuntimeError, match="not available"):
+        database.connection_identity
 
 
 @pytest.mark.asyncio
