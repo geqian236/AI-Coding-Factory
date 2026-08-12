@@ -11,7 +11,7 @@ import hashlib
 import importlib
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -316,6 +316,61 @@ def test_plan_revision_bundle_is_deeply_immutable() -> None:
     plans = _plans_module()
     run_spec, revision = _valid_bundle_inputs()
     bundle = plans.PlanRevisionBundle.from_contracts(run_spec=run_spec, plan_revision=revision)
+    assert bundle.run_spec == run_spec
+    assert run_spec == bundle.run_spec
+    assert bundle.plan_revision["nodes"] == revision["nodes"]
+    assert revision["nodes"] == bundle.plan_revision["nodes"]
+    assert bundle.plan_revision["nodes"] == tuple(revision["nodes"])
+    with pytest.raises(TypeError):
+        hash(bundle.run_spec)
+    with pytest.raises(TypeError):
+        hash(bundle.plan_revision["nodes"])
+
+    # 内部 facade 构造路径仍是安全边界，不能只依赖 bundle 外层预先 deepcopy。
+    alias_list: list[object] = []
+    assert "FrozenDict" not in plans.__all__
+    assert "FrozenList" not in plans.__all__
+    direct_mapping = plans.FrozenDict({"k": alias_list})
+    # 内部 FrozenDict 即使以 tuple 承载 pair，Mapping membership 也只能按 key 判断。
+    assert "k" in direct_mapping
+    assert "unknown" not in direct_mapping
+    assert ("k", direct_mapping["k"]) not in direct_mapping
+
+    mapping_bytes = canonicalize(direct_mapping)
+    alias_list.append("caller-mutated")
+    assert canonicalize(direct_mapping) == mapping_bytes
+
+    alias_dict: dict[str, object] = {}
+    direct_sequence = plans.FrozenList([alias_dict])
+    sequence_bytes = canonicalize(direct_sequence)
+    alias_dict["caller"] = "mutated"
+    assert canonicalize(direct_sequence) == sequence_bytes
+
+    # 已冻结 facade 可再次作为构造输入；generator 每个元素仍需取得深层所有权。
+    assert plans.FrozenDict(direct_mapping) == direct_mapping
+    assert plans.FrozenList(direct_sequence) == direct_sequence
+    generated_alias: dict[str, object] = {"nested": []}
+    generated_sequence = plans.FrozenList(item for item in (generated_alias,))
+    generated_bytes = canonicalize(generated_sequence)
+    nested_alias = generated_alias["nested"]
+    assert isinstance(nested_alias, list)
+    nested_alias.append("caller-mutated")
+    assert canonicalize(generated_sequence) == generated_bytes
+
+    class _DuplicateKeyMapping(Mapping[str, object]):
+        """模拟违反 Mapping key 唯一性的外来实现，构造器必须 fail closed。"""
+
+        def __getitem__(self, key: str) -> object:
+            return key
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(("duplicate", "duplicate"))
+
+        def __len__(self) -> int:
+            return 2
+
+    with pytest.raises(ValueError, match="duplicate frozen JSON object key"):
+        plans.FrozenDict(_DuplicateKeyMapping())
 
     with pytest.raises((AttributeError, TypeError)):
         bundle.spec_revision = 3
@@ -329,6 +384,108 @@ def test_plan_revision_bundle_is_deeply_immutable() -> None:
     ):
         with pytest.raises(TypeError):
             mutation()
+
+    # 仅覆盖子类 mutator 不足以形成安全边界；内建基类描述符也不得绕过冻结层。
+    bypassed: list[str] = []
+    for name, mutation in (
+        ("dict.__setitem__", lambda: dict.__setitem__(bundle.run_spec, "goal", "base-mutated")),
+        ("dict.update", lambda: dict.update(bundle.plan_revision, {"taskId": "task-base-mutated"})),
+        (
+            "list.__setitem__",
+            lambda: list.__setitem__(
+                bundle.run_spec["workPlan"]["nodes"],
+                0,
+                {"logicalNodeId": "base-mutated"},
+            ),
+        ),
+        (
+            "list.append",
+            lambda: list.append(
+                bundle.plan_revision["nodes"],
+                {"logicalNodeId": "base-appended"},
+            ),
+        ),
+    ):
+        try:
+            mutation()
+        except TypeError:
+            continue
+        bypassed.append(name)
+    assert not bypassed, f"mutable base-class bypasses remained: {bypassed}"
+    assert canonicalize(bundle.run_spec) == bundle.canonical_run_spec
+    assert canonicalize(bundle.plan_revision) == bundle.canonical_plan_revision
+
+    # facade 若把 payload 放在实例 slot，普通赋值、object 基类或 slot descriptor
+    # 都可能整体替换内部存储；每条路径使用 fresh bundle，避免一次污染遮住后续反例。
+    slot_bypasses: list[str] = []
+
+    def _replace_slot_through_descriptor(target: object, slot_name: str, replacement: object) -> None:
+        """模拟审查者直接调用旧 slot descriptor；无 slot 的安全实现应直接拒绝。"""
+        descriptor = vars(type(target)).get(slot_name)
+        if descriptor is None:
+            raise AttributeError("frozen facade has no instance data slot")
+        descriptor.__set__(target, replacement)
+
+    for name, target_path, slot_name, replacement, mutation in (
+        (
+            "FrozenDict ordinary assignment",
+            ("run_spec",),
+            "_FrozenDict__data",
+            {"goal": "ordinary-slot-mutated"},
+            setattr,
+        ),
+        (
+            "FrozenDict object.__setattr__",
+            ("run_spec",),
+            "_FrozenDict__data",
+            {"goal": "object-slot-mutated"},
+            object.__setattr__,
+        ),
+        (
+            "FrozenDict slot descriptor",
+            ("run_spec",),
+            "_FrozenDict__data",
+            {"goal": "descriptor-slot-mutated"},
+            _replace_slot_through_descriptor,
+        ),
+        (
+            "FrozenList ordinary assignment",
+            ("plan_revision", "nodes"),
+            "_FrozenList__data",
+            ({"logicalNodeId": "ordinary-slot-mutated"},),
+            setattr,
+        ),
+        (
+            "FrozenList object.__setattr__",
+            ("plan_revision", "nodes"),
+            "_FrozenList__data",
+            ({"logicalNodeId": "object-slot-mutated"},),
+            object.__setattr__,
+        ),
+        (
+            "FrozenList slot descriptor",
+            ("plan_revision", "nodes"),
+            "_FrozenList__data",
+            ({"logicalNodeId": "descriptor-slot-mutated"},),
+            _replace_slot_through_descriptor,
+        ),
+    ):
+        fresh = plans.PlanRevisionBundle.from_contracts(run_spec=run_spec, plan_revision=revision)
+        root = fresh.run_spec if target_path[0] == "run_spec" else fresh.plan_revision
+        target = root if len(target_path) == 1 else root[target_path[1]]
+        try:
+            mutation(target, slot_name, replacement)
+        except (AttributeError, TypeError):
+            pass
+        else:
+            canonical = canonicalize(fresh.run_spec if target_path[0] == "run_spec" else fresh.plan_revision)
+            expected = fresh.canonical_run_spec if target_path[0] == "run_spec" else fresh.canonical_plan_revision
+            if canonical != expected:
+                slot_bypasses.append(name)
+        # 正常属性也不得凭空创建，确保无 __dict__ 退路。
+        with pytest.raises((AttributeError, TypeError)):
+            setattr(target, "ordinary_attribute", "mutated")
+    assert not slot_bypasses, f"frozen facade slot replacement remained: {slot_bypasses}"
 
     # 调用方原始字典后续变化也不得穿透领域对象。
     run_spec["workPlan"]["nodes"][0]["logicalNodeId"] = "caller-mutated"

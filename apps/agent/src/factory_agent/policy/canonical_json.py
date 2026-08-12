@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -178,7 +179,7 @@ def _encode(value: object) -> str:  # noqa: ANN401
     """递归将已解析的 Python 值编码为规范 JSON 字符串片段。
 
     Args:
-        value: None / bool / int / float / str / list / dict。
+        value: None / bool / int / float / str / Mapping / 非字节 Sequence。
 
     Returns:
         规范化 JSON 片段（无多余空白）。
@@ -197,18 +198,20 @@ def _encode(value: object) -> str:  # noqa: ANN401
         return _encode_number(value)
     if isinstance(value, str):
         return _encode_string(value)
-    if isinstance(value, list):
-        return "[" + ",".join(_encode(item) for item in value) + "]"
-    if isinstance(value, dict):
+    # FrozenDict 同时以 tuple 承载不可变 payload；Mapping 必须先于 Sequence，
+    # 否则 JSON object 会被错误编码成内部 pair 数组。
+    if isinstance(value, Mapping):
         return _encode_object(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
+        return "[" + ",".join(_encode(item) for item in value) + "]"
     raise CanonicalJsonError(f"不支持的类型：{type(value).__name__}")
 
 
-def _encode_object(obj: dict[Any, Any]) -> str:
+def _encode_object(obj: Mapping[Any, Any]) -> str:
     """编码对象：键做 NFC，按 UTF-16 code unit 序排序后拼接。
 
     Args:
-        obj: 待编码字典（键必须为字符串）。
+        obj: 待编码映射（键必须为字符串）。
 
     Returns:
         规范化 JSON 对象片段。
@@ -240,7 +243,7 @@ def canonicalize(value: object) -> bytes:  # noqa: ANN401
     """将已解析的 Python 值规范化为 RFC 8785 UTF-8 字节序列。
 
     Args:
-        value: 由 JSON 解析得到的 Python 对象（dict/list/str/int/float/bool/None）。
+        value: JSON 标量、Mapping 或非字符串/字节 Sequence。
 
     Returns:
         规范化后的 UTF-8 字节序列。

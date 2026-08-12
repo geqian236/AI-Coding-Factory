@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import unicodedata
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -716,8 +717,8 @@ class TestPreparedAndDurableWireSchemas:
         )
         assert not list(validator.iter_errors(valid_state))
 
-    def test_rust_codegen_preserves_integer_const_type(self) -> None:
-        """Rust 生成类型不得把 schemaVersion 等整数 const 降级为 String。"""
+    def test_rust_codegen_preserves_integer_const_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """旧式两参 renderer 从权威 catalog 补授权 schema，且每次 direct 调用只加载一次。"""
         generator_path = REPO_ROOT / "contracts" / "codegen" / "generate.py"
         spec = importlib.util.spec_from_file_location("event_contract_codegen", generator_path)
         assert spec is not None and spec.loader is not None
@@ -727,10 +728,210 @@ class TestPreparedAndDurableWireSchemas:
 
         validator_schemas = codegen.load_required_validator_schemas()
         assert {"preparedEvent", "durableEvent"}.issubset(validator_schemas)
-        assert "PREPARED_EVENT_V2_SCHEMA_JSON" in codegen.generate_typescript(
-            [], validator_schemas
+        catalog_calls = 0
+        authorization_loader_calls = 0
+        original_load_catalog = codegen.load_catalog
+        original_authorization_loader = codegen.load_required_authorization_validator_schemas
+
+        def _tracked_catalog() -> dict[str, Any]:
+            """统计 direct fallback 的权威 catalog 读取次数。"""
+            nonlocal catalog_calls
+            catalog_calls += 1
+            return original_load_catalog()
+
+        def _tracked_authorization_loader(
+            entries: list[dict[str, Any]],
+        ) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+            """统计每个 direct renderer 自有 provider 的单次物化。"""
+            nonlocal authorization_loader_calls
+            authorization_loader_calls += 1
+            return original_authorization_loader(entries)
+
+        monkeypatch.setattr(codegen, "load_catalog", _tracked_catalog)
+        monkeypatch.setattr(
+            codegen,
+            "load_required_authorization_validator_schemas",
+            _tracked_authorization_loader,
         )
-        assert "DURABLE_EVENT_V2_SCHEMA_JSON" in codegen.generate_rust([], validator_schemas)
+        typescript = codegen.generate_typescript([], validator_schemas)
+        rust = codegen.generate_rust([], validator_schemas)
+        assert "PREPARED_EVENT_V2_SCHEMA_JSON" in typescript
+        assert "INTENT_AUTHORIZATION_SCHEMA_JSON" in typescript
+        assert "DURABLE_EVENT_V2_SCHEMA_JSON" in rust
+        assert "EXECUTION_AUTHORIZATION_SCHEMA_JSON" in rust
+        assert catalog_calls == authorization_loader_calls == 2
+
+    def test_codegen_cli_shares_one_lazy_authorization_provider_across_renderers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """CLI 三语言必须共享同一 provider，授权 schema 在整个批次只加载一次。"""
+        generator_path = REPO_ROOT / "contracts" / "codegen" / "generate.py"
+        spec = importlib.util.spec_from_file_location("event_contract_codegen_cli", generator_path)
+        assert spec is not None and spec.loader is not None
+        codegen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(codegen)
+        provider_ids: list[int] = []
+        loader_calls = 0
+        original_loader = codegen.load_required_authorization_validator_schemas
+        original_renderers = (
+            codegen.generate_typescript,
+            codegen.generate_python,
+            codegen.generate_rust,
+        )
+
+        def _tracked_loader(
+            entries: list[dict[str, Any]],
+        ) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+            """记录 CLI 批次的真实授权 bundle 物化次数。"""
+            nonlocal loader_calls
+            loader_calls += 1
+            return original_loader(entries)
+
+        def _renderer_wrapper(original: Any) -> Any:  # noqa: ANN401
+            """包裹 renderer，仅记录显式 provider 身份后调用真实实现。"""
+
+            def _tracked_renderer(
+                entries: list[dict[str, Any]],
+                validator_schemas: dict[str, tuple[dict[str, Any], str]],
+                authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+            ) -> str:
+                provider_ids.append(id(authorization_schemas))
+                return original(entries, validator_schemas, authorization_schemas)
+
+            return _tracked_renderer
+
+        def _accept_check(_path: object, _content: str, check_mode: bool) -> bool:
+            """隔离写边界，只验证本测试确实走只读 check 分支。"""
+            return check_mode
+
+        monkeypatch.setattr(codegen, "load_required_authorization_validator_schemas", _tracked_loader)
+        monkeypatch.setattr(codegen, "generate_typescript", _renderer_wrapper(original_renderers[0]))
+        monkeypatch.setattr(codegen, "generate_python", _renderer_wrapper(original_renderers[1]))
+        monkeypatch.setattr(codegen, "generate_rust", _renderer_wrapper(original_renderers[2]))
+        monkeypatch.setattr(codegen, "write_or_check", _accept_check)
+        assert codegen._run_codegen_cli(check_mode=True) == 0
+        assert loader_calls == 1
+        assert len(provider_ids) == 3
+        assert len(set(provider_ids)) == 1
+
+    def test_codegen_explicit_empty_authorization_provider_never_falls_back_to_catalog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """调用方显式给出的坏 catalog provider 必须 fail closed，不能静默改读权威 catalog。"""
+        generator_path = REPO_ROOT / "contracts" / "codegen" / "generate.py"
+        spec = importlib.util.spec_from_file_location("event_contract_codegen_explicit", generator_path)
+        assert spec is not None and spec.loader is not None
+        codegen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(codegen)
+        validator_schemas = codegen.load_required_validator_schemas()
+
+        def _unexpected_catalog_fallback() -> dict[str, Any]:
+            """显式 provider 路径若触发 catalog fallback 就立即失败。"""
+            raise AssertionError("explicit authorization provider must not fall back to catalog")
+
+        monkeypatch.setattr(codegen, "load_catalog", _unexpected_catalog_fallback)
+        explicit_empty_provider = codegen._LazyAuthorizationSchemas([])
+        with pytest.raises(
+            codegen.ValidatorSchemaError,
+            match="VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED",
+        ):
+            codegen.generate_typescript([], validator_schemas, explicit_empty_provider)
+
+    @pytest.mark.parametrize("authorization_name", ["IntentAuthorization", "ExecutionAuthorization"])
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "catalog-name-random",
+            "catalog-name-case",
+            "catalog-path-random",
+            "catalog-path-case",
+            "catalog-path-v999",
+            "catalog-id-random",
+            "catalog-id-case",
+            "catalog-id-v999",
+            "schema-draft",
+            "schema-id",
+            "schema-title",
+        ],
+    )
+    def test_authorization_codegen_loader_binds_exact_catalog_and_schema_identity(
+        self,
+        authorization_name: str,
+        mutation: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """两项授权 metadata 的任一单字段漂移都必须在生成内容前 fail closed。"""
+        generator_path = REPO_ROOT / "contracts" / "codegen" / "generate.py"
+        spec = importlib.util.spec_from_file_location("event_contract_codegen_identity", generator_path)
+        assert spec is not None and spec.loader is not None
+        codegen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(codegen)
+        entries = deepcopy(codegen._catalog_codegen_entries(codegen.load_catalog()))
+        entry = next(candidate for candidate in entries if candidate.get("name") == authorization_name)
+        original_path = entry["schemaPath"]
+        original_id = entry["schemaId"]
+
+        if mutation.startswith("catalog-"):
+            field, replacement = {
+                "catalog-name-random": ("name", "RandomAuthorization"),
+                "catalog-name-case": ("name", authorization_name.swapcase()),
+                "catalog-path-random": ("schemaPath", "contracts/schemas/run-spec.v1.schema.json"),
+                "catalog-path-case": ("schemaPath", original_path.swapcase()),
+                "catalog-path-v999": ("schemaPath", original_path.replace(".v1.", ".v999.")),
+                "catalog-id-random": ("schemaId", "random-authorization.v1"),
+                "catalog-id-case": ("schemaId", original_id.swapcase()),
+                "catalog-id-v999": ("schemaId", original_id.rsplit(".v", maxsplit=1)[0] + ".v999"),
+            }[mutation]
+            entry[field] = replacement
+        else:
+            original_loader = codegen.load_required_validator_schema
+
+            def _poisoned_loader(path: str) -> tuple[dict[str, Any], str]:
+                """在通用 Draft7 loader 后只毒化一个授权 identity 字段。"""
+                schema, digest = original_loader(path)
+                if path == original_path:
+                    schema = deepcopy(schema)
+                    field, replacement = {
+                        "schema-draft": ("$schema", "https://json-schema.org/draft/2020-12/schema"),
+                        "schema-id": ("$id", "https://poison.invalid/authorization.schema.json"),
+                        "schema-title": ("title", "PoisonedAuthorization"),
+                    }[mutation]
+                    schema[field] = replacement
+                return schema, digest
+
+            monkeypatch.setattr(codegen, "load_required_validator_schema", _poisoned_loader)
+
+        with pytest.raises(
+            codegen.ValidatorSchemaError,
+            match="VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED",
+        ):
+            codegen.load_required_authorization_validator_schemas(entries)
+
+    def test_codegen_bad_authorization_catalog_fails_before_any_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """CLI 授权身份漂移只返回固定 validator 错误，且三目标写入次数必须为零。"""
+        generator_path = REPO_ROOT / "contracts" / "codegen" / "generate.py"
+        spec = importlib.util.spec_from_file_location("event_contract_codegen_bad_identity", generator_path)
+        assert spec is not None and spec.loader is not None
+        codegen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(codegen)
+        catalog = deepcopy(codegen.load_catalog())
+        entry = next(item for item in catalog["schemas"] if item.get("name") == "IntentAuthorization")
+        entry["schemaId"] = "intent-authorization.v999"
+        writes: list[object] = []
+
+        monkeypatch.setattr(codegen, "load_catalog", lambda: catalog)
+        monkeypatch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)))
+        assert codegen._run_codegen_cli(check_mode=False) == 1
+        captured = capsys.readouterr()
+        assert "[ERROR] CODEGEN_VALIDATOR_SCHEMA_FAILED" in captured.err
+        assert "intent-authorization.v999" not in captured.out + captured.err
+        assert writes == []
 
 
 def _authoritative_state_event() -> dict[str, Any]:

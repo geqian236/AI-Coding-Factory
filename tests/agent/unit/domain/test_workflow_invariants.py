@@ -17,6 +17,7 @@ from typing import Any
 
 import jsonschema
 import pytest
+from factory_agent.errors import FactoryError
 from factory_agent.policy.canonical_json import canonicalize
 from factory_agent.policy.plan_hash import barrier_id
 
@@ -427,18 +428,171 @@ def test_achieved_stage_advances_monotonically_without_false_target_ceiling() ->
 
 
 def test_attempt_supersession_requires_a_fresh_identity_and_version() -> None:
-    """恢复或重派创建新 Attempt ID，旧实体和 version 不得被复用。"""
+    """恢复或重派创建全新 Attempt，旧执行事实、identity 与 version 均不得被复用。"""
     workflow = _workflow_module()
-    first = workflow.Attempt.from_record(_attempt_record(state_version=3))
+    first = workflow.Attempt.from_record(
+        _attempt_record(
+            phase="TERMINATED",
+            outcome="KILLED",
+            executor_id="executor-old",
+            process_session_id="process-session-old",
+            pid=4217,
+            process_start_time="2026-08-12T00:00:01Z",
+            job_object_id="job-old",
+            wsl_distro="Ubuntu-old",
+            container_id="container-old",
+            image_digest="sha256:" + "a" * 64,
+            exit_code=137,
+            termination_reason="old-attempt-killed",
+            fencing_token=41,
+            control_epoch=7,
+            accepted_control_command_seq=11,
+            interrupt_command_id="command-old",
+            drain_state="DRAINED",
+            started_at="2026-08-12T00:00:00Z",
+            ended_at="2026-08-12T00:01:00Z",
+            state_version=3,
+        )
+    )
     with pytest.raises(workflow.AttemptReuseError) as caught:
-        first.supersede(new_attempt_id=first.attempt_id)
+        first.supersede(
+            new_attempt_id=first.attempt_id,
+            fencing_token=42,
+            control_epoch=8,
+            accepted_control_command_seq=12,
+        )
     assert caught.value.error_code == "ATTEMPT_ID_REUSE"
 
-    successor = first.supersede(new_attempt_id="attempt-domain-2")
+    successor = first.supersede(
+        new_attempt_id="attempt-domain-2",
+        fencing_token=42,
+        control_epoch=8,
+        accepted_control_command_seq=12,
+    )
     assert successor.attempt_id == "attempt-domain-2"
     assert successor.supersedes_attempt_id == first.attempt_id
+    assert successor.step_id == first.step_id
+    assert successor.phase is workflow.AttemptPhase.CREATED
+    assert successor.outcome is workflow.AttemptOutcome.NONE
+    assert (
+        successor.executor_id,
+        successor.process_session_id,
+        successor.pid,
+        successor.process_start_time,
+        successor.job_object_id,
+        successor.wsl_distro,
+        successor.container_id,
+        successor.image_digest,
+        successor.exit_code,
+        successor.termination_reason,
+        successor.interrupt_command_id,
+        successor.started_at,
+        successor.ended_at,
+    ) == (None,) * 13
+    assert successor.drain_state is workflow.DrainState.NONE
+    assert successor.fencing_token == 42
+    assert successor.control_epoch == 8
+    assert successor.accepted_control_command_seq == 12
     assert successor.state_version == 0
     assert first.supersedes_attempt_id is None
+    assert first.phase is workflow.AttemptPhase.TERMINATED
+    assert first.outcome is workflow.AttemptOutcome.KILLED
+    assert first.executor_id == "executor-old"
+    assert first.fencing_token == 41
+    assert first.control_epoch == 7
+    assert first.accepted_control_command_seq == 11
+    assert first.state_version == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "error_name", "error_code"),
+    [
+        pytest.param("new_attempt_id", "", "AttemptReuseError", "ATTEMPT_ID_REUSE", id="empty-id"),
+        pytest.param("new_attempt_id", 42, "AttemptReuseError", "ATTEMPT_ID_REUSE", id="non-string-id"),
+        pytest.param(
+            "fencing_token",
+            41,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="equal-fencing-token",
+        ),
+        pytest.param(
+            "fencing_token",
+            40,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="lower-fencing-token",
+        ),
+        pytest.param("fencing_token", -1, "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="negative-fencing"),
+        pytest.param("fencing_token", True, "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="bool-fencing"),
+        pytest.param("fencing_token", "42", "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="string-fencing"),
+        pytest.param(
+            "fencing_token",
+            2**53,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="overflow-fencing",
+        ),
+        pytest.param("control_epoch", -1, "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="negative-epoch"),
+        pytest.param("control_epoch", True, "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="bool-epoch"),
+        pytest.param("control_epoch", "8", "AttemptDispatchError", "INVALID_ATTEMPT_DISPATCH", id="string-epoch"),
+        pytest.param(
+            "control_epoch",
+            2**53,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="overflow-epoch",
+        ),
+        pytest.param(
+            "accepted_control_command_seq",
+            -1,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="negative-control-seq",
+        ),
+        pytest.param(
+            "accepted_control_command_seq",
+            True,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="bool-control-seq",
+        ),
+        pytest.param(
+            "accepted_control_command_seq",
+            "12",
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="string-control-seq",
+        ),
+        pytest.param(
+            "accepted_control_command_seq",
+            2**53,
+            "AttemptDispatchError",
+            "INVALID_ATTEMPT_DISPATCH",
+            id="overflow-control-seq",
+        ),
+    ],
+)
+def test_attempt_supersession_rejects_invalid_identity_and_dispatch_facts(
+    field: str,
+    replacement: object,
+    error_name: str,
+    error_code: str,
+) -> None:
+    """新 identity 与派发整数必须严格闭合，bool/字符串也不得冒充安全整数。"""
+    workflow = _workflow_module()
+    first = workflow.Attempt.from_record(_attempt_record(fencing_token=41, state_version=3))
+    arguments: dict[str, object] = {
+        "new_attempt_id": "attempt-domain-2",
+        "fencing_token": 42,
+        "control_epoch": 8,
+        "accepted_control_command_seq": 12,
+    }
+    arguments[field] = replacement
+    with pytest.raises(getattr(workflow, error_name)) as caught:
+        first.supersede(**arguments)
+    assert caught.value.error_code == error_code
+    assert first.fencing_token == 41
     assert first.state_version == 3
 
 
@@ -674,6 +828,69 @@ def test_authorization_runtime_schema_constants_are_generated_digest_bound_and_c
         # 撤销 monkeypatch 后重载，避免被注入 validator 泄漏到后续用例。
         authorization = importlib.reload(authorization)
         getattr(authorization, parser_name)(fixture)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "schema-draft",
+        "schema-id",
+        "schema-title",
+        "generated-id-random",
+        "generated-id-case",
+        "generated-id-v999",
+        "generated-version-v999",
+    ],
+)
+def test_authorization_runtime_rejects_generated_identity_metadata_drift(
+    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """runtime 必须把 generated ID/version 与嵌入 schema 的精确身份同时绑定。"""
+    models = _module("factory_agent.contracts.generated.models")
+    authorization = _module("factory_agent.domain.authorization")
+    fixtures = {
+        "INTENT_AUTHORIZATION": ("parse_intent_authorization", _valid_intent_authorization()),
+        "EXECUTION_AUTHORIZATION": ("parse_execution_authorization", _valid_execution_authorization()),
+    }
+    for prefix, (parser_name, fixture) in fixtures.items():
+        try:
+            with monkeypatch.context() as patch:
+                if mutation.startswith("schema-"):
+                    schema = json.loads(getattr(models, f"{prefix}_SCHEMA_JSON"))
+                    field, replacement = {
+                        "schema-draft": ("$schema", "https://json-schema.org/draft/2020-12/schema"),
+                        "schema-id": ("$id", "https://poison.invalid/authorization.schema.json"),
+                        "schema-title": ("title", "PoisonedAuthorization"),
+                    }[mutation]
+                    schema[field] = replacement
+                    poisoned_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                    poisoned_digest = "sha256:" + hashlib.sha256(poisoned_json.encode("utf-8")).hexdigest()
+                    patch.setattr(models, f"{prefix}_SCHEMA_JSON", poisoned_json)
+                    patch.setattr(models, f"{prefix}_SCHEMA_JSON_SHA256", poisoned_digest)
+                elif mutation == "generated-version-v999":
+                    patch.setattr(models, f"{prefix}_SCHEMA_VERSION", 999)
+                else:
+                    schema_id = getattr(models, f"{prefix}_SCHEMA_ID")
+                    replacement = {
+                        "generated-id-random": "random-authorization.v1",
+                        "generated-id-case": schema_id.swapcase(),
+                        "generated-id-v999": schema_id.rsplit(".v", maxsplit=1)[0] + ".v999",
+                    }[mutation]
+                    patch.setattr(models, f"{prefix}_SCHEMA_ID", replacement)
+
+                with pytest.raises(FactoryError) as caught:
+                    reloaded = importlib.reload(authorization)
+                    getattr(reloaded, parser_name)(fixture)
+                assert caught.value.error_code == "INVALID_AUTHORIZATION_CONTRACT"
+                assert caught.value.detail == "authorization validator initialization failed"
+                assert str(caught.value) == (
+                    "[INVALID_AUTHORIZATION_CONTRACT] authorization validator initialization failed"
+                )
+                assert caught.value.__cause__ is None
+        finally:
+            # 即使 reload 在 module 初始化中途失败，也必须恢复权威常量后的可用模块。
+            authorization = importlib.reload(authorization)
 
 
 @pytest.mark.parametrize(

@@ -21,10 +21,11 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NoReturn
+from types import MappingProxyType
+from typing import Any, NamedTuple, NoReturn
 
 import jsonschema
 
@@ -48,8 +49,48 @@ PREPARED_BATCH_VALIDATOR_SCHEMA_PATH = "contracts/schemas/prepared-batch.v2.sche
 AUTHORITATIVE_STATE_EVENT_VALIDATOR_SCHEMA_PATH = (
     "contracts/schemas/authoritative-state-event.v1.schema.json"
 )
-KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
 _DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
+
+
+class _AuthorizationSchemaMetadata(NamedTuple):
+    """冻结一项授权 schema 在 catalog、文档与生成常量间的完整身份。"""
+
+    bundle_key: str
+    schema_path: str
+    schema_id: str
+    schema_version: int
+    draft_uri: str
+    document_id: str
+    title: str
+
+
+# 授权 schema 的身份属于冻结合同；catalog 只提供待核对输入，不能自行改写这张表。
+_AUTHORIZATION_SCHEMA_METADATA: Mapping[str, _AuthorizationSchemaMetadata] = MappingProxyType(
+    {
+        "IntentAuthorization": _AuthorizationSchemaMetadata(
+            bundle_key="intentAuthorization",
+            schema_path="contracts/schemas/intent-authorization.v1.schema.json",
+            schema_id="intent-authorization.v1",
+            schema_version=1,
+            draft_uri=_DRAFT7_SCHEMA_URI,
+            document_id="https://factory.local/contracts/schemas/intent-authorization.v1.schema.json",
+            title="IntentAuthorization",
+        ),
+        "ExecutionAuthorization": _AuthorizationSchemaMetadata(
+            bundle_key="executionAuthorization",
+            schema_path="contracts/schemas/execution-authorization.v1.schema.json",
+            schema_id="execution-authorization.v1",
+            schema_version=1,
+            draft_uri=_DRAFT7_SCHEMA_URI,
+            document_id="https://factory.local/contracts/schemas/execution-authorization.v1.schema.json",
+            title="ExecutionAuthorization",
+        ),
+    }
+)
+AUTHORIZATION_CODEGEN_NAMES: Mapping[str, str] = MappingProxyType(
+    {name: metadata.bundle_key for name, metadata in _AUTHORIZATION_SCHEMA_METADATA.items()}
+)
+KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
 
 # Draft7 中每类子 schema 的位置。按关键字感知地遍历，避免把 `properties` 中用户
 # 自定义的 `format`、`$ref` 字段名误认为 schema keyword。
@@ -383,6 +424,22 @@ def load_catalog() -> dict[str, Any]:
         return json.load(f)  # type: ignore[no-any-return]
 
 
+def _catalog_codegen_entries(catalog: object) -> list[dict[str, Any]]:
+    """从权威 catalog 精确提取 codegen entries；wire 形状漂移立即失败。"""
+    if not isinstance(catalog, dict) or "schemas" not in catalog:
+        raise TypeError("catalog root/schemas shape is invalid")
+    catalog_schemas = catalog["schemas"]
+    if not isinstance(catalog_schemas, list):
+        raise TypeError("catalog schemas must be array")
+    entries: list[dict[str, Any]] = []
+    for schema_entry in catalog_schemas:
+        if not isinstance(schema_entry, dict):
+            raise TypeError("catalog schema entry must be object")
+        if schema_entry.get("codegen") is True:
+            entries.append(schema_entry)
+    return entries
+
+
 def load_schema(schema_path_str: str) -> dict[str, Any]:
     """从 catalog 中的相对路径加载 JSON Schema。"""
     schema_path = REPO_ROOT / schema_path_str
@@ -569,6 +626,85 @@ def load_required_validator_schemas() -> dict[str, tuple[dict[str, Any], str]]:
     }
 
 
+def load_required_authorization_validator_schemas(
+    codegen_entries: list[dict[str, Any]],
+) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+    """把 catalog 与 schema 文档逐字段绑定到冻结授权身份，漂移时不读取错误目标。"""
+    loaded: dict[str, tuple[dict[str, Any], str, int, str]] = {}
+    entries_by_name: dict[str, dict[str, Any]] = {}
+    for entry in codegen_entries:
+        name = entry.get("name")
+        if name not in _AUTHORIZATION_SCHEMA_METADATA:
+            continue
+        if name in entries_by_name:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        entries_by_name[name] = entry
+
+    if frozenset(entries_by_name) != frozenset(_AUTHORIZATION_SCHEMA_METADATA):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+
+    for name, metadata in _AUTHORIZATION_SCHEMA_METADATA.items():
+        entry = entries_by_name[name]
+        if entry.get("schemaPath") != metadata.schema_path or entry.get("schemaId") != metadata.schema_id:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        schema, _source_sha256 = load_required_validator_schema(metadata.schema_path)
+        if (
+            schema.get("$schema") != metadata.draft_uri
+            or schema.get("$id") != metadata.document_id
+            or schema.get("title") != metadata.title
+        ):
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        loaded[metadata.bundle_key] = (
+            schema,
+            metadata.schema_id,
+            metadata.schema_version,
+            metadata.schema_path,
+        )
+    # 顶层 bundle 在一次生成批次内不可替换 entry；三语言 renderer 共享同一对象快照。
+    return MappingProxyType(loaded)
+
+
+class _LazyAuthorizationSchemas(Mapping[str, tuple[dict[str, Any], str, int, str]]):
+    """同一生成批次内惰性加载并复用授权 schema 快照。
+
+    惰性仅用于隔离未消费 renderer 的测试 seam；真实 renderer 首次访问即执行
+    exact-set 与 Draft7 校验，失败仍会在任何生成物写入前 fail closed。
+    """
+
+    def __init__(self, codegen_entries: list[dict[str, Any]] | None) -> None:
+        """绑定显式 entries；None 专用于 direct renderer 的权威 catalog 惰性来源。"""
+        self._codegen_entries = None if codegen_entries is None else list(codegen_entries)
+        self._loaded: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None
+
+    @classmethod
+    def from_authoritative_catalog(cls) -> _LazyAuthorizationSchemas:
+        """构造 direct renderer provider；未被消费时绝不提前读取 catalog/schema。"""
+        return cls(None)
+
+    def _materialize(self) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+        """首次消费时严格加载；成功后三语言始终共享同一 Mapping。"""
+        if self._loaded is None:
+            # direct renderer 兼容入口只能回到权威 catalog；显式 [] 则保留为坏 catalog，
+            # 继续由 exact-set 校验 fail closed，二者不能互相回退。
+            entries = self._codegen_entries
+            if entries is None:
+                entries = _catalog_codegen_entries(load_catalog())
+            self._loaded = load_required_authorization_validator_schemas(entries)
+        return self._loaded
+
+    def __getitem__(self, key: str) -> tuple[dict[str, Any], str, int, str]:
+        """按生成常量 key 取授权 schema 记录，并在首次调用触发加载。"""
+        return self._materialize()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        """迭代已验证 bundle 的闭集 key，首次调用同样触发加载。"""
+        return iter(self._materialize())
+
+    def __len__(self) -> int:
+        """返回已验证 bundle 的 exact-set 大小，未加载时先 fail closed 物化。"""
+        return len(self._materialize())
+
+
 def _embedded_schema_json(schema: dict[str, Any]) -> str:
     """生成标准且稳定的 JSON；任何不可序列化值都归一为无敏感信息的稳定错误。"""
     try:
@@ -728,14 +864,26 @@ def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
     return f"Option<{rs}>" if optional else rs
 
 
-def load_codegen_entry_definition(entry: dict[str, Any]) -> tuple[str, dict[str, Any], list[str]]:
-    """加载一个普通 catalog entry；任何失败都上抛稳定错误而非生成 ERROR 注释。"""
+def load_codegen_entry_definition(
+    entry: dict[str, Any],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> tuple[str, dict[str, Any], list[str]]:
+    """加载一个普通 catalog entry；授权类型必须复用本批次的唯一 schema 快照。"""
     try:
         name = entry["name"]
         schema_path = entry["schemaPath"]
         if not isinstance(name, str) or not isinstance(schema_path, str):
             raise TypeError("catalog entry name/schemaPath must be strings")
-        schema = load_schema(schema_path)
+        schema: dict[str, Any] | None = None
+        authorization_key = AUTHORIZATION_CODEGEN_NAMES.get(name)
+        if authorization_schemas is not None and authorization_key is not None:
+            cached_schema, cached_id, _cached_version, cached_path = authorization_schemas[authorization_key]
+            # catalog 与运行时常量共用一份身份；漂移时不得退回磁盘重读。
+            if schema_path != cached_path or entry.get("schemaId") != cached_id:
+                raise TypeError("authorization catalog identity mismatch")
+            schema = cached_schema
+        if schema is None:
+            schema = load_schema(schema_path)
         definition_key = entry.get("definitionKey")
         if definition_key is not None and not isinstance(definition_key, str):
             raise TypeError("catalog entry definitionKey must be string")
@@ -748,11 +896,13 @@ def load_codegen_entry_definition(entry: dict[str, Any]) -> tuple[str, dict[str,
 
 
 def render_codegen_entry(
-    entry: dict[str, Any], renderer: Callable[[str, dict[str, Any], list[str]], str]
+    entry: dict[str, Any],
+    renderer: Callable[[str, dict[str, Any], list[str]], str],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
 ) -> str:
-    """将单一普通 entry 渲染为目标语言文本；渲染细节异常也必须 fail-closed。"""
+    """渲染单一 entry；授权类型与常量共享同一深度校验后的 schema 对象。"""
     try:
-        name, props, required = load_codegen_entry_definition(entry)
+        name, props, required = load_codegen_entry_definition(entry, authorization_schemas)
         return renderer(name, props, required)
     except CodegenGenerationError:
         raise
@@ -763,7 +913,10 @@ def render_codegen_entry(
 # ────────────────────────────── TypeScript ──────────────────────────────
 
 
-def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+def generate_ts_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
     """生成 TypeScript 运行时 validator 常量；原始 SHA 与派生 material 同时被冻结。"""
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
@@ -774,6 +927,12 @@ def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[di
     authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
         "authoritativeStateEvent"
     ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
@@ -781,6 +940,8 @@ def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[di
     durable_event_json = _embedded_schema_json(durable_event_schema)
     prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
     authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
     return [
         "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         f'export const RUN_SPEC_SCHEMA_SOURCE_SHA256 = "{run_spec_sha256}";',
@@ -810,6 +971,18 @@ def generate_ts_validator_schema_constants(validator_schemas: dict[str, tuple[di
         f"{json.dumps(authoritative_state_event_json, ensure_ascii=False)};",
         "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256 = "
         f'"{_embedded_schema_sha256(authoritative_state_event_json)}";',
+        "// 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'export const INTENT_AUTHORIZATION_SCHEMA_ID = "{intent_authorization_id}";',
+        f"export const INTENT_AUTHORIZATION_SCHEMA_VERSION = {intent_authorization_version};",
+        f"export const INTENT_AUTHORIZATION_SCHEMA_JSON = {json.dumps(intent_authorization_json, ensure_ascii=False)};",
+        "export const INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(intent_authorization_json)}";',
+        f'export const EXECUTION_AUTHORIZATION_SCHEMA_ID = "{execution_authorization_id}";',
+        f"export const EXECUTION_AUTHORIZATION_SCHEMA_VERSION = {execution_authorization_version};",
+        "export const EXECUTION_AUTHORIZATION_SCHEMA_JSON = "
+        f"{json.dumps(execution_authorization_json, ensure_ascii=False)};",
+        "export const EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(execution_authorization_json)}";',
         "",
     ]
 
@@ -832,9 +1005,12 @@ def generate_ts_interface(name: str, props: dict[str, Any], required: list[str])
 def generate_typescript(
     entries: list[dict[str, Any]],
     validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
 ) -> str:
     """生成完整 TypeScript 文件内容。"""
     validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         "// 此文件由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "// 源 schema: contracts/schemas/*.schema.json",
@@ -844,9 +1020,9 @@ def generate_typescript(
         "// @ts-nocheck",
         "",
     ]
-    sections.extend(generate_ts_validator_schema_constants(validator_schemas))
+    sections.extend(generate_ts_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        iface = render_codegen_entry(entry, generate_ts_interface)
+        iface = render_codegen_entry(entry, generate_ts_interface, authorization_schemas)
         sections.append(iface)
         sections.append("")
     return "\n".join(sections)
@@ -855,7 +1031,10 @@ def generate_typescript(
 # ────────────────────────────── Python ──────────────────────────────
 
 
-def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+def generate_py_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
     """生成 Python 原始 schema JSON；计划模块惰性解析，避免 import-time 逃逸。"""
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
@@ -866,6 +1045,12 @@ def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[di
     authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
         "authoritativeStateEvent"
     ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
@@ -873,6 +1058,8 @@ def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[di
     durable_event_json = _embedded_schema_json(durable_event_schema)
     prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
     authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
     return [
         "# 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         f'RUN_SPEC_SCHEMA_SOURCE_SHA256: Final[str] = "{run_spec_sha256}"',
@@ -921,6 +1108,21 @@ def generate_py_validator_schema_constants(validator_schemas: dict[str, tuple[di
             "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: Final[str] = "
             f'"{_embedded_schema_sha256(authoritative_state_event_json)}"'
         ),
+        "# 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'INTENT_AUTHORIZATION_SCHEMA_ID: Final[str] = "{intent_authorization_id}"',
+        f"INTENT_AUTHORIZATION_SCHEMA_VERSION: Final[int] = {intent_authorization_version}",
+        f"INTENT_AUTHORIZATION_SCHEMA_JSON: Final[str] = {intent_authorization_json!r}",
+        (
+            "INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(intent_authorization_json)}"'
+        ),
+        f'EXECUTION_AUTHORIZATION_SCHEMA_ID: Final[str] = "{execution_authorization_id}"',
+        f"EXECUTION_AUTHORIZATION_SCHEMA_VERSION: Final[int] = {execution_authorization_version}",
+        f"EXECUTION_AUTHORIZATION_SCHEMA_JSON: Final[str] = {execution_authorization_json!r}",
+        (
+            "EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(execution_authorization_json)}"'
+        ),
         "",
     ]
 
@@ -951,9 +1153,12 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
 def generate_python(
     entries: list[dict[str, Any]],
     validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
 ) -> str:
     """生成完整 Python 文件内容。"""
     validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         '"""',
         "此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
@@ -965,7 +1170,7 @@ def generate_python(
         "__all__ = [",
     ]
     # 先验证全部普通 entry；若其中一个失败，不能先构造部分 Python 文件再落盘。
-    names = [load_codegen_entry_definition(entry)[0] for entry in entries]
+    names = [load_codegen_entry_definition(entry, authorization_schemas)[0] for entry in entries]
     names = [
         "RUN_SPEC_SCHEMA_SOURCE_SHA256",
         "RUN_SPEC_SCHEMA_JSON",
@@ -987,15 +1192,23 @@ def generate_python(
         "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256",
         "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON",
         "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256",
+        "INTENT_AUTHORIZATION_SCHEMA_ID",
+        "INTENT_AUTHORIZATION_SCHEMA_VERSION",
+        "INTENT_AUTHORIZATION_SCHEMA_JSON",
+        "INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256",
+        "EXECUTION_AUTHORIZATION_SCHEMA_ID",
+        "EXECUTION_AUTHORIZATION_SCHEMA_VERSION",
+        "EXECUTION_AUTHORIZATION_SCHEMA_JSON",
+        "EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256",
         *names,
     ]
     for n in names:
         sections.append(f'    "{n}",')
     sections.append("]")
     sections.append("")
-    sections.extend(generate_py_validator_schema_constants(validator_schemas))
+    sections.extend(generate_py_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        cls = render_codegen_entry(entry, generate_py_class)
+        cls = render_codegen_entry(entry, generate_py_class, authorization_schemas)
         sections.append(cls)
         sections.append("")
     return "\n".join(sections)
@@ -1004,7 +1217,10 @@ def generate_python(
 # ────────────────────────────── Rust ──────────────────────────────
 
 
-def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[dict[str, Any], str]]) -> list[str]:
+def generate_rs_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
     """生成 Rust 运行时 validator 常量；JSON 保持原始 schema 结构并在运行时解析。"""
     run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
     plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
@@ -1015,6 +1231,12 @@ def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[di
     authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
         "authoritativeStateEvent"
     ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
     run_spec_json = _embedded_schema_json(run_spec_schema)
     plan_revision_json = _embedded_schema_json(plan_revision_schema)
     digest_material_json = _embedded_schema_json(digest_material_schema)
@@ -1022,6 +1244,8 @@ def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[di
     durable_event_json = _embedded_schema_json(durable_event_schema)
     prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
     authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
     return [
         "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
         "pub const RUN_SPEC_SCHEMA_SOURCE_SHA256: &str =\n"
@@ -1069,6 +1293,17 @@ def generate_rs_validator_schema_constants(validator_schemas: dict[str, tuple[di
         f"{_rust_raw_string(authoritative_state_event_json)};",
         "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: &str =\n"
         f'    "{_embedded_schema_sha256(authoritative_state_event_json)}";',
+        "// 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'pub const INTENT_AUTHORIZATION_SCHEMA_ID: &str = "{intent_authorization_id}";',
+        f"pub const INTENT_AUTHORIZATION_SCHEMA_VERSION: u32 = {intent_authorization_version};",
+        f"pub const INTENT_AUTHORIZATION_SCHEMA_JSON: &str = {_rust_raw_string(intent_authorization_json)};",
+        "pub const INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(intent_authorization_json)}";',
+        f'pub const EXECUTION_AUTHORIZATION_SCHEMA_ID: &str = "{execution_authorization_id}";',
+        f"pub const EXECUTION_AUTHORIZATION_SCHEMA_VERSION: u32 = {execution_authorization_version};",
+        f"pub const EXECUTION_AUTHORIZATION_SCHEMA_JSON: &str = {_rust_raw_string(execution_authorization_json)};",
+        "pub const EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(execution_authorization_json)}";',
         "",
     ]
 
@@ -1108,9 +1343,12 @@ def generate_rs_struct(name: str, props: dict[str, Any], required: list[str]) ->
 def generate_rust(
     entries: list[dict[str, Any]],
     validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
 ) -> str:
     """生成完整 Rust 文件内容。"""
     validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         "//! 此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "//! 源 schema: contracts/schemas/*.schema.json",
@@ -1120,9 +1358,9 @@ def generate_rust(
         "#![allow(unused_imports)]",
         "",
     ]
-    sections.extend(generate_rs_validator_schema_constants(validator_schemas))
+    sections.extend(generate_rs_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        struct_def = render_codegen_entry(entry, generate_rs_struct)
+        struct_def = render_codegen_entry(entry, generate_rs_struct, authorization_schemas)
         sections.append(struct_def)
         sections.append("")
     return "\n".join(sections)
@@ -1355,20 +1593,7 @@ def _run_codegen_cli(check_mode: bool) -> int:
 
     # 加载并筛选 catalog；JSON 可解析不代表 wire 形状可信，任何结构异常都收敛到同一码。
     try:
-        catalog = load_catalog()
-        if not isinstance(catalog, dict):
-            raise TypeError("catalog root must be object")
-        if "schemas" not in catalog:
-            raise TypeError("catalog schemas key is required")
-        catalog_schemas = catalog["schemas"]
-        if not isinstance(catalog_schemas, list):
-            raise TypeError("catalog schemas must be array")
-        codegen_entries: list[dict[str, Any]] = []
-        for schema_entry in catalog_schemas:
-            if not isinstance(schema_entry, dict):
-                raise TypeError("catalog schema entry must be object")
-            if schema_entry.get("codegen") is True:
-                codegen_entries.append(schema_entry)
+        codegen_entries = _catalog_codegen_entries(load_catalog())
     except Exception:
         _emit_cli_error("CODEGEN_CATALOG_LOAD_FAILED")
         return _finish_cli(
@@ -1396,9 +1621,12 @@ def _run_codegen_cli(check_mode: bool) -> int:
     # 先在内存中严格加载 schema 并生成三语言完整内容；任一 validator 失败时绝不进入写入阶段。
     try:
         validator_schemas = load_required_validator_schemas()
-        ts_content = generate_typescript(codegen_entries, validator_schemas)
-        py_content = generate_python(codegen_entries, validator_schemas)
-        rs_content = generate_rust(codegen_entries, validator_schemas)
+        # 同一惰性 provider 传给三语言；真实 renderer 首次消费时严格加载，
+        # 后续语言复用同一快照，而未消费的测试 seam 不额外引入 catalog 前置。
+        authorization_schemas = _LazyAuthorizationSchemas(codegen_entries)
+        ts_content = generate_typescript(codegen_entries, validator_schemas, authorization_schemas)
+        py_content = generate_python(codegen_entries, validator_schemas, authorization_schemas)
+        rs_content = generate_rust(codegen_entries, validator_schemas, authorization_schemas)
     except ValidatorSchemaError:
         _emit_cli_error("CODEGEN_VALIDATOR_SCHEMA_FAILED")
         return _finish_cli(
