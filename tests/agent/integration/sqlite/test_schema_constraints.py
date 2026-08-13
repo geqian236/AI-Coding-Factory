@@ -1514,12 +1514,17 @@ def _expected_triggers(table: str) -> tuple[TriggerSpec, ...]:
             "WHEN 'PR_READY' THEN 3 WHEN 'MERGED' THEN 4 WHEN 'STAGING_ACCEPTED' THEN 5 "
             "WHEN 'PRODUCTION_ACCEPTED' THEN 6 ELSE -1 END"
         )
+        valid_stages = (
+            "'NONE','DESIGN_APPROVED','CODEX_APPROVED','PR_READY','MERGED','STAGING_ACCEPTED','PRODUCTION_ACCEPTED'"
+        )
         triggers.append(
             TriggerSpec(
                 "trg_tasks__achieved_stage_monotonic",
                 "CREATE TRIGGER trg_tasks__achieved_stage_monotonic "
                 "BEFORE UPDATE OF achieved_stage ON tasks FOR EACH ROW "
-                f"WHEN (CASE OLD.achieved_stage {ranks}) > (CASE NEW.achieved_stage {ranks}) "
+                f"WHEN OLD.achieved_stage IN ({valid_stages}) "
+                f"AND NEW.achieved_stage IN ({valid_stages}) "
+                f"AND (CASE OLD.achieved_stage {ranks}) > (CASE NEW.achieved_stage {ranks}) "
                 "BEGIN SELECT RAISE(ABORT,'achieved_stage_regression'); END",
             )
         )
