@@ -1266,6 +1266,22 @@ def _repository_contract_error_for_mutation(
     return error_type, error_code
 
 
+def _resource_lease_record(**overrides: object) -> dict[str, object]:
+    """构造 Task1 resource lease 持久化行，用于验证仓储边界而不提前实现调度策略。"""
+    record: dict[str, object] = {
+        "resource_key": "repo:project-uow-1",
+        "owner_executor_id": "executor-uow-1",
+        "fencing_token": 1,
+        "control_epoch": 1,
+        "acquired_at": "2026-08-12T00:00:00Z",
+        "heartbeat_at": "2026-08-12T00:00:01Z",
+        "expires_at": "2026-08-12T00:01:00Z",
+        "state_version": 0,
+    }
+    record.update(overrides)
+    return record
+
+
 def _task_state_event(
     *,
     state_event_id: str = "state-event-task-1",
@@ -2946,6 +2962,79 @@ def test_repository_get_rehydrates_and_rejects_raw_persistence_corruption(
         assert caught.value.error_code == error_code
     finally:
         reopened.close()
+
+
+def test_sqlite_database_open_rejects_reentrant_open_without_leaking_connection(tmp_path: Path) -> None:
+    """同一 Database 实例只能持有一条 owner connection；二次 open 必须在 connect 前 fail closed。"""
+    database_module = _database_module()
+    path = _assert_d_test_path(tmp_path / "double-open.sqlite3")
+    connections: list[sqlite3.Connection] = []
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = sqlite3.connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    database = database_module.SqliteDatabase(
+        path,
+        backup_root=_controlled_backup_root(path),
+        connect_factory=connect,
+    )
+    database.open()
+    with pytest.raises(database_module.DatabaseStartupError) as caught:
+        database.open()
+    assert caught.value.error_code == "SQLITE_ALREADY_OPEN"
+    assert len(connections) == 1
+
+    database.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    ("operation", "invalid_key"),
+    [
+        ("insert", "unknown_selector"),
+        ("insert", 'owner_executor_id" = "owner_executor_id'),
+        ("cas", "unknown_selector"),
+        ("cas", 'owner_executor_id" = "owner_executor_id'),
+    ],
+)
+def test_resource_repository_rejects_untrusted_sql_identifier_keys(
+    tmp_path: Path,
+    operation: str,
+    invalid_key: str,
+) -> None:
+    """Resource repository 的动态 Mapping key 不能进入 SQL identifier；必须先转成稳定仓储错误。"""
+    path = _assert_d_test_path(tmp_path / f"resource-identifier-{operation}.sqlite3")
+    database = _database_module().SqliteDatabase(path, backup_root=_controlled_backup_root(path))
+    database.open()
+    try:
+        unit_of_work = database.new_unit_of_work()
+        unit_of_work.begin_immediate()
+        if operation == "insert":
+            forged = _resource_lease_record(**{invalid_key: "attacker-controlled"})
+
+            def action() -> object:
+                return unit_of_work.resources.insert_resource_lease(forged)
+
+        else:
+            unit_of_work.resources.insert_resource_lease(_resource_lease_record())
+
+            def action() -> object:
+                return unit_of_work.resources.compare_and_set_resource_lease(
+                    "repo:project-uow-1",
+                    0,
+                    {invalid_key: "attacker-controlled"},
+                )
+
+        with pytest.raises(Exception) as caught:
+            action()
+        assert caught.value.__class__.__name__ == "StorageIdentifierError"
+        assert getattr(caught.value, "error_code", None) == "INVALID_STORAGE_IDENTIFIER"
+        unit_of_work.rollback()
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio
