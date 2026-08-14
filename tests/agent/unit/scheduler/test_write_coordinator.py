@@ -638,6 +638,65 @@ async def test_bounded_admission_awaits_capacity_without_drop_or_second_writer()
     assert [sequence for _ticket, _stage, sequence in lifecycle] == list(range(1, len(lifecycle) + 1))
 
 
+@pytest.mark.asyncio
+async def test_capacity_waiters_resume_in_fifo_order_when_multiple_callers_wait() -> None:
+    """多个 caller 同时等待 queued 容量时，后到 waiter 不能通过轮询抢先 admission。"""
+    stack = _new_stack(queue_capacity=1)
+    entered = threading.Event()
+    release = threading.Event()
+    execution_order: list[int] = []
+
+    def active(_uow: _FakeUnitOfWork) -> int:
+        execution_order.append(1)
+        entered.set()
+        assert release.wait(timeout=2)
+        return 1
+
+    def queued(ticket_id: int) -> Callable[[_FakeUnitOfWork], int]:
+        def command(_uow: _FakeUnitOfWork) -> int:
+            execution_order.append(ticket_id)
+            return ticket_id
+
+        return command
+
+    await _bounded(stack.coordinator.start())
+    first = asyncio.create_task(
+        stack.coordinator.execute(operation="fifo-active", context={"correlation_id": "corr-fifo-1"}, command=active)
+    )
+    await _wait_thread_event(entered)
+    second = asyncio.create_task(
+        stack.coordinator.execute(operation="fifo-queued", context={"correlation_id": "corr-fifo-2"}, command=queued(2))
+    )
+    await _wait_for_lifecycle(stack.coordinator, lambda events: (2, "admitted") in {(t, s) for t, s, _ in events})
+    third = asyncio.create_task(
+        stack.coordinator.execute(
+            operation="fifo-waiter-3", context={"correlation_id": "corr-fifo-3"}, command=queued(3)
+        )
+    )
+    await _wait_for_lifecycle(
+        stack.coordinator,
+        lambda events: (3, "waiting_for_capacity") in {(t, s) for t, s, _ in events},
+    )
+    fourth = asyncio.create_task(
+        stack.coordinator.execute(
+            operation="fifo-waiter-4", context={"correlation_id": "corr-fifo-4"}, command=queued(4)
+        )
+    )
+    await _wait_for_lifecycle(
+        stack.coordinator,
+        lambda events: (4, "waiting_for_capacity") in {(t, s) for t, s, _ in events},
+    )
+    release.set()
+    try:
+        assert await _bounded(asyncio.gather(first, second, third, fourth)) == [1, 2, 3, 4]
+    finally:
+        await _bounded(stack.coordinator.close())
+    lifecycle = tuple(stack.coordinator.ticket_lifecycle_snapshot())
+    assert [ticket for ticket, stage, _seq in lifecycle if stage == "admitted"] == [1, 2, 3, 4]
+    assert [ticket for ticket, stage, _seq in lifecycle if stage == "started"] == [1, 2, 3, 4]
+    assert execution_order == [1, 2, 3, 4]
+
+
 @pytest.mark.parametrize("invalid_capacity", [None, 0, -1, 4097])
 def test_queue_capacity_rejects_unbounded_nonpositive_and_silent_clamping(
     invalid_capacity: int | None,
@@ -660,6 +719,108 @@ def test_valid_queue_capacity_is_preserved_exactly_without_clamp(capacity: int) 
     """合法容量按请求值原样保存，不偷偷换成默认值。"""
     stack = _new_stack(queue_capacity=capacity)
     assert stack.coordinator.queue_capacity == capacity
+
+
+def test_close_racing_start_never_joins_unstarted_owner_thread() -> None:
+    """start 暴露 STARTING 前必须已调用 Thread.start，避免并发 close join 未启动线程。"""
+    stack = _new_stack()
+    real_thread_start = stack.coordinator.owner_thread.start
+    start_called = threading.Event()
+    errors: list[BaseException] = []
+
+    def delayed_thread_start() -> None:
+        start_called.set()
+        time.sleep(0.05)
+        real_thread_start()
+
+    stack.coordinator.owner_thread.start = delayed_thread_start  # type: ignore[method-assign]
+
+    def run_start() -> None:
+        try:
+            asyncio.run(_bounded(stack.coordinator.start(), timeout=3.0))
+        except BaseException as exc:  # noqa: BLE001 - 竞态中 start 可被 close 稳定拒绝。
+            errors.append(exc)
+
+    starter = threading.Thread(target=run_start, daemon=False)
+    starter.start()
+    assert start_called.wait(timeout=2)
+    try:
+        asyncio.run(_bounded(stack.coordinator.close(), timeout=3.0))
+    finally:
+        starter.join(timeout=3)
+    assert not starter.is_alive()
+    assert not stack.coordinator.owner_thread.is_alive()
+    assert not any(
+        isinstance(exc, RuntimeError) and "cannot join thread before it is started" in str(exc) for exc in errors
+    )
+    assert stack.coordinator.state.name == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_thread_start_failure_is_closed_and_close_never_joins_unstarted_thread() -> None:
+    """Thread.start 自身失败时不得留下 STARTING/CLOSING，也不得 join 未启动线程。"""
+    stack = _new_stack()
+
+    def fail_to_start() -> None:
+        raise RuntimeError("cannot start new thread")
+
+    stack.coordinator.owner_thread.start = fail_to_start  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="cannot start new thread"):
+        await _bounded(stack.coordinator.start())
+    assert stack.coordinator.state.name == "CLOSED"
+    await _bounded(stack.coordinator.close())
+    assert stack.coordinator.state.name == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_close_after_startup_dependency_failure_reaches_closed_state() -> None:
+    """mutex/database 启动失败后 close 仍要给诊断者稳定 CLOSED 终态。"""
+    module = _coordinator_module()
+
+    class AcquireError(Exception):
+        error_code = "SINGLETON_MUTEX_TIMEOUT"
+
+    class FailingMutex:
+        def acquire(self) -> object:
+            raise AcquireError("injected-acquire-timeout")
+
+    coordinator = module.WriteCoordinator(database=_FakeDatabase(), mutex=FailingMutex(), queue_capacity=1)
+    with pytest.raises(AcquireError):
+        await _bounded(coordinator.start())
+    assert coordinator.state.name == "FAILED"
+    await _bounded(coordinator.close())
+    assert coordinator.state.name == "CLOSED"
+    await _bounded(coordinator.close())
+    assert coordinator.state.name == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_close_overlapping_startup_dependency_failure_returns_closed_state() -> None:
+    """close 与启动依赖失败重叠时，owner failure 不能把收尾状态覆盖回 FAILED。"""
+    module = _coordinator_module()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class AcquireError(Exception):
+        error_code = "SINGLETON_MUTEX_TIMEOUT"
+
+    class BlockingFailingMutex:
+        def acquire(self) -> object:
+            entered.set()
+            assert release.wait(timeout=2)
+            raise AcquireError("injected-overlap-timeout")
+
+    coordinator = module.WriteCoordinator(database=_FakeDatabase(), mutex=BlockingFailingMutex(), queue_capacity=1)
+    start_task = asyncio.create_task(coordinator.start())
+    await _wait_thread_event(entered)
+    close_task = asyncio.create_task(coordinator.close())
+    await _wait_for_lifecycle(coordinator, lambda _events: coordinator.state.name == "CLOSING")
+    release.set()
+    await _bounded(close_task)
+    with pytest.raises(AcquireError):
+        await _bounded(start_task)
+    assert coordinator.state.name == "CLOSED"
+    assert not coordinator.owner_thread.is_alive()
 
 
 @pytest.mark.asyncio
@@ -986,6 +1147,80 @@ async def test_f09_commit_outcome_unknown_poisons_writer_and_never_retries() -> 
 
 
 @pytest.mark.asyncio
+async def test_commit_success_never_rolls_back_when_logging_renderer_fails() -> None:
+    """COMMIT 成功后日志链失败只能丢弃日志，不能回到 rollback 分支或污染调用方结果。"""
+    structlog = importlib.import_module("structlog")
+    previous = dict(structlog.get_config())
+
+    def exploding_processor(_logger: object, _method_name: str, _event_dict: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("renderer-down-after-commit")
+
+    structlog.configure(
+        processors=(exploding_processor,),
+        context_class=dict,
+        logger_factory=structlog.ReturnLoggerFactory(),
+        wrapper_class=structlog.make_filtering_bound_logger(0),
+        cache_logger_on_first_use=False,
+    )
+    stack = _new_stack()
+    try:
+        await _bounded(stack.coordinator.start())
+        assert (
+            await _bounded(
+                stack.coordinator.execute(
+                    operation="commit-log-failure",
+                    context={"correlation_id": "corr-commit-log-failure"},
+                    command=lambda _uow: "committed",
+                )
+            )
+            == "committed"
+        )
+    finally:
+        try:
+            await _bounded(stack.coordinator.close())
+        finally:
+            structlog.configure(**previous)
+    events = [event for event, _thread in stack.database.trace]
+    assert events.count("COMMIT") == 1
+    assert "ROLLBACK" not in events
+    assert stack.database.poison_calls == 0
+    assert stack.coordinator.state.name == "CLOSED"
+    lifecycle = tuple(stack.coordinator.ticket_lifecycle_snapshot())
+    assert [stage for ticket, stage, _seq in lifecycle if ticket == 1].count("settled") == 1
+
+
+@pytest.mark.asyncio
+async def test_commit_success_never_rolls_back_when_post_commit_clock_fails() -> None:
+    """COMMIT 成功后 committed timestamp 采样失败也不能回到 rollback 分支。"""
+    clock = _ScriptedMonotonic()
+    stack = _new_stack(monotonic_ns=clock)
+    await _bounded(stack.coordinator.start())
+    clock.reset([1_000_000_000, 1_002_000_000, 1_009_000_000])
+    try:
+        assert (
+            await _bounded(
+                stack.coordinator.execute(
+                    operation="commit-clock-failure",
+                    context={"correlation_id": "corr-commit-clock-failure"},
+                    command=lambda _uow: "committed",
+                )
+            )
+            == "committed"
+        )
+    finally:
+        clock.stop()
+        await _bounded(stack.coordinator.close())
+    events = [event for event, _thread in stack.database.trace]
+    assert events.count("COMMIT") == 1
+    assert "ROLLBACK" not in events
+    assert stack.database.poison_calls == 0
+    assert stack.coordinator.state.name == "CLOSED"
+    assert clock.calls == 3
+    lifecycle = tuple(stack.coordinator.ticket_lifecycle_snapshot())
+    assert [stage for ticket, stage, _seq in lifecycle if ticket == 1].count("settled") == 1
+
+
+@pytest.mark.asyncio
 async def test_f10_rollback_failure_poisons_writer() -> None:
     """callback 失败后的 ROLLBACK 若也失败，所有后续写必须拒绝。"""
     module = _coordinator_module()
@@ -1301,6 +1536,8 @@ def test_production_logging_chain_directly_redacts_recursive_event_payload() -> 
                     {"jwt": SECRET_VALUES[3]},
                     {"aws_access_key": SECRET_VALUES[2]},
                 ],
+                "mapping_key_probe": {SECRET_VALUES[1]: "secret-as-key", "plain-key": benign_sentinel},
+                "set_probe": {SECRET_VALUES[1], benign_sentinel},
             },
         )
     finally:
@@ -1315,6 +1552,46 @@ def test_production_logging_chain_directly_redacts_recursive_event_payload() -> 
     serialized = json.dumps(record, ensure_ascii=False, sort_keys=True)
     assert benign_sentinel in serialized
     _assert_no_secret_shape(serialized)
+
+
+@pytest.mark.asyncio
+async def test_default_structlog_setup_does_not_override_host_configuration() -> None:
+    """宿主已显式配置 structlog 时，coordinator 不得全局替换 processor/logger factory。"""
+    structlog = importlib.import_module("structlog")
+    capture = structlog.testing.LogCapture()
+    previous = dict(structlog.get_config())
+
+    def host_processor(_logger: object, _method_name: str, event_dict: dict[str, object]) -> dict[str, object]:
+        event_dict["host_processor_marker"] = "preserved"
+        return event_dict
+
+    structlog.configure(
+        processors=(host_processor, capture),
+        context_class=dict,
+        logger_factory=structlog.ReturnLoggerFactory(),
+        wrapper_class=structlog.make_filtering_bound_logger(0),
+        cache_logger_on_first_use=False,
+    )
+    stack = _new_stack()
+    try:
+        await _bounded(stack.coordinator.start())
+        await _bounded(
+            stack.coordinator.execute(
+                operation="host-structlog",
+                context={"correlation_id": "corr-host-structlog"},
+                command=lambda _uow: "ok",
+            )
+        )
+    finally:
+        try:
+            await _bounded(stack.coordinator.close())
+        finally:
+            config_after = dict(structlog.get_config())
+            structlog.configure(**previous)
+    assert tuple(config_after["processors"]) == (host_processor, capture)
+    assert capture.entries
+    assert {entry.get("host_processor_marker") for entry in capture.entries} == {"preserved"}
+    assert {entry.get("operation") for entry in capture.entries} == {"host-structlog"}
 
 
 @pytest.mark.asyncio

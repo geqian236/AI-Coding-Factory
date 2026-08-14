@@ -422,20 +422,20 @@ import ctypes
 import json
 import sys
 
-handle = int(sys.argv[1])
+marker_handle = int(sys.argv[1])
 flags = ctypes.c_ulong()
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 get_handle_information = kernel32.GetHandleInformation
 get_handle_information.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
 get_handle_information.restype = ctypes.c_bool
-valid = bool(get_handle_information(ctypes.c_void_p(handle), ctypes.byref(flags)))
-error = 0 if valid else ctypes.get_last_error()
+marker_valid = bool(get_handle_information(ctypes.c_void_p(marker_handle), ctypes.byref(flags)))
+marker_error = 0 if marker_valid else ctypes.get_last_error()
 print(json.dumps({
     "receiptVersion": 1,
     "kind": "mutex-handle-inheritance-probe",
     "status": "ready",
-    "handleValidInChild": valid,
-    "lastError": error,
+    "markerHandleValidInChild": marker_valid,
+    "markerLastError": marker_error,
 }), flush=True)
 """
 
@@ -637,11 +637,12 @@ def test_p08_real_mutex_acquire_release_and_reacquire(tmp_path: Path) -> None:
 def test_real_mutex_handle_is_noninheritable_even_when_grandchild_inherits_handles(
     tmp_path: Path,
 ) -> None:
-    """父进程显式允许继承其他 HANDLE 时，mutex native handle 在 grandchild 仍必须无效。"""
+    """父进程显式允许继承其他 HANDLE 时，mutex native handle 仍必须禁用继承位。"""
     mutex_module = _mutex_module()
     root = _case_root(tmp_path)
     children: list[ManagedChild] = []
     lease: Any | None = None
+    marker_handle: int | None = None
     try:
         mutex = mutex_module.NamedMutex.for_database(
             volume_identity="volume-guid:noninherit",
@@ -650,8 +651,30 @@ def test_real_mutex_handle_is_noninheritable_even_when_grandchild_inherits_handl
         )
         lease = mutex.acquire()
         assert lease.security_receipt.inheritable is False
+
+        class SecurityAttributes(ctypes.Structure):
+            _fields_ = [
+                ("nLength", ctypes.c_ulong),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", ctypes.c_bool),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_handle_information = kernel32.GetHandleInformation
+        get_handle_information.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        get_handle_information.restype = ctypes.c_bool
+        flags = ctypes.c_ulong()
+        assert get_handle_information(ctypes.c_void_p(lease.native_handle), ctypes.byref(flags))
+        assert flags.value & 0x00000001 == 0
+
+        create_event = kernel32.CreateEventW
+        create_event.argtypes = [ctypes.POINTER(SecurityAttributes), ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+        create_event.restype = ctypes.c_void_p
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
+        marker_handle = int(create_event(ctypes.byref(attributes), True, False, None))
+        assert marker_handle != 0
         child = _spawn_managed(
-            [sys.executable, "-c", HANDLE_PROBE_PROGRAM, str(lease.native_handle)],
+            [sys.executable, "-c", HANDLE_PROBE_PROGRAM, str(marker_handle)],
             children,
             close_fds=False,
         )
@@ -662,10 +685,12 @@ def test_real_mutex_handle_is_noninheritable_even_when_grandchild_inherits_handl
             "receiptVersion": 1,
             "kind": "mutex-handle-inheritance-probe",
             "status": "ready",
-            "handleValidInChild": False,
-            "lastError": 6,
+            "markerHandleValidInChild": True,
+            "markerLastError": 0,
         }
     finally:
+        if marker_handle is not None:
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(marker_handle))
         if lease is not None:
             lease.release()
             lease.close()
@@ -960,6 +985,29 @@ class _FakeWin32Api:
     def get_last_error(self) -> int:
         """提供 WAIT_FAILED 的稳定 Win32 code。"""
         return self.last_error
+
+
+@pytest.mark.parametrize("invalid_timeout_ms", [None, True, 0, -1, 60_001, 2**32 - 1])
+def test_timeout_ms_rejects_invalid_values_before_wait_or_handle_creation(
+    tmp_path: Path,
+    invalid_timeout_ms: object,
+) -> None:
+    """timeout 必须是受控毫秒范围；负数不能溢出成 Win32 INFINITE。"""
+    mutex_module = _mutex_module()
+    root = _case_root(tmp_path)
+    api = _FakeWin32Api()
+    try:
+        with pytest.raises(mutex_module.InvalidMutexTimeoutError) as caught:
+            mutex_module.NamedMutex.for_database(
+                volume_identity="volume-guid:invalid-timeout",
+                state_database_path=root / "state.sqlite3",
+                timeout_ms=invalid_timeout_ms,
+                win32_api=api,
+            )
+        assert caught.value.error_code == "SINGLETON_MUTEX_TIMEOUT_INVALID"
+        assert api.calls == []
+    finally:
+        _cleanup_case_root(root)
 
 
 @pytest.mark.parametrize(
