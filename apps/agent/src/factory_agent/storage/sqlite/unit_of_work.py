@@ -931,6 +931,9 @@ class SqliteUnitOfWork:
                     "canonical_state_event": canonical,
                 },
             )
+        # 这里仍未向 SQLite 发送 COMMIT；注入故障必须走可回滚的已知失败分支，
+        # 不能被 coordinator 误判成提交结果未知。
+        self._failure_probe("before_commit")
         LOGGER.info(
             "sqlite_precommit_completed",
             operation="sqlite_precommit",
@@ -942,7 +945,6 @@ class SqliteUnitOfWork:
     def commit(self) -> None:
         """在故障点之后显式提交；成功后清空事务内待配对状态。"""
         started = time.monotonic()
-        self._failure_probe("before_commit")
         self._connection.execute("COMMIT")
         paired_count = len(self._pending_cas)
         self._pending_cas.clear()
