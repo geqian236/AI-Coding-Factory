@@ -2644,8 +2644,17 @@ async def test_each_legal_prefix_runs_exact_pending_trace_in_one_immediate_trans
     outside = (*items[:begin_index], *items[commit_index + 1 :])
     assert not [item for item in outside if item[:2] in {("sql", "create"), ("sql", "alter"), ("sql", "drop")}]
     assert not [item for item in items if item[:2] == ("sql", "drop")]
-    user_version = [item for item in items if item[:3] == ("sql", "pragma", "user_version")]
-    assert user_version == [("sql", *_trace_key(f"PRAGMA user_version={len(MIGRATION_NAMES)}"))]
+    expected_user_version_reads = {
+        ("sql", *_trace_key("PRAGMA user_version")),
+        ("sql", *_trace_key("PRAGMA main.user_version")),
+    }
+    user_version_mutations = [
+        item
+        for item in items
+        if (item[:3] == ("sql", "pragma", "user_version") or item[:5] == ("sql", "pragma", "main", ".", "user_version"))
+        and item not in expected_user_version_reads
+    ]
+    assert user_version_mutations == [("sql", *_trace_key(f"PRAGMA user_version={len(MIGRATION_NAMES)}"))]
 
 
 @pytest.mark.asyncio
