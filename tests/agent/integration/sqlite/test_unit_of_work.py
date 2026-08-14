@@ -2436,6 +2436,7 @@ async def test_import_time_audit_sees_one_owner_connection_and_real_cas_sql_thre
         import asyncio
         import json
         import pathlib
+        import re
         import sys
         import threading
 
@@ -2471,6 +2472,23 @@ async def test_import_time_audit_sees_one_owner_connection_and_real_cas_sql_thre
             def acquire(self):
                 self.owner_thread = threading.get_ident()
                 return Lease(self)
+
+        CAS_SQL = re.compile(r'^UPDATE\\s+(?:"tasks"|tasks)\\s+SET\\b', re.IGNORECASE)
+        EVENT_INSERT_SQL = re.compile(
+            r'^INSERT\\s+INTO\\s+(?:"authoritative_state_events"|authoritative_state_events)\\s*(?:\\(|\\s)',
+            re.IGNORECASE,
+        )
+
+        def unique_statement_count(pattern):
+            # SQLite trace callback 会把带 trigger 的同一 top-level UPDATE 重放一次；
+            # 这里按归一化 SQL 去重，同时允许生产代码为了安全引用标识符。
+            return len(
+                {
+                    " ".join(sql.split())
+                    for _thread_id, sql in traces
+                    if pattern.match(sql.lstrip())
+                }
+            )
 
         async def main():
             database = SqliteDatabase(
@@ -2521,14 +2539,8 @@ async def test_import_time_audit_sees_one_owner_connection_and_real_cas_sql_thre
                 "ownerThread": readiness.owner_thread_id,
                 "mutexThread": mutex.owner_thread,
                 "traceThreads": sorted({thread_id for thread_id, _sql in traces}),
-                "casSqlCount": sum(
-                    1 for _thread_id, sql in traces
-                    if sql.lstrip().upper().startswith("UPDATE TASKS")
-                ),
-                "eventInsertCount": sum(
-                    1 for _thread_id, sql in traces
-                    if sql.lstrip().upper().startswith("INSERT INTO AUTHORITATIVE_STATE_EVENTS")
-                ),
+                "casSqlCount": unique_statement_count(CAS_SQL),
+                "eventInsertCount": unique_statement_count(EVENT_INSERT_SQL),
                 "stateVersion": result[0].state_version,
             }
             print("AUDIT_RECEIPT=" + json.dumps(receipt, separators=(",", ":")))
