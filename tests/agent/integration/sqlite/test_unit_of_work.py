@@ -2837,7 +2837,9 @@ def test_f02_f04_bootstrap_failure_points_never_publish_ready(
     failure_point: str,
 ) -> None:
     """每个 PRAGMA/migration/integrity 切点都关闭连接并保持 coordinator FAILED。"""
-    path = _assert_d_test_path(tmp_path / f"{failure_point.replace(':', '-')}.sqlite3")
+    # 物理数据库 identity 不能复用 failure_point；receipt 允许输出稳定诊断码，
+    # 但不允许泄露真实文件名、stem 或绝对路径。
+    path = _assert_d_test_path(tmp_path / "opaque-r23.sqlite3")
     receipt = _startup_failure_receipt(
         path,
         scenario="fault",
