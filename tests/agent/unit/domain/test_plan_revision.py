@@ -12,6 +12,7 @@ import importlib
 import json
 import sqlite3
 from collections.abc import Iterator, Mapping
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -208,6 +209,149 @@ def _persistence_record(run_spec: dict[str, Any], revision: dict[str, Any]) -> d
         "plan_revision_schema_version": 1,
         "canonical_plan_revision": canonicalize(revision),
     }
+
+
+def _sha256_digest(blob: bytes) -> str:
+    """为持久层 fixture 生成 sha256: 摘要，避免把父行 setup 伪装成生产 repository 行为。"""
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def _parent_plan_revision_record(run_spec: Mapping[str, Any], revision: Mapping[str, Any]) -> dict[str, object]:
+    """构造可被生产 hydration 验证的 genesis 父 revision，仅用于满足子 revision 的自 FK。"""
+    parent_revision_id = revision.get("parentRevisionId")
+    if parent_revision_id is None:
+        raise AssertionError("父 revision 记录只应在子记录声明 parentRevisionId 时构造")
+
+    parent_run_spec = deepcopy(dict(run_spec))
+    parent_run_spec["specRevision"] = int(revision["specRevision"]) - 1
+    parent_run_spec["parentRevisionId"] = None
+    parent_run_spec["planRevisionDigest"] = "sha256:" + "0" * 64
+    parent_run_spec["semanticPlanHash"] = semantic_plan_hash(parent_run_spec)
+
+    parent_revision = _plan_revision_contract(parent_run_spec)
+    parent_revision["planRevisionId"] = parent_revision_id
+    parent_revision["planRevisionDigest"] = _unchecked_plan_revision_digest(parent_revision)
+    parent_run_spec["planRevisionDigest"] = parent_revision["planRevisionDigest"]
+    parent_revision["semanticPlanHash"] = parent_run_spec["semanticPlanHash"]
+    parent_revision["planRevisionDigest"] = _unchecked_plan_revision_digest(parent_revision)
+    parent_run_spec["planRevisionDigest"] = parent_revision["planRevisionDigest"]
+
+    parent_record = _persistence_record(parent_run_spec, parent_revision)
+    _plans_module().PlanRevisionBundle.from_persistence_record(parent_record)
+    return parent_record
+
+
+def _seed_plan_revision_parents(database_path: Path, run_spec: Mapping[str, Any], revision: Mapping[str, Any]) -> None:
+    """只 seed plan_revisions 需要的 FK 父图；被测 append/get 仍必须走生产 repository。"""
+    canonical_intake = canonicalize({"taskId": run_spec["taskId"], "source": "plan-revision-storage-test"})
+    canonical_contract = canonicalize(
+        {
+            "intentAuthorizationId": revision["intentAuthorizationId"],
+            "taskId": revision["taskId"],
+            "purpose": "plan-revision-storage-fk-parent",
+        }
+    )
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("INSERT INTO projects(project_id) VALUES(?)", ("project-plan-revision-test",))
+        connection.execute(
+            """
+            INSERT INTO tasks(
+                task_id, project_id, lifecycle, target_stage, achieved_stage,
+                active_plan_revision_id, active_run_id, state_version, outcome_version,
+                intake_schema_id, intake_schema_version, canonical_intake, intake_digest
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                run_spec["taskId"],
+                "project-plan-revision-test",
+                "ACTIVE",
+                run_spec["targetStage"],
+                "NONE",
+                None,
+                None,
+                0,
+                0,
+                "task-intake.v1",
+                1,
+                canonical_intake,
+                _sha256_digest(canonical_intake),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO intent_authorizations(
+                intent_authorization_id, task_id, user_id, requirement_digest, project_id,
+                repository_id, repository_binding_digest, baseline_digest, target_stage,
+                stage_capability_map_version, allowed_capability_set_digest, target_binding_digest,
+                risk_ceiling, estimated_cost_alert_digest, autonomous_execution_budget_ms,
+                repair_loop_limit, auto_replan_limit, attempt_limit, issued_at, expires_at,
+                revoked_at, revoke_reason, contract_schema_id, contract_schema_version,
+                canonical_contract, canonical_contract_digest
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                revision["intentAuthorizationId"],
+                revision["taskId"],
+                "user-plan-revision-test",
+                canonicalize({"digest": "requirement"}),
+                "project-plan-revision-test",
+                "repo-plan-revision-test",
+                canonicalize({"digest": "repository-binding"}),
+                canonicalize({"digest": "baseline"}),
+                run_spec["targetStage"],
+                run_spec["stageCapabilityMapVersion"],
+                canonicalize({"digest": "allowed-capabilities"}),
+                canonicalize({"digest": "target-binding"}),
+                "medium",
+                canonicalize({"digest": "estimated-cost-alert"}),
+                1,
+                0,
+                0,
+                1,
+                run_spec["createdAt"],
+                "2026-08-13T00:00:00Z",
+                None,
+                None,
+                "intent-authorization.v1",
+                1,
+                canonical_contract,
+                canonicalize({"digest": _sha256_digest(canonical_contract)}),
+            ),
+        )
+        if revision.get("parentRevisionId") is not None:
+            parent_record = _parent_plan_revision_record(run_spec, revision)
+            connection.execute(
+                """
+                INSERT INTO plan_revisions(
+                    plan_revision_id, task_id, spec_revision, parent_revision_id,
+                    intent_authorization_id, semantic_plan_hash, plan_revision_digest,
+                    dag_version, node_capability_map_version, stage_capability_map_version,
+                    created_at, run_spec_schema_id, run_spec_schema_version, canonical_run_spec,
+                    plan_revision_schema_id, plan_revision_schema_version, canonical_plan_revision
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    parent_record["plan_revision_id"],
+                    parent_record["task_id"],
+                    parent_record["spec_revision"],
+                    parent_record["parent_revision_id"],
+                    parent_record["intent_authorization_id"],
+                    parent_record["semantic_plan_hash"],
+                    parent_record["plan_revision_digest"],
+                    parent_record["dag_version"],
+                    parent_record["node_capability_map_version"],
+                    parent_record["stage_capability_map_version"],
+                    parent_record["created_at"],
+                    parent_record["run_spec_schema_id"],
+                    parent_record["run_spec_schema_version"],
+                    parent_record["canonical_run_spec"],
+                    parent_record["plan_revision_schema_id"],
+                    parent_record["plan_revision_schema_version"],
+                    parent_record["canonical_plan_revision"],
+                ),
+            )
+        connection.commit()
 
 
 def _assert_lossless_contract_pair(run_spec: dict[str, Any], revision: dict[str, Any]) -> None:
@@ -779,6 +923,7 @@ def test_append_get_plan_revision_survives_database_close_and_reopen(tmp_path: P
     database = database_module.SqliteDatabase(database_path)
     database.open()
     try:
+        _seed_plan_revision_parents(database_path, run_spec, revision)
         uow = database.new_unit_of_work()
         uow.begin_immediate()
         uow.workflow.append_plan_revision(expected)
@@ -816,6 +961,7 @@ def test_raw_blob_corruption_after_close_reopen_is_rejected_by_production_hydrat
     database = database_module.SqliteDatabase(database_path)
     database.open()
     try:
+        _seed_plan_revision_parents(database_path, run_spec, revision)
         uow = database.new_unit_of_work()
         uow.begin_immediate()
         uow.workflow.append_plan_revision(expected)
@@ -825,7 +971,7 @@ def test_raw_blob_corruption_after_close_reopen_is_rejected_by_production_hydrat
         database.close()
 
     # blobopen 绕过 UPDATE trigger，仅改同长一字节，保留合法 UTF-8/JCS 形状以聚焦 selector/digest 重验。
-    with sqlite3.connect(database_path) as raw:
+    with closing(sqlite3.connect(database_path)) as raw:
         row = raw.execute(
             f'SELECT rowid, "{blob_column}" FROM plan_revisions WHERE plan_revision_id=?',  # noqa: S608
             (revision["planRevisionId"],),
@@ -843,9 +989,8 @@ def test_raw_blob_corruption_after_close_reopen_is_rejected_by_production_hydrat
     reopened = database_module.SqliteDatabase(database_path)
     reopened.open()
     try:
-        loaded = reopened.new_unit_of_work().workflow.get_plan_revision(revision["planRevisionId"])
         with pytest.raises(plans.PlanPersistenceError) as caught:
-            plans.PlanRevisionBundle.from_persistence_record(loaded)
+            reopened.new_unit_of_work().workflow.get_plan_revision(revision["planRevisionId"])
         assert caught.value.error_code == "PLAN_REVISION_PERSISTENCE_MISMATCH"
     finally:
         reopened.close()
