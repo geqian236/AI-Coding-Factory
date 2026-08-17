@@ -520,16 +520,40 @@ class TransitionService:
         next_barrier = (
             None if request.next_barrier_id is None else repository.get_phase_barrier(request.next_barrier_id)
         )
+        next_authority: _PlanBarrierAuthority | None = None
+        if expected_next_spec is not None and request.next_barrier_id is not None:
+            try:
+                # 后继仍从同一 validated PlanRevision 重验五字段与派生 identity，不能只信请求 selector。
+                next_authority = repository.load_barrier_plan_authority(
+                    barrier_id=request.next_barrier_id,
+                    run_id=current_run.run_id,
+                    task_id=current_task.task_id,
+                    require_active_barrier=False,
+                )
+            except WorkflowRepositoryError:
+                next_authority = None
+        expected_next_node_ids = expected_next_spec.get("requiredNodeIds") if expected_next_spec is not None else None
+        expected_next_digest = (
+            None
+            if not isinstance(expected_next_node_ids, (tuple, list))
+            else "sha256:" + hashlib.sha256(canonicalize(list(expected_next_node_ids))).hexdigest()
+        )
         next_selector_valid = (
             expected_next_spec is None and request.next_barrier_id is None and request.next_phase is current_run.phase
         ) or (
             expected_next_spec is not None
             and request.next_barrier_id is not None
             and next_barrier is not None
+            and next_authority is not None
             and next_barrier.run_id == current_run.run_id
             and next_barrier.plan_revision_id == current_barrier.plan_revision_id
             and next_barrier.business_phase == expected_next_spec.get("businessPhase")
             and next_barrier.barrier_ordinal == expected_next_spec.get("barrierOrdinal")
+            and next_authority.business_phase == expected_next_spec.get("businessPhase")
+            and next_authority.barrier_ordinal == expected_next_spec.get("barrierOrdinal")
+            and next_authority.pass_predicate_id == expected_next_spec.get("passPredicateId")
+            and next_authority.required_node_set_digest == expected_next_digest
+            and next_authority.settle_timeout_ms == expected_next_spec.get("settleTimeoutMs")
             and request.next_phase.value == expected_next_spec.get("businessPhase")
         )
         # steps、milestone_evidence、gate_digest 仍保留在请求合同中兼容旧调用方，但不作为证据真源。

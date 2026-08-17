@@ -22,8 +22,10 @@ from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepos
 from tests.agent.integration.control.test_control_commands import (
     SHA_A,
     _connection,
+    _derived_barrier_id,
     _insert,
     _insert_plan_revision_for_barrier,
+    _selector_digest,
     _service,
 )
 
@@ -54,11 +56,12 @@ def _insert_attempt_graph(connection: object) -> None:
         connection,  # type: ignore[arg-type]
         required_node_ids=("implement",),
     )
+    barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
     _insert(
         connection,  # type: ignore[arg-type]
         "phase_barriers",
         {
-            "barrier_id": "barrier-control-1",
+            "barrier_id": barrier_id,
             "run_id": "run-control-1",
             "plan_revision_id": "plan-control-1",
             "business_phase": "PLANNING",
@@ -80,7 +83,7 @@ def _insert_attempt_graph(connection: object) -> None:
             "step_id": "step-control-1",
             "run_id": "run-control-1",
             "plan_revision_id": "plan-control-1",
-            "barrier_id": "barrier-control-1",
+            "barrier_id": barrier_id,
             "logical_node_id": "implement",
             "business_phase": "IMPLEMENTING",
             "node_type": "IMPLEMENT",
@@ -88,8 +91,8 @@ def _insert_attempt_graph(connection: object) -> None:
             "side_effect_class": "workspace_write",
             "phase": "RUNNING",
             "outcome": "NONE",
-            "dependency_hash": SHA_A,
-            "required_artifacts_digest": SHA_A,
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest([]),
             "success_predicate_id": "implementation-complete-v1",
             "timeout_ms": 30_000,
             "retry_policy_id": "no-retry-v1",
