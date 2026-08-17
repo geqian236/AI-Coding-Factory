@@ -182,17 +182,27 @@ class ControlService:
         if run is None:
             raise WorkflowRepositoryError("run does not exist")
         desired = _desired_target(request.command_type)
+        attempt = (
+            workflow.get_active_attempt_for_run(run.run_id) if request.command_type in _BLOCKING_COMMANDS else None
+        )
         immediate_stop_noop = (
             request.command_type is ControlCommandType.IMMEDIATE_STOP
             and run.desired_state is RunDesiredState.PAUSED
             and run.observed_state is RunObservedState.PAUSED
-            and workflow.get_active_attempt_for_run(run.run_id) is None
+            and attempt is None
         )
-        if not immediate_stop_noop:
+        immediate_stop_escalation = (
+            request.command_type is ControlCommandType.IMMEDIATE_STOP
+            and run.desired_state is RunDesiredState.PAUSED
+            and attempt is not None
+        )
+        immediate_stop_completed_without_executor = (
+            request.command_type is ControlCommandType.IMMEDIATE_STOP
+            and attempt is None
+            and run.observed_state in {RunObservedState.PAUSED, RunObservedState.QUEUED}
+        )
+        if not immediate_stop_noop and not immediate_stop_escalation:
             require_desired_transition(run.desired_state, desired)
-        attempt = (
-            workflow.get_active_attempt_for_run(run.run_id) if request.command_type in _BLOCKING_COMMANDS else None
-        )
         issued_at = self._now().isoformat()
         command = ControlCommand(
             command_id=self._command_id_factory(),
@@ -236,8 +246,8 @@ class ControlService:
             evidence_digest=None,
             created_at=issued_at,
         )
-        if immediate_stop_noop:
-            # 已满足 PAUSED 安全谓词时无需 executor 动作，完成事实仍以追加事件表达。
+        if immediate_stop_completed_without_executor:
+            # PAUSED/QUEUED 且无 Attempt 时没有 executor 动作，完成事实仍以追加事件表达。
             controls.append_receipt(
                 receipt_id=self._receipt_id_factory(),
                 command_id=command.command_id,

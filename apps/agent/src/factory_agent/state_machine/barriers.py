@@ -75,12 +75,12 @@ def _unsettled_reason(steps: tuple[BarrierStepFacts, ...]) -> str | None:
 def _unpassed_reason(steps: tuple[BarrierStepFacts, ...]) -> str | None:
     """settled 后按证据优先级返回 gate 未通过原因。"""
     required = tuple(step for step in steps if step.required)
+    if any(step.blocking_finding_open for step in steps):
+        return "BLOCKING_FINDING_OPEN"
     if any(not step.required_artifacts_committed for step in required):
         return "REQUIRED_ARTIFACT_MISSING"
     if any(not step.success_predicate_passed for step in required):
         return "SUCCESS_PREDICATE_FAILED"
-    if any(step.blocking_finding_open for step in required):
-        return "BLOCKING_FINDING_OPEN"
     if any(not required_step_passed(step) for step in required):
         return "SUCCESS_PREDICATE_FAILED"
     return None

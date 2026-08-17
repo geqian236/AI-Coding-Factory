@@ -98,6 +98,18 @@ def test_optional_step_missing_artifact_does_not_block_passed_barrier() -> None:
     assert decision.passed is True
 
 
+def test_optional_step_blocking_finding_still_blocks_barrier() -> None:
+    """optional 只豁免自身成功/Artifact，任何未关闭 blocking finding 都必须阻断 gate。"""
+    decision = evaluate_barrier(
+        (_step(required=False, blocking_finding_open=True),),
+        now=NOW,
+        settle_deadline_at=None,
+    )
+    assert decision.settled is True
+    assert decision.passed is False
+    assert decision.block_reason_code == "BLOCKING_FINDING_OPEN"
+
+
 def test_milestone_advances_and_completes_only_with_atomic_success_evidence() -> None:
     """目标 barrier 与全部收口证据齐全时才可推进里程碑并结束目标 Task。"""
     evidence = MilestoneEvidence(

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from factory_agent.domain.events import payload_digest
@@ -22,10 +23,16 @@ from factory_agent.domain.workflow import (
 )
 from factory_agent.errors import FactoryError
 from factory_agent.observability.logging import get_logger
+from factory_agent.policy.canonical_json import canonicalize
 from factory_agent.state_machine.barriers import BarrierStepFacts, evaluate_barrier
 from factory_agent.state_machine.milestones import MilestoneEvidence, evaluate_milestone
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork
-from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepository, WorkflowRepositoryError
+from factory_agent.storage.sqlite.workflow_repository import (
+    BarrierAuthorityFacts,
+    ObservedStateAuthorityFacts,
+    SqliteWorkflowRepository,
+    WorkflowRepositoryError,
+)
 
 LOGGER = get_logger(__name__)
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -251,6 +258,42 @@ def build_state_001_partial_receipt(checks: Mapping[str, bool]) -> dict[str, obj
     }
 
 
+def _authoritative_gate_digest(
+    authority: BarrierAuthorityFacts,
+    *,
+    settled: bool,
+    passed: bool,
+    timed_out: bool,
+    block_reason_code: str | None,
+) -> str:
+    """只对事务内重算的 gate/证据摘要做 digest，不把请求 payload 当作真源。"""
+    material = {
+        "settled": settled,
+        "passed": passed,
+        "timedOut": timed_out,
+        "blockReasonCode": block_reason_code,
+        "activeAttemptCount": authority.active_attempt_count,
+        "unknownRemoteState": authority.unknown_remote_state,
+        "requiredArtifactsCommitted": authority.required_artifacts_committed,
+        "blockingFindingCount": authority.blocking_finding_count,
+        "steps": [
+            {
+                "stepId": step.step_id,
+                "required": step.required,
+                "phase": step.phase.value,
+                "outcome": step.outcome.value,
+                "activeAttempt": step.active_attempt,
+                "unsettledStartedReceipt": step.unsettled_started_receipt,
+                "successPredicatePassed": step.success_predicate_passed,
+                "requiredArtifactsCommitted": step.required_artifacts_committed,
+                "blockingFindingOpen": step.blocking_finding_open,
+            }
+            for step in authority.steps
+        ],
+    }
+    return "sha256:" + hashlib.sha256(canonicalize(material)).hexdigest()
+
+
 class TransitionService:
     """经唯一 coordinator 执行 observed state CAS 与事件原子提交。"""
 
@@ -259,9 +302,11 @@ class TransitionService:
         *,
         coordinator: TransactionCoordinator,
         state_event_id_factory: Callable[[], str],
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._state_event_id_factory = state_event_id_factory
+        self._now = now or (lambda: datetime.now(UTC))
 
     async def transition_observed(
         self,
@@ -269,10 +314,10 @@ class TransitionService:
         run_id: str,
         expected_state_version: int,
         candidate: RunObservedState,
-        evidence: ObservedStateEvidence,
+        evidence: ObservedStateEvidence | None = None,
         request_id: str,
     ) -> Run:
-        """验证边与目标事实，再在同一事务写 projection 和 state.changed。"""
+        """只使用同一事务查询的权威事实，再写 projection 和 state.changed。"""
         started = time.monotonic()
 
         def command(unit_of_work: SqliteUnitOfWork) -> Run:
@@ -280,7 +325,24 @@ class TransitionService:
             current = repository.get_run(run_id)
             if current is None:
                 raise WorkflowRepositoryError("run does not exist")
-            require_observed_target_predicates(current, candidate, evidence)
+            authority: ObservedStateAuthorityFacts = repository.load_observed_state_authority(
+                run_id=run_id,
+                now=self._now(),
+            )
+            # 保留旧参数仅为兼容调用面；任何调用方摘要都不进入状态判定。
+            require_observed_target_predicates(
+                current,
+                candidate,
+                ObservedStateEvidence(
+                    active_attempt_count=authority.active_attempt_count,
+                    lease_active=authority.lease_active,
+                    authorization_active=authority.authorization_active,
+                    control_sequence_current=authority.control_sequence_current,
+                    heartbeat_valid=authority.heartbeat_valid,
+                    unknown_remote_state=authority.unknown_remote_state,
+                    unsettled_started_receipt=authority.unsettled_started_receipt,
+                ),
+            )
             updated = repository.transition_observed(
                 run_id=run_id,
                 expected_state_version=expected_state_version,
@@ -360,33 +422,56 @@ class TransitionService:
             or next_barrier.barrier_ordinal <= current_barrier.barrier_ordinal
         ):
             raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
+        # steps、milestone_evidence、gate_digest 仍保留在请求合同中兼容旧调用方，但不作为证据真源。
         try:
             settle_deadline = (
                 None
                 if current_barrier.settle_deadline_at is None
                 else datetime.fromisoformat(current_barrier.settle_deadline_at)
             )
+            # steps/attempts/receipts/artifacts/findings 必须在 owner transaction 内重算。
+            authority = repository.load_barrier_authority(
+                barrier_id=current_barrier.barrier_id,
+                run_id=current_run.run_id,
+                task_id=current_task.task_id,
+            )
             barrier_decision = evaluate_barrier(
-                request.steps,
+                authority.steps,
                 now=request.now,
                 settle_deadline_at=settle_deadline,
             )
+        except WorkflowRepositoryError as exc:
+            raise BarrierMilestoneCommitError("barrier authority facts are incomplete") from exc
         except (TypeError, ValueError) as exc:
             raise BarrierMilestoneCommitError("barrier deadline is invalid") from exc
         if not barrier_decision.settled or not barrier_decision.passed:
             raise BarrierMilestoneCommitError("barrier gate has not passed")
+        gate_digest = _authoritative_gate_digest(
+            authority,
+            settled=barrier_decision.settled,
+            passed=barrier_decision.passed,
+            timed_out=barrier_decision.timed_out,
+            block_reason_code=barrier_decision.block_reason_code,
+        )
+        milestone_evidence = MilestoneEvidence(
+            barrier_passed=barrier_decision.passed,
+            active_attempt_count=authority.active_attempt_count,
+            unknown_remote_state=authority.unknown_remote_state,
+            required_artifacts_committed=authority.required_artifacts_committed,
+            blocking_finding_count=authority.blocking_finding_count,
+        )
         milestone = evaluate_milestone(
             current=current_task.achieved_stage,
             candidate=request.candidate_achieved_stage,
             target=current_task.target_stage,
-            evidence=request.milestone_evidence,
+            evidence=milestone_evidence,
         )
         target_lifecycle = TaskLifecycle.SUCCEEDED if milestone.lifecycle_should_succeed else current_task.lifecycle
 
         updated_barrier = repository.pass_phase_barrier(
             barrier_id=request.barrier_id,
             expected_state_version=request.expected_barrier_state_version,
-            gate_digest=request.gate_digest,
+            gate_digest=gate_digest,
         )
         append_authoritative_state_event(
             unit_of_work,
@@ -399,7 +484,7 @@ class TransitionService:
             attempt_id=None,
             previous_state_version=request.expected_barrier_state_version,
             state_version=updated_barrier.state_version,
-            payload={"settled": True, "passed": True, "gateDigest": request.gate_digest},
+            payload={"settled": True, "passed": True, "gateDigest": gate_digest},
         )
         updated_run = repository.advance_run_phase(
             run_id=request.run_id,
