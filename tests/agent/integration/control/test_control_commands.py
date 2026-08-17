@@ -563,8 +563,14 @@ def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
     )
 
 
-def _insert_second_intent_authorization(connection: sqlite3.Connection) -> None:
-    """复制 FK 完整的意图授权，供只漂移 execution authorization intent 绑定的反例使用。"""
+def _insert_intent_authorization_copy(
+    connection: sqlite3.Connection,
+    *,
+    source_id: str,
+    intent_id: str,
+    task_id: str,
+) -> None:
+    """复制 FK 完整的意图授权，并切换绑定 ID/Task，供 lineage 变异夹具使用。"""
     cursor = connection.execute(
         "SELECT intent_authorization_id,task_id,user_id,requirement_digest,project_id,"
         "repository_id,repository_binding_digest,baseline_digest,target_stage,"
@@ -573,13 +579,24 @@ def _insert_second_intent_authorization(connection: sqlite3.Connection) -> None:
         "repair_loop_limit,auto_replan_limit,attempt_limit,issued_at,expires_at,revoked_at,"
         "revoke_reason,contract_schema_id,contract_schema_version,canonical_contract,"
         "canonical_contract_digest FROM intent_authorizations WHERE intent_authorization_id=?",
-        ("intent-control-1",),
+        (source_id,),
     )
     row = cursor.fetchone()
     assert row is not None
     values = dict(zip((item[0] for item in cursor.description or ()), row, strict=True))
-    values["intent_authorization_id"] = "intent-control-2"
+    values["intent_authorization_id"] = intent_id
+    values["task_id"] = task_id
     _insert(connection, "intent_authorizations", values)
+
+
+def _insert_second_intent_authorization(connection: sqlite3.Connection) -> None:
+    """复制当前 Task 的意图授权，供只漂移 execution authorization intent 绑定的反例使用。"""
+    _insert_intent_authorization_copy(
+        connection,
+        source_id="intent-control-1",
+        intent_id="intent-control-2",
+        task_id="task-control-1",
+    )
 
 
 def _target_close_request(*, planning_barrier_id: str, request_id: str) -> BarrierMilestoneRequest:
@@ -867,11 +884,206 @@ def _insert_historical_target_authorization(
     )
 
 
+def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
+    """插入自洽的另一 Task PlanRevision/Step/Attempt，隔离 plan.task_id 单条件漂移。"""
+    _insert(
+        connection,
+        "tasks",
+        {
+            "task_id": "task-control-2",
+            "project_id": "project-control-1",
+            "lifecycle": "ACTIVE",
+            "target_stage": "DESIGN_APPROVED",
+            "achieved_stage": "NONE",
+            "active_plan_revision_id": None,
+            "active_run_id": None,
+            "state_version": 0,
+            "outcome_version": 0,
+            "intake_schema_id": "task-intake.v1",
+            "intake_schema_version": 1,
+            "canonical_intake": b"{}",
+            "intake_digest": SHA_A,
+        },
+    )
+    _insert_intent_authorization_copy(
+        connection,
+        source_id="intent-control-1",
+        intent_id="intent-control-3",
+        task_id="task-control-2",
+    )
+    plan_cursor = connection.execute("SELECT * FROM plan_revisions WHERE plan_revision_id=?", ("plan-control-1",))
+    plan_row = plan_cursor.fetchone()
+    assert plan_row is not None
+    plan_values = dict(zip((item[0] for item in plan_cursor.description or ()), plan_row, strict=True))
+    run_spec = json.loads(bytes(plan_values["canonical_run_spec"]).decode("utf-8"))
+    revision = json.loads(bytes(plan_values["canonical_plan_revision"]).decode("utf-8"))
+    run_spec["taskId"] = "task-control-2"
+    run_spec["intentAuthorizationId"] = "intent-control-3"
+    revision["planRevisionId"] = "plan-control-other-task"
+    revision["taskId"] = "task-control-2"
+    revision["intentAuthorizationId"] = "intent-control-3"
+    for document in (run_spec, revision):
+        node_collection = document["workPlan"]["nodes"] if document is run_spec else document["nodes"]
+        plan_node = next(node for node in node_collection if node["logicalNodeId"] == "plan")
+        plan_node["requiredArtifacts"] = ["artifact-planning-other-task"]
+    run_spec["semanticPlanHash"] = semantic_plan_hash(run_spec)
+    revision["semanticPlanHash"] = run_spec["semanticPlanHash"]
+    revision["planRevisionDigest"] = plan_revision_digest(revision)
+    run_spec["planRevisionDigest"] = revision["planRevisionDigest"]
+    canonical_run_spec = canonicalize(run_spec)
+    canonical_revision = canonicalize(revision)
+    other_plan_revision_id = "plan-control-other-task"
+    other_plan_digest = str(revision["planRevisionDigest"])
+    plan_values.update(
+        {
+            "plan_revision_id": other_plan_revision_id,
+            "task_id": "task-control-2",
+            "intent_authorization_id": "intent-control-3",
+            "semantic_plan_hash": revision["semanticPlanHash"],
+            "plan_revision_digest": other_plan_digest,
+            "canonical_run_spec": canonical_run_spec,
+            "canonical_plan_revision": canonical_revision,
+        }
+    )
+    _insert(connection, "plan_revisions", plan_values)
+    connection.execute(
+        "UPDATE tasks SET active_plan_revision_id=? WHERE task_id=?",
+        (other_plan_revision_id, "task-control-2"),
+    )
+    raw_barrier = revision["barriers"][0]
+    assert isinstance(raw_barrier, Mapping)
+    required_node_ids = list(raw_barrier["requiredNodeIds"])
+    other_barrier_id = PhaseBarrier.from_plan_barrier(
+        run_id="run-control-1",
+        plan_revision_id=other_plan_revision_id,
+        plan_revision_digest=other_plan_digest,
+        plan_barrier=raw_barrier,
+    ).barrier_id
+    _insert(
+        connection,
+        "phase_barriers",
+        {
+            "barrier_id": other_barrier_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": other_plan_revision_id,
+            "business_phase": raw_barrier["businessPhase"],
+            "barrier_ordinal": raw_barrier["barrierOrdinal"],
+            "required_node_set_digest": _selector_digest(required_node_ids),
+            "settle_timeout_ms": raw_barrier["settleTimeoutMs"],
+            "settle_deadline_at": None,
+            "pass_predicate_id": raw_barrier["passPredicateId"],
+            "settled": 0,
+            "passed": 0,
+            "gate_digest": None,
+            "state_version": 0,
+        },
+    )
+    plan_node = next(node for node in revision["nodes"] if node["logicalNodeId"] == "plan")
+    other_step_id = "step-planning-other-task"
+    other_attempt_id = "attempt-planning-other-task"
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": other_step_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": other_plan_revision_id,
+            "barrier_id": other_barrier_id,
+            "logical_node_id": "plan",
+            "business_phase": plan_node["businessPhase"],
+            "node_type": plan_node["nodeType"],
+            "required": 1,
+            "side_effect_class": plan_node["sideEffectClass"],
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest(list(plan_node["dependsOn"])),
+            "required_artifacts_digest": _selector_digest(list(plan_node["requiredArtifacts"])),
+            "success_predicate_id": plan_node["successPredicateId"],
+            "timeout_ms": plan_node["timeoutMs"],
+            "retry_policy_id": plan_node["retryPolicyId"],
+            "idempotency_key": "step-planning-other-task-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": other_attempt_id,
+            "step_id": other_step_id,
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": "executor-planning-other-task",
+            "process_session_id": "process-planning-other-task",
+            "pid": 4567,
+            "process_start_time": "2026-08-17T06:00:00Z",
+            "job_object_id": "job-planning-other-task",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 13,
+            "control_epoch": 5,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "DRAINED",
+            "started_at": "2026-08-17T06:00:00Z",
+            "ended_at": "2026-08-17T06:30:00Z",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "artifacts",
+        {
+            "artifact_id": "artifact-planning-other-task",
+            "producer_attempt_id": other_attempt_id,
+            "media_type": "text/plain",
+            "confidentiality": "INTERNAL",
+            "commit_state": "COMMITTED",
+            "storage_path": "artifact-planning-other-task",
+            "size_bytes": 1,
+            "digest": SHA_A,
+            "created_at": "2026-08-17T06:30:00Z",
+        },
+    )
+    _insert_target_close_authorization(connection)
+    connection.execute(
+        "UPDATE execution_authorizations SET intent_authorization_id=?,plan_revision_id=?,"
+        "semantic_plan_hash=?,plan_revision_digest=?,step_id=?,attempt_id=?,node_type=?,executor_id=?,"
+        "fencing_token=?,control_epoch=?,accepted_control_command_seq=?,consumption_state=?,max_uses=?,"
+        "issued_at=?,expires_at=?,revoked_at=?,revoke_reason=? WHERE execution_authorization_id=?",
+        (
+            "intent-control-3",
+            other_plan_revision_id,
+            canonicalize(revision["semanticPlanHash"]),
+            canonicalize(other_plan_digest),
+            other_step_id,
+            other_attempt_id,
+            "PLAN",
+            "executor-planning-other-task",
+            13,
+            5,
+            0,
+            "CONSUMED",
+            0,
+            "2026-08-17T06:00:00Z",
+            "2026-08-17T07:00:00Z",
+            "2026-08-17T07:30:00Z",
+            "superseded-by-task-lineage-probe",
+            "auth-target-auth-only",
+        ),
+    )
+
+
 _LINEAGE_MUTATIONS = (
     "run_id",
     "step_attempt",
     "step_run",
     "plan_revision",
+    "plan_task",
     "intent_authorization",
     "semantic_plan_hash",
     "plan_revision_digest",
@@ -896,6 +1108,9 @@ def _prepare_inactive_authorization_lineage_mutation(
     planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
     if mutation in {"run_id", "step_run"}:
         _insert_secondary_run_graph(connection)
+    if mutation == "plan_task":
+        _insert_other_task_plan_graph(connection)
+        return planning_barrier_id
     old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
     _insert_historical_target_authorization(
         connection,
@@ -911,15 +1126,29 @@ def _prepare_inactive_authorization_lineage_mutation(
         )
     elif mutation == "step_attempt":
         connection.execute(
-            "UPDATE execution_authorizations SET attempt_id=? WHERE execution_authorization_id=?",
-            ("attempt-planning-contract", "auth-target-auth-only"),
+            "UPDATE execution_authorizations SET attempt_id=?,executor_id=?,fencing_token=?,control_epoch=?,"
+            "accepted_control_command_seq=? WHERE execution_authorization_id=?",
+            ("attempt-planning-contract", "executor-planning-contract", 1, 1, 0, "auth-target-auth-only"),
         )
     elif mutation == "step_run":
         connection.execute("UPDATE steps SET run_id=? WHERE step_id=?", ("run-control-2", old_step_id))
     elif mutation == "plan_revision":
+        current_plan_row = connection.execute(
+            "SELECT intent_authorization_id,semantic_plan_hash,plan_revision_digest "
+            "FROM plan_revisions WHERE plan_revision_id=?",
+            ("plan-control-1",),
+        ).fetchone()
+        assert current_plan_row is not None
         connection.execute(
-            "UPDATE execution_authorizations SET plan_revision_id=? WHERE execution_authorization_id=?",
-            ("plan-control-1", "auth-target-auth-only"),
+            "UPDATE execution_authorizations SET plan_revision_id=?,intent_authorization_id=?,"
+            "semantic_plan_hash=?,plan_revision_digest=? WHERE execution_authorization_id=?",
+            (
+                "plan-control-1",
+                current_plan_row[0],
+                canonicalize(current_plan_row[1]),
+                canonicalize(current_plan_row[2]),
+                "auth-target-auth-only",
+            ),
         )
     elif mutation == "intent_authorization":
         _insert_second_intent_authorization(connection)
@@ -2677,8 +2906,9 @@ async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls
             active=False,
         )
         connection.execute(
-            "UPDATE execution_authorizations SET attempt_id=? WHERE execution_authorization_id=?",
-            ("attempt-planning-contract", "auth-target-auth-only"),
+            "UPDATE execution_authorizations SET attempt_id=?,executor_id=?,fencing_token=?,control_epoch=?,"
+            "accepted_control_command_seq=? WHERE execution_authorization_id=?",
+            ("attempt-planning-contract", "executor-planning-contract", 1, 1, 0, "auth-target-auth-only"),
         )
         service = TransitionService(
             coordinator=_SqliteCoordinator(connection),
