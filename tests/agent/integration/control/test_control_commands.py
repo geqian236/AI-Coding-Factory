@@ -838,6 +838,56 @@ async def test_terminated_requires_known_terminal_step_and_attempt_outcomes(
         connection.close()
 
 
+@pytest.mark.asyncio
+async def test_terminated_allows_zero_attempt_cancelled_before_dispatch() -> None:
+    """尚未派发即取消的终态 Step 不需要虚构 Attempt，且只追加一条 Run event。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_current_barrier(connection)
+        barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert(
+            connection,
+            "steps",
+            {
+                "step_id": "step-cancelled-before-dispatch",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "barrier_id": barrier_id,
+                "logical_node_id": "plan",
+                "business_phase": "PLANNING",
+                "node_type": "PLAN",
+                "required": 1,
+                "side_effect_class": "none",
+                "phase": "TERMINAL",
+                "outcome": "CANCELLED",
+                "dependency_hash": _selector_digest([]),
+                "required_artifacts_digest": _selector_digest(["artifact-planning"]),
+                "success_predicate_id": "planning-complete-v1",
+                "timeout_ms": 30_000,
+                "retry_policy_id": "no-retry-v1",
+                "idempotency_key": "step-cancelled-before-dispatch-v1",
+                "state_version": 0,
+            },
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-cancelled-before-dispatch"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        result = await service.transition_observed(
+            run_id="run-control-1",
+            expected_state_version=0,
+            candidate=RunObservedState.TERMINATED,
+            evidence=ObservedStateEvidence(0, False, False, False, False, False, False),
+            request_id="request-cancelled-before-dispatch",
+        )
+        assert result.observed_state is RunObservedState.TERMINATED
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("TERMINATED", 1)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
 def test_barrier_authority_rejects_settle_timeout_drift() -> None:
     """PlanRevision 的 settleTimeoutMs 与运行时 barrier 漂移时必须 fail closed。"""
     connection = _connection()

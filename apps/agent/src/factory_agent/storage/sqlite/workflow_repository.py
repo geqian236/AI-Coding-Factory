@@ -329,7 +329,6 @@ class SqliteWorkflowRepository:
             and not authorization_active
             and not unsettled_started_receipt
             and bool(step_fact_rows)
-            and bool(attempt_fact_rows)
             and all(
                 phase == StepPhase.TERMINAL.value and outcome in {item.value for item in KNOWN_TERMINAL_OUTCOMES}
                 for phase, outcome in step_fact_rows
