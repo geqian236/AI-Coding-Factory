@@ -1877,6 +1877,183 @@ async def test_target_reached_closes_run_without_selecting_successor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_target_reached_rejects_precreated_successor_step_and_rolls_back() -> None:
+    """目标收口前必须确认后继 Step 已合法收口，预建 PENDING Step 不能伪造 TERMINATED。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        _insert(
+            connection,
+            "steps",
+            {
+                "step_id": "step-design-precreated-pending",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "barrier_id": design_barrier_id,
+                "logical_node_id": "design-review",
+                "business_phase": "DESIGN_REVIEWING",
+                "node_type": "DESIGN_REVIEW",
+                "required": 1,
+                "side_effect_class": "none",
+                "phase": "PENDING",
+                "outcome": "NONE",
+                "dependency_hash": _selector_digest([]),
+                "required_artifacts_digest": _selector_digest(["artifact-design-stale"]),
+                "success_predicate_id": "design-complete-v1",
+                "timeout_ms": 30_000,
+                "retry_policy_id": "no-retry-v1",
+                "idempotency_key": "step-design-precreated-pending-v1",
+                "state_version": 0,
+            },
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-pending"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-target-pending-successor",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=planning_barrier_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.PLANNING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_active_authorization_and_lease_and_rolls_back() -> None:
+    """目标收口必须撤销全部执行副作用，残留 AVAILABLE 授权或 lease 时三路回滚。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert(
+            connection,
+            "resource_leases",
+            {
+                "resource_key": "resource-target-close",
+                "owner_executor_id": "executor-planning-contract",
+                "fencing_token": 1,
+                "control_epoch": 1,
+                "acquired_at": "2026-08-17T08:00:00Z",
+                "heartbeat_at": "2026-08-17T08:30:00Z",
+                "expires_at": "2026-08-17T10:00:00Z",
+                "state_version": 0,
+            },
+        )
+        _insert(
+            connection,
+            "execution_authorizations",
+            {
+                "execution_authorization_id": "auth-target-close",
+                "intent_authorization_id": "intent-control-1",
+                "plan_revision_id": "plan-control-1",
+                "semantic_plan_hash": b"semantic",
+                "plan_revision_digest": b"revision",
+                "stage_capability_map_version": "stage-capability-map.v1",
+                "stage_capability_map_digest": b"stage",
+                "node_capability_map_version": "node-capability-map.v1",
+                "node_capability_map_digest": b"node",
+                "run_id": "run-control-1",
+                "step_id": "step-planning-contract",
+                "attempt_id": "attempt-planning-contract",
+                "node_type": "PLAN",
+                "executor_id": "executor-planning-contract",
+                "resource_fingerprint": b"resource",
+                "capability_scope_digest": b"scope",
+                "idempotency_key": b"idempotency",
+                "input_bindings": b"bindings",
+                "action_capability": "repo.read",
+                "action_policy_snapshot_digest": b"policy",
+                "fencing_token": 1,
+                "control_epoch": 1,
+                "accepted_control_command_seq": 0,
+                "max_uses": 1,
+                "consumption_state": "AVAILABLE",
+                "issued_at": "2026-08-17T08:00:00Z",
+                "expires_at": "2026-08-17T10:00:00Z",
+                "revoked_at": None,
+                "revoke_reason": None,
+                "contract_schema_id": "execution-authorization.v1",
+                "contract_schema_version": 1,
+                "canonical_contract": b"{}",
+                "canonical_contract_digest": b"contract",
+            },
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-side-effect"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-target-active-side-effect",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=planning_barrier_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.PLANNING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT consumption_state,revoked_at FROM execution_authorizations WHERE execution_authorization_id=?",
+            ("auth-target-close",),
+        ).fetchone() == ("AVAILABLE", None)
+        assert connection.execute(
+            "SELECT state_version FROM resource_leases WHERE resource_key=?", ("resource-target-close",)
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
 async def test_passed_barrier_requires_first_unpassed_sequence() -> None:
     """当前 barrier 必须是冻结序列首个未通过项，前驱未通过时全事务回滚。"""
     connection = _connection()

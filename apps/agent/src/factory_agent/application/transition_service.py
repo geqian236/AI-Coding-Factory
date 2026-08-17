@@ -680,6 +680,36 @@ class TransitionService:
             if request.next_barrier_id is not None or request.next_phase is not current_run.phase:
                 # Task 目标已达成时，Run 必须在本事务直接收口，不能选择另一个后继继续执行。
                 raise BarrierMilestoneCommitError("target milestone cannot select a successor")
+            try:
+                # 目标收口不能只依赖 observed 状态转换图；同一写事务内重算所有 Step、Attempt、receipt、授权与 lease。
+                terminal_authority = repository.load_observed_state_authority(
+                    run_id=current_run.run_id,
+                    now=self._now(),
+                )
+                require_observed_target_predicates(
+                    current_run,
+                    RunObservedState.TERMINATED,
+                    ObservedStateEvidence(
+                        active_attempt_count=terminal_authority.active_attempt_count,
+                        lease_active=terminal_authority.lease_active,
+                        authorization_active=terminal_authority.authorization_active,
+                        control_sequence_current=terminal_authority.control_sequence_current,
+                        heartbeat_valid=terminal_authority.heartbeat_valid,
+                        unknown_remote_state=terminal_authority.unknown_remote_state,
+                        unsettled_started_receipt=terminal_authority.unsettled_started_receipt,
+                        dispatch_state_valid=terminal_authority.dispatch_state_valid,
+                        blocking_fact=terminal_authority.blocking_fact,
+                        block_reason_code=terminal_authority.block_reason_code,
+                        pausing_fact=terminal_authority.pausing_fact,
+                        stopping_fact=terminal_authority.stopping_fact,
+                        interrupted_fact=terminal_authority.interrupted_fact,
+                        reconciling_fact=terminal_authority.reconciling_fact,
+                        terminated_fact=terminal_authority.terminated_fact,
+                    ),
+                )
+            except (TransitionPredicateError, WorkflowRepositoryError) as exc:
+                # 权威事实不完整时，不能先写 barrier 再依赖事务回滚来掩盖非法终局。
+                raise BarrierMilestoneCommitError("target termination authority is incomplete") from exc
         elif not next_selector_valid:
             raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
 
