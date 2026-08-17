@@ -791,8 +791,8 @@ class SqliteWorkflowRepository:
             (barrier_id,),
         ).fetchone()[0]
         rows_cursor = self._connection.execute(
-            "SELECT * FROM steps WHERE run_id=? AND barrier_id=? ORDER BY step_id",
-            (run_id, barrier_id),
+            "SELECT * FROM steps WHERE barrier_id=? ORDER BY step_id",
+            (barrier_id,),
         )
         rows = rows_cursor.fetchall()
         if not rows:
@@ -802,7 +802,11 @@ class SqliteWorkflowRepository:
         actual_node_ids: list[str] = []
         for values in rows:
             record = dict(zip(columns, values, strict=True))
-            if record["plan_revision_id"] != barrier_revision_id or record["business_phase"] != barrier_phase:
+            if (
+                record["run_id"] != run_id
+                or record["plan_revision_id"] != barrier_revision_id
+                or record["business_phase"] != barrier_phase
+            ):
                 raise WorkflowRepositoryError("barrier step lineage is inconsistent")
             logical_node_id = record["logical_node_id"]
             if type(logical_node_id) is not str or not logical_node_id:
@@ -810,6 +814,22 @@ class SqliteWorkflowRepository:
             plan_node = plan_authority.nodes.get(logical_node_id)
             if plan_node is None:
                 raise WorkflowRepositoryError("barrier step is not declared by the plan")
+            plan_node_phase = plan_node.get("businessPhase")
+            plan_node_ordinal = plan_node.get("barrierOrdinal")
+            if type(plan_node_phase) is not str or type(plan_node_ordinal) is not int:
+                raise WorkflowRepositoryError("barrier step plan selector is invalid")
+            try:
+                expected_step_barrier_id = derive_barrier_id(
+                    run_id,
+                    plan_authority.plan_revision_digest,
+                    plan_node_phase,
+                    plan_node_ordinal,
+                )
+            except (FactoryError, TypeError, ValueError) as exc:
+                raise WorkflowRepositoryError("barrier step identity cannot be derived") from exc
+            if expected_step_barrier_id != record["barrier_id"] or record["barrier_id"] != barrier_id:
+                # Step 的 barrier 身份必须由 active PlanRevision node phase/ordinal 派生且指向当前 barrier。
+                raise WorkflowRepositoryError("barrier step identity is inconsistent")
             actual_node_ids.append(logical_node_id)
             try:
                 phase = StepPhase(record["phase"])
@@ -1088,11 +1108,14 @@ class SqliteWorkflowRepository:
                 raise WorkflowRepositoryError("barrier successor selector is invalid")
             successor_id = persisted_by_key[(phase, ordinal)][0]
             step_cursor = self._connection.execute(
-                "SELECT step_id,phase,outcome FROM steps WHERE run_id=? AND plan_revision_id=? AND barrier_id=?",
-                (run_id, plan_revision_id, successor_id),
+                "SELECT step_id,run_id,plan_revision_id,phase,outcome FROM steps WHERE barrier_id=?",
+                (successor_id,),
             )
             successor_steps = step_cursor.fetchall()
-            for step_id, step_phase, step_outcome in successor_steps:
+            for step_id, step_run_id, step_plan_revision_id, step_phase, step_outcome in successor_steps:
+                if step_run_id != run_id or step_plan_revision_id != plan_revision_id:
+                    # barrier_id 是后继投影的唯一枚举入口；跨 Run/Revision 挂接必须 fail closed。
+                    raise WorkflowRepositoryError("barrier successor step lineage is inconsistent")
                 if (
                     step_phase not in {StepPhase.PENDING.value, StepPhase.READY.value}
                     or step_outcome != StepOutcome.NONE.value
@@ -1108,9 +1131,8 @@ class SqliteWorkflowRepository:
                 receipt_row = self._connection.execute(
                     "SELECT 1 FROM action_receipt_events AS r "
                     "JOIN attempts AS a ON a.attempt_id=r.attempt_id "
-                    "JOIN steps AS s ON s.step_id=a.step_id "
-                    "WHERE s.run_id=? AND s.plan_revision_id=? AND s.barrier_id=? LIMIT 1",
-                    (run_id, plan_revision_id, successor_id),
+                    "WHERE a.step_id=? LIMIT 1",
+                    (step_id,),
                 ).fetchone()
                 if receipt_row is not None:
                     raise WorkflowRepositoryError("barrier successor receipt was precreated")
