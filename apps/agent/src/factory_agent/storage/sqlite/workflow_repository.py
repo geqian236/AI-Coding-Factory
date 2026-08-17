@@ -85,6 +85,7 @@ class _PlanBarrierAuthority:
     """已通过领域 hydrator 校验的当前 barrier 合同投影。"""
 
     plan_revision_id: str
+    plan_revision_digest: str
     business_phase: str
     barrier_ordinal: int
     pass_predicate_id: str
@@ -531,8 +532,34 @@ class SqliteWorkflowRepository:
             dependencies = node.get("dependsOn")
             if not isinstance(dependencies, Sequence) or isinstance(dependencies, (str, bytes, bytearray)):
                 raise WorkflowRepositoryError("plan revision dependency selector is invalid")
+            if any(dependency_id == node.get("logicalNodeId") for dependency_id in dependencies):
+                # 自依赖会让当前节点自证成功，冻结 DAG 必须在 authority 边界拒绝。
+                raise WorkflowRepositoryError("plan revision dependency cycle is invalid")
             if any(dependency_id not in nodes for dependency_id in dependencies):
                 raise WorkflowRepositoryError("plan revision dependency selector is invalid")
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            """深度优先确认冻结 DAG 无环，避免依赖节点互相自证成功。"""
+            if node_id in visiting:
+                raise WorkflowRepositoryError("plan revision dependency cycle is invalid")
+            if node_id in visited:
+                return
+            node = nodes[node_id]
+            dependencies = node["dependsOn"]
+            if not isinstance(dependencies, Sequence) or isinstance(dependencies, (str, bytes, bytearray)):
+                raise WorkflowRepositoryError("plan revision dependency selector is invalid")
+            visiting.add(node_id)
+            for dependency_id in dependencies:
+                if dependency_id not in nodes:
+                    raise WorkflowRepositoryError("plan revision dependency selector is invalid")
+                visit(dependency_id)
+            visiting.remove(node_id)
+            visited.add(node_id)
+
+        for node_id in nodes:
+            visit(node_id)
         for node_id in required_node_ids:
             node = nodes.get(node_id)
             if (
@@ -574,6 +601,7 @@ class SqliteWorkflowRepository:
             stage_maps[stage] = normalized_stage_nodes
         return _PlanBarrierAuthority(
             plan_revision_id=str(barrier_row[0]),
+            plan_revision_digest=plan_revision_digest,
             business_phase=str(barrier_row[1]),
             barrier_ordinal=int(barrier_row[2]),
             pass_predicate_id=stored_pass_predicate_id,
@@ -600,6 +628,127 @@ class SqliteWorkflowRepository:
             task_id=task_id,
             require_active_barrier=require_active_barrier,
         )
+
+    def _require_successful_dependency_step(
+        self,
+        *,
+        run_id: str,
+        plan_revision_id: str,
+        plan_revision_digest: str,
+        dependency_id: str,
+        plan_node: Mapping[str, object],
+    ) -> None:
+        """核对 dependsOn 的真实 Step、终态谓词和 Artifact，不允许摘要或 FAILED 依赖放行。"""
+        dependency_cursor = self._connection.execute(
+            "SELECT * FROM steps WHERE run_id=? AND plan_revision_id=? AND logical_node_id=? ORDER BY step_id",
+            (run_id, plan_revision_id, dependency_id),
+        )
+        dependency_rows = dependency_cursor.fetchall()
+        if len(dependency_rows) != 1:
+            raise WorkflowRepositoryError("barrier dependency step is missing or ambiguous")
+        columns = tuple(item[0] for item in dependency_cursor.description)
+        record = dict(zip(columns, dependency_rows[0], strict=True))
+        expected_phase = plan_node.get("businessPhase")
+        expected_ordinal = plan_node.get("barrierOrdinal")
+        if (
+            record["logical_node_id"] != dependency_id
+            or record["business_phase"] != expected_phase
+            or record["plan_revision_id"] != plan_revision_id
+            or type(expected_phase) is not str
+            or type(expected_ordinal) is not int
+        ):
+            raise WorkflowRepositoryError("barrier dependency step lineage is inconsistent")
+        try:
+            expected_dependency_barrier_id = derive_barrier_id(
+                run_id,
+                plan_revision_digest,
+                expected_phase,
+                expected_ordinal,
+            )
+        except (FactoryError, TypeError, ValueError) as exc:
+            raise WorkflowRepositoryError("barrier dependency identity cannot be derived") from exc
+        if record["barrier_id"] != expected_dependency_barrier_id:
+            raise WorkflowRepositoryError("barrier dependency identity is inconsistent")
+        if (
+            record["node_type"] != plan_node.get("nodeType")
+            or record["side_effect_class"] != plan_node.get("sideEffectClass")
+            or record["success_predicate_id"] != plan_node.get("successPredicateId")
+            or record["timeout_ms"] != plan_node.get("timeoutMs")
+            or record["retry_policy_id"] != plan_node.get("retryPolicyId")
+            or type(record["required"]) is not int
+            or record["required"] not in (0, 1)
+            or bool(record["required"]) != (plan_node.get("required") is True)
+        ):
+            raise WorkflowRepositoryError("barrier dependency frozen role is inconsistent")
+        raw_dependencies = plan_node.get("dependsOn")
+        raw_required_artifacts = plan_node.get("requiredArtifacts")
+        if (
+            not isinstance(raw_dependencies, Sequence)
+            or isinstance(raw_dependencies, (str, bytes, bytearray))
+            or not isinstance(raw_required_artifacts, Sequence)
+            or isinstance(raw_required_artifacts, (str, bytes, bytearray))
+        ):
+            raise WorkflowRepositoryError("barrier dependency selector registry is invalid")
+        if record["dependency_hash"] != "sha256:" + hashlib.sha256(canonicalize(list(raw_dependencies))).hexdigest():
+            raise WorkflowRepositoryError("barrier dependency digest is inconsistent")
+        if record["required_artifacts_digest"] != (
+            "sha256:" + hashlib.sha256(canonicalize(list(raw_required_artifacts))).hexdigest()
+        ):
+            raise WorkflowRepositoryError("barrier dependency artifact digest is inconsistent")
+        if record["phase"] != StepPhase.TERMINAL.value or record["outcome"] != StepOutcome.SUCCEEDED.value:
+            # Step 的冻结 success predicate 必须由权威终态满足，FAILED/NONE 不能作为依赖通过。
+            raise WorkflowRepositoryError("barrier dependency success predicate has not passed")
+        attempts_cursor = self._connection.execute(
+            "SELECT phase,outcome,drain_state FROM attempts WHERE step_id=? ORDER BY attempt_id",
+            (record["step_id"],),
+        )
+        attempts = attempts_cursor.fetchall()
+        allowed_attempt_outcomes = {
+            AttemptOutcome.SUCCEEDED.value,
+            AttemptOutcome.FAILED.value,
+            AttemptOutcome.INTERRUPTED.value,
+            AttemptOutcome.KILLED.value,
+            AttemptOutcome.LOST.value,
+        }
+        if any(
+            phase != AttemptPhase.TERMINATED.value
+            or drain_state not in {DrainState.NONE.value, DrainState.DRAINED.value}
+            or outcome not in allowed_attempt_outcomes
+            for phase, outcome, drain_state in attempts
+        ):
+            raise WorkflowRepositoryError("barrier dependency attempt is not terminal")
+        if any(outcome == AttemptOutcome.UNKNOWN_REMOTE_STATE.value for _phase, outcome, _drain in attempts):
+            raise WorkflowRepositoryError("barrier dependency attempt state is unknown")
+        unsettled_receipt = self._connection.execute(
+            "SELECT 1 FROM action_receipt_events AS r "
+            "JOIN actions AS a ON a.action_id=r.action_id "
+            "JOIN attempts AS at ON at.attempt_id=r.attempt_id "
+            "WHERE at.step_id=? AND r.phase='STARTED' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM action_receipt_events AS later "
+            "WHERE later.action_id=r.action_id AND later.receipt_seq>r.receipt_seq "
+            "AND later.phase IN ('COMPLETED','ABSENT_CONFIRMED','FAILED_RECONCILED')) LIMIT 1",
+            (record["step_id"],),
+        ).fetchone()
+        if unsettled_receipt is not None:
+            raise WorkflowRepositoryError("barrier dependency receipt is unsettled")
+        artifact_cursor = self._connection.execute(
+            "SELECT ar.* FROM artifacts AS ar JOIN attempts AS at "
+            "ON at.attempt_id=ar.producer_attempt_id WHERE at.step_id=? ORDER BY ar.artifact_id",
+            (record["step_id"],),
+        )
+        artifact_columns = tuple(item[0] for item in artifact_cursor.description)
+        committed_artifact_ids: set[str] = set()
+        for artifact_values in artifact_cursor.fetchall():
+            artifact_record = dict(zip(artifact_columns, artifact_values, strict=True))
+            try:
+                artifact = Artifact.from_record(artifact_record)
+            except FactoryError as exc:
+                raise WorkflowRepositoryError("barrier dependency artifact identity is invalid") from exc
+            if artifact.is_gate_eligible:
+                committed_artifact_ids.add(artifact.artifact_id)
+        if committed_artifact_ids != set(raw_required_artifacts):
+            raise WorkflowRepositoryError("barrier dependency artifacts are incomplete")
 
     def load_barrier_authority(
         self,
@@ -694,6 +843,17 @@ class SqliteWorkflowRepository:
             ):
                 # Step 的 selector 必须由冻结 node role 派生，任意摘要不能伪造 gate 输入。
                 raise WorkflowRepositoryError("barrier step selector digest is inconsistent")
+            for dependency_id in plan_dependencies:
+                dependency_node = plan_authority.nodes.get(dependency_id)
+                if dependency_node is None:
+                    raise WorkflowRepositoryError("barrier dependency node is not declared")
+                self._require_successful_dependency_step(
+                    run_id=run_id,
+                    plan_revision_id=barrier_revision_id,
+                    plan_revision_digest=plan_authority.plan_revision_digest,
+                    dependency_id=dependency_id,
+                    plan_node=dependency_node,
+                )
             required = declared_required
             active_attempt = (
                 self._connection.execute(
@@ -818,6 +978,78 @@ class SqliteWorkflowRepository:
             required_node_ids=required_node_ids,
             required_node_set_digest=required_node_set_digest,
         )
+
+    def validate_barrier_sequence(
+        self,
+        *,
+        run_id: str,
+        plan_revision_id: str,
+        plan_revision_digest: str,
+        barrier_specs: tuple[Mapping[str, object], ...],
+        current_business_phase: str,
+        current_barrier_ordinal: int,
+    ) -> int:
+        """在同一事务校验 barrier 的完整冻结序列、首个未通过项和后继未预通过。"""
+        persisted_cursor = self._connection.execute(
+            "SELECT barrier_id,plan_revision_id,business_phase,barrier_ordinal,settled,passed "
+            "FROM phase_barriers WHERE run_id=? AND plan_revision_id=? ORDER BY barrier_ordinal,business_phase",
+            (run_id, plan_revision_id),
+        )
+        persisted_rows = persisted_cursor.fetchall()
+        if len(persisted_rows) != len(barrier_specs):
+            raise WorkflowRepositoryError("barrier sequence projection is incomplete")
+        persisted_by_key: dict[tuple[str, int], tuple[object, ...]] = {}
+        for row in persisted_rows:
+            phase = row[2]
+            ordinal = row[3]
+            if (
+                type(phase) is not str
+                or type(ordinal) is not int
+                or ordinal < 0
+                or (phase, ordinal) in persisted_by_key
+                or type(row[4]) is not int
+                or row[4] not in (0, 1)
+                or type(row[5]) is not int
+                or row[5] not in (0, 1)
+            ):
+                raise WorkflowRepositoryError("barrier sequence projection is invalid")
+            persisted_by_key[(phase, ordinal)] = row
+        current_index: int | None = None
+        seen_keys: set[tuple[str, int]] = set()
+        for index, spec in enumerate(barrier_specs):
+            phase = spec.get("businessPhase")
+            ordinal = spec.get("barrierOrdinal")
+            if type(phase) is not str or type(ordinal) is not int or ordinal < 0:
+                raise WorkflowRepositoryError("barrier sequence declaration is invalid")
+            key = (phase, ordinal)
+            if key in seen_keys:
+                raise WorkflowRepositoryError("barrier sequence declaration is duplicated")
+            seen_keys.add(key)
+            persisted = persisted_by_key.get(key)
+            if persisted is None:
+                raise WorkflowRepositoryError("barrier sequence member is missing")
+            try:
+                expected_id = derive_barrier_id(run_id, plan_revision_digest, phase, ordinal)
+            except (FactoryError, TypeError, ValueError) as exc:
+                raise WorkflowRepositoryError("barrier sequence identity cannot be derived") from exc
+            if persisted[0] != expected_id or persisted[1] != plan_revision_id:
+                raise WorkflowRepositoryError("barrier sequence identity is inconsistent")
+            if phase == current_business_phase and ordinal == current_barrier_ordinal:
+                if current_index is not None:
+                    raise WorkflowRepositoryError("current barrier is ambiguous")
+                current_index = index
+            if current_index is None or index < current_index:
+                if persisted[4] != 1 or persisted[5] != 1:
+                    raise WorkflowRepositoryError("barrier predecessor has not passed")
+            elif current_index is not None and index > current_index:
+                if persisted[4] != 0 or persisted[5] != 0:
+                    raise WorkflowRepositoryError("barrier successor was prepassed")
+        if current_index is None:
+            raise WorkflowRepositoryError("current barrier is absent from frozen sequence")
+        current_persisted = persisted_by_key[(current_business_phase, current_barrier_ordinal)]
+        if current_persisted[4] != 0 or current_persisted[5] != 0:
+            raise WorkflowRepositoryError("current barrier is already passed")
+        return current_index
 
     def update_run_control(
         self,
@@ -953,6 +1185,32 @@ class SqliteWorkflowRepository:
             aggregate_type="RUN",
         )
         return Run.from_record({key: row[key] for key in Run.__dataclass_fields__})
+
+    def complete_run(
+        self,
+        *,
+        run_id: str,
+        expected_state_version: int,
+    ) -> Run:
+        """目标达成时原子收口 Run，清除 active barrier 并写入 TERMINATED observed。"""
+        current = self.get_run(run_id)
+        if current is None:
+            raise WorkflowRepositoryError("run does not exist")
+        require_observed_transition(current.observed_state, RunObservedState.TERMINATED)
+        row = self._task1._cas(
+            table="runs",
+            identity_column="run_id",
+            identity=run_id,
+            expected_state_version=expected_state_version,
+            changes={
+                "observed_state": RunObservedState.TERMINATED.value,
+                "active_barrier_id": None,
+            },
+            aggregate_type="RUN",
+        )
+        record = {key: row[key] for key in Run.__dataclass_fields__}
+        record["requires_user_action"] = bool(record["requires_user_action"])
+        return Run.from_record(record)
 
     def advance_task_milestone(
         self,

@@ -126,24 +126,34 @@ def _reject() -> NoReturn:
 
 def require_observed_transition(current: RunObservedState, candidate: RunObservedState) -> None:
     """校验 §7.3 observed_state 的精确有向边，自环也不算新转换。"""
-    current_state = RunObservedState(current)
-    candidate_state = RunObservedState(candidate)
+    try:
+        current_state = RunObservedState(current)
+        candidate_state = RunObservedState(candidate)
+    except (TypeError, ValueError):
+        # 外部枚举值不属于冻结闭集时统一归类为稳定 FactoryError。
+        _reject()
     if candidate_state not in _OBSERVED_TRANSITIONS[current_state]:
         _reject()
 
 
 def require_desired_transition(current: RunDesiredState, candidate: RunDesiredState) -> None:
     """校验用户意图转换；CANCELLED 进入后不可逆。"""
-    current_state = RunDesiredState(current)
-    candidate_state = RunDesiredState(candidate)
+    try:
+        current_state = RunDesiredState(current)
+        candidate_state = RunDesiredState(candidate)
+    except (TypeError, ValueError):
+        _reject()
     if candidate_state not in _DESIRED_TRANSITIONS[current_state]:
         _reject()
 
 
 def require_task_lifecycle_transition(current: TaskLifecycle, candidate: TaskLifecycle) -> None:
     """任务终局只允许从 ACTIVE 进入一次，终态不再产生状态边。"""
-    current_state = TaskLifecycle(current)
-    candidate_state = TaskLifecycle(candidate)
+    try:
+        current_state = TaskLifecycle(current)
+        candidate_state = TaskLifecycle(candidate)
+    except (TypeError, ValueError):
+        _reject()
     if current_state is not TaskLifecycle.ACTIVE or candidate_state is TaskLifecycle.ACTIVE:
         _reject()
 
@@ -155,15 +165,21 @@ def require_phase_transition(
     reason: PhaseTransitionReason | None = None,
 ) -> None:
     """校验正常顺序与修复、重规划、回滚三种有原因的非顺序边。"""
-    current_phase = RunPhase(current)
-    candidate_phase = RunPhase(candidate)
+    try:
+        current_phase = RunPhase(current)
+        candidate_phase = RunPhase(candidate)
+    except (TypeError, ValueError):
+        _reject()
     phases = tuple(RunPhase)
     current_index = phases.index(current_phase)
     if reason is None:
         if current_index + 1 < len(phases) and phases[current_index + 1] is candidate_phase:
             return
         _reject()
-    transition_reason = PhaseTransitionReason(reason)
+    try:
+        transition_reason = PhaseTransitionReason(reason)
+    except (TypeError, ValueError):
+        _reject()
     if (
         transition_reason is PhaseTransitionReason.REPAIR
         and current_phase is RunPhase.CODE_REVIEWING
@@ -187,8 +203,11 @@ def require_phase_transition(
 
 def require_achieved_stage_transition(current: AchievedStage, candidate: AchievedStage) -> None:
     """校验里程碑单调投影；同值允许幂等重放，跨级与倒退均拒绝。"""
-    current_stage = AchievedStage(current)
-    candidate_stage = AchievedStage(candidate)
+    try:
+        current_stage = AchievedStage(current)
+        candidate_stage = AchievedStage(candidate)
+    except (TypeError, ValueError):
+        _reject()
     stages = tuple(AchievedStage)
     current_index = stages.index(current_stage)
     candidate_index = stages.index(candidate_stage)

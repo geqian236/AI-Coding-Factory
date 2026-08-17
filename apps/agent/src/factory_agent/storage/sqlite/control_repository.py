@@ -131,7 +131,30 @@ class SqliteControlRepository:
         created_at: str,
     ) -> ControlReceiptEvent:
         """基于上一完整 receipt 摘要追加后继，不原位修改历史事实。"""
+        command = self.get_command(command_id)
+        if command is None:
+            raise ControlReceiptRecordError("control command does not exist")
         receipts = self.list_receipts(command_id)
+        try:
+            receipt_phase = ControlCommandReceiptPhase(phase)
+        except (TypeError, ValueError) as exc:
+            raise ControlReceiptRecordError("control receipt phase is invalid") from exc
+        if not receipts:
+            if receipt_phase is not ControlCommandReceiptPhase.ACKNOWLEDGED:
+                raise ControlReceiptRecordError("control receipt chain must start with acknowledgement")
+        elif len(receipts) == 1 and receipts[0].phase is ControlCommandReceiptPhase.ACKNOWLEDGED:
+            if receipt_phase not in {ControlCommandReceiptPhase.COMPLETED, ControlCommandReceiptPhase.FAILED}:
+                raise ControlReceiptRecordError("control receipt terminal phase is invalid")
+            if (
+                receipts[0].attempt_id != command.acknowledged_attempt_id
+                or attempt_id != command.acknowledged_attempt_id
+            ):
+                raise ControlReceiptRecordError("control receipt attempt lineage is inconsistent")
+        else:
+            # ACK 后只允许一次终态 receipt；COMPLETED/FAILED 后的竞争追加必须 fail closed。
+            raise ControlReceiptRecordError("control receipt chain is already terminal")
+        if attempt_id != command.acknowledged_attempt_id:
+            raise ControlReceiptRecordError("control acknowledgement attempt lineage is inconsistent")
         previous_digest = None
         if receipts:
             previous = receipts[-1]
@@ -146,7 +169,7 @@ class SqliteControlRepository:
             command_receipt_event_id=receipt_id,
             command_id=command_id,
             receipt_seq=len(receipts),
-            phase=ControlCommandReceiptPhase(phase),
+            phase=receipt_phase,
             attempt_id=attempt_id,
             state_event_id=state_event_id,
             evidence_digest=evidence_digest,

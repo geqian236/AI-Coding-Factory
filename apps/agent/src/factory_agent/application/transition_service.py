@@ -150,8 +150,11 @@ class BarrierMilestoneRequest:
 
     def __post_init__(self) -> None:
         """进入事务和日志前拒绝空 identity、旧式摘要与宽松数值。"""
-        object.__setattr__(self, "next_phase", RunPhase(self.next_phase))
-        object.__setattr__(self, "candidate_achieved_stage", AchievedStage(self.candidate_achieved_stage))
+        try:
+            object.__setattr__(self, "next_phase", RunPhase(self.next_phase))
+            object.__setattr__(self, "candidate_achieved_stage", AchievedStage(self.candidate_achieved_stage))
+        except (TypeError, ValueError) as exc:
+            raise BarrierMilestoneCommitError("barrier milestone enum is invalid") from exc
         versions = (
             self.expected_task_state_version,
             self.expected_run_state_version,
@@ -193,7 +196,10 @@ def require_observed_target_predicates(
     evidence: ObservedStateEvidence,
 ) -> None:
     """在合法边之外核对五维 observed 的权威事实与阻断原因。"""
-    target = RunObservedState(candidate)
+    try:
+        target = RunObservedState(candidate)
+    except (TypeError, ValueError) as exc:
+        raise TransitionPredicateError("observed state target enum is invalid") from exc
     valid = True
     if target is RunObservedState.RUNNING:
         valid = (
@@ -238,6 +244,7 @@ def require_observed_target_predicates(
             run.desired_state is RunDesiredState.PAUSED
             and evidence.active_attempt_count == 1
             and evidence.stopping_fact
+            and not evidence.unknown_remote_state
         )
     elif target is RunObservedState.INTERRUPTED:
         valid = (
@@ -616,8 +623,18 @@ class TransitionService:
                 },
             )
             return BarrierMilestoneResult(barrier=current_barrier, run=updated_run, task=current_task)
-        if not next_selector_valid:
-            raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
+        try:
+            # 通过前先确认当前是首个未通过 barrier，且后继没有被预置成 settled/passed。
+            repository.validate_barrier_sequence(
+                run_id=current_run.run_id,
+                plan_revision_id=current_barrier.plan_revision_id,
+                plan_revision_digest=plan_authority.plan_revision_digest,
+                barrier_specs=barrier_specs,
+                current_business_phase=current_barrier.business_phase,
+                current_barrier_ordinal=current_barrier.barrier_ordinal,
+            )
+        except WorkflowRepositoryError as exc:
+            raise BarrierMilestoneCommitError("barrier sequence is not the first unpassed projection") from exc
         passed_barrier_rows = repository._connection.execute(
             "SELECT business_phase,barrier_ordinal FROM phase_barriers "
             "WHERE run_id=? AND plan_revision_id=? AND passed=1",
@@ -659,6 +676,12 @@ class TransitionService:
             evidence=milestone_evidence,
         )
         target_lifecycle = TaskLifecycle.SUCCEEDED if milestone.lifecycle_should_succeed else current_task.lifecycle
+        if milestone.lifecycle_should_succeed:
+            if request.next_barrier_id is not None or request.next_phase is not current_run.phase:
+                # Task 目标已达成时，Run 必须在本事务直接收口，不能选择另一个后继继续执行。
+                raise BarrierMilestoneCommitError("target milestone cannot select a successor")
+        elif not next_selector_valid:
+            raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
 
         updated_barrier = repository.pass_phase_barrier(
             barrier_id=request.barrier_id,
@@ -678,11 +701,18 @@ class TransitionService:
             state_version=updated_barrier.state_version,
             payload={"settled": True, "passed": True, "gateDigest": gate_digest},
         )
-        updated_run = repository.advance_run_phase(
-            run_id=request.run_id,
-            expected_state_version=request.expected_run_state_version,
-            candidate_phase=request.next_phase,
-            next_barrier_id=request.next_barrier_id,
+        updated_run = (
+            repository.complete_run(
+                run_id=request.run_id,
+                expected_state_version=request.expected_run_state_version,
+            )
+            if milestone.lifecycle_should_succeed
+            else repository.advance_run_phase(
+                run_id=request.run_id,
+                expected_state_version=request.expected_run_state_version,
+                candidate_phase=request.next_phase,
+                next_barrier_id=request.next_barrier_id,
+            )
         )
         append_authoritative_state_event(
             unit_of_work,
@@ -695,7 +725,11 @@ class TransitionService:
             attempt_id=None,
             previous_state_version=request.expected_run_state_version,
             state_version=updated_run.state_version,
-            payload={"phase": updated_run.phase.value, "activeBarrierId": updated_run.active_barrier_id},
+            payload={
+                "phase": updated_run.phase.value,
+                "activeBarrierId": updated_run.active_barrier_id,
+                "observedState": updated_run.observed_state.value,
+            },
         )
         updated_task = repository.advance_task_milestone(
             task_id=request.task_id,

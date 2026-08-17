@@ -15,6 +15,7 @@ import pytest
 from factory_agent.application.control_service import (
     ControlCommandRequest,
     ControlRequestConflictError,
+    ControlRequestError,
     ControlService,
 )
 from factory_agent.application.transition_service import (
@@ -141,6 +142,7 @@ def _insert_plan_revision_for_barrier(
     *,
     required_node_ids: tuple[str, ...],
     additional_barriers: tuple[tuple[str, int, tuple[str, ...], str], ...] = (),
+    dependencies_by_node: Mapping[str, tuple[str, ...]] | None = None,
     plan_revision_id: str = "plan-control-1",
     spec_revision: int = 1,
     run_spec_target_stage: str = "CODEX_APPROVED",
@@ -165,10 +167,13 @@ def _insert_plan_revision_for_barrier(
         }
         for business_phase, barrier_ordinal, node_ids, predicate_id in additional_barriers
     )
+    dependency_map = {} if dependencies_by_node is None else dict(dependencies_by_node)
     node_ids = ["plan"]
     node_ids.extend(node_id for node_id in required_node_ids if node_id not in node_ids)
     for _business_phase, _ordinal, extra_node_ids, _predicate_id in additional_barriers:
         node_ids.extend(node_id for node_id in extra_node_ids if node_id not in node_ids)
+    for dependency_ids in dependency_map.values():
+        node_ids.extend(node_id for node_id in dependency_ids if node_id not in node_ids)
     node_location = {
         node_id: (business_phase, ordinal)
         for business_phase, ordinal, barrier_node_ids in (
@@ -214,7 +219,7 @@ def _insert_plan_revision_for_barrier(
                         *additional_barriers,
                     ]
                 ),
-                "dependsOn": [],
+                "dependsOn": list(dependency_map.get(node_id, ())),
                 "sideEffectClass": "workspace_write" if node_type == "IMPLEMENT" else "none",
                 "requiredArtifacts": artifact_ids.get(node_id, []),
                 "successPredicateId": success_predicate_by_id.get(node_id, "planning-complete-v1"),
@@ -309,12 +314,14 @@ def _insert_current_barrier(
     required_node_ids: tuple[str, ...] = ("plan",),
     settle_timeout_ms: int = 30_000,
     run_spec_target_stage: str = "CODEX_APPROVED",
+    dependencies_by_node: Mapping[str, tuple[str, ...]] | None = None,
 ) -> str:
     """插入 FK-on 的当前 barrier，PlanRevision 与 Run/Task selector 保持有效谱系。"""
     required_digest = _insert_plan_revision_for_barrier(
         connection,
         required_node_ids=required_node_ids,
         run_spec_target_stage=run_spec_target_stage,
+        dependencies_by_node=dependencies_by_node,
     )
     persisted_barrier_id = _derived_barrier_id(
         connection,
@@ -351,12 +358,14 @@ def _insert_passing_planning_graph(
     next_pass_predicate_id: str = "design-approved-v1",
     next_required_node_set_digest: str | None = None,
     next_settle_timeout_ms: int = 30_000,
+    run_spec_target_stage: str = "CODEX_APPROVED",
 ) -> None:
     """插入可通过 planning gate 的完整图，并允许单独污染 next barrier 持久 selector。"""
     planning_digest = _insert_plan_revision_for_barrier(
         connection,
         required_node_ids=("plan",),
         additional_barriers=(("DESIGN_REVIEWING", 1, ("design-review",), "design-approved-v1"),),
+        run_spec_target_stage=run_spec_target_stage,
     )
     design_digest = _selector_digest(["design-review"])
     planning_barrier_id = _derived_barrier_id(
@@ -605,6 +614,153 @@ def _request(
     )
 
 
+def _insert_active_attempt_graph(
+    connection: sqlite3.Connection,
+    *,
+    step_phase: str = "RUNNING",
+    step_outcome: str = "NONE",
+    attempt_phase: str = "RUNNING",
+    attempt_outcome: str = "NONE",
+    drain_state: str = "NONE",
+) -> None:
+    """插入带 FK 谱系的执行事实，供控制 receipt 与 observed authority 反例复用。"""
+    _insert_current_barrier(connection)
+    barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": "step-control-active",
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": barrier_id,
+            "logical_node_id": "plan",
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": step_phase,
+            "outcome": step_outcome,
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest(["artifact-planning"]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": "step-control-active-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": "attempt-control-lineage",
+            "step_id": "step-control-active",
+            "supersedes_attempt_id": None,
+            "phase": attempt_phase,
+            "outcome": attempt_outcome,
+            "executor_id": "executor-control-lineage",
+            "process_session_id": "process-control-lineage",
+            "pid": 1234,
+            "process_start_time": "2026-08-17T07:00:00Z",
+            "job_object_id": "job-control-lineage",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": None,
+            "termination_reason": None,
+            "fencing_token": 7,
+            "control_epoch": 9,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": drain_state,
+            "started_at": "2026-08-17T07:00:00Z",
+            "ended_at": None,
+            "state_version": 0,
+        },
+    )
+
+
+def _insert_successful_plan_step(
+    connection: sqlite3.Connection,
+    *,
+    barrier_id: str,
+    step_id: str,
+    attempt_id: str,
+    logical_node_id: str = "plan",
+    required_artifact_id: str = "artifact-planning",
+) -> None:
+    """为 barrier 顺序测试插入已收口且有精确 Artifact 的成功 Step。"""
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": step_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": barrier_id,
+            "logical_node_id": logical_node_id,
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest([required_artifact_id]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": f"{step_id}-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": attempt_id,
+            "step_id": step_id,
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": f"executor-{attempt_id}",
+            "process_session_id": f"process-{attempt_id}",
+            "pid": 1234,
+            "process_start_time": "2026-08-17T07:00:00Z",
+            "job_object_id": f"job-{attempt_id}",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 1,
+            "control_epoch": 1,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "DRAINED",
+            "started_at": "2026-08-17T07:00:00Z",
+            "ended_at": "2026-08-17T07:30:00Z",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "artifacts",
+        {
+            "artifact_id": required_artifact_id,
+            "producer_attempt_id": attempt_id,
+            "media_type": "text/plain",
+            "confidentiality": "INTERNAL",
+            "commit_state": "COMMITTED",
+            "storage_path": required_artifact_id,
+            "size_bytes": 1,
+            "digest": SHA_A,
+            "created_at": "2026-08-17T07:30:00Z",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_request_id_is_idempotent_and_receipts_are_append_only() -> None:
     """相同 requestId 只接受一次，后续完成事实只能追加 receipt event。"""
@@ -634,6 +790,46 @@ async def test_request_id_is_idempotent_and_receipts_are_append_only() -> None:
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE control_command_receipt_events SET phase='FAILED' WHERE receipt_seq=0")
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_control_receipt_requires_attempt_lineage_and_terminal_fsm() -> None:
+    """receipt 必须沿 acknowledged Attempt 追加，COMPLETED/FAILED 后禁止冲突终态。"""
+    connection = _connection()
+    try:
+        _insert_active_attempt_graph(connection)
+        service = _service(connection)
+        accepted = await service.submit(_request())
+        assert accepted.command.acknowledged_attempt_id == "attempt-control-lineage"
+        with pytest.raises(ControlRequestError):
+            await service.append_receipt(
+                command_id=accepted.command.command_id,
+                phase=ControlCommandReceiptPhase.COMPLETED,
+                attempt_id="attempt-other",
+                evidence_digest=SHA_A,
+            )
+        completed = await service.append_receipt(
+            command_id=accepted.command.command_id,
+            phase=ControlCommandReceiptPhase.COMPLETED,
+            attempt_id="attempt-control-lineage",
+            evidence_digest=SHA_A,
+        )
+        assert completed.receipt_seq == 1
+        with pytest.raises(ControlRequestError):
+            await service.append_receipt(
+                command_id=accepted.command.command_id,
+                phase=ControlCommandReceiptPhase.FAILED,
+                attempt_id="attempt-control-lineage",
+                evidence_digest=SHA_A,
+            )
+        assert connection.execute(
+            "SELECT phase,attempt_id FROM control_command_receipt_events ORDER BY receipt_seq"
+        ).fetchall() == [
+            ("ACKNOWLEDGED", "attempt-control-lineage"),
+            ("COMPLETED", "attempt-control-lineage"),
+        ]
     finally:
         connection.close()
 
@@ -748,6 +944,60 @@ async def test_queued_to_blocked_requires_authoritative_block_reason() -> None:
             )
         assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_interrupting_attempt_cannot_transition_to_stopping() -> None:
+    """UNKNOWN_REMOTE_STATE 与 INTERRUPTING/DRAINING 并存时必须保持 RECONCILING。"""
+    connection = _connection(desired_state="PAUSED", observed_state="RUNNING")
+    try:
+        _insert_active_attempt_graph(
+            connection,
+            step_phase="RUNNING",
+            step_outcome="UNKNOWN_REMOTE_STATE",
+            attempt_phase="INTERRUPTING",
+            attempt_outcome="UNKNOWN_REMOTE_STATE",
+            drain_state="DRAINING",
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-unknown-stopping"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        with pytest.raises(TransitionPredicateError):
+            await service.transition_observed(
+                run_id="run-control-1",
+                expected_state_version=0,
+                candidate=RunObservedState.STOPPING,
+                evidence=ObservedStateEvidence(1, False, False, True, False, True, False),
+                request_id="request-unknown-stopping",
+            )
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("RUNNING", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_observed_state_enum_maps_to_factory_error() -> None:
+    """非法 observed 枚举必须映射为稳定 FactoryError，而不是泄漏 ValueError。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-invalid-observed"),
+        )
+        with pytest.raises(TransitionPredicateError):
+            await service.transition_observed(
+                run_id="run-control-1",
+                expected_state_version=0,
+                candidate="NOT_A_RUN_STATE",
+                evidence=ObservedStateEvidence(0, False, False, False, False, False, False),
+                request_id="request-invalid-observed",
+            )
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
     finally:
         connection.close()
 
@@ -990,6 +1240,81 @@ def test_barrier_authority_rejects_run_spec_target_stage_drift() -> None:
         try:
             with pytest.raises(WorkflowRepositoryError):
                 SqliteWorkflowRepository(unit_of_work).load_barrier_plan_authority(
+                    barrier_id=barrier_id,
+                    run_id="run-control-1",
+                    task_id="task-control-1",
+                )
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("dependency_outcome", [None, "FAILED"])
+def test_barrier_authority_rejects_missing_or_failed_dependency_step(dependency_outcome: str | None) -> None:
+    """冻结 dependsOn 必须有同 Run/Revision 的成功 Step，不能只校验摘要。"""
+    connection = _connection()
+    try:
+        _insert_current_barrier(
+            connection,
+            required_node_ids=("node-current",),
+            dependencies_by_node={"node-current": ("node-dependency",)},
+        )
+        barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert(
+            connection,
+            "steps",
+            {
+                "step_id": "step-current-dependency-gate",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "barrier_id": barrier_id,
+                "logical_node_id": "node-current",
+                "business_phase": "PLANNING",
+                "node_type": "PLAN",
+                "required": 1,
+                "side_effect_class": "none",
+                "phase": "TERMINAL",
+                "outcome": "SUCCEEDED",
+                "dependency_hash": _selector_digest(["node-dependency"]),
+                "required_artifacts_digest": _selector_digest([]),
+                "success_predicate_id": "planning-complete-v1",
+                "timeout_ms": 30_000,
+                "retry_policy_id": "no-retry-v1",
+                "idempotency_key": "step-current-dependency-gate-v1",
+                "state_version": 0,
+            },
+        )
+        if dependency_outcome is not None:
+            _insert(
+                connection,
+                "steps",
+                {
+                    "step_id": "step-dependency-gate",
+                    "run_id": "run-control-1",
+                    "plan_revision_id": "plan-control-1",
+                    "barrier_id": barrier_id,
+                    "logical_node_id": "node-dependency",
+                    "business_phase": "PLANNING",
+                    "node_type": "PLAN",
+                    "required": 0,
+                    "side_effect_class": "none",
+                    "phase": "TERMINAL",
+                    "outcome": dependency_outcome,
+                    "dependency_hash": _selector_digest([]),
+                    "required_artifacts_digest": _selector_digest([]),
+                    "success_predicate_id": "planning-complete-v1",
+                    "timeout_ms": 30_000,
+                    "retry_policy_id": "no-retry-v1",
+                    "idempotency_key": "step-dependency-gate-v1",
+                    "state_version": 0,
+                },
+            )
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError):
+                SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
                     barrier_id=barrier_id,
                     run_id="run-control-1",
                     task_id="task-control-1",
@@ -1390,6 +1715,173 @@ async def test_passed_barrier_phase_and_milestone_commit_atomically() -> None:
             "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?",
             (design_barrier_id,),
         ).fetchone() == (0, 0, 0)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_closes_run_without_selecting_successor() -> None:
+    """达到 RunSpec targetStage 时必须原子收口 Run，不得把 Task 标成成功后继续执行。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-close"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-target-close",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=planning_barrier_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.PLANNING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        result = await service.commit_passed_barrier(request)
+        assert result.task.lifecycle.value == "SUCCEEDED"
+        assert result.run.observed_state is RunObservedState.TERMINATED
+        assert result.run.active_barrier_id is None
+        assert connection.execute(
+            "SELECT phase,active_barrier_id,observed_state FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == ("PLANNING", None, "TERMINATED")
+        assert connection.execute(
+            "SELECT lifecycle,achieved_stage FROM tasks WHERE task_id=?", ("task-control-1",)
+        ).fetchone() == ("SUCCEEDED", "DESIGN_APPROVED")
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_passed_barrier_requires_first_unpassed_sequence() -> None:
+    """当前 barrier 必须是冻结序列首个未通过项，前驱未通过时全事务回滚。"""
+    connection = _connection()
+    try:
+        _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("predecessor",),
+            additional_barriers=(
+                ("PLANNING", 1, ("plan",), "planning-next-v1"),
+                ("DESIGN_REVIEWING", 2, ("design-review",), "design-approved-v1"),
+            ),
+        )
+        predecessor_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        current_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=1)
+        next_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=2)
+        for barrier_id, phase, ordinal, node_ids, predicate_id in (
+            (predecessor_id, "PLANNING", 0, ("predecessor",), "planning-approved-v1"),
+            (current_id, "PLANNING", 1, ("plan",), "planning-next-v1"),
+            (next_id, "DESIGN_REVIEWING", 2, ("design-review",), "design-approved-v1"),
+        ):
+            _insert(
+                connection,
+                "phase_barriers",
+                {
+                    "barrier_id": barrier_id,
+                    "run_id": "run-control-1",
+                    "plan_revision_id": "plan-control-1",
+                    "business_phase": phase,
+                    "barrier_ordinal": ordinal,
+                    "required_node_set_digest": _selector_digest(list(node_ids)),
+                    "settle_timeout_ms": 30_000,
+                    "settle_deadline_at": None,
+                    "pass_predicate_id": predicate_id,
+                    "settled": 0,
+                    "passed": 0,
+                    "gate_digest": None,
+                    "state_version": 0,
+                },
+            )
+        _insert_successful_plan_step(
+            connection,
+            barrier_id=current_id,
+            step_id="step-sequence-current",
+            attempt_id="attempt-sequence-current",
+        )
+        connection.execute("UPDATE runs SET active_barrier_id=?", (current_id,))
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-sequence-predecessor"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-sequence-predecessor",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=current_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=next_id,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
+        ).fetchall() == [(0, 0, 0), (0, 0, 0), (0, 0, 0)]
+        assert connection.execute(
+            "SELECT phase,active_barrier_id,state_version FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == ("PLANNING", current_id, 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_passed_barrier_rejects_prepassed_successor() -> None:
+    """后继 barrier 若被预置 settled/passed，当前推进必须拒绝并回滚。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        current_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        next_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        connection.execute(
+            "UPDATE phase_barriers SET settled=1,passed=1,state_version=1,gate_digest=? WHERE barrier_id=?",
+            (SHA_A, next_id),
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-sequence-successor"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-sequence-successor",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=current_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=next_id,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
+        ).fetchall() == [(0, 0, 0), (1, 1, 1)]
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
 

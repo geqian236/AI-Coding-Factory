@@ -59,7 +59,10 @@ class ControlCommandRequest:
 
     def __post_init__(self) -> None:
         """在进入日志和数据库前校验闭集、版本与摘要。"""
-        object.__setattr__(self, "command_type", ControlCommandType(self.command_type))
+        try:
+            object.__setattr__(self, "command_type", ControlCommandType(self.command_type))
+        except (TypeError, ValueError) as exc:
+            raise ControlRequestError("control command type is invalid") from exc
         if (
             any(not isinstance(value, str) or not value for value in (self.request_id, self.run_id, self.actor_id))
             or type(self.expected_state_version) is not int
@@ -312,7 +315,10 @@ class ControlService:
     ) -> ControlReceiptEvent:
         """追加 COMPLETED/FAILED receipt；不修改原命令或既有 receipt。"""
         started = time.monotonic()
-        receipt_phase = ControlCommandReceiptPhase(phase)
+        try:
+            receipt_phase = ControlCommandReceiptPhase(phase)
+        except (TypeError, ValueError) as exc:
+            raise ControlRequestError("receipt phase is invalid") from exc
         if receipt_phase is ControlCommandReceiptPhase.ACKNOWLEDGED:
             raise ControlRequestError("acknowledgement is created only by command acceptance")
         if evidence_digest is not None and _SHA256.fullmatch(evidence_digest) is None:
@@ -323,6 +329,16 @@ class ControlService:
             accepted = controls.get_command(command_id)
             if accepted is None:
                 raise ControlCommandNotFoundError("control command does not exist")
+            receipts = controls.list_receipts(command_id)
+            if len(receipts) != 1 or receipts[0].phase is not ControlCommandReceiptPhase.ACKNOWLEDGED:
+                # receipt 链只能从唯一 ACK 进入一个终态，终态后不允许竞争追加。
+                raise ControlRequestError("control command receipt is already terminal or incomplete")
+            if (
+                receipts[0].attempt_id != accepted.acknowledged_attempt_id
+                or attempt_id != accepted.acknowledged_attempt_id
+            ):
+                # 完成/失败 receipt 必须沿 command 接受时锁定的 Attempt identity 追加。
+                raise ControlRequestError("control receipt attempt lineage is inconsistent")
             return controls.append_receipt(
                 receipt_id=self._receipt_id_factory(),
                 command_id=command_id,
