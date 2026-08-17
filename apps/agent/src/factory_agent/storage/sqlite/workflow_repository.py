@@ -168,6 +168,7 @@ class SqliteWorkflowRepository:
             # 只有 Step 与 Attempt 都进入 RUNNING，观察态才可越过 QUEUED。
             dispatch_state_valid = (
                 active_attempt.phase is AttemptPhase.RUNNING
+                and active_attempt.drain_state is DrainState.NONE
                 and step_phase_row is not None
                 and step_phase_row[0] == StepPhase.RUNNING.value
             )
@@ -274,7 +275,7 @@ class SqliteWorkflowRepository:
         barrier_id: str,
         run_id: str,
         task_id: str,
-    ) -> tuple[tuple[str, ...], str]:
+    ) -> tuple[tuple[str, ...], str, str, str]:
         """同一事务从不可变 PlanRevision 重算 required node 集及其摘要。"""
         barrier_row = self._connection.execute(
             "SELECT plan_revision_id,business_phase,barrier_ordinal,required_node_set_digest "
@@ -283,6 +284,20 @@ class SqliteWorkflowRepository:
         ).fetchone()
         if barrier_row is None:
             raise WorkflowRepositoryError("barrier declaration is missing")
+        if type(barrier_row[0]) is not str or type(barrier_row[1]) is not str:
+            raise WorkflowRepositoryError("barrier selector is invalid")
+        run_row = self._connection.execute(
+            "SELECT task_id,phase,active_barrier_id FROM runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        if run_row is None or run_row[0] != task_id or run_row[1] != barrier_row[1] or run_row[2] != barrier_id:
+            raise WorkflowRepositoryError("barrier run lineage is inconsistent")
+        task_row = self._connection.execute(
+            "SELECT active_plan_revision_id FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or task_row[0] != barrier_row[0]:
+            raise WorkflowRepositoryError("barrier is not the current plan revision")
         plan_row = self._connection.execute(
             "SELECT task_id,canonical_plan_revision FROM plan_revisions WHERE plan_revision_id=?",
             (barrier_row[0],),
@@ -326,7 +341,7 @@ class SqliteWorkflowRepository:
         expected_digest = "sha256:" + hashlib.sha256(canonicalize(required_node_ids)).hexdigest()
         if expected_digest != stored_digest:
             raise WorkflowRepositoryError("required node set digest is inconsistent")
-        return tuple(required_node_ids), stored_digest
+        return tuple(required_node_ids), stored_digest, barrier_row[0], barrier_row[1]
 
     def load_barrier_authority(
         self,
@@ -336,7 +351,12 @@ class SqliteWorkflowRepository:
         task_id: str,
     ) -> BarrierAuthorityFacts:
         """从权威表重算 barrier，拒绝空步骤和调用方自报的成功摘要。"""
-        required_node_ids, required_node_set_digest = self._load_required_node_authority(
+        (
+            required_node_ids,
+            required_node_set_digest,
+            barrier_revision_id,
+            barrier_phase,
+        ) = self._load_required_node_authority(
             barrier_id=barrier_id,
             run_id=run_id,
             task_id=task_id,
@@ -353,6 +373,8 @@ class SqliteWorkflowRepository:
         actual_node_ids: list[str] = []
         for values in rows:
             record = dict(zip(columns, values, strict=True))
+            if record["plan_revision_id"] != barrier_revision_id or record["business_phase"] != barrier_phase:
+                raise WorkflowRepositoryError("barrier step lineage is inconsistent")
             logical_node_id = record["logical_node_id"]
             if type(logical_node_id) is not str or not logical_node_id:
                 raise WorkflowRepositoryError("barrier logical node selector is invalid")

@@ -94,6 +94,8 @@ def _insert_plan_revision_for_barrier(
     *,
     required_node_ids: tuple[str, ...],
     additional_barriers: tuple[tuple[str, int, tuple[str, ...], str], ...] = (),
+    plan_revision_id: str = "plan-control-1",
+    spec_revision: int = 1,
 ) -> str:
     """写入测试用不可变 plan revision，让 barrier 节点声明可被仓储重新核对。"""
     barriers = [
@@ -121,9 +123,9 @@ def _insert_plan_revision_for_barrier(
         connection,
         "plan_revisions",
         {
-            "plan_revision_id": "plan-control-1",
+            "plan_revision_id": plan_revision_id,
             "task_id": "task-control-1",
-            "spec_revision": 1,
+            "spec_revision": spec_revision,
             "parent_revision_id": None,
             "intent_authorization_id": "intent-control-1",
             "semantic_plan_hash": SHA_A,
@@ -139,6 +141,10 @@ def _insert_plan_revision_for_barrier(
             "plan_revision_schema_version": 1,
             "canonical_plan_revision": canonical_revision,
         },
+    )
+    connection.execute(
+        "UPDATE tasks SET active_plan_revision_id=? WHERE task_id=?",
+        (plan_revision_id, "task-control-1"),
     )
     return "sha256:" + hashlib.sha256(canonicalize(list(required_node_ids))).hexdigest()
 
@@ -668,17 +674,154 @@ async def test_transition_observed_rejects_fabricated_facts_when_authority_table
         connection.close()
 
 
+@pytest.mark.asyncio
+async def test_passed_barrier_rejects_step_from_stale_revision_or_phase() -> None:
+    """同名节点若来自旧 PlanRevision 或错误业务阶段，不能伪造当前 barrier 成功。"""
+    connection = _connection()
+    try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("node-current",),
+        )
+        old_revision = {
+            "barriers": [
+                {
+                    "businessPhase": "PLANNING",
+                    "barrierOrdinal": 0,
+                    "requiredNodeIds": ["node-current"],
+                    "settleTimeoutMs": 30_000,
+                    "passPredicateId": "planning-approved-v1",
+                }
+            ]
+        }
+        _insert(
+            connection,
+            "plan_revisions",
+            {
+                "plan_revision_id": "plan-old",
+                "task_id": "task-control-1",
+                "spec_revision": 2,
+                "parent_revision_id": None,
+                "intent_authorization_id": "intent-control-1",
+                "semantic_plan_hash": SHA_A,
+                "plan_revision_digest": "sha256:" + "b" * 64,
+                "dag_version": 1,
+                "node_capability_map_version": "node-v1",
+                "stage_capability_map_version": "stage-v1",
+                "created_at": "2026-08-17T08:00:00Z",
+                "run_spec_schema_id": "run-spec.v1",
+                "run_spec_schema_version": 1,
+                "canonical_run_spec": b"{}",
+                "plan_revision_schema_id": "plan-revision.v1",
+                "plan_revision_schema_version": 1,
+                "canonical_plan_revision": json.dumps(
+                    old_revision,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            },
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-current-lineage",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_node_set_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
+        _insert(
+            connection,
+            "steps",
+            {
+                "step_id": "step-stale-revision",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-old",
+                "barrier_id": "barrier-current-lineage",
+                "logical_node_id": "node-current",
+                "business_phase": "DESIGN_REVIEWING",
+                "node_type": "DESIGN_REVIEW",
+                "required": 0,
+                "side_effect_class": "none",
+                "phase": "TERMINAL",
+                "outcome": "SUCCEEDED",
+                "dependency_hash": SHA_A,
+                "required_artifacts_digest": SHA_A,
+                "success_predicate_id": "planning-complete-v1",
+                "timeout_ms": 30_000,
+                "retry_policy_id": "no-retry-v1",
+                "idempotency_key": "step-stale-revision-v1",
+                "state_version": 0,
+            },
+        )
+        connection.execute("UPDATE runs SET active_barrier_id='barrier-current-lineage'")
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-stale-revision"),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-stale-revision",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id="barrier-current-lineage",
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(
+                BarrierStepFacts(
+                    step_id="step-stale-revision",
+                    required=False,
+                    phase=StepPhase.TERMINAL,
+                    outcome=StepOutcome.SUCCEEDED,
+                    active_attempt=False,
+                    unsettled_started_receipt=False,
+                    success_predicate_passed=True,
+                    required_artifacts_committed=True,
+                    blocking_finding_open=False,
+                ),
+            ),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute("SELECT settled,passed,state_version FROM phase_barriers").fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT phase,state_version FROM runs").fetchone() == ("PLANNING", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
-    ("step_phase", "attempt_phase", "should_reject"),
-    [("RUNNING", "RUNNING", False), ("DISPATCHED", "STARTING", True)],
+    ("step_phase", "attempt_phase", "drain_state", "should_reject"),
+    [
+        ("RUNNING", "RUNNING", "NONE", False),
+        ("DISPATCHED", "STARTING", "NONE", True),
+        ("RUNNING", "RUNNING", "DRAINING", True),
+    ],
 )
 @pytest.mark.asyncio
 async def test_transition_observed_requires_authoritative_dispatch_state(
     step_phase: str,
     attempt_phase: str,
+    drain_state: str,
     should_reject: bool,
 ) -> None:
-    """QUEUED→RUNNING 还必须有 Step=RUNNING、Attempt=RUNNING 的权威派发事实。"""
+    """QUEUED→RUNNING 还必须有可派发的 Step/Attempt，DRAINING 不能复用旧执行。"""
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
         _insert(
@@ -728,7 +871,7 @@ async def test_transition_observed_requires_authoritative_dispatch_state(
                 "control_epoch": 9,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "NONE",
+                "drain_state": drain_state,
                 "started_at": "2026-08-17T08:59:00Z",
                 "ended_at": None,
                 "state_version": 0,
@@ -981,9 +1124,17 @@ async def test_passed_barrier_rejects_incomplete_authoritative_required_node_set
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("expected_task_state_version", "expected_barrier_state_version", "should_reject"),
+    [(0, 0, False), (41, 0, True), (0, 43, True)],
+)
 @pytest.mark.asyncio
-async def test_unknown_remote_state_timeout_persists_blocked_action_required() -> None:
-    """UNKNOWN_REMOTE_STATE 超时必须持久化 BLOCKED/ACTION_REQUIRED 并追加事件。"""
+async def test_unknown_remote_state_timeout_requires_all_expected_versions(
+    expected_task_state_version: int,
+    expected_barrier_state_version: int,
+    should_reject: bool,
+) -> None:
+    """UNKNOWN 超时必须同时校验 Task、barrier、Run 版本后才可落 BLOCKED。"""
     connection = _connection()
     try:
         required_node_set_digest = _insert_plan_revision_for_barrier(
@@ -1038,49 +1189,58 @@ async def test_unknown_remote_state_timeout_persists_blocked_action_required() -
             coordinator=_SqliteCoordinator(connection),
             state_event_id_factory=_ids("state-event-unknown-timeout"),
         )
-        result = await service.commit_passed_barrier(
-            BarrierMilestoneRequest(
-                request_id="request-unknown-timeout",
-                task_id="task-control-1",
-                run_id="run-control-1",
-                barrier_id="barrier-unknown-timeout",
-                expected_task_state_version=0,
-                expected_run_state_version=0,
-                expected_barrier_state_version=0,
-                next_phase=RunPhase.DESIGN_REVIEWING,
-                next_barrier_id=None,
-                candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
-                gate_digest=SHA_A,
-                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
-                # 调用方故意声称成功；服务必须只采用事务内权威 UNKNOWN 事实。
-                steps=(
-                    BarrierStepFacts(
-                        step_id="step-unknown",
-                        required=True,
-                        phase=StepPhase.TERMINAL,
-                        outcome=StepOutcome.SUCCEEDED,
-                        active_attempt=False,
-                        unsettled_started_receipt=False,
-                        success_predicate_passed=True,
-                        required_artifacts_committed=True,
-                        blocking_finding_open=False,
-                    ),
+        request = BarrierMilestoneRequest(
+            request_id="request-unknown-timeout",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id="barrier-unknown-timeout",
+            expected_task_state_version=expected_task_state_version,
+            expected_run_state_version=0,
+            expected_barrier_state_version=expected_barrier_state_version,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            # 调用方故意声称成功；服务必须只采用事务内权威 UNKNOWN 事实。
+            steps=(
+                BarrierStepFacts(
+                    step_id="step-unknown",
+                    required=True,
+                    phase=StepPhase.TERMINAL,
+                    outcome=StepOutcome.SUCCEEDED,
+                    active_attempt=False,
+                    unsettled_started_receipt=False,
+                    success_predicate_passed=True,
+                    required_artifacts_committed=True,
+                    blocking_finding_open=False,
                 ),
-                milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
-            )
+            ),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
         )
-        assert result.run.observed_state.value == "BLOCKED"
-        assert result.run.requires_user_action is True
-        assert result.run.block_reason_code == "UNKNOWN_REMOTE_STATE_TIMEOUT"
-        assert connection.execute(
-            "SELECT observed_state,requires_user_action,block_reason_code,state_version FROM runs"
-        ).fetchone() == ("BLOCKED", 1, "UNKNOWN_REMOTE_STATE_TIMEOUT", 1)
-        assert connection.execute("SELECT settled,passed,state_version FROM phase_barriers").fetchone() == (0, 0, 0)
-        assert connection.execute("SELECT achieved_stage,state_version FROM tasks").fetchone() == ("NONE", 0)
-        event = connection.execute(
-            "SELECT aggregate_type,canonical_state_event FROM authoritative_state_events"
-        ).fetchone()
-        assert event[0] == "RUN"
-        assert json.loads(event[1].decode("utf-8"))["payload"]["actionRequired"] is True
+        if should_reject:
+            with pytest.raises(StaleStateVersionError):
+                await service.commit_passed_barrier(request)
+            assert connection.execute(
+                "SELECT observed_state,requires_user_action,block_reason_code,state_version FROM runs"
+            ).fetchone() == ("QUEUED", 0, None, 0)
+            assert connection.execute("SELECT settled,passed,state_version FROM phase_barriers").fetchone() == (0, 0, 0)
+            assert connection.execute("SELECT achieved_stage,state_version FROM tasks").fetchone() == ("NONE", 0)
+            assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+        else:
+            result = await service.commit_passed_barrier(request)
+            assert result.run.observed_state.value == "BLOCKED"
+            assert result.run.requires_user_action is True
+            assert result.run.block_reason_code == "UNKNOWN_REMOTE_STATE_TIMEOUT"
+            assert connection.execute(
+                "SELECT observed_state,requires_user_action,block_reason_code,state_version FROM runs"
+            ).fetchone() == ("BLOCKED", 1, "UNKNOWN_REMOTE_STATE_TIMEOUT", 1)
+            assert connection.execute("SELECT settled,passed,state_version FROM phase_barriers").fetchone() == (0, 0, 0)
+            assert connection.execute("SELECT achieved_stage,state_version FROM tasks").fetchone() == ("NONE", 0)
+            event = connection.execute(
+                "SELECT aggregate_type,canonical_state_event FROM authoritative_state_events"
+            ).fetchone()
+            assert event[0] == "RUN"
+            assert json.loads(event[1].decode("utf-8"))["payload"]["actionRequired"] is True
     finally:
         connection.close()

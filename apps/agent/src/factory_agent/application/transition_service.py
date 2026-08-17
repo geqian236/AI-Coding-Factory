@@ -26,7 +26,7 @@ from factory_agent.observability.logging import get_logger
 from factory_agent.policy.canonical_json import canonicalize
 from factory_agent.state_machine.barriers import BarrierStepFacts, evaluate_barrier
 from factory_agent.state_machine.milestones import MilestoneEvidence, evaluate_milestone
-from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork
+from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork, StaleStateVersionError
 from factory_agent.storage.sqlite.workflow_repository import (
     BarrierAuthorityFacts,
     ObservedStateAuthorityFacts,
@@ -456,6 +456,13 @@ class TransitionService:
             and barrier_decision.block_reason_code == "UNKNOWN_REMOTE_STATE_TIMEOUT"
         ):
             # 未知远端状态不能伪造成功；超时在本事务落成 BLOCKED，并保留可追踪行动事件。
+            if (
+                current_task.state_version != request.expected_task_state_version
+                or current_barrier.state_version != request.expected_barrier_state_version
+                or current_run.state_version != request.expected_run_state_version
+            ):
+                # action-required 也是 barrier milestone 的一次闭集提交，三路版本必须同时匹配。
+                raise StaleStateVersionError("stale barrier milestone aggregate version")
             updated_run = repository.block_run_for_action_required(
                 run_id=current_run.run_id,
                 expected_state_version=request.expected_run_state_version,
