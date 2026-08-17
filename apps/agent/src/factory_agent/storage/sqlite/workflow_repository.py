@@ -385,9 +385,14 @@ class SqliteWorkflowRepository:
                 required_value = record["required"]
                 if type(required_value) is not int or required_value not in (0, 1):
                     raise ValueError("step required flag is invalid")
-                required = required_value == 1
+                persisted_required = required_value == 1
             except (TypeError, ValueError, KeyError) as exc:
                 raise WorkflowRepositoryError("barrier step selector is invalid") from exc
+            declared_required = logical_node_id in required_node_ids
+            if persisted_required != declared_required:
+                # required 身份由不可变 PlanRevision 派生，数据库漂移不能削弱 Artifact/成功谓词门禁。
+                raise WorkflowRepositoryError("barrier step required flag is inconsistent")
+            required = declared_required
             active_attempt = (
                 self._connection.execute(
                     "SELECT 1 FROM attempts WHERE step_id=? AND phase<>'TERMINATED' AND drain_state<>'DRAINED' LIMIT 1",
