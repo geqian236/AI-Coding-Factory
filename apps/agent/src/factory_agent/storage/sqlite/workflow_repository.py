@@ -251,14 +251,13 @@ class SqliteWorkflowRepository:
             lease_active = (
                 self._connection.execute(
                     "SELECT 1 FROM resource_leases AS l "
-                    "JOIN execution_authorizations AS ea "
-                    "ON ea.executor_id=l.owner_executor_id "
-                    "AND ea.fencing_token=l.fencing_token "
-                    "AND ea.control_epoch=l.control_epoch "
-                    "WHERE ea.run_id=? AND ea.consumption_state='AVAILABLE' "
-                    "AND ea.revoked_at IS NULL AND ea.issued_at<=? AND ea.expires_at>? "
-                    "AND l.heartbeat_at<=? AND l.expires_at>? LIMIT 1",
-                    (run_id, now_text, now_text, now_text, now_text),
+                    "JOIN attempts AS a "
+                    "ON a.executor_id=l.owner_executor_id "
+                    "AND a.fencing_token=l.fencing_token "
+                    "AND a.control_epoch=l.control_epoch "
+                    "JOIN steps AS s ON s.step_id=a.step_id "
+                    "WHERE s.run_id=? AND l.heartbeat_at<=? AND l.expires_at>? LIMIT 1",
+                    (run_id, now_text, now_text),
                 ).fetchone()
                 is not None
             )

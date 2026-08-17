@@ -496,6 +496,87 @@ def _insert_passing_planning_graph(
     connection.execute("UPDATE runs SET active_barrier_id=?", (planning_barrier_id,))
 
 
+def _insert_target_close_lease(connection: sqlite3.Connection) -> None:
+    """插入只与已终止 Attempt 归属匹配的有效 lease，验证授权缺失时也必须阻断终局。"""
+    _insert(
+        connection,
+        "resource_leases",
+        {
+            "resource_key": "resource-target-lease-only",
+            "owner_executor_id": "executor-planning-contract",
+            "fencing_token": 1,
+            "control_epoch": 1,
+            "acquired_at": "2026-08-17T08:00:00Z",
+            "heartbeat_at": "2026-08-17T08:30:00Z",
+            "expires_at": "2026-08-17T10:00:00Z",
+            "state_version": 0,
+        },
+    )
+
+
+def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
+    """插入独立 AVAILABLE 授权但不插入 lease，验证授权路径不会依赖 lease 查询。"""
+    _insert(
+        connection,
+        "execution_authorizations",
+        {
+            "execution_authorization_id": "auth-target-auth-only",
+            "intent_authorization_id": "intent-control-1",
+            "plan_revision_id": "plan-control-1",
+            "semantic_plan_hash": b"semantic",
+            "plan_revision_digest": b"revision",
+            "stage_capability_map_version": "stage-capability-map.v1",
+            "stage_capability_map_digest": b"stage",
+            "node_capability_map_version": "node-capability-map.v1",
+            "node_capability_map_digest": b"node",
+            "run_id": "run-control-1",
+            "step_id": "step-planning-contract",
+            "attempt_id": "attempt-planning-contract",
+            "node_type": "PLAN",
+            "executor_id": "executor-planning-contract",
+            "resource_fingerprint": b"resource",
+            "capability_scope_digest": b"scope",
+            "idempotency_key": b"idempotency-auth-only",
+            "input_bindings": b"bindings",
+            "action_capability": "repo.read",
+            "action_policy_snapshot_digest": b"policy",
+            "fencing_token": 1,
+            "control_epoch": 1,
+            "accepted_control_command_seq": 0,
+            "max_uses": 1,
+            "consumption_state": "AVAILABLE",
+            "issued_at": "2026-08-17T08:00:00Z",
+            "expires_at": "2026-08-17T10:00:00Z",
+            "revoked_at": None,
+            "revoke_reason": None,
+            "contract_schema_id": "execution-authorization.v1",
+            "contract_schema_version": 1,
+            "canonical_contract": b"{}",
+            "canonical_contract_digest": b"contract",
+        },
+    )
+
+
+def _target_close_request(*, planning_barrier_id: str, request_id: str) -> BarrierMilestoneRequest:
+    """构造统一 target close 请求，调用方证据仍是故意无效的兼容摘要。"""
+    return BarrierMilestoneRequest(
+        request_id=request_id,
+        task_id="task-control-1",
+        run_id="run-control-1",
+        barrier_id=planning_barrier_id,
+        expected_task_state_version=0,
+        expected_run_state_version=0,
+        expected_barrier_state_version=0,
+        next_phase=RunPhase.PLANNING,
+        next_barrier_id=None,
+        candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+        gate_digest=SHA_A,
+        now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        steps=(),
+        milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+    )
+
+
 def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED") -> sqlite3.Connection:
     """加载真实 migration，并以 FK ON 建立可验证的控制测试 lineage。"""
     connection = sqlite3.connect(":memory:", isolation_level=None)
@@ -2048,6 +2129,87 @@ async def test_target_reached_rejects_active_authorization_and_lease_and_rolls_b
         assert connection.execute(
             "SELECT state_version FROM resource_leases WHERE resource_key=?", ("resource-target-close",)
         ).fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_lease_without_authorization_and_rolls_back() -> None:
+    """已终止 Attempt 仍持有效 lease 时，即使授权缺失也不能提交 TERMINATED。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_target_close_lease(connection)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-lease-only"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-lease-only",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT state_version FROM resource_leases WHERE resource_key=?", ("resource-target-lease-only",)
+        ).fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM execution_authorizations").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_authorization_without_lease_and_rolls_back() -> None:
+    """独立 AVAILABLE 授权本身也必须阻断目标收口，不能依赖 lease 分支。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_target_close_authorization(connection)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-auth-only"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-auth-only",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT consumption_state,revoked_at FROM execution_authorizations WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("AVAILABLE", None)
+        assert connection.execute("SELECT count(*) FROM resource_leases").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
