@@ -577,6 +577,126 @@ def _target_close_request(*, planning_barrier_id: str, request_id: str) -> Barri
     )
 
 
+def _insert_secondary_run_graph(connection: sqlite3.Connection) -> tuple[str, str]:
+    """插入 FK-on 的第二 Run/Step/Attempt，供授权双向错配测试使用。"""
+    planning_barrier_id = _derived_barrier_id(
+        connection,
+        business_phase="PLANNING",
+        barrier_ordinal=0,
+        run_id="run-control-2",
+    )
+    current_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    required_digest = connection.execute(
+        "SELECT required_node_set_digest FROM phase_barriers WHERE barrier_id=?", (current_barrier_id,)
+    ).fetchone()[0]
+    _insert(
+        connection,
+        "runs",
+        {
+            "run_id": "run-control-2",
+            "task_id": "task-control-1",
+            "desired_state": "RUNNING",
+            "observed_state": "QUEUED",
+            "phase": "PLANNING",
+            "active_barrier_id": None,
+            "dag_version": 1,
+            "run_cursor": None,
+            "durable_cursor": None,
+            "control_command_seq": 0,
+            "repair_loop_used": 0,
+            "auto_replan_used": 0,
+            "requires_user_action": 0,
+            "block_reason_code": None,
+            "budget_accumulated_ms": 0,
+            "budget_clock_state": None,
+            "budget_clock_boot_id": None,
+            "budget_clock_monotonic_ns": None,
+            "budget_clock_wall_time": None,
+            "budget_suspension_reason": None,
+            "executor_id": None,
+            "host_id": None,
+            "runtime": None,
+            "protocol_version": "control-plane.v1",
+            "recovery_target_phase": None,
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "phase_barriers",
+        {
+            "barrier_id": planning_barrier_id,
+            "run_id": "run-control-2",
+            "plan_revision_id": "plan-control-1",
+            "business_phase": "PLANNING",
+            "barrier_ordinal": 0,
+            "required_node_set_digest": required_digest,
+            "settle_timeout_ms": 30_000,
+            "settle_deadline_at": None,
+            "pass_predicate_id": "planning-approved-v1",
+            "settled": 0,
+            "passed": 0,
+            "gate_digest": None,
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": "step-control-2",
+            "run_id": "run-control-2",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": planning_barrier_id,
+            "logical_node_id": "plan",
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest(["artifact-planning"]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": "step-control-2-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": "attempt-control-2",
+            "step_id": "step-control-2",
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": "executor-control-2",
+            "process_session_id": "process-control-2",
+            "pid": 2345,
+            "process_start_time": "2026-08-17T07:00:00Z",
+            "job_object_id": "job-control-2",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 7,
+            "control_epoch": 2,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "DRAINED",
+            "started_at": "2026-08-17T07:00:00Z",
+            "ended_at": "2026-08-17T07:30:00Z",
+            "state_version": 0,
+        },
+    )
+    connection.execute("UPDATE runs SET active_barrier_id=? WHERE run_id=?", (planning_barrier_id, "run-control-2"))
+    return "step-control-2", "attempt-control-2"
+
+
 def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED") -> sqlite3.Connection:
     """加载真实 migration，并以 FK ON 建立可验证的控制测试 lineage。"""
     connection = sqlite3.connect(":memory:", isolation_level=None)
@@ -2210,6 +2330,106 @@ async def test_target_reached_rejects_authorization_without_lease_and_rolls_back
             ("auth-target-auth-only",),
         ).fetchone() == ("AVAILABLE", None)
         assert connection.execute("SELECT count(*) FROM resource_leases").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_cross_run_authorization_and_rolls_back() -> None:
+    """授权 run_id 漂移到另一 Run 但仍指向当前 Step/Attempt 时必须 fail closed。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_secondary_run_graph(connection)
+        _insert_target_close_authorization(connection)
+        connection.execute(
+            "UPDATE execution_authorizations SET run_id=? WHERE execution_authorization_id=?",
+            ("run-control-2", "auth-target-auth-only"),
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-cross-run-auth"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-cross-run-auth",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute(
+            "SELECT observed_state,state_version FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == (
+            "QUEUED",
+            0,
+        )
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT run_id,step_id,attempt_id FROM execution_authorizations WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("run-control-2", "step-planning-contract", "attempt-planning-contract")
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls_back() -> None:
+    """授权 run_id 虽正确但 Step/Attempt 指向另一 Run 时也必须 fail closed。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        other_step_id, other_attempt_id = _insert_secondary_run_graph(connection)
+        _insert_target_close_authorization(connection)
+        connection.execute(
+            "UPDATE execution_authorizations SET step_id=?,attempt_id=? WHERE execution_authorization_id=?",
+            (other_step_id, other_attempt_id, "auth-target-auth-only"),
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-reverse-auth"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-reverse-auth",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute(
+            "SELECT observed_state,state_version FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == (
+            "QUEUED",
+            0,
+        )
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT run_id,step_id,attempt_id FROM execution_authorizations WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("run-control-1", other_step_id, other_attempt_id)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()

@@ -238,16 +238,58 @@ class SqliteWorkflowRepository:
                 is not None
             )
         else:
-            # Attempt 已收口时，Run 仍不能带着未撤销授权或其 lease 假装 PAUSED/QUEUED。
-            authorization_active = (
-                self._connection.execute(
-                    "SELECT 1 FROM execution_authorizations "
-                    "WHERE run_id=? AND consumption_state='AVAILABLE' AND revoked_at IS NULL "
-                    "AND issued_at<=? AND expires_at>? LIMIT 1",
-                    (run_id, now_text, now_text),
-                ).fetchone()
-                is not None
+            # Attempt 已收口时，反向枚举 run/step/attempt 三种授权关联，不能先按 run_id 过滤掉漂移行。
+            authorization_cursor = self._connection.execute(
+                "SELECT ea.* FROM execution_authorizations AS ea WHERE ea.run_id=? "
+                "UNION SELECT ea.* FROM execution_authorizations AS ea "
+                "JOIN steps AS s ON s.step_id=ea.step_id WHERE s.run_id=? "
+                "UNION SELECT ea.* FROM execution_authorizations AS ea "
+                "JOIN attempts AS a ON a.attempt_id=ea.attempt_id "
+                "JOIN steps AS s ON s.step_id=a.step_id WHERE s.run_id=?",
+                (run_id, run_id, run_id),
             )
+            authorization_rows = authorization_cursor.fetchall()
+            authorization_columns = tuple(item[0] for item in authorization_cursor.description or ())
+            task_row = self._connection.execute(
+                "SELECT active_plan_revision_id FROM tasks WHERE task_id=?",
+                (run.task_id,),
+            ).fetchone()
+            active_plan_revision_id = None if task_row is None else task_row[0]
+            for authorization_row in authorization_rows:
+                authorization = dict(zip(authorization_columns, authorization_row, strict=True))
+                step_row = self._connection.execute(
+                    "SELECT run_id,plan_revision_id,node_type FROM steps WHERE step_id=?",
+                    (authorization["step_id"],),
+                ).fetchone()
+                attempt_row = self._connection.execute(
+                    "SELECT step_id,executor_id,fencing_token,control_epoch,accepted_control_command_seq "
+                    "FROM attempts WHERE attempt_id=?",
+                    (authorization["attempt_id"],),
+                ).fetchone()
+                lineage_valid = (
+                    step_row is not None
+                    and attempt_row is not None
+                    and authorization["run_id"] == run_id
+                    and step_row[0] == run_id
+                    and authorization["step_id"] == attempt_row[0]
+                    and authorization["plan_revision_id"] == step_row[1] == active_plan_revision_id
+                    and authorization["node_type"] == step_row[2]
+                    and authorization["executor_id"] == attempt_row[1]
+                    and authorization["fencing_token"] == attempt_row[2]
+                    and authorization["control_epoch"] == attempt_row[3]
+                    and authorization["accepted_control_command_seq"] == attempt_row[4]
+                )
+                if not lineage_valid:
+                    # 任一授权身份漂移都要 fail closed，避免损坏行被状态过滤器静默忽略。
+                    authorization_active = True
+                    continue
+                if (
+                    authorization["consumption_state"] == "AVAILABLE"
+                    and authorization["revoked_at"] is None
+                    and authorization["issued_at"] <= now_text
+                    and authorization["expires_at"] > now_text
+                ):
+                    authorization_active = True
             lease_active = (
                 self._connection.execute(
                     "SELECT 1 FROM resource_leases AS l "
