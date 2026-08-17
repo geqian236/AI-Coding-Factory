@@ -516,6 +516,11 @@ def _insert_target_close_lease(connection: sqlite3.Connection) -> None:
 
 def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
     """插入独立 AVAILABLE 授权但不插入 lease，验证授权路径不会依赖 lease 查询。"""
+    plan_row = connection.execute(
+        "SELECT semantic_plan_hash,plan_revision_digest FROM plan_revisions WHERE plan_revision_id=?",
+        ("plan-control-1",),
+    ).fetchone()
+    assert plan_row is not None
     _insert(
         connection,
         "execution_authorizations",
@@ -523,8 +528,9 @@ def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
             "execution_authorization_id": "auth-target-auth-only",
             "intent_authorization_id": "intent-control-1",
             "plan_revision_id": "plan-control-1",
-            "semantic_plan_hash": b"semantic",
-            "plan_revision_digest": b"revision",
+            # AVAILABLE 正例必须是真实的当前 PlanRevision 合同，避免测试只因伪造摘要而阻断。
+            "semantic_plan_hash": canonicalize(plan_row[0]),
+            "plan_revision_digest": canonicalize(plan_row[1]),
             "stage_capability_map_version": "stage-capability-map.v1",
             "stage_capability_map_digest": b"stage",
             "node_capability_map_version": "node-capability-map.v1",
@@ -555,6 +561,25 @@ def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
             "canonical_contract_digest": b"contract",
         },
     )
+
+
+def _insert_second_intent_authorization(connection: sqlite3.Connection) -> None:
+    """复制 FK 完整的意图授权，供只漂移 execution authorization intent 绑定的反例使用。"""
+    cursor = connection.execute(
+        "SELECT intent_authorization_id,task_id,user_id,requirement_digest,project_id,"
+        "repository_id,repository_binding_digest,baseline_digest,target_stage,"
+        "stage_capability_map_version,allowed_capability_set_digest,target_binding_digest,"
+        "risk_ceiling,estimated_cost_alert_digest,autonomous_execution_budget_ms,"
+        "repair_loop_limit,auto_replan_limit,attempt_limit,issued_at,expires_at,revoked_at,"
+        "revoke_reason,contract_schema_id,contract_schema_version,canonical_contract,"
+        "canonical_contract_digest FROM intent_authorizations WHERE intent_authorization_id=?",
+        ("intent-control-1",),
+    )
+    row = cursor.fetchone()
+    assert row is not None
+    values = dict(zip((item[0] for item in cursor.description or ()), row, strict=True))
+    values["intent_authorization_id"] = "intent-control-2"
+    _insert(connection, "intent_authorizations", values)
 
 
 def _target_close_request(*, planning_barrier_id: str, request_id: str) -> BarrierMilestoneRequest:
@@ -840,6 +865,104 @@ def _insert_historical_target_authorization(
             "auth-target-auth-only",
         ),
     )
+
+
+_LINEAGE_MUTATIONS = (
+    "run_id",
+    "step_attempt",
+    "step_run",
+    "plan_revision",
+    "intent_authorization",
+    "semantic_plan_hash",
+    "plan_revision_digest",
+    "node_type",
+    "executor_id",
+    "fencing_token",
+    "control_epoch",
+    "control_seq",
+)
+
+
+def _prepare_inactive_authorization_lineage_mutation(
+    connection: sqlite3.Connection,
+    *,
+    mutation: str,
+) -> str:
+    """构造已失效授权并仅漂移一个绑定字段，确保 lineage 校验本身被命中。"""
+    if mutation not in _LINEAGE_MUTATIONS:
+        raise AssertionError(f"未知授权 lineage 变异：{mutation}")
+    _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+    connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+    planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    if mutation in {"run_id", "step_run"}:
+        _insert_secondary_run_graph(connection)
+    old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+    _insert_historical_target_authorization(
+        connection,
+        plan_revision_id=old_plan_revision_id,
+        step_id=old_step_id,
+        attempt_id=old_attempt_id,
+        active=False,
+    )
+    if mutation == "run_id":
+        connection.execute(
+            "UPDATE execution_authorizations SET run_id=? WHERE execution_authorization_id=?",
+            ("run-control-2", "auth-target-auth-only"),
+        )
+    elif mutation == "step_attempt":
+        connection.execute(
+            "UPDATE execution_authorizations SET attempt_id=? WHERE execution_authorization_id=?",
+            ("attempt-planning-contract", "auth-target-auth-only"),
+        )
+    elif mutation == "step_run":
+        connection.execute("UPDATE steps SET run_id=? WHERE step_id=?", ("run-control-2", old_step_id))
+    elif mutation == "plan_revision":
+        connection.execute(
+            "UPDATE execution_authorizations SET plan_revision_id=? WHERE execution_authorization_id=?",
+            ("plan-control-1", "auth-target-auth-only"),
+        )
+    elif mutation == "intent_authorization":
+        _insert_second_intent_authorization(connection)
+        connection.execute(
+            "UPDATE execution_authorizations SET intent_authorization_id=? WHERE execution_authorization_id=?",
+            ("intent-control-2", "auth-target-auth-only"),
+        )
+    elif mutation == "semantic_plan_hash":
+        connection.execute(
+            "UPDATE execution_authorizations SET semantic_plan_hash=? WHERE execution_authorization_id=?",
+            (b"mutated-semantic-plan-hash", "auth-target-auth-only"),
+        )
+    elif mutation == "plan_revision_digest":
+        connection.execute(
+            "UPDATE execution_authorizations SET plan_revision_digest=? WHERE execution_authorization_id=?",
+            (b"mutated-plan-revision-digest", "auth-target-auth-only"),
+        )
+    elif mutation == "node_type":
+        connection.execute(
+            "UPDATE execution_authorizations SET node_type=? WHERE execution_authorization_id=?",
+            ("IMPLEMENT", "auth-target-auth-only"),
+        )
+    elif mutation == "executor_id":
+        connection.execute(
+            "UPDATE execution_authorizations SET executor_id=? WHERE execution_authorization_id=?",
+            ("executor-planning-contract", "auth-target-auth-only"),
+        )
+    elif mutation == "fencing_token":
+        connection.execute(
+            "UPDATE execution_authorizations SET fencing_token=? WHERE execution_authorization_id=?",
+            (1, "auth-target-auth-only"),
+        )
+    elif mutation == "control_epoch":
+        connection.execute(
+            "UPDATE execution_authorizations SET control_epoch=? WHERE execution_authorization_id=?",
+            (1, "auth-target-auth-only"),
+        )
+    elif mutation == "control_seq":
+        connection.execute(
+            "UPDATE execution_authorizations SET accepted_control_command_seq=? WHERE execution_authorization_id=?",
+            (1, "auth-target-auth-only"),
+        )
+    return planning_barrier_id
 
 
 def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED") -> sqlite3.Connection:
@@ -2482,14 +2605,21 @@ async def test_target_reached_rejects_authorization_without_lease_and_rolls_back
 
 @pytest.mark.asyncio
 async def test_target_reached_rejects_cross_run_authorization_and_rolls_back() -> None:
-    """授权 run_id 漂移到另一 Run 但仍指向当前 Step/Attempt 时必须 fail closed。"""
+    """已失效授权只漂移 run_id 时也必须由 lineage 校验 fail closed。"""
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
         connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert_secondary_run_graph(connection)
-        _insert_target_close_authorization(connection)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert_historical_target_authorization(
+            connection,
+            plan_revision_id=old_plan_revision_id,
+            step_id=old_step_id,
+            attempt_id=old_attempt_id,
+            active=False,
+        )
         connection.execute(
             "UPDATE execution_authorizations SET run_id=? WHERE execution_authorization_id=?",
             ("run-control-2", "auth-target-auth-only"),
@@ -2524,7 +2654,7 @@ async def test_target_reached_rejects_cross_run_authorization_and_rolls_back() -
         assert connection.execute(
             "SELECT run_id,step_id,attempt_id FROM execution_authorizations WHERE execution_authorization_id=?",
             ("auth-target-auth-only",),
-        ).fetchone() == ("run-control-2", "step-planning-contract", "attempt-planning-contract")
+        ).fetchone() == ("run-control-2", old_step_id, old_attempt_id)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
@@ -2532,17 +2662,23 @@ async def test_target_reached_rejects_cross_run_authorization_and_rolls_back() -
 
 @pytest.mark.asyncio
 async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls_back() -> None:
-    """授权 run_id 虽正确但 Step/Attempt 指向另一 Run 时也必须 fail closed。"""
+    """已失效授权只漂移 attempt 绑定时也必须由 lineage 校验 fail closed。"""
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
         connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
-        other_step_id, other_attempt_id = _insert_secondary_run_graph(connection)
-        _insert_target_close_authorization(connection)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert_historical_target_authorization(
+            connection,
+            plan_revision_id=old_plan_revision_id,
+            step_id=old_step_id,
+            attempt_id=old_attempt_id,
+            active=False,
+        )
         connection.execute(
-            "UPDATE execution_authorizations SET step_id=?,attempt_id=? WHERE execution_authorization_id=?",
-            (other_step_id, other_attempt_id, "auth-target-auth-only"),
+            "UPDATE execution_authorizations SET attempt_id=? WHERE execution_authorization_id=?",
+            ("attempt-planning-contract", "auth-target-auth-only"),
         )
         service = TransitionService(
             coordinator=_SqliteCoordinator(connection),
@@ -2574,7 +2710,49 @@ async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls
         assert connection.execute(
             "SELECT run_id,step_id,attempt_id FROM execution_authorizations WHERE execution_authorization_id=?",
             ("auth-target-auth-only",),
-        ).fetchone() == ("run-control-1", other_step_id, other_attempt_id)
+        ).fetchone() == ("run-control-1", old_step_id, "attempt-planning-contract")
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("mutation", _LINEAGE_MUTATIONS, ids=_LINEAGE_MUTATIONS)
+@pytest.mark.asyncio
+async def test_target_reached_rejects_each_inactive_authorization_lineage_mutation(mutation: str) -> None:
+    """失效授权只要任一身份字段漂移，终局也必须拒绝并保持三路状态不变。"""
+    connection = _connection()
+    try:
+        planning_barrier_id = _prepare_inactive_authorization_lineage_mutation(connection, mutation=mutation)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids(f"state-event-target-lineage-{mutation}"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id=f"request-target-lineage-{mutation}",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute(
+            "SELECT observed_state,active_barrier_id,state_version FROM runs WHERE run_id=?",
+            ("run-control-1",),
+        ).fetchone() == ("QUEUED", planning_barrier_id, 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT consumption_state,max_uses,revoked_at FROM execution_authorizations "
+            "WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("CONSUMED", 0, "2026-08-17T07:30:00Z")
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
