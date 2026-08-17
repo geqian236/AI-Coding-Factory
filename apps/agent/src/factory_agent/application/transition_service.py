@@ -32,6 +32,7 @@ from factory_agent.storage.sqlite.workflow_repository import (
     ObservedStateAuthorityFacts,
     SqliteWorkflowRepository,
     WorkflowRepositoryError,
+    _PlanBarrierAuthority,
 )
 
 LOGGER = get_logger(__name__)
@@ -81,7 +82,7 @@ class TransactionCoordinator(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ObservedStateEvidence:
-    """RUNNING/PAUSED/QUEUED 目标状态所需的执行事实摘要。"""
+    """五维 observed 目标状态所需的权威执行事实摘要。"""
 
     active_attempt_count: int
     lease_active: bool
@@ -91,6 +92,13 @@ class ObservedStateEvidence:
     unknown_remote_state: bool
     unsettled_started_receipt: bool
     dispatch_state_valid: bool = False
+    blocking_fact: bool = False
+    block_reason_code: str | None = None
+    pausing_fact: bool = False
+    stopping_fact: bool = False
+    interrupted_fact: bool = False
+    reconciling_fact: bool = False
+    terminated_fact: bool = False
 
     def __post_init__(self) -> None:
         """阻断负计数和 bool/int 混淆。"""
@@ -102,11 +110,21 @@ class ObservedStateEvidence:
             self.unknown_remote_state,
             self.unsettled_started_receipt,
             self.dispatch_state_valid,
+            self.blocking_fact,
+            self.pausing_fact,
+            self.stopping_fact,
+            self.interrupted_fact,
+            self.reconciling_fact,
+            self.terminated_fact,
         )
         if (
             type(self.active_attempt_count) is not int
             or self.active_attempt_count < 0
             or any(type(value) is not bool for value in booleans)
+            or (
+                self.block_reason_code is not None
+                and (not isinstance(self.block_reason_code, str) or not self.block_reason_code)
+            )
         ):
             raise TransitionPredicateError("observed state evidence is invalid")
 
@@ -174,7 +192,7 @@ def require_observed_target_predicates(
     candidate: RunObservedState,
     evidence: ObservedStateEvidence,
 ) -> None:
-    """在合法边之外继续核对 RUNNING/PAUSED/QUEUED 的冻结事实。"""
+    """在合法边之外核对五维 observed 的权威事实与阻断原因。"""
     target = RunObservedState(candidate)
     valid = True
     if target is RunObservedState.RUNNING:
@@ -193,6 +211,8 @@ def require_observed_target_predicates(
             run.desired_state is RunDesiredState.PAUSED
             and evidence.active_attempt_count == 0
             and not evidence.lease_active
+            and not evidence.heartbeat_valid
+            and not evidence.authorization_active
             and not evidence.unknown_remote_state
             and not evidence.unsettled_started_receipt
         )
@@ -202,7 +222,48 @@ def require_observed_target_predicates(
             and evidence.active_attempt_count == 0
             and not evidence.lease_active
             and not evidence.authorization_active
+            and not evidence.heartbeat_valid
             and not evidence.unknown_remote_state
+            and not evidence.unsettled_started_receipt
+        )
+    elif target is RunObservedState.PAUSING:
+        valid = (
+            run.desired_state is RunDesiredState.PAUSED
+            and evidence.active_attempt_count == 1
+            and evidence.pausing_fact
+            and not evidence.unknown_remote_state
+        )
+    elif target is RunObservedState.STOPPING:
+        valid = (
+            run.desired_state is RunDesiredState.PAUSED
+            and evidence.active_attempt_count == 1
+            and evidence.stopping_fact
+        )
+    elif target is RunObservedState.INTERRUPTED:
+        valid = (
+            run.desired_state is RunDesiredState.PAUSED
+            and evidence.active_attempt_count == 0
+            and evidence.interrupted_fact
+            and not evidence.lease_active
+            and not evidence.authorization_active
+            and not evidence.heartbeat_valid
+            and not evidence.unknown_remote_state
+            and not evidence.unsettled_started_receipt
+        )
+    elif target is RunObservedState.RECONCILING:
+        valid = evidence.reconciling_fact or evidence.unsettled_started_receipt or evidence.unknown_remote_state
+    elif target is RunObservedState.BLOCKED:
+        valid = evidence.blocking_fact and evidence.block_reason_code is not None
+    elif target is RunObservedState.TERMINATED:
+        valid = (
+            evidence.terminated_fact
+            and evidence.active_attempt_count == 0
+            and not evidence.lease_active
+            and not evidence.authorization_active
+            and not evidence.heartbeat_valid
+            and not evidence.unknown_remote_state
+            and not evidence.unsettled_started_receipt
+            and not evidence.blocking_fact
         )
     if not valid:
         raise TransitionPredicateError("observed state target facts are incomplete")
@@ -347,6 +408,13 @@ class TransitionService:
                     unknown_remote_state=authority.unknown_remote_state,
                     unsettled_started_receipt=authority.unsettled_started_receipt,
                     dispatch_state_valid=authority.dispatch_state_valid,
+                    blocking_fact=authority.blocking_fact,
+                    block_reason_code=authority.block_reason_code,
+                    pausing_fact=authority.pausing_fact,
+                    stopping_fact=authority.stopping_fact,
+                    interrupted_fact=authority.interrupted_fact,
+                    reconciling_fact=authority.reconciling_fact,
+                    terminated_fact=authority.terminated_fact,
                 ),
             )
             updated = repository.transition_observed(
@@ -411,6 +479,9 @@ class TransitionService:
             raise BarrierMilestoneCommitError("barrier milestone lineage is missing")
         if (
             current_run.task_id != current_task.task_id
+            or current_task.lifecycle is not TaskLifecycle.ACTIVE
+            or current_task.active_run_id != current_run.run_id
+            or current_task.active_plan_revision_id != current_barrier.plan_revision_id
             or current_barrier.run_id != current_run.run_id
             or current_run.active_barrier_id != current_barrier.barrier_id
             or current_barrier.business_phase != current_run.phase.value
@@ -418,16 +489,49 @@ class TransitionService:
             or current_barrier.passed
         ):
             raise BarrierMilestoneCommitError("barrier milestone lineage is inconsistent")
+        if (
+            current_task.state_version != request.expected_task_state_version
+            or current_barrier.state_version != request.expected_barrier_state_version
+            or current_run.state_version != request.expected_run_state_version
+        ):
+            # 版本竞争优先于请求 selector 解析，保证失败事务不会泄漏任何 lineage 判断副作用。
+            raise StaleStateVersionError("stale barrier milestone aggregate version")
+        try:
+            plan_authority: _PlanBarrierAuthority = repository.load_barrier_plan_authority(
+                barrier_id=current_barrier.barrier_id,
+                run_id=current_run.run_id,
+                task_id=current_task.task_id,
+            )
+        except WorkflowRepositoryError as exc:
+            raise BarrierMilestoneCommitError("active PlanRevision authority is incomplete") from exc
+        barrier_specs = plan_authority.barriers
+        current_spec_indexes = [
+            index
+            for index, spec in enumerate(barrier_specs)
+            if spec.get("businessPhase") == current_barrier.business_phase
+            and spec.get("barrierOrdinal") == current_barrier.barrier_ordinal
+        ]
+        if len(current_spec_indexes) != 1:
+            raise BarrierMilestoneCommitError("current barrier is not a unique frozen successor")
+        current_spec_index = current_spec_indexes[0]
+        expected_next_spec = (
+            None if current_spec_index + 1 >= len(barrier_specs) else barrier_specs[current_spec_index + 1]
+        )
         next_barrier = (
             None if request.next_barrier_id is None else repository.get_phase_barrier(request.next_barrier_id)
         )
-        if request.next_barrier_id is not None and (
-            next_barrier is None
-            or next_barrier.run_id != current_run.run_id
-            or next_barrier.business_phase != request.next_phase.value
-            or next_barrier.barrier_ordinal <= current_barrier.barrier_ordinal
-        ):
-            raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
+        next_selector_valid = (
+            expected_next_spec is None and request.next_barrier_id is None and request.next_phase is current_run.phase
+        ) or (
+            expected_next_spec is not None
+            and request.next_barrier_id is not None
+            and next_barrier is not None
+            and next_barrier.run_id == current_run.run_id
+            and next_barrier.plan_revision_id == current_barrier.plan_revision_id
+            and next_barrier.business_phase == expected_next_spec.get("businessPhase")
+            and next_barrier.barrier_ordinal == expected_next_spec.get("barrierOrdinal")
+            and request.next_phase.value == expected_next_spec.get("businessPhase")
+        )
         # steps、milestone_evidence、gate_digest 仍保留在请求合同中兼容旧调用方，但不作为证据真源。
         try:
             settle_deadline = (
@@ -435,7 +539,7 @@ class TransitionService:
                 if current_barrier.settle_deadline_at is None
                 else datetime.fromisoformat(current_barrier.settle_deadline_at)
             )
-            # steps/attempts/receipts/artifacts/findings 必须在 owner transaction 内重算。
+            # steps/attempts/receipts/artifacts/findings 必须在唯一写事务内重算。
             authority = repository.load_barrier_authority(
                 barrier_id=current_barrier.barrier_id,
                 run_id=current_run.run_id,
@@ -443,7 +547,8 @@ class TransitionService:
             )
             barrier_decision = evaluate_barrier(
                 authority.steps,
-                now=request.now,
+                # 超时只能由服务端注入时钟决定，request.now 仅为兼容字段，绝不参与授权。
+                now=self._now(),
                 settle_deadline_at=settle_deadline,
             )
         except WorkflowRepositoryError as exc:
@@ -487,6 +592,26 @@ class TransitionService:
                 },
             )
             return BarrierMilestoneResult(barrier=current_barrier, run=updated_run, task=current_task)
+        if not next_selector_valid:
+            raise BarrierMilestoneCommitError("next barrier selector is inconsistent")
+        passed_barrier_rows = repository._connection.execute(
+            "SELECT business_phase,barrier_ordinal FROM phase_barriers "
+            "WHERE run_id=? AND plan_revision_id=? AND passed=1",
+            (current_run.run_id, current_barrier.plan_revision_id),
+        ).fetchall()
+        passed_keys = {(str(phase), int(ordinal)) for phase, ordinal in passed_barrier_rows}
+        passed_keys.add((current_barrier.business_phase, current_barrier.barrier_ordinal))
+        passed_node_ids: set[object] = set()
+        for spec in barrier_specs:
+            if (spec.get("businessPhase"), spec.get("barrierOrdinal")) not in passed_keys:
+                continue
+            required_node_ids = spec.get("requiredNodeIds", ())
+            if not isinstance(required_node_ids, (tuple, list, set, frozenset)):
+                raise BarrierMilestoneCommitError("PlanRevision barrier node selector is invalid")
+            passed_node_ids.update(required_node_ids)
+        candidate_stage_nodes = plan_authority.stage_maps.get(request.candidate_achieved_stage.value)
+        if candidate_stage_nodes is None or not set(candidate_stage_nodes).issubset(passed_node_ids):
+            raise BarrierMilestoneCommitError("candidate milestone is not derived from passed PlanRevision barriers")
         if not barrier_decision.settled or not barrier_decision.passed:
             raise BarrierMilestoneCommitError("barrier gate has not passed")
         gate_digest = _authoritative_gate_digest(

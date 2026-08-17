@@ -19,7 +19,13 @@ from factory_agent.state_machine.write_guards import (
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork
 from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepository, WorkflowRepositoryError
 
-from tests.agent.integration.control.test_control_commands import SHA_A, _connection, _insert, _service
+from tests.agent.integration.control.test_control_commands import (
+    SHA_A,
+    _connection,
+    _insert,
+    _insert_plan_revision_for_barrier,
+    _service,
+)
 
 
 def _guard_context(**overrides: object) -> WriteGuardContext:
@@ -43,7 +49,30 @@ def _guard_context(**overrides: object) -> WriteGuardContext:
 
 
 def _insert_attempt_graph(connection: object) -> None:
-    """在已关闭 FK 的真实 migration schema 中插入最小 Step/Attempt lineage。"""
+    """在 FK-on migration schema 中插入完整 Plan/Barrier/Step/Attempt lineage。"""
+    required_node_set_digest = _insert_plan_revision_for_barrier(
+        connection,  # type: ignore[arg-type]
+        required_node_ids=("implement",),
+    )
+    _insert(
+        connection,  # type: ignore[arg-type]
+        "phase_barriers",
+        {
+            "barrier_id": "barrier-control-1",
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "business_phase": "PLANNING",
+            "barrier_ordinal": 0,
+            "required_node_set_digest": required_node_set_digest,
+            "settle_timeout_ms": 30_000,
+            "settle_deadline_at": None,
+            "pass_predicate_id": "planning-approved-v1",
+            "settled": 0,
+            "passed": 0,
+            "gate_digest": None,
+            "state_version": 0,
+        },
+    )
     _insert(
         connection,  # type: ignore[arg-type]
         "steps",

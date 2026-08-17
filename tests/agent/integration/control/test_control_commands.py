@@ -25,12 +25,14 @@ from factory_agent.application.transition_service import (
     TransitionService,
 )
 from factory_agent.domain.control import ControlCommandReceiptPhase, ControlCommandType
-from factory_agent.domain.workflow import AchievedStage, RunPhase, StepOutcome, StepPhase
+from factory_agent.domain.workflow import AchievedStage, RunObservedState, RunPhase, StepOutcome, StepPhase
 from factory_agent.policy.canonical_json import canonicalize
+from factory_agent.policy.plan_hash import plan_revision_digest, semantic_plan_hash
 from factory_agent.state_machine.barriers import BarrierStepFacts
 from factory_agent.state_machine.milestones import MilestoneEvidence
 from factory_agent.state_machine.transitions import StateTransitionError
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork, StaleStateVersionError
+from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepository
 
 SHA_A = "sha256:" + "a" * 64
 MIGRATION_ROOT = (
@@ -97,7 +99,7 @@ def _insert_plan_revision_for_barrier(
     plan_revision_id: str = "plan-control-1",
     spec_revision: int = 1,
 ) -> str:
-    """写入测试用不可变 plan revision，让 barrier 节点声明可被仓储重新核对。"""
+    """写入 FK-on 且双合同自洽的 PlanRevision fixture，供仓储作为唯一权威。"""
     barriers = [
         {
             "businessPhase": "PLANNING",
@@ -117,8 +119,113 @@ def _insert_plan_revision_for_barrier(
         }
         for business_phase, barrier_ordinal, node_ids, predicate_id in additional_barriers
     )
-    revision = {"barriers": barriers}
-    canonical_revision = json.dumps(revision, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    node_ids = ["plan"]
+    node_ids.extend(node_id for node_id in required_node_ids if node_id not in node_ids)
+    for _business_phase, _ordinal, extra_node_ids, _predicate_id in additional_barriers:
+        node_ids.extend(node_id for node_id in extra_node_ids if node_id not in node_ids)
+    node_location = {
+        node_id: (business_phase, ordinal)
+        for business_phase, ordinal, barrier_node_ids in (
+            ("PLANNING", 0, required_node_ids),
+            *(item[:3] for item in additional_barriers),
+        )
+        for node_id in barrier_node_ids
+    }
+    node_location.setdefault("plan", ("PLANNING", 0))
+    artifact_ids = {
+        "plan": ["artifact-planning"],
+        "design-review": ["artifact-design-stale"],
+    }
+    node_type_by_id = {
+        "plan": "PLAN",
+        "design-review": "DESIGN_REVIEW",
+        "implement": "IMPLEMENT",
+        "node-unknown": "RECONCILE_TARGET",
+    }
+    success_predicate_by_id = {
+        "plan": "planning-complete-v1",
+        "design-review": "design-complete-v1",
+        "implement": "implementation-complete-v1",
+        "node-unknown": "planning-complete-v1",
+    }
+    nodes = []
+    for node_id in node_ids:
+        business_phase, barrier_ordinal = node_location.get(node_id, ("PLANNING", 0))
+        node_type = node_type_by_id.get(
+            node_id,
+            "RECONCILE_TARGET" if node_id.startswith("node-unknown") else "PLAN",
+        )
+        nodes.append(
+            {
+                "logicalNodeId": node_id,
+                "businessPhase": business_phase,
+                "barrierOrdinal": barrier_ordinal,
+                "nodeType": node_type,
+                "required": any(
+                    node_id in declared_ids
+                    for _phase, _ordinal, declared_ids, _pred in [
+                        ("PLANNING", 0, required_node_ids, "planning-approved-v1"),
+                        *additional_barriers,
+                    ]
+                ),
+                "dependsOn": [],
+                "sideEffectClass": "workspace_write" if node_type == "IMPLEMENT" else "none",
+                "requiredArtifacts": artifact_ids.get(node_id, []),
+                "successPredicateId": success_predicate_by_id.get(node_id, "planning-complete-v1"),
+                "timeoutMs": 30_000,
+                "retryPolicyId": "no-retry-v1",
+            }
+        )
+    run_spec: dict[str, object] = {
+        "schemaVersion": 1,
+        "specRevision": spec_revision,
+        "parentRevisionId": None,
+        "taskId": "task-control-1",
+        "goal": "验证 Phase 1 状态控制面",
+        "assumptions": ["测试使用真实事务"],
+        "scope": {"include": ["apps/agent/src/factory_agent"], "exclude": ["Task 3+"]},
+        "constraints": ["单 writer"],
+        "acceptanceCriteria": ["状态 CAS 与 gate 原子"],
+        "targetStage": "CODEX_APPROVED",
+        "repository": {
+            "mode": "existing",
+            "root": "D:/codex项目/AI-Coding-Factory",
+            "baseBranch": "factory/bootstrap-plan",
+            "baseCommit": "a" * 40,
+        },
+        "workPlan": {"dagVersion": 1, "nodes": nodes, "barriers": barriers},
+        "riskProfile": {"level": "medium", "reasons": ["状态控制测试"]},
+        "nodeCapabilityMapVersion": "node-capability-map.v1",
+        "stageCapabilityMapVersion": "stage-capability-map.v1",
+        "intentAuthorizationId": "intent-control-1",
+        "semanticPlanHash": SHA_A,
+        "planRevisionDigest": SHA_A,
+        "createdAt": "2026-08-17T08:00:00Z",
+    }
+    run_spec["semanticPlanHash"] = semantic_plan_hash(run_spec)
+    revision: dict[str, object] = {
+        "planRevisionId": plan_revision_id,
+        "taskId": "task-control-1",
+        "specRevision": spec_revision,
+        "intentAuthorizationId": "intent-control-1",
+        "semanticPlanHash": run_spec["semanticPlanHash"],
+        "planRevisionDigest": SHA_A,
+        "dagVersion": 1,
+        "nodeCapabilityMapVersion": "node-capability-map.v1",
+        "stageCapabilityMapVersion": "stage-capability-map.v1",
+        "nodes": nodes,
+        "barriers": barriers,
+        "stageMaps": {"DESIGN_APPROVED": ["plan"], "CODEX_APPROVED": node_ids},
+        "createdAt": "2026-08-17T08:00:00Z",
+    }
+    revision["planRevisionDigest"] = plan_revision_digest(revision)
+    run_spec["planRevisionDigest"] = revision["planRevisionDigest"]
+    run_spec["semanticPlanHash"] = semantic_plan_hash(run_spec)
+    revision["semanticPlanHash"] = run_spec["semanticPlanHash"]
+    revision["planRevisionDigest"] = plan_revision_digest(revision)
+    run_spec["planRevisionDigest"] = revision["planRevisionDigest"]
+    canonical_run_spec = canonicalize(run_spec)
+    canonical_revision = canonicalize(revision)
     _insert(
         connection,
         "plan_revisions",
@@ -128,15 +235,15 @@ def _insert_plan_revision_for_barrier(
             "spec_revision": spec_revision,
             "parent_revision_id": None,
             "intent_authorization_id": "intent-control-1",
-            "semantic_plan_hash": SHA_A,
-            "plan_revision_digest": SHA_A,
+            "semantic_plan_hash": revision["semanticPlanHash"],
+            "plan_revision_digest": revision["planRevisionDigest"],
             "dag_version": 1,
-            "node_capability_map_version": "node-v1",
-            "stage_capability_map_version": "stage-v1",
+            "node_capability_map_version": "node-capability-map.v1",
+            "stage_capability_map_version": "stage-capability-map.v1",
             "created_at": "2026-08-17T08:00:00Z",
             "run_spec_schema_id": "run-spec.v1",
             "run_spec_schema_version": 1,
-            "canonical_run_spec": b"{}",
+            "canonical_run_spec": canonical_run_spec,
             "plan_revision_schema_id": "plan-revision.v1",
             "plan_revision_schema_version": 1,
             "canonical_plan_revision": canonical_revision,
@@ -150,9 +257,9 @@ def _insert_plan_revision_for_barrier(
 
 
 def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED") -> sqlite3.Connection:
-    """加载真实四个 migration，并插入控制测试所需的最小 lineage。"""
+    """加载真实 migration，并以 FK ON 建立可验证的控制测试 lineage。"""
     connection = sqlite3.connect(":memory:", isolation_level=None)
-    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("PRAGMA foreign_keys=ON")
     for path in sorted(MIGRATION_ROOT.glob("*.sql")):
         connection.executescript(path.read_text(encoding="utf-8"))
     _insert(connection, "projects", {"project_id": "project-control-1"})
@@ -166,13 +273,45 @@ def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED
             "target_stage": "CODEX_APPROVED",
             "achieved_stage": "NONE",
             "active_plan_revision_id": None,
-            "active_run_id": "run-control-1",
+            "active_run_id": None,
             "state_version": 0,
             "outcome_version": 0,
             "intake_schema_id": "task-intake.v1",
             "intake_schema_version": 1,
             "canonical_intake": b"{}",
             "intake_digest": SHA_A,
+        },
+    )
+    _insert(
+        connection,
+        "intent_authorizations",
+        {
+            "intent_authorization_id": "intent-control-1",
+            "task_id": "task-control-1",
+            "user_id": "user-control-1",
+            "requirement_digest": b"requirement",
+            "project_id": "project-control-1",
+            "repository_id": "repo-control-1",
+            "repository_binding_digest": b"repository",
+            "baseline_digest": b"baseline",
+            "target_stage": "CODEX_APPROVED",
+            "stage_capability_map_version": "stage-capability-map.v1",
+            "allowed_capability_set_digest": b"capabilities",
+            "target_binding_digest": b"target",
+            "risk_ceiling": "medium",
+            "estimated_cost_alert_digest": b"cost",
+            "autonomous_execution_budget_ms": 60_000,
+            "repair_loop_limit": 1,
+            "auto_replan_limit": 1,
+            "attempt_limit": 3,
+            "issued_at": "2026-08-17T07:00:00Z",
+            "expires_at": "2026-08-17T10:00:00Z",
+            "revoked_at": None,
+            "revoke_reason": None,
+            "contract_schema_id": "intent-authorization.v1",
+            "contract_schema_version": 1,
+            "canonical_contract": b"{}",
+            "canonical_contract_digest": b"contract",
         },
     )
     _insert(
@@ -206,6 +345,10 @@ def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED
             "recovery_target_phase": None,
             "state_version": 0,
         },
+    )
+    connection.execute(
+        "UPDATE tasks SET active_run_id=? WHERE task_id=?",
+        ("run-control-1", "task-control-1"),
     )
     return connection
 
@@ -341,6 +484,46 @@ async def test_immediate_stop_on_queued_run_without_attempt_completes_immediatel
         assert connection.execute(
             "SELECT phase FROM control_command_receipt_events ORDER BY receipt_seq"
         ).fetchall() == [("ACKNOWLEDGED",), ("COMPLETED",)]
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_terminated_run_rejects_every_control_command() -> None:
+    """终止 Run 没有可恢复控制面，任何命令都必须在事务入口拒绝。"""
+    connection = _connection(desired_state="RUNNING", observed_state="TERMINATED")
+    try:
+        service = _service(connection)
+        with pytest.raises(StateTransitionError):
+            await service.submit(
+                _request(request_id="request-terminal-pause", command_type=ControlCommandType.SOFT_PAUSE)
+            )
+        assert connection.execute("SELECT count(*) FROM control_commands").fetchone() == (0,)
+        assert connection.execute("SELECT desired_state,state_version FROM runs").fetchone() == ("RUNNING", 0)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_to_blocked_requires_authoritative_block_reason() -> None:
+    """QUEUED→BLOCKED 必须有数据库阻断事实与原因，不能只凭目标枚举值写入。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-blocked-without-reason"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        with pytest.raises(TransitionPredicateError):
+            await service.transition_observed(
+                run_id="run-control-1",
+                expected_state_version=0,
+                candidate=RunObservedState.BLOCKED,
+                evidence=ObservedStateEvidence(0, False, False, False, False, False, False),
+                request_id="request-blocked-without-reason",
+            )
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
 
@@ -643,10 +826,100 @@ async def test_passed_barrier_phase_and_milestone_commit_atomically() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_business_phase_barrier_uses_frozen_successor() -> None:
+    """同一 business phase 的多个 barrier 必须按 PlanRevision 精确后继推进。"""
+    connection = _connection()
+    try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("plan",),
+            additional_barriers=(("PLANNING", 1, ("node-next",), "planning-next-v1"),),
+        )
+        next_digest = "sha256:" + hashlib.sha256(canonicalize(["node-next"])).hexdigest()
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-planning-current",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_node_set_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-planning-next",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 1,
+                "required_node_set_digest": next_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-next-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
+        connection.execute("UPDATE runs SET active_barrier_id='barrier-planning-current'")
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            updated = SqliteWorkflowRepository(unit_of_work).advance_run_phase(
+                run_id="run-control-1",
+                expected_state_version=0,
+                candidate_phase=RunPhase.PLANNING,
+                next_barrier_id="barrier-planning-next",
+            )
+            assert updated.phase is RunPhase.PLANNING
+            assert updated.active_barrier_id == "barrier-planning-next"
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
 async def test_transition_observed_rejects_fabricated_facts_when_authority_tables_empty() -> None:
     """空 lease/auth/receipt/artifact/finding 权威表不得被调用方 True 证据越过。"""
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("implement",),
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-authority-1",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_node_set_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
         _insert(
             connection,
             "steps",
@@ -727,43 +1000,15 @@ async def test_passed_barrier_rejects_step_from_stale_revision_or_phase() -> Non
             connection,
             required_node_ids=("node-current",),
         )
-        old_revision = {
-            "barriers": [
-                {
-                    "businessPhase": "PLANNING",
-                    "barrierOrdinal": 0,
-                    "requiredNodeIds": ["node-current"],
-                    "settleTimeoutMs": 30_000,
-                    "passPredicateId": "planning-approved-v1",
-                }
-            ]
-        }
-        _insert(
+        _insert_plan_revision_for_barrier(
             connection,
-            "plan_revisions",
-            {
-                "plan_revision_id": "plan-old",
-                "task_id": "task-control-1",
-                "spec_revision": 2,
-                "parent_revision_id": None,
-                "intent_authorization_id": "intent-control-1",
-                "semantic_plan_hash": SHA_A,
-                "plan_revision_digest": "sha256:" + "b" * 64,
-                "dag_version": 1,
-                "node_capability_map_version": "node-v1",
-                "stage_capability_map_version": "stage-v1",
-                "created_at": "2026-08-17T08:00:00Z",
-                "run_spec_schema_id": "run-spec.v1",
-                "run_spec_schema_version": 1,
-                "canonical_run_spec": b"{}",
-                "plan_revision_schema_id": "plan-revision.v1",
-                "plan_revision_schema_version": 1,
-                "canonical_plan_revision": json.dumps(
-                    old_revision,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-            },
+            required_node_ids=("node-current",),
+            plan_revision_id="plan-old",
+            spec_revision=2,
+        )
+        connection.execute(
+            "UPDATE tasks SET active_plan_revision_id=? WHERE task_id=?",
+            ("plan-control-1", "task-control-1"),
         )
         _insert(
             connection,
@@ -963,6 +1208,29 @@ async def test_transition_observed_requires_authoritative_dispatch_state(
     """QUEUED→RUNNING 还必须有可派发的 Step/Attempt，DRAINING 不能复用旧执行。"""
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("implement",),
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-authority-valid",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_node_set_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
         _insert(
             connection,
             "steps",
@@ -1035,7 +1303,7 @@ async def test_transition_observed_requires_authoritative_dispatch_state(
             "execution_authorizations",
             {
                 "execution_authorization_id": "auth-authority-valid",
-                "intent_authorization_id": "intent-authority-valid",
+                "intent_authorization_id": "intent-control-1",
                 "plan_revision_id": "plan-control-1",
                 "semantic_plan_hash": b"semantic",
                 "plan_revision_digest": b"revision",
@@ -1105,6 +1373,10 @@ async def test_passed_barrier_rejects_fabricated_request_facts_when_authority_st
     """空 steps/attempts/artifacts/findings 时，调用方伪造成功摘要必须整事务回滚。"""
     connection = _connection()
     try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("plan",),
+        )
         _insert(
             connection,
             "phase_barriers",
@@ -1114,7 +1386,7 @@ async def test_passed_barrier_rejects_fabricated_request_facts_when_authority_st
                 "plan_revision_id": "plan-control-1",
                 "business_phase": "PLANNING",
                 "barrier_ordinal": 0,
-                "required_node_set_digest": SHA_A,
+                "required_node_set_digest": required_node_set_digest,
                 "settle_timeout_ms": 30_000,
                 "settle_deadline_at": None,
                 "pass_predicate_id": "planning-approved-v1",
@@ -1327,6 +1599,8 @@ async def test_unknown_remote_state_timeout_requires_all_expected_versions(
         service = TransitionService(
             coordinator=_SqliteCoordinator(connection),
             state_event_id_factory=_ids("state-event-unknown-timeout"),
+            # 真实超时以服务时钟为准；请求时间故意落在 deadline 之前，形成回归 RED。
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
         )
         request = BarrierMilestoneRequest(
             request_id="request-unknown-timeout",
@@ -1340,7 +1614,7 @@ async def test_unknown_remote_state_timeout_requires_all_expected_versions(
             next_barrier_id=None,
             candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
             gate_digest=SHA_A,
-            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            now=datetime(2026, 8, 17, 7, 0, tzinfo=UTC),
             # 调用方故意声称成功；服务必须只采用事务内权威 UNKNOWN 事实。
             steps=(
                 BarrierStepFacts(
@@ -1381,5 +1655,119 @@ async def test_unknown_remote_state_timeout_requires_all_expected_versions(
             ).fetchone()
             assert event[0] == "RUN"
             assert json.loads(event[1].decode("utf-8"))["payload"]["actionRequired"] is True
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_only_unknown_timeout_persists_blocked_run_event() -> None:
+    """仅 Attempt 带 UNKNOWN_REMOTE_STATE 时也必须形成 BLOCKED/行动闭环。"""
+    connection = _connection()
+    try:
+        required_node_set_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("node-unknown-attempt",),
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": "barrier-unknown-attempt",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_node_set_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": "2026-08-17T08:00:00+00:00",
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
+        _insert(
+            connection,
+            "steps",
+            {
+                "step_id": "step-unknown-attempt",
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-1",
+                "barrier_id": "barrier-unknown-attempt",
+                "logical_node_id": "node-unknown-attempt",
+                "business_phase": "PLANNING",
+                "node_type": "RECONCILE_TARGET",
+                "required": 1,
+                "side_effect_class": "none",
+                "phase": "TERMINAL",
+                "outcome": "NONE",
+                "dependency_hash": SHA_A,
+                "required_artifacts_digest": SHA_A,
+                "success_predicate_id": "planning-complete-v1",
+                "timeout_ms": 30_000,
+                "retry_policy_id": "no-retry-v1",
+                "idempotency_key": "step-unknown-attempt-v1",
+                "state_version": 0,
+            },
+        )
+        _insert(
+            connection,
+            "attempts",
+            {
+                "attempt_id": "attempt-unknown-only",
+                "step_id": "step-unknown-attempt",
+                "supersedes_attempt_id": None,
+                "phase": "TERMINATED",
+                "outcome": "UNKNOWN_REMOTE_STATE",
+                "executor_id": "executor-unknown-only",
+                "process_session_id": "process-unknown-only",
+                "pid": 1234,
+                "process_start_time": "2026-08-17T07:00:00Z",
+                "job_object_id": "job-unknown-only",
+                "wsl_distro": None,
+                "container_id": None,
+                "image_digest": None,
+                "exit_code": None,
+                "termination_reason": "remote state unknown",
+                "fencing_token": 1,
+                "control_epoch": 1,
+                "accepted_control_command_seq": 0,
+                "interrupt_command_id": None,
+                "drain_state": "DRAINED",
+                "started_at": "2026-08-17T07:00:00Z",
+                "ended_at": "2026-08-17T07:30:00Z",
+                "state_version": 0,
+            },
+        )
+        connection.execute("UPDATE runs SET active_barrier_id='barrier-unknown-attempt'")
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-unknown-attempt"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-unknown-attempt",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id="barrier-unknown-attempt",
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=None,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 7, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        result = await service.commit_passed_barrier(request)
+        assert result.run.observed_state is RunObservedState.BLOCKED
+        assert result.run.requires_user_action is True
+        assert connection.execute(
+            "SELECT observed_state,requires_user_action,block_reason_code,state_version FROM runs"
+        ).fetchone() == ("BLOCKED", 1, "UNKNOWN_REMOTE_STATE_TIMEOUT", 1)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
     finally:
         connection.close()

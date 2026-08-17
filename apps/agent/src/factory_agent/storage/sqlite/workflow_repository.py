@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from factory_agent.domain.artifacts import Artifact
+from factory_agent.domain.plans import PlanRevisionBundle
 from factory_agent.domain.workflow import (
     AchievedStage,
     Attempt,
@@ -54,6 +56,13 @@ class ObservedStateAuthorityFacts:
     unknown_remote_state: bool
     unsettled_started_receipt: bool
     dispatch_state_valid: bool = False
+    blocking_fact: bool = False
+    block_reason_code: str | None = None
+    pausing_fact: bool = False
+    stopping_fact: bool = False
+    interrupted_fact: bool = False
+    reconciling_fact: bool = False
+    terminated_fact: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +76,20 @@ class BarrierAuthorityFacts:
     blocking_finding_count: int
     required_node_ids: tuple[str, ...] = ()
     required_node_set_digest: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _PlanBarrierAuthority:
+    """已通过领域 hydrator 校验的当前 barrier 合同投影。"""
+
+    plan_revision_id: str
+    business_phase: str
+    barrier_ordinal: int
+    pass_predicate_id: str
+    required_node_ids: tuple[str, ...]
+    nodes: Mapping[str, Mapping[str, object]]
+    barriers: tuple[Mapping[str, object], ...]
+    stage_maps: Mapping[str, tuple[str, ...]]
 
 
 class SqliteWorkflowRepository:
@@ -243,6 +266,44 @@ class SqliteWorkflowRepository:
             ).fetchone()
             is not None
         )
+        attempt_fact_rows = self._connection.execute(
+            "SELECT a.phase,a.outcome,a.drain_state FROM attempts AS a "
+            "JOIN steps AS s ON s.step_id=a.step_id WHERE s.run_id=?",
+            (run_id,),
+        ).fetchall()
+        step_fact_rows = self._connection.execute(
+            "SELECT phase,outcome FROM steps WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        blocking_finding_row = self._connection.execute(
+            "SELECT COUNT(*) FROM review_findings WHERE task_id=? "
+            "AND UPPER(severity)='BLOCKING' "
+            "AND UPPER(status) NOT IN ('CLOSED','RESOLVED','SUPERSEDED','DISMISSED')",
+            (run.task_id,),
+        ).fetchone()
+        blocking_finding = bool(blocking_finding_row and int(blocking_finding_row[0]) > 0)
+        blocking_fact = blocking_finding or unknown_remote_state or bool(run.requires_user_action)
+        block_reason_code = run.block_reason_code
+        if block_reason_code is None:
+            if blocking_finding:
+                block_reason_code = "BLOCKING_FINDING_OPEN"
+            elif unknown_remote_state:
+                block_reason_code = "UNKNOWN_REMOTE_STATE"
+        pausing_fact = active_attempt is not None and active_attempt.drain_state is DrainState.DRAINING
+        stopping_fact = active_attempt is not None and (
+            active_attempt.phase is AttemptPhase.INTERRUPTING or active_attempt.drain_state is DrainState.DRAINING
+        )
+        interrupted_fact = active_attempt is None and any(
+            outcome in {"INTERRUPTED", "KILLED", "LOST"} for _phase, outcome, _drain_state in attempt_fact_rows
+        )
+        reconciling_fact = (
+            unknown_remote_state
+            or any(
+                phase == StepPhase.RECONCILING.value or phase == AttemptPhase.RECONCILING.value
+                for phase, _outcome, _drain_state in attempt_fact_rows
+            )
+            or any(phase == StepPhase.RECONCILING.value for phase, _outcome in step_fact_rows)
+        )
         unsettled_started_receipt = (
             self._connection.execute(
                 "SELECT 1 FROM action_receipt_events AS r "
@@ -258,6 +319,16 @@ class SqliteWorkflowRepository:
             ).fetchone()
             is not None
         )
+        terminated_fact = (
+            active_attempt is None
+            and not lease_active
+            and not authorization_active
+            and not unsettled_started_receipt
+            and bool(step_fact_rows)
+            and all(phase == StepPhase.TERMINAL.value for phase, _outcome in step_fact_rows)
+            and not unknown_remote_state
+            and not blocking_fact
+        )
         return ObservedStateAuthorityFacts(
             active_attempt_count=len(active_rows),
             lease_active=lease_active,
@@ -267,6 +338,13 @@ class SqliteWorkflowRepository:
             unknown_remote_state=unknown_remote_state,
             unsettled_started_receipt=unsettled_started_receipt,
             dispatch_state_valid=dispatch_state_valid,
+            blocking_fact=blocking_fact,
+            block_reason_code=block_reason_code,
+            pausing_fact=pausing_fact,
+            stopping_fact=stopping_fact,
+            interrupted_fact=interrupted_fact,
+            reconciling_fact=reconciling_fact,
+            terminated_fact=terminated_fact,
         )
 
     def _load_required_node_authority(
@@ -275,10 +353,10 @@ class SqliteWorkflowRepository:
         barrier_id: str,
         run_id: str,
         task_id: str,
-    ) -> tuple[tuple[str, ...], str, str, str]:
-        """同一事务从不可变 PlanRevision 重算 required node 集及其摘要。"""
+    ) -> _PlanBarrierAuthority:
+        """从已验证 PlanRevisionBundle 派生当前 barrier 的完整合同投影。"""
         barrier_row = self._connection.execute(
-            "SELECT plan_revision_id,business_phase,barrier_ordinal,required_node_set_digest "
+            "SELECT plan_revision_id,business_phase,barrier_ordinal,required_node_set_digest,pass_predicate_id "
             "FROM phase_barriers WHERE barrier_id=? AND run_id=?",
             (barrier_id, run_id),
         ).fetchone()
@@ -298,38 +376,35 @@ class SqliteWorkflowRepository:
         ).fetchone()
         if task_row is None or task_row[0] != barrier_row[0]:
             raise WorkflowRepositoryError("barrier is not the current plan revision")
-        plan_row = self._connection.execute(
-            "SELECT task_id,canonical_plan_revision FROM plan_revisions WHERE plan_revision_id=?",
-            (barrier_row[0],),
-        ).fetchone()
-        if plan_row is None or plan_row[0] != task_id:
+        plan_record = self._task1.get_plan_revision(str(barrier_row[0]))
+        if plan_record is None or plan_record.get("task_id") != task_id:
             raise WorkflowRepositoryError("barrier plan lineage is incomplete")
         stored_digest = barrier_row[3]
-        if not isinstance(stored_digest, str):
+        stored_pass_predicate_id = barrier_row[4]
+        if type(stored_digest) is not str or type(stored_pass_predicate_id) is not str:
             raise WorkflowRepositoryError("barrier node set digest is invalid")
-        canonical_revision = plan_row[1]
-        if not isinstance(canonical_revision, (bytes, str)):
-            raise WorkflowRepositoryError("plan revision payload is invalid")
         try:
-            parsed_revision = json.loads(canonical_revision)
-        except (TypeError, ValueError) as exc:
-            raise WorkflowRepositoryError("plan revision payload is invalid") from exc
-        if not isinstance(parsed_revision, dict):
-            raise WorkflowRepositoryError("plan revision payload is invalid")
+            bundle = PlanRevisionBundle.from_persistence_record(plan_record)
+            parsed_revision = bundle.plan_revision
+        except (FactoryError, TypeError, ValueError) as exc:
+            raise WorkflowRepositoryError("validated plan revision is unavailable") from exc
         raw_barriers = parsed_revision.get("barriers")
-        if not isinstance(raw_barriers, list):
+        if not isinstance(raw_barriers, Sequence) or isinstance(raw_barriers, (str, bytes, bytearray)):
             raise WorkflowRepositoryError("plan revision barrier declaration is missing")
         matching_barriers = [
             barrier
             for barrier in raw_barriers
-            if isinstance(barrier, dict)
+            if isinstance(barrier, Mapping)
             and barrier.get("businessPhase") == barrier_row[1]
             and barrier.get("barrierOrdinal") == barrier_row[2]
         ]
         if len(matching_barriers) != 1:
             raise WorkflowRepositoryError("plan revision barrier selector is ambiguous")
-        raw_node_ids = matching_barriers[0].get("requiredNodeIds")
-        if not isinstance(raw_node_ids, list) or not raw_node_ids:
+        declared_barrier = matching_barriers[0]
+        if declared_barrier.get("passPredicateId") != stored_pass_predicate_id:
+            raise WorkflowRepositoryError("barrier predicate is not the plan predicate")
+        raw_node_ids = declared_barrier.get("requiredNodeIds")
+        if not isinstance(raw_node_ids, Sequence) or isinstance(raw_node_ids, (str, bytes, bytearray)):
             raise WorkflowRepositoryError("required node declaration is empty")
         required_node_ids: list[str] = []
         for node_id in raw_node_ids:
@@ -341,7 +416,100 @@ class SqliteWorkflowRepository:
         expected_digest = "sha256:" + hashlib.sha256(canonicalize(required_node_ids)).hexdigest()
         if expected_digest != stored_digest:
             raise WorkflowRepositoryError("required node set digest is inconsistent")
-        return tuple(required_node_ids), stored_digest, barrier_row[0], barrier_row[1]
+        raw_nodes = parsed_revision.get("nodes")
+        if not isinstance(raw_nodes, Sequence) or isinstance(raw_nodes, (str, bytes, bytearray)):
+            raise WorkflowRepositoryError("plan revision node registry is missing")
+        nodes: dict[str, Mapping[str, object]] = {}
+        for node in raw_nodes:
+            if not isinstance(node, Mapping):
+                raise WorkflowRepositoryError("plan revision node registry is invalid")
+            node_id = node.get("logicalNodeId")
+            if type(node_id) is not str or not node_id or node_id in nodes:
+                raise WorkflowRepositoryError("plan revision node identity is invalid")
+            required_artifacts = node.get("requiredArtifacts")
+            if (
+                not isinstance(required_artifacts, Sequence)
+                or isinstance(required_artifacts, (str, bytes, bytearray))
+                or any(type(artifact) is not str or not artifact for artifact in required_artifacts)
+            ):
+                raise WorkflowRepositoryError("plan revision artifact registry is invalid")
+            if len(set(required_artifacts)) != len(required_artifacts):
+                raise WorkflowRepositoryError("plan revision artifact registry is duplicated")
+            if (
+                any(
+                    type(node.get(field)) is not str or not node.get(field)
+                    for field in (
+                        "businessPhase",
+                        "nodeType",
+                        "sideEffectClass",
+                        "successPredicateId",
+                        "retryPolicyId",
+                    )
+                )
+                or type(node.get("barrierOrdinal")) is not int
+                or type(node.get("required")) is not bool
+            ):
+                raise WorkflowRepositoryError("plan revision node role is invalid")
+            nodes[node_id] = node
+        for node_id in required_node_ids:
+            node = nodes.get(node_id)
+            if (
+                node is None
+                or node.get("businessPhase") != barrier_row[1]
+                or node.get("barrierOrdinal") != barrier_row[2]
+            ):
+                raise WorkflowRepositoryError("required node is outside the current barrier")
+            if node.get("required") is not True:
+                raise WorkflowRepositoryError("required node role is inconsistent")
+        plan_required_node_ids = {
+            node_id
+            for node_id, node in nodes.items()
+            if node.get("businessPhase") == barrier_row[1]
+            and node.get("barrierOrdinal") == barrier_row[2]
+            and node.get("required") is True
+        }
+        if plan_required_node_ids != set(required_node_ids):
+            raise WorkflowRepositoryError("plan required node selector is incomplete")
+        raw_stage_maps = parsed_revision.get("stageMaps")
+        if not isinstance(raw_stage_maps, Mapping):
+            raise WorkflowRepositoryError("plan stage map registry is missing")
+        stage_maps: dict[str, tuple[str, ...]] = {}
+        for stage, stage_node_ids in raw_stage_maps.items():
+            if (
+                type(stage) is not str
+                or not stage
+                or not isinstance(stage_node_ids, Sequence)
+                or isinstance(stage_node_ids, (str, bytes, bytearray))
+            ):
+                raise WorkflowRepositoryError("plan stage map registry is invalid")
+            normalized_stage_nodes = tuple(stage_node_ids)
+            if any(
+                type(node_id) is not str or not node_id or node_id not in nodes for node_id in normalized_stage_nodes
+            ):
+                raise WorkflowRepositoryError("plan stage map node selector is invalid")
+            if len(set(normalized_stage_nodes)) != len(normalized_stage_nodes):
+                raise WorkflowRepositoryError("plan stage map node selector is duplicated")
+            stage_maps[stage] = normalized_stage_nodes
+        return _PlanBarrierAuthority(
+            plan_revision_id=str(barrier_row[0]),
+            business_phase=str(barrier_row[1]),
+            barrier_ordinal=int(barrier_row[2]),
+            pass_predicate_id=stored_pass_predicate_id,
+            required_node_ids=tuple(required_node_ids),
+            nodes=nodes,
+            barriers=tuple(item for item in raw_barriers if isinstance(item, Mapping)),
+            stage_maps=stage_maps,
+        )
+
+    def load_barrier_plan_authority(
+        self,
+        *,
+        barrier_id: str,
+        run_id: str,
+        task_id: str,
+    ) -> _PlanBarrierAuthority:
+        """暴露当前 active barrier 的已验证 PlanRevision 投影给应用层 lineage 检查。"""
+        return self._load_required_node_authority(barrier_id=barrier_id, run_id=run_id, task_id=task_id)
 
     def load_barrier_authority(
         self,
@@ -351,16 +519,18 @@ class SqliteWorkflowRepository:
         task_id: str,
     ) -> BarrierAuthorityFacts:
         """从权威表重算 barrier，拒绝空步骤和调用方自报的成功摘要。"""
-        (
-            required_node_ids,
-            required_node_set_digest,
-            barrier_revision_id,
-            barrier_phase,
-        ) = self._load_required_node_authority(
+        plan_authority = self._load_required_node_authority(
             barrier_id=barrier_id,
             run_id=run_id,
             task_id=task_id,
         )
+        required_node_ids = plan_authority.required_node_ids
+        barrier_revision_id = plan_authority.plan_revision_id
+        barrier_phase = plan_authority.business_phase
+        required_node_set_digest = self._connection.execute(
+            "SELECT required_node_set_digest FROM phase_barriers WHERE barrier_id=?",
+            (barrier_id,),
+        ).fetchone()[0]
         rows_cursor = self._connection.execute(
             "SELECT * FROM steps WHERE run_id=? AND barrier_id=? ORDER BY step_id",
             (run_id, barrier_id),
@@ -378,6 +548,9 @@ class SqliteWorkflowRepository:
             logical_node_id = record["logical_node_id"]
             if type(logical_node_id) is not str or not logical_node_id:
                 raise WorkflowRepositoryError("barrier logical node selector is invalid")
+            plan_node = plan_authority.nodes.get(logical_node_id)
+            if plan_node is None:
+                raise WorkflowRepositoryError("barrier step is not declared by the plan")
             actual_node_ids.append(logical_node_id)
             try:
                 phase = StepPhase(record["phase"])
@@ -389,6 +562,26 @@ class SqliteWorkflowRepository:
             except (TypeError, ValueError, KeyError) as exc:
                 raise WorkflowRepositoryError("barrier step selector is invalid") from exc
             declared_required = logical_node_id in required_node_ids
+            expected_role = {
+                "business_phase": plan_node.get("businessPhase"),
+                "node_type": plan_node.get("nodeType"),
+                "required": plan_node.get("required"),
+                "side_effect_class": plan_node.get("sideEffectClass"),
+                "success_predicate_id": plan_node.get("successPredicateId"),
+                "timeout_ms": plan_node.get("timeoutMs"),
+                "retry_policy_id": plan_node.get("retryPolicyId"),
+            }
+            if (
+                record["business_phase"] != expected_role["business_phase"]
+                or record["node_type"] != expected_role["node_type"]
+                or record["side_effect_class"] != expected_role["side_effect_class"]
+                or record["success_predicate_id"] != expected_role["success_predicate_id"]
+                or record["timeout_ms"] != expected_role["timeout_ms"]
+                or record["retry_policy_id"] != expected_role["retry_policy_id"]
+            ):
+                raise WorkflowRepositoryError("barrier step role or predicate is inconsistent")
+            if type(expected_role["required"]) is not bool or expected_role["required"] != declared_required:
+                raise WorkflowRepositoryError("plan node required role is inconsistent")
             if persisted_required != declared_required:
                 # required 身份由不可变 PlanRevision 派生，数据库漂移不能削弱 Artifact/成功谓词门禁。
                 raise WorkflowRepositoryError("barrier step required flag is inconsistent")
@@ -414,15 +607,42 @@ class SqliteWorkflowRepository:
                 ).fetchone()
                 is not None
             )
-            required_artifacts_committed = (
+            artifact_cursor = self._connection.execute(
+                "SELECT ar.* FROM artifacts AS ar JOIN attempts AS at "
+                "ON at.attempt_id=ar.producer_attempt_id "
+                "WHERE at.step_id=? ORDER BY ar.artifact_id",
+                (record["step_id"],),
+            )
+            artifact_rows = artifact_cursor.fetchall()
+            artifact_columns = tuple(item[0] for item in artifact_cursor.description)
+            committed_artifact_ids: set[str] = set()
+            for artifact_values in artifact_rows:
+                artifact_record = dict(zip(artifact_columns, artifact_values, strict=True))
+                try:
+                    artifact = Artifact.from_record(artifact_record)
+                except FactoryError as exc:
+                    raise WorkflowRepositoryError("barrier artifact identity is invalid") from exc
+                if artifact.is_gate_eligible:
+                    committed_artifact_ids.add(artifact.artifact_id)
+            raw_required_artifact_ids = plan_node.get("requiredArtifacts", ())
+            if not isinstance(raw_required_artifact_ids, Sequence) or isinstance(
+                raw_required_artifact_ids, (str, bytes)
+            ):
+                raise WorkflowRepositoryError("plan artifact requirement is invalid")
+            required_artifact_ids: tuple[object, ...] = tuple(raw_required_artifact_ids)
+            if any(type(item) is not str or not item for item in required_artifact_ids):
+                raise WorkflowRepositoryError("plan artifact requirement is invalid")
+            required_artifacts_committed = committed_artifact_ids == set(required_artifact_ids)
+            attempt_unknown = (
                 self._connection.execute(
-                    "SELECT 1 FROM artifacts AS ar JOIN attempts AS at "
-                    "ON at.attempt_id=ar.producer_attempt_id "
-                    "WHERE at.step_id=? AND ar.commit_state='COMMITTED' AND ar.digest=? LIMIT 1",
-                    (record["step_id"], record["required_artifacts_digest"]),
+                    "SELECT 1 FROM attempts WHERE step_id=? AND outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
+                    (record["step_id"],),
                 ).fetchone()
                 is not None
             )
+            if attempt_unknown:
+                # Attempt-only UNKNOWN 也必须进入 barrier 的未知闭环，不能被终止 Step 的成功投影覆盖。
+                outcome = StepOutcome.UNKNOWN_REMOTE_STATE
             facts.append(
                 BarrierStepFacts(
                     step_id=str(record["step_id"]),
@@ -431,19 +651,21 @@ class SqliteWorkflowRepository:
                     outcome=outcome,
                     active_attempt=active_attempt,
                     unsettled_started_receipt=unsettled_started_receipt,
-                    # Predicate result is the persisted terminal Step outcome; no caller boolean is trusted.
+                    # 谓词结果只能来自持久化终态 Step outcome，绝不采信调用方布尔值。
                     success_predicate_passed=phase is StepPhase.TERMINAL and outcome is StepOutcome.SUCCEEDED,
                     required_artifacts_committed=required_artifacts_committed,
                     blocking_finding_open=False,
                 )
             )
+        if len(set(actual_node_ids)) != len(actual_node_ids):
+            raise WorkflowRepositoryError("barrier step node set is duplicated")
         if not set(required_node_ids).issubset(actual_node_ids):
             raise WorkflowRepositoryError("barrier required node set is incomplete")
         blocking_cursor = self._connection.execute(
             "SELECT COUNT(*) FROM review_findings "
-            "WHERE task_id=? AND UPPER(severity)='BLOCKING' "
+            "WHERE task_id=? AND plan_revision_id=? AND UPPER(severity)='BLOCKING' "
             "AND UPPER(status) NOT IN ('CLOSED','RESOLVED','SUPERSEDED','DISMISSED')",
-            (task_id,),
+            (task_id, barrier_revision_id),
         )
         blocking_finding_count = int(blocking_cursor.fetchone()[0])
         if blocking_finding_count:
@@ -587,7 +809,29 @@ class SqliteWorkflowRepository:
         current = self.get_run(run_id)
         if current is None:
             raise WorkflowRepositoryError("run does not exist")
-        require_phase_transition(current.phase, candidate_phase)
+        if RunPhase(candidate_phase) is current.phase:
+            current_barrier = self.get_phase_barrier(current.active_barrier_id) if current.active_barrier_id else None
+            if current_barrier is None:
+                raise WorkflowRepositoryError("same-phase progress has no current barrier")
+            if next_barrier_id is None:
+                future_row = self._connection.execute(
+                    "SELECT 1 FROM phase_barriers WHERE run_id=? AND plan_revision_id=? AND barrier_ordinal>? LIMIT 1",
+                    (run_id, current_barrier.plan_revision_id, current_barrier.barrier_ordinal),
+                ).fetchone()
+                if future_row is not None:
+                    raise WorkflowRepositoryError("same-phase successor is required")
+            else:
+                next_barrier = self.get_phase_barrier(next_barrier_id)
+                if (
+                    next_barrier is None
+                    or next_barrier.run_id != run_id
+                    or next_barrier.plan_revision_id != current_barrier.plan_revision_id
+                    or next_barrier.business_phase != current.phase.value
+                    or next_barrier.barrier_ordinal <= current_barrier.barrier_ordinal
+                ):
+                    raise WorkflowRepositoryError("same-phase successor is invalid")
+        else:
+            require_phase_transition(current.phase, candidate_phase)
         row = self._task1._cas(
             table="runs",
             identity_column="run_id",

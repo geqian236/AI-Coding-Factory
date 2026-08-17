@@ -16,7 +16,7 @@ from factory_agent.domain.control import ControlCommand, ControlCommandReceiptPh
 from factory_agent.domain.workflow import Attempt, Run, RunDesiredState, RunObservedState
 from factory_agent.errors import FactoryError
 from factory_agent.observability.logging import get_logger
-from factory_agent.state_machine.transitions import require_desired_transition
+from factory_agent.state_machine.transitions import StateTransitionError, require_desired_transition
 from factory_agent.storage.sqlite.control_repository import ControlReceiptEvent, SqliteControlRepository
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork
 from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepository, WorkflowRepositoryError
@@ -181,6 +181,9 @@ class ControlService:
         run = workflow.get_run(request.run_id)
         if run is None:
             raise WorkflowRepositoryError("run does not exist")
+        if run.observed_state is RunObservedState.TERMINATED:
+            # 终止态没有可恢复的控制面；幂等命令也不能重新打开已终止 Run。
+            raise StateTransitionError("terminated run rejects all control commands")
         desired = _desired_target(request.command_type)
         attempt = (
             workflow.get_active_attempt_for_run(run.run_id) if request.command_type in _BLOCKING_COMMANDS else None
