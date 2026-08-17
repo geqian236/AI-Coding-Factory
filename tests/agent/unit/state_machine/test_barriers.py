@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from factory_agent.domain.workflow import AchievedStage, StepOutcome, StepPhase, TargetStage
-from factory_agent.state_machine.barriers import BarrierStepFacts, evaluate_barrier
+from factory_agent.state_machine.barriers import BarrierContractError, BarrierStepFacts, evaluate_barrier
 from factory_agent.state_machine.milestones import (
     MilestoneEvidence,
     MilestoneEvidenceError,
@@ -30,6 +30,15 @@ def _step(**overrides: object) -> BarrierStepFacts:
     }
     values.update(overrides)
     return BarrierStepFacts(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["phase", "outcome"])
+def test_barrier_step_invalid_enum_maps_to_factory_error(field: str) -> None:
+    """Barrier 事实入口遇到未知枚举时必须返回稳定 FactoryError，而不是泄漏 ValueError。"""
+    with pytest.raises(BarrierContractError) as caught:
+        _step(**{field: "NOT_A_FROZEN_ENUM"})
+
+    assert caught.value.error_code == "INVALID_BARRIER_FACTS"
 
 
 def test_barrier_is_settled_and_passed_only_when_all_frozen_predicates_hold() -> None:
@@ -149,3 +158,25 @@ def test_milestone_rejects_missing_or_unsettled_evidence(evidence: MilestoneEvid
             target=TargetStage.PRODUCTION_ACCEPTED,
             evidence=evidence,
         )
+
+
+@pytest.mark.parametrize("invalid_target", ["NOT_A_TARGET_STAGE", ""])
+def test_milestone_invalid_target_maps_to_factory_error(invalid_target: str) -> None:
+    """里程碑 target 的 wire 枚举必须在公共入口映射为稳定业务异常。"""
+    evidence = MilestoneEvidence(
+        barrier_passed=True,
+        active_attempt_count=0,
+        unknown_remote_state=False,
+        required_artifacts_committed=True,
+        blocking_finding_count=0,
+    )
+
+    with pytest.raises(MilestoneEvidenceError) as caught:
+        evaluate_milestone(
+            current=AchievedStage.DESIGN_APPROVED,
+            candidate=AchievedStage.CODEX_APPROVED,
+            target=invalid_target,  # type: ignore[arg-type]
+            evidence=evidence,
+        )
+
+    assert caught.value.error_code == "MILESTONE_EVIDENCE_INCOMPLETE"

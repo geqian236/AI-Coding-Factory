@@ -94,6 +94,7 @@ class _PlanBarrierAuthority:
     settle_timeout_ms: int
     nodes: Mapping[str, Mapping[str, object]]
     barriers: tuple[Mapping[str, object], ...]
+    barrier_wire_index: Mapping[tuple[str, int], int]
     stage_maps: Mapping[str, tuple[str, ...]]
 
 
@@ -454,6 +455,18 @@ class SqliteWorkflowRepository:
         raw_barriers = parsed_revision.get("barriers")
         if not isinstance(raw_barriers, Sequence) or isinstance(raw_barriers, (str, bytes, bytearray)):
             raise WorkflowRepositoryError("plan revision barrier declaration is missing")
+        barrier_wire_index: dict[tuple[str, int], int] = {}
+        for wire_index, barrier in enumerate(raw_barriers):
+            if not isinstance(barrier, Mapping):
+                raise WorkflowRepositoryError("plan revision barrier declaration is invalid")
+            phase = barrier.get("businessPhase")
+            ordinal = barrier.get("barrierOrdinal")
+            if type(phase) is not str or not phase or type(ordinal) is not int or ordinal < 0:
+                raise WorkflowRepositoryError("plan revision barrier selector is invalid")
+            key = (phase, ordinal)
+            if key in barrier_wire_index:
+                raise WorkflowRepositoryError("plan revision barrier selector is duplicated")
+            barrier_wire_index[key] = wire_index
         matching_barriers = [
             barrier
             for barrier in raw_barriers
@@ -527,6 +540,9 @@ class SqliteWorkflowRepository:
                 or type(node.get("required")) is not bool
             ):
                 raise WorkflowRepositoryError("plan revision node role is invalid")
+            node_key = (str(node["businessPhase"]), int(node["barrierOrdinal"]))
+            if node_key not in barrier_wire_index:
+                raise WorkflowRepositoryError("plan revision node barrier is not declared")
             nodes[node_id] = node
         for node in nodes.values():
             dependencies = node.get("dependsOn")
@@ -610,6 +626,7 @@ class SqliteWorkflowRepository:
             settle_timeout_ms=stored_settle_timeout_ms,
             nodes=nodes,
             barriers=tuple(item for item in raw_barriers if isinstance(item, Mapping)),
+            barrier_wire_index=barrier_wire_index,
             stage_maps=stage_maps,
         )
 
@@ -766,6 +783,9 @@ class SqliteWorkflowRepository:
         required_node_ids = plan_authority.required_node_ids
         barrier_revision_id = plan_authority.plan_revision_id
         barrier_phase = plan_authority.business_phase
+        current_wire_index = plan_authority.barrier_wire_index.get((barrier_phase, plan_authority.barrier_ordinal))
+        if current_wire_index is None:
+            raise WorkflowRepositoryError("current barrier wire order is missing")
         required_node_set_digest = self._connection.execute(
             "SELECT required_node_set_digest FROM phase_barriers WHERE barrier_id=?",
             (barrier_id,),
@@ -847,6 +867,14 @@ class SqliteWorkflowRepository:
                 dependency_node = plan_authority.nodes.get(dependency_id)
                 if dependency_node is None:
                     raise WorkflowRepositoryError("barrier dependency node is not declared")
+                dependency_phase = dependency_node.get("businessPhase")
+                dependency_ordinal = dependency_node.get("barrierOrdinal")
+                if type(dependency_phase) is not str or type(dependency_ordinal) is not int:
+                    raise WorkflowRepositoryError("barrier dependency barrier selector is invalid")
+                dependency_wire_index = plan_authority.barrier_wire_index.get((dependency_phase, dependency_ordinal))
+                if dependency_wire_index is None or dependency_wire_index > current_wire_index:
+                    # 依赖只能指向当前或已完成 wire barrier，禁止未来 barrier 反向伪造当前 gate。
+                    raise WorkflowRepositoryError("barrier dependency points to a future barrier")
                 self._require_successful_dependency_step(
                     run_id=run_id,
                     plan_revision_id=barrier_revision_id,
@@ -1049,6 +1077,43 @@ class SqliteWorkflowRepository:
         current_persisted = persisted_by_key[(current_business_phase, current_barrier_ordinal)]
         if current_persisted[4] != 0 or current_persisted[5] != 0:
             raise WorkflowRepositoryError("current barrier is already passed")
+        future_keys = [
+            key
+            for index, spec in enumerate(barrier_specs)
+            if index > current_index
+            for key in [(spec.get("businessPhase"), spec.get("barrierOrdinal"))]
+        ]
+        for phase, ordinal in future_keys:
+            if type(phase) is not str or type(ordinal) is not int:
+                raise WorkflowRepositoryError("barrier successor selector is invalid")
+            successor_id = persisted_by_key[(phase, ordinal)][0]
+            step_cursor = self._connection.execute(
+                "SELECT step_id,phase,outcome FROM steps WHERE run_id=? AND plan_revision_id=? AND barrier_id=?",
+                (run_id, plan_revision_id, successor_id),
+            )
+            successor_steps = step_cursor.fetchall()
+            for step_id, step_phase, step_outcome in successor_steps:
+                if (
+                    step_phase not in {StepPhase.PENDING.value, StepPhase.READY.value}
+                    or step_outcome != StepOutcome.NONE.value
+                ):
+                    # 后继只有未派发的 PENDING/READY 空壳可以预建，任何执行态或终态都意味着跨 barrier 提前执行。
+                    raise WorkflowRepositoryError("barrier successor step was preexecuted")
+                attempt_row = self._connection.execute(
+                    "SELECT 1 FROM attempts WHERE step_id=? LIMIT 1",
+                    (step_id,),
+                ).fetchone()
+                if attempt_row is not None:
+                    raise WorkflowRepositoryError("barrier successor attempt was precreated")
+                receipt_row = self._connection.execute(
+                    "SELECT 1 FROM action_receipt_events AS r "
+                    "JOIN attempts AS a ON a.attempt_id=r.attempt_id "
+                    "JOIN steps AS s ON s.step_id=a.step_id "
+                    "WHERE s.run_id=? AND s.plan_revision_id=? AND s.barrier_id=? LIMIT 1",
+                    (run_id, plan_revision_id, successor_id),
+                ).fetchone()
+                if receipt_row is not None:
+                    raise WorkflowRepositoryError("barrier successor receipt was precreated")
         return current_index
 
     def update_run_control(

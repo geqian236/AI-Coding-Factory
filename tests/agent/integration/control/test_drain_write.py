@@ -50,6 +50,39 @@ def _guard_context(**overrides: object) -> WriteGuardContext:
     return WriteGuardContext(**values)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("field", ["run_desired_state", "attempt_drain_state"])
+def test_write_guard_context_invalid_enum_maps_to_factory_error(field: str) -> None:
+    """写保护上下文不能把未知 wire 枚举泄漏为原生 ValueError。"""
+    with pytest.raises(WriteGuardError) as caught:
+        _guard_context(**{field: "NOT_A_FROZEN_ENUM"})
+
+    assert caught.value.error_code == "WRITE_GUARD_REJECTED"
+
+
+@pytest.mark.parametrize("invalid_operation", ["NOT_A_WRITE_OPERATION", ""])
+def test_require_write_invalid_operation_maps_to_factory_error(invalid_operation: str) -> None:
+    """写操作入口必须把非法枚举映射为稳定错误码。"""
+    with pytest.raises(WriteGuardError) as caught:
+        require_write(_guard_context(), invalid_operation)  # type: ignore[arg-type]
+
+    assert caught.value.error_code == "WRITE_GUARD_REJECTED"
+
+
+@pytest.mark.parametrize("invalid_observed_state", ["NOT_A_RUN_STATE", ""])
+def test_require_new_attempt_dispatch_invalid_observed_maps_to_factory_error(
+    invalid_observed_state: str,
+) -> None:
+    """新 Attempt 派发入口必须把非法 observed wire 值映射为稳定错误码。"""
+    with pytest.raises(WriteGuardError) as caught:
+        require_new_attempt_dispatch(
+            observed_state=invalid_observed_state,  # type: ignore[arg-type]
+            new_attempt_id="attempt-new",
+            previous_attempt_id="attempt-old",
+        )
+
+    assert caught.value.error_code == "WRITE_GUARD_REJECTED"
+
+
 def _insert_attempt_graph(connection: object) -> None:
     """在 FK-on migration schema 中插入完整 Plan/Barrier/Step/Attempt lineage。"""
     required_node_set_digest = _insert_plan_revision_for_barrier(

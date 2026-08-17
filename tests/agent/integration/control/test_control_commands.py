@@ -359,6 +359,7 @@ def _insert_passing_planning_graph(
     next_required_node_set_digest: str | None = None,
     next_settle_timeout_ms: int = 30_000,
     run_spec_target_stage: str = "CODEX_APPROVED",
+    dependencies_by_node: Mapping[str, tuple[str, ...]] | None = None,
 ) -> None:
     """插入可通过 planning gate 的完整图，并允许单独污染 next barrier 持久 selector。"""
     planning_digest = _insert_plan_revision_for_barrier(
@@ -366,6 +367,7 @@ def _insert_passing_planning_graph(
         required_node_ids=("plan",),
         additional_barriers=(("DESIGN_REVIEWING", 1, ("design-review",), "design-approved-v1"),),
         run_spec_target_stage=run_spec_target_stage,
+        dependencies_by_node=dependencies_by_node,
     )
     design_digest = _selector_digest(["design-review"])
     planning_barrier_id = _derived_barrier_id(
@@ -715,6 +717,7 @@ def _insert_successful_plan_step(
             "state_version": 0,
         },
     )
+
     _insert(
         connection,
         "attempts",
@@ -754,6 +757,84 @@ def _insert_successful_plan_step(
             "confidentiality": "INTERNAL",
             "commit_state": "COMMITTED",
             "storage_path": required_artifact_id,
+            "size_bytes": 1,
+            "digest": SHA_A,
+            "created_at": "2026-08-17T07:30:00Z",
+        },
+    )
+
+
+def _insert_successful_design_review_step(
+    connection: sqlite3.Connection,
+    *,
+    barrier_id: str,
+    step_id: str,
+    attempt_id: str,
+) -> None:
+    """为后继 barrier 预执行反例写入完整成功 Step、Attempt 与 Artifact。"""
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": step_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": barrier_id,
+            "logical_node_id": "design-review",
+            "business_phase": "DESIGN_REVIEWING",
+            "node_type": "DESIGN_REVIEW",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest(["artifact-design-stale"]),
+            "success_predicate_id": "design-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": f"{step_id}-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": attempt_id,
+            "step_id": step_id,
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": f"executor-{attempt_id}",
+            "process_session_id": f"process-{attempt_id}",
+            "pid": 1234,
+            "process_start_time": "2026-08-17T07:00:00Z",
+            "job_object_id": f"job-{attempt_id}",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 1,
+            "control_epoch": 1,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "DRAINED",
+            "started_at": "2026-08-17T07:00:00Z",
+            "ended_at": "2026-08-17T07:30:00Z",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "artifacts",
+        {
+            "artifact_id": "artifact-design-stale",
+            "producer_attempt_id": attempt_id,
+            "media_type": "text/plain",
+            "confidentiality": "INTERNAL",
+            "commit_state": "COMMITTED",
+            "storage_path": "artifact-design-stale",
             "size_bytes": 1,
             "digest": SHA_A,
             "created_at": "2026-08-17T07:30:00Z",
@@ -1881,6 +1962,100 @@ async def test_passed_barrier_rejects_prepassed_successor() -> None:
         assert connection.execute(
             "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
         ).fetchall() == [(0, 0, 0), (1, 1, 1)]
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_passed_barrier_rejects_dependency_on_future_barrier() -> None:
+    """当前 barrier 的 dependsOn 不得跨越 wire 序列依赖未来 barrier。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, dependencies_by_node={"plan": ("design-review",)})
+        current_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        next_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        _insert_successful_design_review_step(
+            connection,
+            barrier_id=next_id,
+            step_id="step-design-review-future-dependency",
+            attempt_id="attempt-design-review-future-dependency",
+        )
+        connection.execute(
+            "UPDATE steps SET dependency_hash=? WHERE logical_node_id='plan'",
+            (_selector_digest(["design-review"]),),
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-future-dependency"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-future-dependency",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=current_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=next_id,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
+        ).fetchall() == [(0, 0, 0), (0, 0, 0)]
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_passed_barrier_rejects_preexecuted_successor_step() -> None:
+    """后继 barrier 即使仍未 passed，也不得已有终态 Step、Attempt 和副作用 Artifact。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        current_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        next_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        _insert_successful_design_review_step(
+            connection,
+            barrier_id=next_id,
+            step_id="step-design-review-preexecuted",
+            attempt_id="attempt-design-review-preexecuted",
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-preexecuted-successor"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        request = BarrierMilestoneRequest(
+            request_id="request-preexecuted-successor",
+            task_id="task-control-1",
+            run_id="run-control-1",
+            barrier_id=current_id,
+            expected_task_state_version=0,
+            expected_run_state_version=0,
+            expected_barrier_state_version=0,
+            next_phase=RunPhase.DESIGN_REVIEWING,
+            next_barrier_id=next_id,
+            candidate_achieved_stage=AchievedStage.DESIGN_APPROVED,
+            gate_digest=SHA_A,
+            now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            steps=(),
+            milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
+        )
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(request)
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
+        ).fetchall() == [(0, 0, 0), (0, 0, 0)]
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()

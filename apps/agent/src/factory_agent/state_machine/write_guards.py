@@ -69,8 +69,12 @@ class WriteGuardContext:
 
     def __post_init__(self) -> None:
         """拒绝空 identity、负数与 bool/int 混淆，避免宽松比较绕过 fencing。"""
-        object.__setattr__(self, "run_desired_state", RunDesiredState(self.run_desired_state))
-        object.__setattr__(self, "attempt_drain_state", DrainState(self.attempt_drain_state))
+        try:
+            # wire 枚举必须映射为统一写保护异常，避免调用方收到不稳定的原生 ValueError。
+            object.__setattr__(self, "run_desired_state", RunDesiredState(self.run_desired_state))
+            object.__setattr__(self, "attempt_drain_state", DrainState(self.attempt_drain_state))
+        except (TypeError, ValueError) as exc:
+            raise WriteGuardError("write guard enum is invalid") from exc
         numeric_fields = (
             self.run_control_command_seq,
             self.run_state_version,
@@ -114,7 +118,10 @@ def _drain_write_allowed(context: WriteGuardContext) -> bool:
 
 def require_write(context: WriteGuardContext, operation: WriteOperation) -> WriteMode:
     """返回唯一允许模式；旧序号只能在 DRAIN 白名单内安全收尾。"""
-    requested_operation = WriteOperation(operation)
+    try:
+        requested_operation = WriteOperation(operation)
+    except (TypeError, ValueError) as exc:
+        raise WriteGuardError("write operation is invalid") from exc
     if _normal_write_allowed(context):
         return WriteMode.NORMAL_WRITE
     if _drain_write_allowed(context) and requested_operation in _DRAIN_OPERATIONS:
@@ -129,8 +136,12 @@ def require_new_attempt_dispatch(
     previous_attempt_id: str | None,
 ) -> None:
     """新 Attempt 只可从 QUEUED 派发，且必须使用未复用的新 identity。"""
+    try:
+        requested_observed_state = RunObservedState(observed_state)
+    except (TypeError, ValueError) as exc:
+        raise WriteGuardError("observed state is invalid") from exc
     if (
-        RunObservedState(observed_state) is not RunObservedState.QUEUED
+        requested_observed_state is not RunObservedState.QUEUED
         or not isinstance(new_attempt_id, str)
         or not new_attempt_id
         or new_attempt_id == previous_attempt_id

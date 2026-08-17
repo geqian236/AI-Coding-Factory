@@ -56,7 +56,14 @@ def evaluate_milestone(
     evidence: MilestoneEvidence,
 ) -> MilestoneDecision:
     """在完整证据下推进一个里程碑；达到所选 target 才建议 Task SUCCEEDED。"""
-    require_achieved_stage_transition(current, candidate)
+    try:
+        current_stage = AchievedStage(current)
+        candidate_stage = AchievedStage(candidate)
+        target_stage = TargetStage(target)
+    except (TypeError, ValueError) as exc:
+        # 里程碑公共入口统一返回 FactoryError，避免非法 wire 枚举泄漏 ValueError。
+        raise MilestoneEvidenceError("milestone enum is invalid") from exc
+    require_achieved_stage_transition(current_stage, candidate_stage)
     if not (
         evidence.barrier_passed
         and evidence.active_attempt_count == 0
@@ -65,8 +72,7 @@ def evaluate_milestone(
         and evidence.blocking_finding_count == 0
     ):
         raise MilestoneEvidenceError("milestone success evidence is incomplete")
-    candidate_stage = AchievedStage(candidate)
-    target_reached = candidate_stage.value == TargetStage(target).value
+    target_reached = candidate_stage.value == target_stage.value
     return MilestoneDecision(
         achieved_stage=candidate_stage,
         target_reached=target_reached,

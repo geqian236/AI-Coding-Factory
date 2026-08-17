@@ -44,8 +44,12 @@ class BarrierStepFacts:
         ):
             if type(getattr(self, name)) is not bool:
                 raise BarrierContractError("barrier boolean fact is invalid")
-        object.__setattr__(self, "phase", StepPhase(self.phase))
-        object.__setattr__(self, "outcome", StepOutcome(self.outcome))
+        try:
+            # wire 枚举必须在 Barrier 边界收敛，不能让 Python 原生 ValueError 穿透服务层。
+            object.__setattr__(self, "phase", StepPhase(self.phase))
+            object.__setattr__(self, "outcome", StepOutcome(self.outcome))
+        except (TypeError, ValueError) as exc:
+            raise BarrierContractError("barrier step enum is invalid") from exc
 
 
 @dataclass(frozen=True, slots=True)
