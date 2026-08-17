@@ -90,6 +90,7 @@ class ObservedStateEvidence:
     heartbeat_valid: bool
     unknown_remote_state: bool
     unsettled_started_receipt: bool
+    dispatch_state_valid: bool = False
 
     def __post_init__(self) -> None:
         """阻断负计数和 bool/int 混淆。"""
@@ -100,6 +101,7 @@ class ObservedStateEvidence:
             self.heartbeat_valid,
             self.unknown_remote_state,
             self.unsettled_started_receipt,
+            self.dispatch_state_valid,
         )
         if (
             type(self.active_attempt_count) is not int
@@ -183,6 +185,7 @@ def require_observed_target_predicates(
             and evidence.authorization_active
             and evidence.control_sequence_current
             and evidence.heartbeat_valid
+            and evidence.dispatch_state_valid
             and not evidence.unknown_remote_state
         )
     elif target is RunObservedState.PAUSED:
@@ -276,6 +279,8 @@ def _authoritative_gate_digest(
         "unknownRemoteState": authority.unknown_remote_state,
         "requiredArtifactsCommitted": authority.required_artifacts_committed,
         "blockingFindingCount": authority.blocking_finding_count,
+        "requiredNodeIds": list(authority.required_node_ids),
+        "requiredNodeSetDigest": authority.required_node_set_digest,
         "steps": [
             {
                 "stepId": step.step_id,
@@ -341,6 +346,7 @@ class TransitionService:
                     heartbeat_valid=authority.heartbeat_valid,
                     unknown_remote_state=authority.unknown_remote_state,
                     unsettled_started_receipt=authority.unsettled_started_receipt,
+                    dispatch_state_valid=authority.dispatch_state_valid,
                 ),
             )
             updated = repository.transition_observed(
@@ -444,6 +450,36 @@ class TransitionService:
             raise BarrierMilestoneCommitError("barrier authority facts are incomplete") from exc
         except (TypeError, ValueError) as exc:
             raise BarrierMilestoneCommitError("barrier deadline is invalid") from exc
+        if (
+            not barrier_decision.settled
+            and barrier_decision.requires_user_action
+            and barrier_decision.block_reason_code == "UNKNOWN_REMOTE_STATE_TIMEOUT"
+        ):
+            # 未知远端状态不能伪造成功；超时在本事务落成 BLOCKED，并保留可追踪行动事件。
+            updated_run = repository.block_run_for_action_required(
+                run_id=current_run.run_id,
+                expected_state_version=request.expected_run_state_version,
+                reason_code=barrier_decision.block_reason_code,
+            )
+            append_authoritative_state_event(
+                unit_of_work,
+                state_event_id=self._state_event_id_factory(),
+                aggregate_type="RUN",
+                aggregate_id=updated_run.run_id,
+                task_id=current_task.task_id,
+                run_id=updated_run.run_id,
+                step_id=None,
+                attempt_id=None,
+                previous_state_version=request.expected_run_state_version,
+                state_version=updated_run.state_version,
+                payload={
+                    "observedState": updated_run.observed_state.value,
+                    "requiresUserAction": updated_run.requires_user_action,
+                    "blockReasonCode": updated_run.block_reason_code,
+                    "actionRequired": True,
+                },
+            )
+            return BarrierMilestoneResult(barrier=current_barrier, run=updated_run, task=current_task)
         if not barrier_decision.settled or not barrier_decision.passed:
             raise BarrierMilestoneCommitError("barrier gate has not passed")
         gate_digest = _authoritative_gate_digest(
@@ -551,17 +587,29 @@ class TransitionService:
                 error_code=getattr(exc, "error_code", type(exc).__name__),
             )
             raise
-        LOGGER.info(
-            "barrier_milestone_committed",
-            request_id=request.request_id,
-            run_id=request.run_id,
-            operation="commit_passed_barrier",
-            status="committed",
-            duration_ms=round((time.monotonic() - started) * 1000, 3),
-            task_state_version=result.task.state_version,
-            run_state_version=result.run.state_version,
-            barrier_state_version=result.barrier.state_version,
-        )
+        if result.run.requires_user_action:
+            LOGGER.warning(
+                "barrier_milestone_action_required",
+                request_id=request.request_id,
+                run_id=request.run_id,
+                operation="commit_passed_barrier",
+                status="action_required",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                block_reason_code=result.run.block_reason_code,
+                run_state_version=result.run.state_version,
+            )
+        else:
+            LOGGER.info(
+                "barrier_milestone_committed",
+                request_id=request.request_id,
+                run_id=request.run_id,
+                operation="commit_passed_barrier",
+                status="committed",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                task_state_version=result.task.state_version,
+                run_state_version=result.run.state_version,
+                barrier_state_version=result.barrier.state_version,
+            )
         return result
 
 

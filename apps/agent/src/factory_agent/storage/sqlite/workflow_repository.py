@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -22,6 +24,7 @@ from factory_agent.domain.workflow import (
     TaskLifecycle,
 )
 from factory_agent.errors import FactoryError
+from factory_agent.policy.canonical_json import canonicalize
 from factory_agent.state_machine.barriers import BarrierStepFacts
 from factory_agent.state_machine.transitions import (
     require_achieved_stage_transition,
@@ -50,6 +53,7 @@ class ObservedStateAuthorityFacts:
     heartbeat_valid: bool
     unknown_remote_state: bool
     unsettled_started_receipt: bool
+    dispatch_state_valid: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +65,8 @@ class BarrierAuthorityFacts:
     unknown_remote_state: bool
     required_artifacts_committed: bool
     blocking_finding_count: int
+    required_node_ids: tuple[str, ...] = ()
+    required_node_set_digest: str = ""
 
 
 class SqliteWorkflowRepository:
@@ -153,7 +159,18 @@ class SqliteWorkflowRepository:
         heartbeat_valid = False
         authorization_active = False
         control_sequence_current = False
+        dispatch_state_valid = False
         if active_attempt is not None:
+            step_phase_row = self._connection.execute(
+                "SELECT phase FROM steps WHERE step_id=? AND run_id=?",
+                (active_attempt.step_id, run_id),
+            ).fetchone()
+            # 只有 Step 与 Attempt 都进入 RUNNING，观察态才可越过 QUEUED。
+            dispatch_state_valid = (
+                active_attempt.phase is AttemptPhase.RUNNING
+                and step_phase_row is not None
+                and step_phase_row[0] == StepPhase.RUNNING.value
+            )
             lease_row = self._connection.execute(
                 "SELECT 1 FROM resource_leases "
                 "WHERE owner_executor_id=? AND fencing_token=? AND control_epoch=? "
@@ -248,7 +265,68 @@ class SqliteWorkflowRepository:
             heartbeat_valid=heartbeat_valid,
             unknown_remote_state=unknown_remote_state,
             unsettled_started_receipt=unsettled_started_receipt,
+            dispatch_state_valid=dispatch_state_valid,
         )
+
+    def _load_required_node_authority(
+        self,
+        *,
+        barrier_id: str,
+        run_id: str,
+        task_id: str,
+    ) -> tuple[tuple[str, ...], str]:
+        """同一事务从不可变 PlanRevision 重算 required node 集及其摘要。"""
+        barrier_row = self._connection.execute(
+            "SELECT plan_revision_id,business_phase,barrier_ordinal,required_node_set_digest "
+            "FROM phase_barriers WHERE barrier_id=? AND run_id=?",
+            (barrier_id, run_id),
+        ).fetchone()
+        if barrier_row is None:
+            raise WorkflowRepositoryError("barrier declaration is missing")
+        plan_row = self._connection.execute(
+            "SELECT task_id,canonical_plan_revision FROM plan_revisions WHERE plan_revision_id=?",
+            (barrier_row[0],),
+        ).fetchone()
+        if plan_row is None or plan_row[0] != task_id:
+            raise WorkflowRepositoryError("barrier plan lineage is incomplete")
+        stored_digest = barrier_row[3]
+        if not isinstance(stored_digest, str):
+            raise WorkflowRepositoryError("barrier node set digest is invalid")
+        canonical_revision = plan_row[1]
+        if not isinstance(canonical_revision, (bytes, str)):
+            raise WorkflowRepositoryError("plan revision payload is invalid")
+        try:
+            parsed_revision = json.loads(canonical_revision)
+        except (TypeError, ValueError) as exc:
+            raise WorkflowRepositoryError("plan revision payload is invalid") from exc
+        if not isinstance(parsed_revision, dict):
+            raise WorkflowRepositoryError("plan revision payload is invalid")
+        raw_barriers = parsed_revision.get("barriers")
+        if not isinstance(raw_barriers, list):
+            raise WorkflowRepositoryError("plan revision barrier declaration is missing")
+        matching_barriers = [
+            barrier
+            for barrier in raw_barriers
+            if isinstance(barrier, dict)
+            and barrier.get("businessPhase") == barrier_row[1]
+            and barrier.get("barrierOrdinal") == barrier_row[2]
+        ]
+        if len(matching_barriers) != 1:
+            raise WorkflowRepositoryError("plan revision barrier selector is ambiguous")
+        raw_node_ids = matching_barriers[0].get("requiredNodeIds")
+        if not isinstance(raw_node_ids, list) or not raw_node_ids:
+            raise WorkflowRepositoryError("required node declaration is empty")
+        required_node_ids: list[str] = []
+        for node_id in raw_node_ids:
+            if type(node_id) is not str or not node_id:
+                raise WorkflowRepositoryError("required node declaration is invalid")
+            required_node_ids.append(node_id)
+        if len(set(required_node_ids)) != len(required_node_ids):
+            raise WorkflowRepositoryError("required node declaration is duplicated")
+        expected_digest = "sha256:" + hashlib.sha256(canonicalize(required_node_ids)).hexdigest()
+        if expected_digest != stored_digest:
+            raise WorkflowRepositoryError("required node set digest is inconsistent")
+        return tuple(required_node_ids), stored_digest
 
     def load_barrier_authority(
         self,
@@ -258,6 +336,11 @@ class SqliteWorkflowRepository:
         task_id: str,
     ) -> BarrierAuthorityFacts:
         """从权威表重算 barrier，拒绝空步骤和调用方自报的成功摘要。"""
+        required_node_ids, required_node_set_digest = self._load_required_node_authority(
+            barrier_id=barrier_id,
+            run_id=run_id,
+            task_id=task_id,
+        )
         rows_cursor = self._connection.execute(
             "SELECT * FROM steps WHERE run_id=? AND barrier_id=? ORDER BY step_id",
             (run_id, barrier_id),
@@ -267,8 +350,13 @@ class SqliteWorkflowRepository:
             raise WorkflowRepositoryError("barrier has no authoritative steps")
         columns = tuple(item[0] for item in rows_cursor.description)
         facts: list[BarrierStepFacts] = []
+        actual_node_ids: list[str] = []
         for values in rows:
             record = dict(zip(columns, values, strict=True))
+            logical_node_id = record["logical_node_id"]
+            if type(logical_node_id) is not str or not logical_node_id:
+                raise WorkflowRepositoryError("barrier logical node selector is invalid")
+            actual_node_ids.append(logical_node_id)
             try:
                 phase = StepPhase(record["phase"])
                 outcome = StepOutcome(record["outcome"])
@@ -322,6 +410,8 @@ class SqliteWorkflowRepository:
                     blocking_finding_open=False,
                 )
             )
+        if not set(required_node_ids).issubset(actual_node_ids):
+            raise WorkflowRepositoryError("barrier required node set is incomplete")
         blocking_cursor = self._connection.execute(
             "SELECT COUNT(*) FROM review_findings "
             "WHERE task_id=? AND UPPER(severity)='BLOCKING' "
@@ -367,6 +457,8 @@ class SqliteWorkflowRepository:
             unknown_remote_state=unknown_remote_state,
             required_artifacts_committed=required_artifacts_committed,
             blocking_finding_count=blocking_finding_count,
+            required_node_ids=required_node_ids,
+            required_node_set_digest=required_node_set_digest,
         )
 
     def update_run_control(
@@ -426,6 +518,35 @@ class SqliteWorkflowRepository:
             aggregate_type="PHASE_BARRIER",
         )
         return self._hydrate_barrier(row)
+
+    def block_run_for_action_required(
+        self,
+        *,
+        run_id: str,
+        expected_state_version: int,
+        reason_code: str,
+    ) -> Run:
+        """UNKNOWN 超时在同一 owner transaction 内落成 BLOCKED/ACTION_REQUIRED。"""
+        current = self.get_run(run_id)
+        if current is None:
+            raise WorkflowRepositoryError("run does not exist")
+        # 通过统一转换图校验 BLOCKED 边，CAS 失败时由 coordinator 整体回滚。
+        require_observed_transition(current.observed_state, RunObservedState.BLOCKED)
+        row = self._task1._cas(
+            table="runs",
+            identity_column="run_id",
+            identity=run_id,
+            expected_state_version=expected_state_version,
+            changes={
+                "observed_state": RunObservedState.BLOCKED.value,
+                "requires_user_action": 1,
+                "block_reason_code": reason_code,
+            },
+            aggregate_type="RUN",
+        )
+        record = {key: row[key] for key in Run.__dataclass_fields__}
+        record["requires_user_action"] = bool(record["requires_user_action"])
+        return Run.from_record(record)
 
     def advance_run_phase(
         self,
