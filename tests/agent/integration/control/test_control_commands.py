@@ -697,6 +697,151 @@ def _insert_secondary_run_graph(connection: sqlite3.Connection) -> tuple[str, st
     return "step-control-2", "attempt-control-2"
 
 
+def _insert_historical_attempt_graph(connection: sqlite3.Connection) -> tuple[str, str, str]:
+    """插入同一 Task 的旧 PlanRevision 与自洽终态 Step/Attempt，保持 FK-on。"""
+    current_plan_revision_id = connection.execute(
+        "SELECT active_plan_revision_id FROM tasks WHERE task_id=?", ("task-control-1",)
+    ).fetchone()[0]
+    required_digest = _insert_plan_revision_for_barrier(
+        connection,
+        required_node_ids=("plan",),
+        plan_revision_id="plan-control-old",
+        spec_revision=2,
+        run_spec_target_stage="DESIGN_APPROVED",
+    )
+    connection.execute(
+        "UPDATE tasks SET active_plan_revision_id=? WHERE task_id=?",
+        (current_plan_revision_id, "task-control-1"),
+    )
+    old_barrier_id = _derived_barrier_id(
+        connection,
+        business_phase="PLANNING",
+        barrier_ordinal=0,
+        plan_revision_id="plan-control-old",
+    )
+    _insert(
+        connection,
+        "phase_barriers",
+        {
+            "barrier_id": old_barrier_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-old",
+            "business_phase": "PLANNING",
+            "barrier_ordinal": 0,
+            "required_node_set_digest": required_digest,
+            "settle_timeout_ms": 30_000,
+            "settle_deadline_at": None,
+            "pass_predicate_id": "planning-approved-v1",
+            "settled": 1,
+            "passed": 1,
+            "gate_digest": SHA_A,
+            "state_version": 1,
+        },
+    )
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": "step-planning-historical",
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-old",
+            "barrier_id": old_barrier_id,
+            "logical_node_id": "plan",
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest(["artifact-planning"]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": "step-planning-historical-v1",
+            "state_version": 0,
+        },
+    )
+    _insert(
+        connection,
+        "attempts",
+        {
+            "attempt_id": "attempt-planning-historical",
+            "step_id": "step-planning-historical",
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": "executor-planning-historical",
+            "process_session_id": "process-planning-historical",
+            "pid": 3456,
+            "process_start_time": "2026-08-17T06:00:00Z",
+            "job_object_id": "job-planning-historical",
+            "wsl_distro": None,
+            "container_id": None,
+            "image_digest": None,
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 11,
+            "control_epoch": 4,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "DRAINED",
+            "started_at": "2026-08-17T06:00:00Z",
+            "ended_at": "2026-08-17T06:30:00Z",
+            "state_version": 0,
+        },
+    )
+    return "plan-control-old", "step-planning-historical", "attempt-planning-historical"
+
+
+def _insert_historical_target_authorization(
+    connection: sqlite3.Connection,
+    *,
+    plan_revision_id: str,
+    step_id: str,
+    attempt_id: str,
+    active: bool,
+) -> None:
+    """把授权完整绑定到旧 Step/Attempt，再切换为历史失效或当前有效状态。"""
+    _insert_target_close_authorization(connection)
+    plan_row = connection.execute(
+        "SELECT intent_authorization_id,semantic_plan_hash,plan_revision_digest "
+        "FROM plan_revisions WHERE plan_revision_id=?",
+        (plan_revision_id,),
+    ).fetchone()
+    assert plan_row is not None
+    state = "AVAILABLE" if active else "CONSUMED"
+    max_uses = 1 if active else 0
+    issued_at = "2026-08-17T08:00:00Z" if active else "2026-08-17T06:00:00Z"
+    expires_at = "2026-08-17T10:00:00Z" if active else "2026-08-17T07:00:00Z"
+    revoked_at = None if active else "2026-08-17T07:30:00Z"
+    revoke_reason = None if active else "superseded-by-replan"
+    connection.execute(
+        "UPDATE execution_authorizations SET intent_authorization_id=?,plan_revision_id=?,"
+        "semantic_plan_hash=?,plan_revision_digest=?,step_id=?,attempt_id=?,executor_id=?,"
+        "fencing_token=?,control_epoch=?,consumption_state=?,max_uses=?,issued_at=?,expires_at=?,"
+        "revoked_at=?,revoke_reason=? WHERE execution_authorization_id=?",
+        (
+            plan_row[0],
+            plan_revision_id,
+            canonicalize(plan_row[1]),
+            canonicalize(plan_row[2]),
+            step_id,
+            attempt_id,
+            "executor-planning-historical",
+            11,
+            4,
+            state,
+            max_uses,
+            issued_at,
+            expires_at,
+            revoked_at,
+            revoke_reason,
+            "auth-target-auth-only",
+        ),
+    )
+
+
 def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED") -> sqlite3.Connection:
     """加载真实 migration，并以 FK ON 建立可验证的控制测试 lineage。"""
     connection = sqlite3.connect(":memory:", isolation_level=None)
@@ -2430,6 +2575,100 @@ async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls
             "SELECT run_id,step_id,attempt_id FROM execution_authorizations WHERE execution_authorization_id=?",
             ("auth-target-auth-only",),
         ).fetchone() == ("run-control-1", other_step_id, other_attempt_id)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_allows_self_consistent_expired_historical_authorization() -> None:
+    """同一 Task 旧 PlanRevision 的 CONSUMED/revoked/expired 授权不应阻断合法终局。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert_historical_target_authorization(
+            connection,
+            plan_revision_id=old_plan_revision_id,
+            step_id=old_step_id,
+            attempt_id=old_attempt_id,
+            active=False,
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-historical-auth"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        result = await service.commit_passed_barrier(
+            _target_close_request(
+                planning_barrier_id=planning_barrier_id,
+                request_id="request-target-historical-auth",
+            )
+        )
+
+        assert result.run.observed_state is RunObservedState.TERMINATED
+        assert result.task.lifecycle.value == "SUCCEEDED"
+        assert connection.execute(
+            "SELECT phase,active_barrier_id,observed_state FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == ("PLANNING", None, "TERMINATED")
+        assert connection.execute(
+            "SELECT consumption_state,max_uses,revoked_at FROM execution_authorizations "
+            "WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("CONSUMED", 0, "2026-08-17T07:30:00Z")
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (3,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_active_stale_plan_authorization_and_rolls_back() -> None:
+    """旧 PlanRevision 上仍有效的授权必须阻断终局，不能借历史豁免绕过 lineage。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert_historical_target_authorization(
+            connection,
+            plan_revision_id=old_plan_revision_id,
+            step_id=old_step_id,
+            attempt_id=old_attempt_id,
+            active=True,
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-target-stale-plan-auth"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await service.commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-stale-plan-auth",
+                )
+            )
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute(
+            "SELECT observed_state,state_version FROM runs WHERE run_id=?", ("run-control-1",)
+        ).fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute(
+            "SELECT consumption_state,max_uses,revoked_at FROM execution_authorizations "
+            "WHERE execution_authorization_id=?",
+            ("auth-target-auth-only",),
+        ).fetchone() == ("AVAILABLE", 1, None)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()

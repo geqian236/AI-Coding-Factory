@@ -250,11 +250,6 @@ class SqliteWorkflowRepository:
             )
             authorization_rows = authorization_cursor.fetchall()
             authorization_columns = tuple(item[0] for item in authorization_cursor.description or ())
-            task_row = self._connection.execute(
-                "SELECT active_plan_revision_id FROM tasks WHERE task_id=?",
-                (run.task_id,),
-            ).fetchone()
-            active_plan_revision_id = None if task_row is None else task_row[0]
             for authorization_row in authorization_rows:
                 authorization = dict(zip(authorization_columns, authorization_row, strict=True))
                 step_row = self._connection.execute(
@@ -266,13 +261,30 @@ class SqliteWorkflowRepository:
                     "FROM attempts WHERE attempt_id=?",
                     (authorization["attempt_id"],),
                 ).fetchone()
+                plan_row = self._connection.execute(
+                    "SELECT task_id,intent_authorization_id,semantic_plan_hash,plan_revision_digest "
+                    "FROM plan_revisions WHERE plan_revision_id=?",
+                    (authorization["plan_revision_id"],),
+                ).fetchone()
+                try:
+                    plan_contract_valid = (
+                        plan_row is not None
+                        and authorization["intent_authorization_id"] == plan_row[1]
+                        and authorization["semantic_plan_hash"] == canonicalize(plan_row[2])
+                        and authorization["plan_revision_digest"] == canonicalize(plan_row[3])
+                    )
+                except (FactoryError, TypeError, ValueError):
+                    plan_contract_valid = False
                 lineage_valid = (
                     step_row is not None
                     and attempt_row is not None
+                    and plan_row is not None
                     and authorization["run_id"] == run_id
                     and step_row[0] == run_id
                     and authorization["step_id"] == attempt_row[0]
-                    and authorization["plan_revision_id"] == step_row[1] == active_plan_revision_id
+                    and authorization["plan_revision_id"] == step_row[1]
+                    and plan_row[0] == run.task_id
+                    and plan_contract_valid
                     and authorization["node_type"] == step_row[2]
                     and authorization["executor_id"] == attempt_row[1]
                     and authorization["fencing_token"] == attempt_row[2]
