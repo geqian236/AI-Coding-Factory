@@ -36,7 +36,7 @@ from factory_agent.domain.workflow import (
 )
 from factory_agent.policy.canonical_json import canonicalize
 from factory_agent.policy.plan_hash import plan_revision_digest, semantic_plan_hash
-from factory_agent.state_machine.barriers import BarrierStepFacts
+from factory_agent.state_machine.barriers import BarrierStepFacts, evaluate_barrier
 from factory_agent.state_machine.milestones import MilestoneEvidence
 from factory_agent.state_machine.transitions import StateTransitionError
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork, StaleStateVersionError
@@ -1394,8 +1394,10 @@ def _insert_successful_plan_step(
     attempt_id: str,
     logical_node_id: str = "plan",
     required_artifact_id: str = "artifact-planning",
+    required: bool = True,
+    extra_artifact_ids: tuple[str, ...] = (),
 ) -> None:
-    """为 barrier 顺序测试插入已收口且有精确 Artifact 的成功 Step。"""
+    """插入成功 Step；额外 Artifact 用于证明 requiredArtifacts 是包含门禁。"""
     _insert(
         connection,
         "steps",
@@ -1407,7 +1409,7 @@ def _insert_successful_plan_step(
             "logical_node_id": logical_node_id,
             "business_phase": "PLANNING",
             "node_type": "PLAN",
-            "required": 1,
+            "required": int(required),
             "side_effect_class": "none",
             "phase": "TERMINAL",
             "outcome": "SUCCEEDED",
@@ -1465,6 +1467,69 @@ def _insert_successful_plan_step(
             "created_at": "2026-08-17T07:30:00Z",
         },
     )
+    for artifact_id in extra_artifact_ids:
+        _insert(
+            connection,
+            "artifacts",
+            {
+                "artifact_id": artifact_id,
+                "producer_attempt_id": attempt_id,
+                "media_type": "text/plain",
+                "confidentiality": "INTERNAL",
+                "commit_state": "COMMITTED",
+                "storage_path": artifact_id,
+                "size_bytes": 1,
+                "digest": SHA_A,
+                "created_at": "2026-08-17T07:30:00Z",
+            },
+        )
+
+
+def _insert_successful_artifact_dependency_graph(
+    connection: sqlite3.Connection,
+    *,
+    extra_artifact_ids: tuple[str, ...] = (),
+) -> str:
+    """插入 required current Step 与 optional dependency，二者共享当前 barrier。"""
+    _insert_current_barrier(
+        connection,
+        required_node_ids=("node-current",),
+        dependencies_by_node={"node-current": ("plan",)},
+    )
+    barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    _insert_successful_plan_step(
+        connection,
+        barrier_id=barrier_id,
+        step_id="step-artifact-dependency",
+        attempt_id="attempt-artifact-dependency",
+        required=False,
+        extra_artifact_ids=extra_artifact_ids,
+    )
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": "step-current-artifact-dependency",
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": barrier_id,
+            "logical_node_id": "node-current",
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 1,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "SUCCEEDED",
+            "dependency_hash": _selector_digest(["plan"]),
+            "required_artifacts_digest": _selector_digest([]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": "step-current-artifact-dependency-v1",
+            "state_version": 0,
+        },
+    )
+    return barrier_id
 
 
 def _insert_successful_design_review_step(
@@ -2056,6 +2121,114 @@ def test_barrier_authority_rejects_run_spec_target_stage_drift() -> None:
                     run_id="run-control-1",
                     task_id="task-control-1",
                 )
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+def test_barrier_dependency_allows_extra_committed_artifact_from_same_attempt() -> None:
+    """依赖的必需 Artifact 已提交时，同 Attempt 的额外合法产物不能阻断 barrier。"""
+    connection = _connection()
+    try:
+        barrier_id = _insert_successful_artifact_dependency_graph(
+            connection,
+            extra_artifact_ids=("artifact-planning-diagnostics",),
+        )
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            authority = SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                barrier_id=barrier_id,
+                run_id="run-control-1",
+                task_id="task-control-1",
+            )
+            decision = evaluate_barrier(
+                authority.steps,
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                settle_deadline_at=None,
+            )
+            assert decision.passed is True
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+def test_barrier_current_step_allows_extra_committed_artifact_from_same_attempt() -> None:
+    """当前 required Step 的 requiredArtifacts 是下限，额外 COMMITTED Artifact 合法。"""
+    connection = _connection()
+    try:
+        _insert_current_barrier(connection)
+        barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_successful_plan_step(
+            connection,
+            barrier_id=barrier_id,
+            step_id="step-current-artifact-subset",
+            attempt_id="attempt-current-artifact-subset",
+            extra_artifact_ids=("artifact-planning-diagnostics",),
+        )
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            authority = SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                barrier_id=barrier_id,
+                run_id="run-control-1",
+                task_id="task-control-1",
+            )
+            decision = evaluate_barrier(
+                authority.steps,
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                settle_deadline_at=None,
+            )
+            assert decision.passed is True
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("authority_path", ["dependency", "current"])
+def test_barrier_rejects_missing_required_artifact(authority_path: str) -> None:
+    """subset 门禁仍必须拒绝 requiredArtifacts 缺失，防止正例放宽成任意产物通过。"""
+    connection = _connection()
+    try:
+        if authority_path == "dependency":
+            barrier_id = _insert_successful_artifact_dependency_graph(connection)
+        else:
+            _insert_current_barrier(connection)
+            barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+            _insert_successful_plan_step(
+                connection,
+                barrier_id=barrier_id,
+                step_id="step-current-artifact-missing",
+                attempt_id="attempt-current-artifact-missing",
+            )
+        connection.execute("DELETE FROM artifacts WHERE artifact_id='artifact-planning'")
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            repository = SqliteWorkflowRepository(unit_of_work)
+            if authority_path == "dependency":
+                with pytest.raises(WorkflowRepositoryError, match="artifacts are incomplete"):
+                    repository.load_barrier_authority(
+                        barrier_id=barrier_id,
+                        run_id="run-control-1",
+                        task_id="task-control-1",
+                    )
+            else:
+                authority = repository.load_barrier_authority(
+                    barrier_id=barrier_id,
+                    run_id="run-control-1",
+                    task_id="task-control-1",
+                )
+                decision = evaluate_barrier(
+                    authority.steps,
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                    settle_deadline_at=None,
+                )
+                assert decision.passed is False
+                assert decision.block_reason_code == "REQUIRED_ARTIFACT_MISSING"
         finally:
             unit_of_work.rollback()
     finally:

@@ -817,7 +817,9 @@ class SqliteWorkflowRepository:
                 raise WorkflowRepositoryError("barrier dependency artifact identity is invalid") from exc
             if artifact.is_gate_eligible:
                 committed_artifact_ids.add(artifact.artifact_id)
-        if committed_artifact_ids != set(raw_required_artifacts):
+        # requiredArtifacts 是门禁下限；同 Attempt 的额外 COMMITTED 产物不改变冻结需求。
+        required_artifact_ids = set(raw_required_artifacts)
+        if not required_artifact_ids.issubset(committed_artifact_ids):
             raise WorkflowRepositoryError("barrier dependency artifacts are incomplete")
 
     def load_barrier_authority(
@@ -1002,7 +1004,9 @@ class SqliteWorkflowRepository:
             required_artifact_ids: tuple[object, ...] = tuple(raw_required_artifact_ids)
             if any(type(item) is not str or not item for item in required_artifact_ids):
                 raise WorkflowRepositoryError("plan artifact requirement is invalid")
-            required_artifacts_committed = committed_artifact_ids == set(required_artifact_ids)
+            # 仅要求冻结清单全部提交；额外合法产物不能把已满足的 required Step 判成失败。
+            required_artifact_id_set = set(required_artifact_ids)
+            required_artifacts_committed = required_artifact_id_set.issubset(committed_artifact_ids)
             attempt_unknown = (
                 self._connection.execute(
                     "SELECT 1 FROM attempts WHERE step_id=? AND outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
