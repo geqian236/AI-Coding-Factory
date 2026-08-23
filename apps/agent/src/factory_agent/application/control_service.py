@@ -321,7 +321,10 @@ class ControlService:
             raise ControlRequestError("receipt phase is invalid") from exc
         if receipt_phase is ControlCommandReceiptPhase.ACKNOWLEDGED:
             raise ControlRequestError("acknowledgement is created only by command acceptance")
-        if evidence_digest is not None and _SHA256.fullmatch(evidence_digest) is None:
+        # 类型先于正则校验，确保 int/bytes/list 都映射为稳定请求错误而非泄漏 TypeError。
+        if evidence_digest is not None and (
+            type(evidence_digest) is not str or _SHA256.fullmatch(evidence_digest) is None
+        ):
             raise ControlRequestError("receipt evidence digest is invalid")
 
         def command(unit_of_work: SqliteUnitOfWork) -> ControlReceiptEvent:

@@ -6,8 +6,17 @@ from dataclasses import replace
 
 import pytest
 from factory_agent.application.control_service import ControlCommandRequest
+from factory_agent.application.transition_service import TransitionService
 from factory_agent.domain.control import ControlCommandType
-from factory_agent.domain.workflow import AttemptPhase, DrainState, RunDesiredState, RunObservedState
+from factory_agent.domain.workflow import (
+    Attempt,
+    AttemptOutcome,
+    AttemptPhase,
+    DrainState,
+    RunDesiredState,
+    RunObservedState,
+    StepPhase,
+)
 from factory_agent.state_machine.write_guards import (
     WriteGuardContext,
     WriteGuardError,
@@ -23,10 +32,12 @@ from tests.agent.integration.control.test_control_commands import (
     SHA_A,
     _connection,
     _derived_barrier_id,
+    _ids,
     _insert,
     _insert_plan_revision_for_barrier,
     _selector_digest,
     _service,
+    _SqliteCoordinator,
 )
 
 
@@ -38,6 +49,8 @@ def _guard_context(**overrides: object) -> WriteGuardContext:
         "run_state_version": 2,
         "expected_run_state_version": 2,
         "attempt_id": "attempt-control-1",
+        "attempt_executor_id": "executor-control-1",
+        "expected_executor_id": "executor-control-1",
         "attempt_accepted_control_command_seq": 0,
         "attempt_fencing_token": 7,
         "expected_fencing_token": 7,
@@ -162,6 +175,49 @@ def _insert_attempt_graph(connection: object) -> None:
             "state_version": 0,
         },
     )
+
+
+def _attempt_record(attempt: Attempt) -> dict[str, object]:
+    """把不可变 Attempt 转成持久投影，供损坏/竞争事实测试精确造数。"""
+    return {
+        field: getattr(attempt, field).value if hasattr(getattr(attempt, field), "value") else getattr(attempt, field)
+        for field in Attempt.__dataclass_fields__
+    }
+
+
+def _prepare_drained_predecessor(connection: object) -> tuple[Attempt, Attempt]:
+    """准备已收尾 predecessor 与合法 fresh successor，避免重放用例重复造图。"""
+    _insert_attempt_graph(connection)
+    connection.execute(  # type: ignore[attr-defined]
+        "UPDATE attempts SET phase='TERMINATED', outcome='KILLED', drain_state='DRAINED', "
+        "ended_at='2026-08-17T09:00:00Z' WHERE attempt_id='attempt-control-1'"
+    )
+    connection.execute("UPDATE runs SET control_command_seq=1")  # type: ignore[attr-defined]
+    repository = SqliteWorkflowRepository(
+        SqliteUnitOfWork(connection, failure_probe=lambda _point: None)  # type: ignore[arg-type]
+    )
+    previous = repository.get_attempt("attempt-control-1")
+    assert previous is not None
+    candidate = previous.supersede(
+        new_attempt_id="attempt-control-2",
+        fencing_token=8,
+        control_epoch=10,
+        accepted_control_command_seq=1,
+    )
+    return previous, candidate
+
+
+def _commit_superseding_attempt(connection: object, previous: Attempt, candidate: Attempt) -> None:
+    """在 BEGIN IMMEDIATE owner transaction 内提交 scheduler 后继写。"""
+    unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)  # type: ignore[arg-type]
+    unit_of_work.begin_immediate()
+    try:
+        SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(previous, candidate)
+        unit_of_work.precommit()
+        unit_of_work.commit()
+    except BaseException:
+        unit_of_work.rollback()
+        raise
 
 
 @pytest.mark.asyncio
@@ -321,6 +377,257 @@ def test_superseding_attempt_rejects_malformed_authoritative_candidate(malformed
         connection.close()
 
 
+def test_superseding_attempt_exact_candidate_replay_is_idempotent() -> None:
+    """相同 predecessor/candidate 重放必须成功且不能重复插入。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+
+        _commit_superseding_attempt(connection, previous, candidate)
+        _commit_superseding_attempt(connection, previous, candidate)
+
+        assert connection.execute(
+            "SELECT attempt_id,supersedes_attempt_id,phase,fencing_token,control_epoch,"
+            "accepted_control_command_seq FROM attempts ORDER BY attempt_id"
+        ).fetchall() == [
+            ("attempt-control-1", None, "TERMINATED", 7, 9, 0),
+            ("attempt-control-2", "attempt-control-1", "CREATED", 8, 10, 1),
+        ]
+    finally:
+        connection.close()
+
+
+def test_superseding_attempt_rejects_different_direct_successor() -> None:
+    """predecessor 已有直接后继时，任何不同 candidate 都必须歧义拒绝。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        _commit_superseding_attempt(connection, previous, candidate)
+        conflicting = previous.supersede(
+            new_attempt_id="attempt-control-3",
+            fencing_token=9,
+            control_epoch=11,
+            accepted_control_command_seq=1,
+        )
+
+        with pytest.raises(WorkflowRepositoryError, match="different successor"):
+            _commit_superseding_attempt(connection, previous, conflicting)
+
+        assert connection.execute("SELECT count(*) FROM attempts").fetchone() == (2,)
+    finally:
+        connection.close()
+
+
+def test_superseding_attempt_rejects_ambiguous_multiple_direct_successors() -> None:
+    """历史损坏为多个直接后继时，不能把任一行误判成精确幂等重放。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        _insert(connection, "attempts", _attempt_record(candidate))  # type: ignore[arg-type]
+        _insert(
+            connection,  # type: ignore[arg-type]
+            "attempts",
+            _attempt_record(
+                replace(
+                    candidate,
+                    attempt_id="attempt-control-3",
+                    fencing_token=9,
+                    control_epoch=11,
+                )
+            ),
+        )
+
+        with pytest.raises(WorkflowRepositoryError, match="multiple direct successors"):
+            _commit_superseding_attempt(connection, previous, candidate)
+
+        assert connection.execute("SELECT count(*) FROM attempts").fetchone() == (3,)
+    finally:
+        connection.close()
+
+
+def test_superseding_attempt_rejects_other_active_attempt_for_run() -> None:
+    """无直接后继时，同一 Run 的任一其他活动 Attempt 都阻断新派发。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        unrelated = replace(
+            candidate,
+            attempt_id="attempt-control-unrelated",
+            supersedes_attempt_id=None,
+        )
+        _insert(connection, "attempts", _attempt_record(unrelated))  # type: ignore[arg-type]
+
+        with pytest.raises(WorkflowRepositoryError, match="another active attempt"):
+            _commit_superseding_attempt(connection, previous, candidate)
+
+        assert connection.execute("SELECT count(*) FROM attempts").fetchone() == (2,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_guarded_step_state_commits_projection_and_paired_event() -> None:
+    """NORMAL_WRITE Step CAS 与 authoritative event 必须在同一 UoW 成对提交。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        updated = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-step-write"),
+        ).transition_executor_step_state(
+            request_id="request-step-write",
+            run_id="run-control-1",
+            step_id="step-control-1",
+            attempt_id="attempt-control-1",
+            expected_run_state_version=0,
+            expected_step_state_version=0,
+            executor_id="executor-control-1",
+            fencing_token=7,
+            control_epoch=9,
+            candidate=StepPhase.RECONCILING,
+        )
+
+        assert (updated.phase, updated.state_version) == (StepPhase.RECONCILING, 1)
+        assert connection.execute("SELECT phase,state_version FROM steps").fetchone() == ("RECONCILING", 1)
+        assert connection.execute(
+            "SELECT aggregate_type,aggregate_id,run_id,step_id,attempt_id,"
+            "previous_state_version,state_version FROM authoritative_state_events"
+        ).fetchone() == (
+            "STEP",
+            "step-control-1",
+            "run-control-1",
+            "step-control-1",
+            None,
+            0,
+            1,
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_guarded_attempt_state_commits_projection_and_paired_event() -> None:
+    """NORMAL_WRITE Attempt CAS 与 authoritative event 必须共享事务和精确 lineage。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        updated = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-attempt-write"),
+        ).transition_executor_attempt_state(
+            request_id="request-attempt-write",
+            run_id="run-control-1",
+            attempt_id="attempt-control-1",
+            expected_run_state_version=0,
+            expected_attempt_state_version=0,
+            executor_id="executor-control-1",
+            fencing_token=7,
+            control_epoch=9,
+            candidate=AttemptPhase.RECONCILING,
+        )
+
+        assert (updated.phase, updated.state_version) == (AttemptPhase.RECONCILING, 1)
+        assert connection.execute("SELECT phase,state_version FROM attempts").fetchone() == ("RECONCILING", 1)
+        assert connection.execute(
+            "SELECT aggregate_type,aggregate_id,run_id,step_id,attempt_id,"
+            "previous_state_version,state_version FROM authoritative_state_events"
+        ).fetchone() == (
+            "ATTEMPT",
+            "attempt-control-1",
+            "run-control-1",
+            "step-control-1",
+            "attempt-control-1",
+            0,
+            1,
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guarded_writes_only_allow_attempt_termination() -> None:
+    """DRAIN_WRITE 拒绝普通 Step/Attempt CAS，只允许 Attempt 原子收尾并配对事件。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        paused = await _service(connection).submit(
+            ControlCommandRequest(
+                request_id="request-drain-guarded-writes",
+                run_id="run-control-1",
+                command_type=ControlCommandType.SOFT_PAUSE,
+                actor_id="actor-control-1",
+                expected_state_version=0,
+                reason_digest=SHA_A,
+            )
+        )
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-drain-write"),
+        )
+        event_count = connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone()[0]
+
+        with pytest.raises(WriteGuardError):
+            await service.transition_executor_step_state(
+                request_id="request-drain-step-write",
+                run_id="run-control-1",
+                step_id="step-control-1",
+                attempt_id="attempt-control-1",
+                expected_run_state_version=1,
+                expected_step_state_version=0,
+                executor_id="executor-control-1",
+                fencing_token=7,
+                control_epoch=9,
+                candidate=StepPhase.RECONCILING,
+            )
+        with pytest.raises(WriteGuardError):
+            await service.transition_executor_attempt_state(
+                request_id="request-drain-attempt-write",
+                run_id="run-control-1",
+                attempt_id="attempt-control-1",
+                expected_run_state_version=1,
+                expected_attempt_state_version=1,
+                executor_id="executor-control-1",
+                fencing_token=7,
+                control_epoch=9,
+                candidate=AttemptPhase.RECONCILING,
+            )
+        assert connection.execute("SELECT phase,state_version FROM steps").fetchone() == ("RUNNING", 0)
+        assert connection.execute("SELECT phase,drain_state,state_version FROM attempts").fetchone() == (
+            "RUNNING",
+            "DRAINING",
+            1,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (event_count,)
+
+        terminated = await service.terminate_executor_attempt(
+            request_id="request-drain-attempt-termination",
+            run_id="run-control-1",
+            attempt_id="attempt-control-1",
+            expected_run_state_version=1,
+            expected_attempt_state_version=1,
+            executor_id="executor-control-1",
+            fencing_token=7,
+            control_epoch=9,
+            outcome=AttemptOutcome.INTERRUPTED,
+            ended_at="2026-08-17T09:00:00Z",
+            termination_reason="soft-pause",
+        )
+
+        assert paused.command.acknowledged_attempt_id == "attempt-control-1"
+        assert (
+            terminated.phase,
+            terminated.outcome,
+            terminated.drain_state,
+            terminated.state_version,
+        ) == (AttemptPhase.TERMINATED, AttemptOutcome.INTERRUPTED, DrainState.DRAINED, 2)
+        assert connection.execute(
+            "SELECT phase,outcome,drain_state,ended_at,state_version FROM attempts"
+        ).fetchone() == ("TERMINATED", "INTERRUPTED", "DRAINED", "2026-08-17T09:00:00Z", 2)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (event_count + 1,)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "operation",
     [
@@ -361,6 +668,7 @@ def test_current_attempt_can_start_work_only_in_normal_write(operation: WriteOpe
     [
         {"run_desired_state": RunDesiredState.PAUSED},
         {"attempt_accepted_control_command_seq": 1},
+        {"attempt_executor_id": "executor-other"},
         {"attempt_fencing_token": 6},
         {"attempt_control_epoch": 8},
         {"run_state_version": 1},
@@ -400,6 +708,7 @@ def test_old_attempt_cannot_restart_normal_work_after_resume(operation: WriteOpe
     "mutation",
     [
         {"blocking_command_attempt_id": "attempt-other"},
+        {"attempt_executor_id": "executor-other"},
         {"attempt_fencing_token": 6},
         {"attempt_control_epoch": 8},
         {"attempt_drain_state": DrainState.DRAINED},

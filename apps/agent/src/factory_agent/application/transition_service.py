@@ -13,11 +13,16 @@ from typing import Protocol
 from factory_agent.domain.events import payload_digest
 from factory_agent.domain.workflow import (
     AchievedStage,
+    Attempt,
+    AttemptOutcome,
+    AttemptPhase,
     PhaseBarrier,
     Run,
     RunDesiredState,
     RunObservedState,
     RunPhase,
+    Step,
+    StepPhase,
     Task,
     TaskLifecycle,
 )
@@ -276,6 +281,27 @@ def require_observed_target_predicates(
         raise TransitionPredicateError("observed state target facts are incomplete")
 
 
+def _observed_evidence(authority: ObservedStateAuthorityFacts) -> ObservedStateEvidence:
+    """把同事务仓储事实映射为目标谓词输入，拒绝任何调用方摘要充当真源。"""
+    return ObservedStateEvidence(
+        active_attempt_count=authority.active_attempt_count,
+        lease_active=authority.lease_active,
+        authorization_active=authority.authorization_active,
+        control_sequence_current=authority.control_sequence_current,
+        heartbeat_valid=authority.heartbeat_valid,
+        unknown_remote_state=authority.unknown_remote_state,
+        unsettled_started_receipt=authority.unsettled_started_receipt,
+        dispatch_state_valid=authority.dispatch_state_valid,
+        blocking_fact=authority.blocking_fact,
+        block_reason_code=authority.block_reason_code,
+        pausing_fact=authority.pausing_fact,
+        stopping_fact=authority.stopping_fact,
+        interrupted_fact=authority.interrupted_fact,
+        reconciling_fact=authority.reconciling_fact,
+        terminated_fact=authority.terminated_fact,
+    )
+
+
 def append_authoritative_state_event(
     unit_of_work: SqliteUnitOfWork,
     *,
@@ -381,7 +407,7 @@ class TransitionService:
         self._state_event_id_factory = state_event_id_factory
         self._now = now or (lambda: datetime.now(UTC))
 
-    async def transition_observed(
+    async def transition_control_plane_observed(
         self,
         *,
         run_id: str,
@@ -390,7 +416,7 @@ class TransitionService:
         evidence: ObservedStateEvidence | None = None,
         request_id: str,
     ) -> Run:
-        """只使用同一事务查询的权威事实，再写 projection 和 state.changed。"""
+        """trusted control-plane 只提交非 RUNNING projection 与配对事件。"""
         started = time.monotonic()
 
         def command(unit_of_work: SqliteUnitOfWork) -> Run:
@@ -403,31 +429,11 @@ class TransitionService:
                 now=self._now(),
             )
             # 保留旧参数仅为兼容调用面；任何调用方摘要都不进入状态判定。
-            require_observed_target_predicates(
-                current,
-                candidate,
-                ObservedStateEvidence(
-                    active_attempt_count=authority.active_attempt_count,
-                    lease_active=authority.lease_active,
-                    authorization_active=authority.authorization_active,
-                    control_sequence_current=authority.control_sequence_current,
-                    heartbeat_valid=authority.heartbeat_valid,
-                    unknown_remote_state=authority.unknown_remote_state,
-                    unsettled_started_receipt=authority.unsettled_started_receipt,
-                    dispatch_state_valid=authority.dispatch_state_valid,
-                    blocking_fact=authority.blocking_fact,
-                    block_reason_code=authority.block_reason_code,
-                    pausing_fact=authority.pausing_fact,
-                    stopping_fact=authority.stopping_fact,
-                    interrupted_fact=authority.interrupted_fact,
-                    reconciling_fact=authority.reconciling_fact,
-                    terminated_fact=authority.terminated_fact,
-                ),
-            )
-            updated = repository.transition_observed(
+            require_observed_target_predicates(current, target, _observed_evidence(authority))
+            updated = repository.transition_control_plane_observed(
                 run_id=run_id,
                 expected_state_version=expected_state_version,
-                candidate=candidate,
+                candidate=target,
             )
             append_authoritative_state_event(
                 unit_of_work,
@@ -445,30 +451,361 @@ class TransitionService:
             return updated
 
         try:
+            try:
+                target = RunObservedState(candidate)
+            except (TypeError, ValueError) as exc:
+                raise TransitionPredicateError("observed state target enum is invalid") from exc
+            if target is RunObservedState.RUNNING:
+                # API 分离是安全边界：control-plane 即使拥有完整事实也不得冒充 executor。
+                raise TransitionPredicateError("RUNNING observed projection is executor-only")
             updated = await self._coordinator.execute(
-                operation="transition_observed_state",
+                operation="transition_control_plane_observed",
                 context={"request_id": request_id, "run_id": run_id},
                 command=command,
             )
         except Exception as exc:
             LOGGER.warning(
-                "observed_state_transition_rejected",
+                "control_plane_observed_transition_rejected",
                 request_id=request_id,
                 run_id=run_id,
-                operation="transition_observed_state",
+                attempt_id=None,
+                operation="transition_control_plane_observed",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
                 error_code=getattr(exc, "error_code", type(exc).__name__),
             )
             raise
         LOGGER.info(
-            "observed_state_transition_committed",
+            "control_plane_observed_transition_committed",
             request_id=request_id,
             run_id=run_id,
-            operation="transition_observed_state",
+            attempt_id=None,
+            operation="transition_control_plane_observed",
             status="committed",
             duration_ms=round((time.monotonic() - started) * 1000, 3),
             state_version=updated.state_version,
+        )
+        return updated
+
+    async def transition_executor_observed(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        expected_state_version: int,
+        executor_id: str,
+        fencing_token: int,
+        control_epoch: int,
+        request_id: str,
+    ) -> Run:
+        """executor 仅可用权威 selector 提交 QUEUED→RUNNING。"""
+        started = time.monotonic()
+
+        def command(unit_of_work: SqliteUnitOfWork) -> tuple[Run, str]:
+            repository = SqliteWorkflowRepository(unit_of_work)
+            current = repository.get_run(run_id)
+            if current is None:
+                raise WorkflowRepositoryError("run does not exist")
+            authority = repository.load_observed_state_authority(run_id=run_id, now=self._now())
+            require_observed_target_predicates(
+                current,
+                RunObservedState.RUNNING,
+                _observed_evidence(authority),
+            )
+            updated, write_authority, mode = repository.transition_executor_observed_running(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                expected_state_version=expected_state_version,
+                executor_id=executor_id,
+                fencing_token=fencing_token,
+                control_epoch=control_epoch,
+            )
+            append_authoritative_state_event(
+                unit_of_work,
+                state_event_id=self._state_event_id_factory(),
+                aggregate_type="RUN",
+                aggregate_id=run_id,
+                task_id=updated.task_id,
+                run_id=run_id,
+                step_id=None,
+                attempt_id=None,
+                previous_state_version=expected_state_version,
+                state_version=updated.state_version,
+                payload={
+                    "observedState": updated.observed_state.value,
+                    "executorAttemptId": write_authority.attempt.attempt_id,
+                },
+            )
+            return updated, mode.value
+
+        try:
+            updated, write_mode = await self._coordinator.execute(
+                operation="transition_executor_observed",
+                context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
+                command=command,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "executor_observed_transition_rejected",
+                request_id=request_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                operation="transition_executor_observed",
+                status="rejected",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                error_code=getattr(exc, "error_code", type(exc).__name__),
+            )
+            raise
+        LOGGER.info(
+            "executor_observed_transition_committed",
+            request_id=request_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            operation="transition_executor_observed",
+            status="committed",
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            state_version=updated.state_version,
+            write_mode=write_mode,
+        )
+        return updated
+
+    async def transition_executor_step_state(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        step_id: str,
+        attempt_id: str,
+        expected_run_state_version: int,
+        expected_step_state_version: int,
+        executor_id: str,
+        fencing_token: int,
+        control_epoch: int,
+        candidate: StepPhase,
+    ) -> Step:
+        """在一个 owner transaction 内完成 Step guard、CAS 与事件配对。"""
+        started = time.monotonic()
+
+        def command(unit_of_work: SqliteUnitOfWork) -> tuple[Step, str]:
+            updated, authority, mode = SqliteWorkflowRepository(unit_of_work).guarded_executor_step_state(
+                run_id=run_id,
+                step_id=step_id,
+                attempt_id=attempt_id,
+                expected_run_state_version=expected_run_state_version,
+                expected_step_state_version=expected_step_state_version,
+                executor_id=executor_id,
+                fencing_token=fencing_token,
+                control_epoch=control_epoch,
+                candidate=candidate,
+            )
+            append_authoritative_state_event(
+                unit_of_work,
+                state_event_id=self._state_event_id_factory(),
+                aggregate_type="STEP",
+                aggregate_id=updated.step_id,
+                task_id=authority.run.task_id,
+                run_id=authority.run.run_id,
+                step_id=updated.step_id,
+                attempt_id=None,
+                previous_state_version=expected_step_state_version,
+                state_version=updated.state_version,
+                payload={"phase": updated.phase.value},
+            )
+            return updated, mode.value
+
+        try:
+            updated, write_mode = await self._coordinator.execute(
+                operation="transition_executor_step_state",
+                context={
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "attempt_id": attempt_id,
+                },
+                command=command,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "executor_step_state_rejected",
+                request_id=request_id,
+                run_id=run_id,
+                step_id=step_id,
+                attempt_id=attempt_id,
+                operation="transition_executor_step_state",
+                status="rejected",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                error_code=getattr(exc, "error_code", type(exc).__name__),
+            )
+            raise
+        LOGGER.info(
+            "executor_step_state_committed",
+            request_id=request_id,
+            run_id=run_id,
+            step_id=step_id,
+            attempt_id=attempt_id,
+            operation="transition_executor_step_state",
+            status="committed",
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            state_version=updated.state_version,
+            write_mode=write_mode,
+        )
+        return updated
+
+    async def transition_executor_attempt_state(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        attempt_id: str,
+        expected_run_state_version: int,
+        expected_attempt_state_version: int,
+        executor_id: str,
+        fencing_token: int,
+        control_epoch: int,
+        candidate: AttemptPhase,
+    ) -> Attempt:
+        """在一个 owner transaction 内完成普通 Attempt guard、CAS 与事件配对。"""
+        started = time.monotonic()
+
+        def command(unit_of_work: SqliteUnitOfWork) -> tuple[Attempt, str, str]:
+            updated, authority, mode = SqliteWorkflowRepository(unit_of_work).guarded_executor_attempt_state(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                expected_run_state_version=expected_run_state_version,
+                expected_attempt_state_version=expected_attempt_state_version,
+                executor_id=executor_id,
+                fencing_token=fencing_token,
+                control_epoch=control_epoch,
+                candidate=candidate,
+            )
+            append_authoritative_state_event(
+                unit_of_work,
+                state_event_id=self._state_event_id_factory(),
+                aggregate_type="ATTEMPT",
+                aggregate_id=updated.attempt_id,
+                task_id=authority.run.task_id,
+                run_id=authority.run.run_id,
+                step_id=authority.step.step_id,
+                attempt_id=updated.attempt_id,
+                previous_state_version=expected_attempt_state_version,
+                state_version=updated.state_version,
+                payload={"phase": updated.phase.value},
+            )
+            return updated, mode.value, authority.step.step_id
+
+        try:
+            updated, write_mode, step_id = await self._coordinator.execute(
+                operation="transition_executor_attempt_state",
+                context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
+                command=command,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "executor_attempt_state_rejected",
+                request_id=request_id,
+                run_id=run_id,
+                step_id=None,
+                attempt_id=attempt_id,
+                operation="transition_executor_attempt_state",
+                status="rejected",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                error_code=getattr(exc, "error_code", type(exc).__name__),
+            )
+            raise
+        LOGGER.info(
+            "executor_attempt_state_committed",
+            request_id=request_id,
+            run_id=run_id,
+            step_id=step_id,
+            attempt_id=attempt_id,
+            operation="transition_executor_attempt_state",
+            status="committed",
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            state_version=updated.state_version,
+            write_mode=write_mode,
+        )
+        return updated
+
+    async def terminate_executor_attempt(
+        self,
+        *,
+        request_id: str,
+        run_id: str,
+        attempt_id: str,
+        expected_run_state_version: int,
+        expected_attempt_state_version: int,
+        executor_id: str,
+        fencing_token: int,
+        control_epoch: int,
+        outcome: AttemptOutcome,
+        ended_at: str,
+        termination_reason: str | None,
+    ) -> Attempt:
+        """以独立 ATTEMPT_TERMINATION 操作允许 NORMAL 或 DRAIN 安全收尾。"""
+        started = time.monotonic()
+
+        def command(unit_of_work: SqliteUnitOfWork) -> tuple[Attempt, str, str]:
+            updated, authority, mode = SqliteWorkflowRepository(unit_of_work).guarded_executor_attempt_termination(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                expected_run_state_version=expected_run_state_version,
+                expected_attempt_state_version=expected_attempt_state_version,
+                executor_id=executor_id,
+                fencing_token=fencing_token,
+                control_epoch=control_epoch,
+                outcome=outcome,
+                ended_at=ended_at,
+                termination_reason=termination_reason,
+            )
+            append_authoritative_state_event(
+                unit_of_work,
+                state_event_id=self._state_event_id_factory(),
+                aggregate_type="ATTEMPT",
+                aggregate_id=updated.attempt_id,
+                task_id=authority.run.task_id,
+                run_id=authority.run.run_id,
+                step_id=authority.step.step_id,
+                attempt_id=updated.attempt_id,
+                previous_state_version=expected_attempt_state_version,
+                state_version=updated.state_version,
+                payload={
+                    "phase": updated.phase.value,
+                    "outcome": updated.outcome.value,
+                    "drainState": updated.drain_state.value,
+                },
+            )
+            return updated, mode.value, authority.step.step_id
+
+        try:
+            updated, write_mode, step_id = await self._coordinator.execute(
+                operation="terminate_executor_attempt",
+                context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
+                command=command,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "executor_attempt_termination_rejected",
+                request_id=request_id,
+                run_id=run_id,
+                step_id=None,
+                attempt_id=attempt_id,
+                operation="terminate_executor_attempt",
+                status="rejected",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                error_code=getattr(exc, "error_code", type(exc).__name__),
+            )
+            raise
+        LOGGER.info(
+            "executor_attempt_termination_committed",
+            request_id=request_id,
+            run_id=run_id,
+            step_id=step_id,
+            attempt_id=attempt_id,
+            operation="terminate_executor_attempt",
+            status="committed",
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            state_version=updated.state_version,
+            write_mode=write_mode,
         )
         return updated
 

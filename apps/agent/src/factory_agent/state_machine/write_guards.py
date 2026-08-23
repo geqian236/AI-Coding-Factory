@@ -52,13 +52,15 @@ _DRAIN_OPERATIONS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class WriteGuardContext:
-    """一次写入必须同时核对的 Run/Attempt/lease 快照。"""
+    """一次写入必须同时核对的 Run/Attempt/executor/fencing 快照。"""
 
     run_desired_state: RunDesiredState
     run_control_command_seq: int
     run_state_version: int
     expected_run_state_version: int
     attempt_id: str
+    attempt_executor_id: str
+    expected_executor_id: str
     attempt_accepted_control_command_seq: int
     attempt_fencing_token: int
     expected_fencing_token: int
@@ -88,15 +90,20 @@ class WriteGuardContext:
         if (
             not isinstance(self.attempt_id, str)
             or not self.attempt_id
+            or not isinstance(self.attempt_executor_id, str)
+            or not self.attempt_executor_id
+            or not isinstance(self.expected_executor_id, str)
+            or not self.expected_executor_id
             or any(type(value) is not int or value < 0 for value in numeric_fields)
         ):
             raise WriteGuardError("write guard context is invalid")
 
 
 def _normal_write_allowed(context: WriteGuardContext) -> bool:
-    """NORMAL_WRITE 同时绑定最新 control seq、desired、token、epoch、version 与无 drain latch。"""
+    """NORMAL_WRITE 绑定 executor、最新 control seq、token/epoch/version 与无 drain latch。"""
     return (
         context.run_desired_state is RunDesiredState.RUNNING
+        and context.attempt_executor_id == context.expected_executor_id
         and context.attempt_accepted_control_command_seq == context.run_control_command_seq
         and context.attempt_fencing_token == context.expected_fencing_token
         and context.attempt_control_epoch == context.expected_control_epoch
@@ -106,9 +113,10 @@ def _normal_write_allowed(context: WriteGuardContext) -> bool:
 
 
 def _drain_write_allowed(context: WriteGuardContext) -> bool:
-    """DRAIN_WRITE 绑定阻断命令锁定的同一 Attempt，并保留 token/epoch/version 校验。"""
+    """DRAIN_WRITE 绑定阻断命令锁定的同一 executor/Attempt，并保留 fencing/version 校验。"""
     return (
         context.blocking_command_attempt_id == context.attempt_id
+        and context.attempt_executor_id == context.expected_executor_id
         and context.attempt_fencing_token == context.expected_fencing_token
         and context.attempt_control_epoch == context.expected_control_epoch
         and context.run_state_version == context.expected_run_state_version
