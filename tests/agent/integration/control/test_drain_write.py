@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -37,6 +38,7 @@ from tests.agent.integration.control.test_control_commands import (
     _derived_barrier_id,
     _ids,
     _insert,
+    _insert_control_command_ack,
     _insert_plan_revision_for_barrier,
     _selector_digest,
     _service,
@@ -196,6 +198,180 @@ def _insert_attempt_graph(connection: object) -> None:
     )
 
 
+def _insert_other_terminal_attempt(connection: sqlite3.Connection) -> None:
+    """插入合法 terminal/NONE sibling，供 command 与 ACK 的错误 Attempt 牙齿使用。"""
+    cursor = connection.execute("SELECT * FROM attempts WHERE attempt_id='attempt-control-1'")
+    row = cursor.fetchone()
+    assert row is not None
+    record = dict(zip((column[0] for column in cursor.description), row, strict=True))
+    record.update(
+        {
+            "attempt_id": "attempt-control-other",
+            "supersedes_attempt_id": None,
+            "phase": "TERMINATED",
+            "outcome": "SUCCEEDED",
+            "executor_id": "executor-control-other",
+            "process_session_id": "process-session-other",
+            "pid": 5678,
+            "process_start_time": "2026-08-14T07:58:00Z",
+            "job_object_id": "job-control-other",
+            "exit_code": 0,
+            "termination_reason": None,
+            "fencing_token": 17,
+            "control_epoch": 19,
+            "accepted_control_command_seq": 0,
+            "interrupt_command_id": None,
+            "drain_state": "NONE",
+            "started_at": "2026-08-14T07:58:00Z",
+            "ended_at": "2026-08-14T07:59:00Z",
+            "state_version": 0,
+        }
+    )
+    _insert(connection, "attempts", record)
+
+
+def _insert_secondary_run(connection: sqlite3.Connection) -> None:
+    """复制最小 Run FK 父行，隔离 command 指向错误 Run 的单变量反例。"""
+    cursor = connection.execute("SELECT * FROM runs WHERE run_id='run-control-1'")
+    row = cursor.fetchone()
+    assert row is not None
+    record = dict(zip((column[0] for column in cursor.description), row, strict=True))
+    record.update(
+        {
+            "run_id": "run-control-other",
+            "active_barrier_id": None,
+            "control_command_seq": 1,
+            "state_version": 0,
+        }
+    )
+    _insert(connection, "runs", record)
+
+
+def _attach_blocking_lineage(
+    connection: sqlite3.Connection,
+    *,
+    command_id: str = "command-drain-lineage-1",
+    command_seq: int = 1,
+    command_run_id: str = "run-control-1",
+    command_type: ControlCommandType = ControlCommandType.SOFT_PAUSE,
+    acknowledged_attempt_id: str = "attempt-control-1",
+    include_ack: bool = True,
+    receipt_attempt_id: str | None = None,
+    run_control_command_seq: int = 1,
+    drain_state: str = "DRAINING",
+) -> None:
+    """把 Attempt 指向一条可按字段逐项污染的 blocking command/ACK 谱系。"""
+    _insert_control_command_ack(
+        connection,
+        command_id=command_id,
+        command_seq=command_seq,
+        acknowledged_attempt_id=acknowledged_attempt_id,
+        run_id=command_run_id,
+        command_type=command_type,
+        include_ack=include_ack,
+        receipt_attempt_id=receipt_attempt_id,
+    )
+    connection.execute(
+        "UPDATE attempts SET drain_state=?,interrupt_command_id=? WHERE attempt_id='attempt-control-1'",
+        (drain_state, command_id),
+    )
+    connection.execute(
+        "UPDATE runs SET control_command_seq=? WHERE run_id='run-control-1'",
+        (run_control_command_seq,),
+    )
+
+
+def _set_missing_interrupt_command(connection: sqlite3.Connection) -> None:
+    """仅为损坏持久事实 fixture 暂停 FK，制造指向不存在 command 的非空 selector。"""
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute(
+            "UPDATE attempts SET drain_state='DRAINING',interrupt_command_id='command-missing' "
+            "WHERE attempt_id='attempt-control-1'"
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("UPDATE runs SET control_command_seq=1 WHERE run_id='run-control-1'")
+
+
+def _configure_invalid_drain_authority(connection: sqlite3.Connection, case: str) -> None:
+    """每个 case 只污染 drain 矩阵或 command/ACK 谱系中的一个权威条件。"""
+    _insert_attempt_graph(connection)
+    if case in {"wrong-command-attempt", "ack-attempt-mismatch"}:
+        _insert_other_terminal_attempt(connection)
+    if case == "wrong-run":
+        _insert_secondary_run(connection)
+
+    if case == "terminated-draining":
+        _attach_blocking_lineage(connection)
+        connection.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='KILLED',ended_at='2026-08-14T08:00:00Z' "
+            "WHERE attempt_id='attempt-control-1'"
+        )
+    elif case == "nonterminal-drained":
+        _attach_blocking_lineage(connection, drain_state="DRAINED")
+    elif case == "none-with-interrupt":
+        _attach_blocking_lineage(connection, drain_state="NONE")
+    elif case == "draining-null":
+        connection.execute("UPDATE attempts SET drain_state='DRAINING' WHERE attempt_id='attempt-control-1'")
+    elif case == "terminal-drained-null":
+        connection.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='KILLED',drain_state='DRAINED',"
+            "ended_at='2026-08-14T08:00:00Z' WHERE attempt_id='attempt-control-1'"
+        )
+    elif case == "missing-command":
+        _set_missing_interrupt_command(connection)
+    elif case == "wrong-run":
+        _attach_blocking_lineage(connection, command_run_id="run-control-other")
+    elif case == "resume-as-blocker":
+        _attach_blocking_lineage(connection, command_type=ControlCommandType.RESUME)
+    elif case == "wrong-command-attempt":
+        _attach_blocking_lineage(connection, acknowledged_attempt_id="attempt-control-other")
+    elif case == "seq-not-newer":
+        _attach_blocking_lineage(connection)
+        connection.execute("UPDATE attempts SET accepted_control_command_seq=1 WHERE attempt_id='attempt-control-1'")
+    elif case == "seq-after-run":
+        _attach_blocking_lineage(connection, command_seq=2, run_control_command_seq=1)
+    elif case == "missing-initial-ack":
+        _attach_blocking_lineage(connection, include_ack=False)
+    elif case == "ack-attempt-mismatch":
+        _attach_blocking_lineage(connection, receipt_attempt_id="attempt-control-other")
+    elif case in {"current-not-run-latest", "historical-not-attempt-latest"}:
+        _attach_blocking_lineage(connection)
+        _insert_control_command_ack(
+            connection,
+            command_id="command-drain-lineage-2",
+            command_seq=2,
+            acknowledged_attempt_id="attempt-control-1",
+        )
+        connection.execute("UPDATE runs SET control_command_seq=2 WHERE run_id='run-control-1'")
+        if case == "historical-not-attempt-latest":
+            connection.execute(
+                "UPDATE attempts SET phase='TERMINATED',outcome='KILLED',drain_state='DRAINED',"
+                "ended_at='2026-08-14T08:00:00Z' WHERE attempt_id='attempt-control-1'"
+            )
+    else:
+        known = {
+            "terminated-draining",
+            "nonterminal-drained",
+            "none-with-interrupt",
+            "draining-null",
+            "terminal-drained-null",
+            "missing-command",
+            "wrong-run",
+            "resume-as-blocker",
+            "wrong-command-attempt",
+            "seq-not-newer",
+            "seq-after-run",
+            "missing-initial-ack",
+            "ack-attempt-mismatch",
+            "current-not-run-latest",
+            "historical-not-attempt-latest",
+        }
+        if case not in known:
+            raise AssertionError(f"未知 drain authority 反例：{case}")
+
+
 def _attempt_record(attempt: Attempt) -> dict[str, object]:
     """把不可变 Attempt 转成持久投影，供损坏/竞争事实测试精确造数。"""
     return {
@@ -204,17 +380,15 @@ def _attempt_record(attempt: Attempt) -> dict[str, object]:
     }
 
 
-def _prepare_drained_predecessor(connection: object) -> tuple[Attempt, Attempt]:
+def _prepare_drained_predecessor(connection: sqlite3.Connection) -> tuple[Attempt, Attempt]:
     """准备已收尾 predecessor 与合法 fresh successor，避免重放用例重复造图。"""
     _insert_attempt_graph(connection)
-    connection.execute(  # type: ignore[attr-defined]
-        "UPDATE attempts SET phase='TERMINATED', outcome='KILLED', drain_state='DRAINED', "
+    _attach_blocking_lineage(connection, drain_state="DRAINED")
+    connection.execute(
+        "UPDATE attempts SET phase='TERMINATED', outcome='KILLED', "
         "ended_at='2026-08-17T09:00:00Z' WHERE attempt_id='attempt-control-1'"
     )
-    connection.execute("UPDATE runs SET control_command_seq=1")  # type: ignore[attr-defined]
-    repository = SqliteWorkflowRepository(
-        SqliteUnitOfWork(connection, failure_probe=lambda _point: None)  # type: ignore[arg-type]
-    )
+    repository = SqliteWorkflowRepository(SqliteUnitOfWork(connection, failure_probe=lambda _point: None))
     previous = repository.get_attempt("attempt-control-1")
     assert previous is not None
     candidate = previous.supersede(
@@ -237,6 +411,188 @@ def _commit_superseding_attempt(connection: object, previous: Attempt, candidate
     except BaseException:
         unit_of_work.rollback()
         raise
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "terminated-draining",
+        "nonterminal-drained",
+        "none-with-interrupt",
+        "draining-null",
+        "terminal-drained-null",
+        "missing-command",
+        "wrong-run",
+        "resume-as-blocker",
+        "wrong-command-attempt",
+        "seq-not-newer",
+        "seq-after-run",
+        "missing-initial-ack",
+        "ack-attempt-mismatch",
+        "current-not-run-latest",
+        "historical-not-attempt-latest",
+    ],
+)
+def test_run_wide_drain_authority_rejects_each_corrupt_matrix_or_lineage(case: str) -> None:
+    """Run 下任一 Attempt drain 或 command/ACK 条件损坏都必须 fail closed。"""
+    connection = _connection(desired_state="PAUSED", observed_state="RUNNING")
+    try:
+        _configure_invalid_drain_authority(connection, case)
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError):
+                SqliteWorkflowRepository(unit_of_work).get_active_attempt_for_run("run-control-1")
+        finally:
+            unit_of_work.rollback()
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_attempt_id"),
+    [
+        ("nonterminal-none", "attempt-control-1"),
+        ("nonterminal-draining", "attempt-control-1"),
+        ("terminal-none", None),
+        ("terminal-drained", None),
+    ],
+)
+def test_run_wide_drain_authority_accepts_frozen_valid_matrix(
+    case: str,
+    expected_attempt_id: str | None,
+) -> None:
+    """active 仅按 phase 推导；合法 NONE 与闭合 blocking lineage 的 DRAIN 状态均可读取。"""
+    connection = _connection(desired_state="PAUSED", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        if case == "nonterminal-draining":
+            _attach_blocking_lineage(connection)
+        elif case == "terminal-none":
+            connection.execute(
+                "UPDATE attempts SET phase='TERMINATED',outcome='SUCCEEDED',ended_at='2026-08-14T08:00:00Z'"
+            )
+        elif case == "terminal-drained":
+            _attach_blocking_lineage(connection, drain_state="DRAINED")
+            connection.execute(
+                "UPDATE attempts SET phase='TERMINATED',outcome='KILLED',ended_at='2026-08-14T08:00:00Z'"
+            )
+
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            active = SqliteWorkflowRepository(unit_of_work).get_active_attempt_for_run("run-control-1")
+        finally:
+            unit_of_work.rollback()
+        assert (None if active is None else active.attempt_id) == expected_attempt_id
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "command_type"),
+    [
+        ("current-not-run-latest", ControlCommandType.RESUME),
+        ("draining-null", ControlCommandType.SOFT_PAUSE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_control_acceptance_rejects_corrupt_drain_authority_before_any_write(
+    case: str,
+    command_type: ControlCommandType,
+) -> None:
+    """RESUME 与 blocking 接受都必须先验 Run-wide drain，不得留下命令、receipt、CAS 或事件。"""
+    desired_state = "PAUSED" if command_type is ControlCommandType.RESUME else "RUNNING"
+    connection = _connection(desired_state=desired_state, observed_state="RUNNING")
+    try:
+        _configure_invalid_drain_authority(connection, case)
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(WorkflowRepositoryError):
+            await _service(connection).submit(
+                ControlCommandRequest(
+                    request_id=f"request-corrupt-drain-{case}",
+                    run_id="run-control-1",
+                    command_type=command_type,
+                    actor_id="actor-control-1",
+                    expected_state_version=0,
+                    reason_digest=SHA_A,
+                )
+            )
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_control_idempotent_replay_revalidates_run_wide_drain_before_returning() -> None:
+    """精确重放也不能绕过 Run-wide drain 校验或掩盖接受后出现的损坏 latch。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        request = ControlCommandRequest(
+            request_id="request-replay-corrupt-drain",
+            run_id="run-control-1",
+            command_type=ControlCommandType.SOFT_PAUSE,
+            actor_id="actor-control-1",
+            expected_state_version=0,
+            reason_digest=SHA_A,
+        )
+        service = _service(connection)
+        accepted = await service.submit(request)
+        assert accepted.idempotent_replay is False
+        connection.execute("UPDATE attempts SET interrupt_command_id=NULL WHERE attempt_id='attempt-control-1'")
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(WorkflowRepositoryError):
+            await service.submit(request)
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+def test_historical_drained_uses_attempt_latest_while_successor_uses_run_latest() -> None:
+    """历史 DRAINED 看本 Attempt 最新 blocker；后继 DRAINING 看当前 Run 最新 blocker。"""
+    connection = _connection(desired_state="PAUSED", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        _attach_blocking_lineage(connection, drain_state="DRAINED")
+        connection.execute("UPDATE attempts SET phase='TERMINATED',outcome='KILLED',ended_at='2026-08-14T08:00:00Z'")
+        repository = SqliteWorkflowRepository(SqliteUnitOfWork(connection, failure_probe=lambda _point: None))
+        previous = repository.get_attempt("attempt-control-1")
+        assert previous is not None
+        successor = previous.supersede(
+            new_attempt_id="attempt-control-2",
+            fencing_token=8,
+            control_epoch=10,
+            accepted_control_command_seq=1,
+        )
+        _insert(connection, "attempts", _attempt_record(successor))
+        _insert_control_command_ack(
+            connection,
+            command_id="command-drain-lineage-2",
+            command_seq=2,
+            acknowledged_attempt_id="attempt-control-2",
+        )
+        connection.execute(
+            "UPDATE attempts SET drain_state='DRAINING',interrupt_command_id='command-drain-lineage-2' "
+            "WHERE attempt_id='attempt-control-2'"
+        )
+        connection.execute("UPDATE runs SET control_command_seq=2 WHERE run_id='run-control-1'")
+
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            active = SqliteWorkflowRepository(unit_of_work).get_active_attempt_for_run("run-control-1")
+        finally:
+            unit_of_work.rollback()
+        assert active is not None and active.attempt_id == "attempt-control-2"
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio
@@ -275,6 +631,10 @@ async def test_fast_pause_resume_keeps_old_attempt_draining() -> None:
         assert connection.execute(
             "SELECT drain_state,interrupt_command_id,accepted_control_command_seq,state_version FROM attempts"
         ).fetchone() == ("DRAINING", paused.command.command_id, 0, 1)
+        active = SqliteWorkflowRepository(
+            SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        ).get_active_attempt_for_run("run-control-1")
+        assert active is not None and active.attempt_id == "attempt-control-1"
     finally:
         connection.close()
 
@@ -359,11 +719,11 @@ def test_superseding_attempt_rejects_malformed_authoritative_candidate(malformed
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
         _insert_attempt_graph(connection)
+        _attach_blocking_lineage(connection, drain_state="DRAINED")
         connection.execute(
-            "UPDATE attempts SET phase='TERMINATED', outcome='KILLED', drain_state='DRAINED', "
+            "UPDATE attempts SET phase='TERMINATED', outcome='KILLED', "
             "ended_at='2026-08-17T09:00:00Z' WHERE attempt_id='attempt-control-1'"
         )
-        connection.execute("UPDATE runs SET control_command_seq=1")
         unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
         unit_of_work.begin_immediate()
         try:

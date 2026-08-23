@@ -179,25 +179,27 @@ class ControlService:
         """在一个同步 UoW callback 内接受或幂等读取命令。"""
         workflow = SqliteWorkflowRepository(unit_of_work)
         controls = SqliteControlRepository(unit_of_work)
+        authority_now = self._now()
         existing = controls.get_by_request_id(request.request_id)
+        if existing is not None and not _same_request(existing, request):
+            raise ControlRequestConflictError("request id already belongs to another command")
+
+        run = workflow.get_run(request.run_id)
+        if run is None:
+            raise WorkflowRepositoryError("run does not exist")
+        # 所有接受路径（含 RESUME 与幂等读取）均在任何写前验证 Run-wide drain 权威。
+        active_attempt = workflow.get_active_attempt_for_run(run.run_id)
         if existing is not None:
-            if not _same_request(existing, request):
-                raise ControlRequestConflictError("request id already belongs to another command")
             receipts = controls.list_receipts(existing.command_id)
             if not receipts:
                 raise ControlRequestError("accepted command is missing its acknowledgement receipt")
             return ControlAcceptance(command=existing, receipt=receipts[0], idempotent_replay=True)
 
-        run = workflow.get_run(request.run_id)
-        if run is None:
-            raise WorkflowRepositoryError("run does not exist")
         if run.observed_state is RunObservedState.TERMINATED:
             # 终止态没有可恢复的控制面；幂等命令也不能重新打开已终止 Run。
             raise StateTransitionError("terminated run rejects all control commands")
         desired = _desired_target(request.command_type)
-        attempt = (
-            workflow.get_active_attempt_for_run(run.run_id) if request.command_type in _BLOCKING_COMMANDS else None
-        )
+        attempt = active_attempt if request.command_type in _BLOCKING_COMMANDS else None
         immediate_stop_noop = (
             request.command_type is ControlCommandType.IMMEDIATE_STOP
             and run.desired_state is RunDesiredState.PAUSED
@@ -216,7 +218,7 @@ class ControlService:
         )
         if not immediate_stop_noop and not immediate_stop_escalation:
             require_desired_transition(run.desired_state, desired)
-        issued_at = self._now().isoformat()
+        issued_at = authority_now.isoformat()
         command = ControlCommand(
             command_id=self._command_id_factory(),
             run_id=run.run_id,

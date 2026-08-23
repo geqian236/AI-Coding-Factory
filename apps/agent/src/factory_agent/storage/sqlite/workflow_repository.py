@@ -269,21 +269,101 @@ class SqliteWorkflowRepository:
             return None
         return Attempt.from_record({key: row[key] for key in Attempt.__dataclass_fields__})
 
-    def get_active_attempt_for_run(self, run_id: str) -> Attempt | None:
-        """返回唯一未终止且未 DRAINED Attempt；多个活动执行事实必须 fail closed。"""
+    def _validate_attempt_interrupt_lineage(
+        self,
+        *,
+        run: Run,
+        attempt: Attempt,
+        historical: bool,
+    ) -> None:
+        """验证 DRAINING/DRAINED 指针对应的 blocking command 与初始 ACK。"""
+        command_id = attempt.interrupt_command_id
+        if command_id is None:
+            raise WorkflowRepositoryError("draining attempt interrupt command is missing")
+        blocking_types = (
+            ControlCommandType.SOFT_PAUSE.value,
+            ControlCommandType.IMMEDIATE_STOP.value,
+            ControlCommandType.CANCEL.value,
+        )
+        command = self._connection.execute(
+            "SELECT command_id,run_id,command_seq,command_type,acknowledged_attempt_id "
+            "FROM control_commands WHERE command_id=?",
+            (command_id,),
+        ).fetchone()
+        if (
+            command is None
+            or command[1] != run.run_id
+            or type(command[2]) is not int
+            or command[3] not in blocking_types
+            or command[4] != attempt.attempt_id
+            or not attempt.accepted_control_command_seq < command[2] <= run.control_command_seq
+        ):
+            raise WorkflowRepositoryError("attempt blocking command lineage is inconsistent")
+        initial_ack_rows = self._connection.execute(
+            "SELECT phase,attempt_id FROM control_command_receipt_events WHERE command_id=? AND receipt_seq=0",
+            (command_id,),
+        ).fetchall()
+        if len(initial_ack_rows) != 1 or initial_ack_rows[0] != ("ACKNOWLEDGED", attempt.attempt_id):
+            raise WorkflowRepositoryError("attempt blocking command acknowledgement is inconsistent")
+
+        if historical:
+            latest = self._connection.execute(
+                "SELECT command_id FROM control_commands WHERE run_id=? AND acknowledged_attempt_id=? "
+                "AND command_type IN (?,?,?) ORDER BY command_seq DESC LIMIT 1",
+                (run.run_id, attempt.attempt_id, *blocking_types),
+            ).fetchone()
+        else:
+            latest = self._connection.execute(
+                "SELECT command_id FROM control_commands WHERE run_id=? AND command_type IN (?,?,?) "
+                "ORDER BY command_seq DESC LIMIT 1",
+                (run.run_id, *blocking_types),
+            ).fetchone()
+        if latest is None or latest[0] != command_id:
+            # 当前 DRAINING 绑定 Run-latest blocker；历史 DRAINED 只绑定确认该 Attempt 的 latest blocker。
+            raise WorkflowRepositoryError("attempt latest blocking command lineage is inconsistent")
+
+    def _run_attempts_with_valid_drain_authority(self, run: Run) -> tuple[Attempt, ...]:
+        """扫描 Run 全部 Attempt；active 只按 phase 推导，drain 状态独立做 fail-closed 校验。"""
         cursor = self._connection.execute(
             "SELECT a.* FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-            "WHERE s.run_id=? AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' "
-            "ORDER BY a.attempt_id",
-            (run_id,),
+            "WHERE s.run_id=? ORDER BY a.attempt_id",
+            (run.run_id,),
         )
-        rows = cursor.fetchall()
-        if len(rows) > 1:
+        columns = tuple(item[0] for item in cursor.description)
+        attempts: list[Attempt] = []
+        for values in cursor.fetchall():
+            record = dict(zip(columns, values, strict=True))
+            try:
+                attempt = Attempt.from_record({key: record[key] for key in Attempt.__dataclass_fields__})
+            except (FactoryError, KeyError, TypeError, ValueError) as exc:
+                raise WorkflowRepositoryError("run Attempt drain projection is invalid") from exc
+            terminal = attempt.phase is AttemptPhase.TERMINATED
+            if attempt.drain_state is DrainState.NONE:
+                if attempt.interrupt_command_id is not None:
+                    raise WorkflowRepositoryError("NONE drain state cannot retain an interrupt command")
+            elif attempt.drain_state is DrainState.DRAINING:
+                if terminal:
+                    raise WorkflowRepositoryError("terminated attempt cannot remain DRAINING")
+                self._validate_attempt_interrupt_lineage(run=run, attempt=attempt, historical=False)
+            elif attempt.drain_state is DrainState.DRAINED:
+                if not terminal:
+                    raise WorkflowRepositoryError("nonterminal attempt cannot be DRAINED")
+                self._validate_attempt_interrupt_lineage(run=run, attempt=attempt, historical=True)
+            attempts.append(attempt)
+        return tuple(attempts)
+
+    def get_active_attempt_for_run(self, run_id: str) -> Attempt | None:
+        """先验证 Run 全部 drain 权威，再仅以 phase 返回唯一活动 Attempt。"""
+        run = self.get_run(run_id)
+        if run is None:
+            raise WorkflowRepositoryError("run does not exist")
+        attempts = self._run_attempts_with_valid_drain_authority(run)
+        active_attempts = tuple(attempt for attempt in attempts if attempt.phase is not AttemptPhase.TERMINATED)
+        if len(active_attempts) > 1:
             raise WorkflowRepositoryError("multiple active attempts exist for one run")
-        if not rows:
+        if not active_attempts:
             return None
-        record = dict(zip((item[0] for item in cursor.description), rows[0], strict=True))
-        return Attempt.from_record({key: record[key] for key in Attempt.__dataclass_fields__})
+        return active_attempts[0]
 
     def load_executor_write_authority(
         self,
@@ -517,19 +597,7 @@ class SqliteWorkflowRepository:
         run = self.get_run(run_id)
         if run is None:
             raise WorkflowRepositoryError("run does not exist")
-        active_cursor = self._connection.execute(
-            "SELECT a.* FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-            "WHERE s.run_id=? AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' "
-            "ORDER BY a.attempt_id",
-            (run_id,),
-        )
-        active_rows = active_cursor.fetchall()
-        if len(active_rows) > 1:
-            raise WorkflowRepositoryError("multiple active attempts exist for one run")
-        active_attempt = None
-        if active_rows:
-            record = dict(zip((item[0] for item in active_cursor.description), active_rows[0], strict=True))
-            active_attempt = Attempt.from_record({key: record[key] for key in Attempt.__dataclass_fields__})
+        active_attempt = self.get_active_attempt_for_run(run_id)
         # observed 判定前扫描当前 Run 的全部执行投影；不能让一条合法 active 行掩盖历史损坏事实。
         for (step_id,) in self._connection.execute(
             "SELECT step_id FROM steps WHERE run_id=? ORDER BY step_id",
@@ -700,7 +768,7 @@ class SqliteWorkflowRepository:
             and not blocking_fact
         )
         return ObservedStateAuthorityFacts(
-            active_attempt_count=len(active_rows),
+            active_attempt_count=0 if active_attempt is None else 1,
             lease_active=lease_active,
             authorization_active=authorization_active,
             control_sequence_current=control_sequence_current,
@@ -1130,6 +1198,8 @@ class SqliteWorkflowRepository:
             run_id=run_id,
             task_id=task_id,
         )
+        # barrier/target-close 同样先扫描 Run 全部 Attempt，不能让 terminal 坏 drain 事实绕过 active 查询。
+        run_active_attempt = self.get_active_attempt_for_run(run_id)
         required_node_ids = plan_authority.required_node_ids
         barrier_revision_id = plan_authority.plan_revision_id
         barrier_phase = plan_authority.business_phase
@@ -1255,7 +1325,7 @@ class SqliteWorkflowRepository:
             required = declared_required
             active_attempt = (
                 self._connection.execute(
-                    "SELECT 1 FROM attempts WHERE step_id=? AND phase<>'TERMINATED' AND drain_state<>'DRAINED' LIMIT 1",
+                    "SELECT 1 FROM attempts WHERE step_id=? AND phase<>'TERMINATED' LIMIT 1",
                     (record["step_id"],),
                 ).fetchone()
                 is not None
@@ -1352,13 +1422,7 @@ class SqliteWorkflowRepository:
                 )
                 for step in facts
             ]
-        active_attempt_count = int(
-            self._connection.execute(
-                "SELECT COUNT(*) FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-                "WHERE s.run_id=? AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED'",
-                (run_id,),
-            ).fetchone()[0]
-        )
+        active_attempt_count = 0 if run_active_attempt is None else 1
         unknown_remote_state = (
             self._connection.execute(
                 "SELECT 1 FROM steps AS s WHERE s.run_id=? AND s.outcome='UNKNOWN_REMOTE_STATE' "
@@ -1947,14 +2011,14 @@ class SqliteWorkflowRepository:
             other_active = self._connection.execute(
                 "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
                 "WHERE s.run_id=? AND a.attempt_id NOT IN (?,?) "
-                "AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' LIMIT 1",
+                "AND a.phase<>'TERMINATED' LIMIT 1",
                 (run.run_id, stored_previous.attempt_id, candidate.attempt_id),
             ).fetchone()
         else:
             other_active = self._connection.execute(
                 "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
                 "WHERE s.run_id=? AND a.attempt_id<>? "
-                "AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' LIMIT 1",
+                "AND a.phase<>'TERMINATED' LIMIT 1",
                 (run.run_id, stored_previous.attempt_id),
             ).fetchone()
         if other_active is not None:

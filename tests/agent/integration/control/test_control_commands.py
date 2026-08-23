@@ -158,6 +158,54 @@ def _insert(connection: sqlite3.Connection, table: str, values: Mapping[str, obj
     )
 
 
+def _insert_control_command_ack(
+    connection: sqlite3.Connection,
+    *,
+    command_id: str,
+    command_seq: int,
+    acknowledged_attempt_id: str | None,
+    run_id: str = "run-control-1",
+    command_type: ControlCommandType = ControlCommandType.SOFT_PAUSE,
+    include_ack: bool = True,
+    receipt_attempt_id: str | None = None,
+) -> None:
+    """直接插入 command 与初始 ACK，供 drain lineage 单变量 fixture 复用。"""
+    issued_at = "2026-08-14T08:00:00Z"
+    _insert(
+        connection,
+        "control_commands",
+        {
+            "command_id": command_id,
+            "run_id": run_id,
+            "command_seq": command_seq,
+            "request_id": f"request-{command_id}",
+            "command_type": command_type.value,
+            "actor_id": "actor-control-lineage",
+            "expected_state_version": max(command_seq - 1, 0),
+            "accepted_state_version": command_seq,
+            "issued_at": issued_at,
+            "acknowledged_attempt_id": acknowledged_attempt_id,
+            "reason_digest": SHA_A,
+        },
+    )
+    if include_ack:
+        _insert(
+            connection,
+            "control_command_receipt_events",
+            {
+                "command_receipt_event_id": f"receipt-{command_id}",
+                "command_id": command_id,
+                "receipt_seq": 0,
+                "phase": ControlCommandReceiptPhase.ACKNOWLEDGED.value,
+                "attempt_id": acknowledged_attempt_id if receipt_attempt_id is None else receipt_attempt_id,
+                "state_event_id": None,
+                "evidence_digest": None,
+                "previous_receipt_digest": None,
+                "created_at": issued_at,
+            },
+        )
+
+
 def _authorization_snapshot(schema_id: str, marker: str, *, digest: str | None = None) -> dict[str, str]:
     """构造真实授权合同引用；指定 digest 时用于闭合 PlanRevision 权威摘要。"""
     return {
@@ -719,7 +767,7 @@ def _insert_passing_planning_graph(
             "control_epoch": 1,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T07:00:00Z",
             "ended_at": "2026-08-17T07:30:00Z",
             "state_version": 0,
@@ -954,7 +1002,7 @@ def _insert_secondary_run_graph(connection: sqlite3.Connection) -> tuple[str, st
             "control_epoch": 2,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T07:00:00Z",
             "ended_at": "2026-08-17T07:30:00Z",
             "state_version": 0,
@@ -1052,7 +1100,7 @@ def _insert_historical_attempt_graph(connection: sqlite3.Connection) -> tuple[st
             "control_epoch": 4,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T06:00:00Z",
             "ended_at": "2026-08-17T06:30:00Z",
             "state_version": 0,
@@ -1231,7 +1279,7 @@ def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
             "control_epoch": 5,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T06:00:00Z",
             "ended_at": "2026-08-17T06:30:00Z",
             "state_version": 0,
@@ -1788,6 +1836,18 @@ def _insert_active_attempt_graph(
             "state_version": 0,
         },
     )
+    if drain_state == "DRAINING":
+        _insert_control_command_ack(
+            connection,
+            command_id="command-control-lineage-drain",
+            command_seq=1,
+            acknowledged_attempt_id="attempt-control-lineage",
+        )
+        connection.execute(
+            "UPDATE attempts SET interrupt_command_id='command-control-lineage-drain' "
+            "WHERE attempt_id='attempt-control-lineage'"
+        )
+        connection.execute("UPDATE runs SET control_command_seq=1 WHERE run_id='run-control-1'")
 
 
 def _insert_canonical_active_authority(
@@ -2273,7 +2333,7 @@ def _insert_successful_plan_step(
             "control_epoch": 1,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T07:00:00Z",
             "ended_at": "2026-08-17T07:30:00Z",
             "state_version": 0,
@@ -2417,7 +2477,7 @@ def _insert_successful_design_review_step(
             "control_epoch": 1,
             "accepted_control_command_seq": 0,
             "interrupt_command_id": None,
-            "drain_state": "DRAINED",
+            "drain_state": "NONE",
             "started_at": "2026-08-17T07:00:00Z",
             "ended_at": "2026-08-17T07:30:00Z",
             "state_version": 0,
@@ -3162,7 +3222,7 @@ async def test_running_authority_ignores_valid_historical_attempt_authorization(
                 "control_epoch": 8,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "DRAINED",
+                "drain_state": "NONE",
                 "started_at": "2026-08-17T07:00:00Z",
                 "ended_at": "2026-08-17T08:00:00Z",
                 "state_version": 0,
@@ -3583,7 +3643,7 @@ async def test_terminated_requires_known_terminal_step_and_attempt_outcomes(
                 "control_epoch": 1,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "DRAINED",
+                "drain_state": "NONE",
                 "started_at": "2026-08-17T07:00:00Z",
                 "ended_at": "2026-08-17T07:30:00Z",
                 "state_version": 0,
@@ -4181,7 +4241,7 @@ async def test_passed_barrier_phase_and_milestone_commit_atomically() -> None:
                 "control_epoch": 1,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "DRAINED",
+                "drain_state": "NONE",
                 "started_at": "2026-08-14T07:59:00Z",
                 "ended_at": "2026-08-14T08:00:00Z",
                 "state_version": 0,
@@ -4305,7 +4365,7 @@ async def test_passed_barrier_phase_and_milestone_commit_atomically() -> None:
                 "control_epoch": 1,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "DRAINED",
+                "drain_state": "NONE",
                 "started_at": "2026-08-14T08:01:00Z",
                 "ended_at": "2026-08-14T08:02:00Z",
                 "state_version": 0,
@@ -6161,6 +6221,18 @@ async def test_transition_observed_requires_authoritative_dispatch_state(
                 "state_version": 0,
             },
         )
+        if drain_state == "DRAINING":
+            _insert_control_command_ack(
+                connection,
+                command_id="command-authority-valid-drain",
+                command_seq=1,
+                acknowledged_attempt_id="attempt-authority-valid",
+            )
+            connection.execute(
+                "UPDATE attempts SET interrupt_command_id='command-authority-valid-drain' "
+                "WHERE attempt_id='attempt-authority-valid'"
+            )
+            connection.execute("UPDATE runs SET control_command_seq=1 WHERE run_id='run-control-1'")
         _insert(
             connection,
             "resource_leases",
@@ -6585,7 +6657,7 @@ async def test_attempt_only_unknown_timeout_persists_blocked_run_event() -> None
                 "control_epoch": 1,
                 "accepted_control_command_seq": 0,
                 "interrupt_command_id": None,
-                "drain_state": "DRAINED",
+                "drain_state": "NONE",
                 "started_at": "2026-08-17T07:00:00Z",
                 "ended_at": "2026-08-17T07:30:00Z",
                 "state_version": 0,
@@ -6620,5 +6692,100 @@ async def test_attempt_only_unknown_timeout_persists_blocked_run_event() -> None
             "SELECT observed_state,requires_user_action,block_reason_code,state_version FROM runs"
         ).fetchone() == ("BLOCKED", 1, "UNKNOWN_REMOTE_STATE_TIMEOUT", 1)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_running_drained_attempt_cannot_be_hidden_as_inactive_for_queued_transition() -> None:
+    """RUNNING/DRAINED 是损坏投影，不能被 SQL 过滤后伪装成零活动 Attempt。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_active_attempt_graph(connection, drain_state="DRAINED")
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(WorkflowRepositoryError):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-running-drained"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_control_plane_observed(
+                request_id="request-running-drained",
+                run_id="run-control-1",
+                expected_state_version=0,
+                candidate=RunObservedState.QUEUED,
+            )
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_close_rejects_historical_drained_attempt_without_interrupt_lineage() -> None:
+    """历史 DRAINED 必须闭合阻断命令与 ACK，不能只凭枚举值通过目标收口。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        connection.execute(
+            "UPDATE attempts SET drain_state='DRAINED',interrupt_command_id=NULL "
+            "WHERE attempt_id='attempt-planning-contract'"
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError) as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-drained-without-lineage"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-drained-without-lineage",
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_close_accepts_historical_drained_attempt_with_authoritative_interrupt_lineage() -> None:
+    """闭合 blocking command 与初始 ACK 的历史 DRAINED 仍可合法完成目标收口。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_control_command_ack(
+            connection,
+            command_id="command-target-close-drain",
+            command_seq=1,
+            acknowledged_attempt_id="attempt-planning-contract",
+        )
+        connection.execute(
+            "UPDATE attempts SET drain_state='DRAINED',interrupt_command_id='command-target-close-drain' "
+            "WHERE attempt_id='attempt-planning-contract'"
+        )
+        connection.execute("UPDATE runs SET control_command_seq=1 WHERE run_id='run-control-1'")
+
+        result = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-authoritative-drained-target"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).commit_passed_barrier(
+            _target_close_request(
+                planning_barrier_id=planning_barrier_id,
+                request_id="request-authoritative-drained-target",
+            )
+        )
+
+        assert result.run.observed_state is RunObservedState.TERMINATED
+        assert result.task.lifecycle.value == "SUCCEEDED"
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (3,)
     finally:
         connection.close()
