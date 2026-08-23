@@ -216,7 +216,8 @@ class BarrierMilestoneRequest:
                 self.next_barrier_id is not None
                 and (not isinstance(self.next_barrier_id, str) or not self.next_barrier_id)
             )
-            or any(type(value) is not int or value < 0 for value in versions)
+            # 三路 CAS selector 与其他 application API 共用跨语言安全整数闭集。
+            or any(type(value) is not int or not 0 <= value <= _MAX_SAFE_SELECTOR_INTEGER for value in versions)
             or not isinstance(self.gate_digest, str)
             or _SHA256.fullmatch(self.gate_digest) is None
             or not isinstance(self.now, datetime)

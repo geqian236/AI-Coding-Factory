@@ -20,6 +20,7 @@ from factory_agent.domain.workflow import (
     StepPhase,
     TaskLifecycle,
 )
+from factory_agent.state_machine import transitions as transition_rules
 from factory_agent.state_machine.transitions import (
     PhaseTransitionReason,
     StateTransitionError,
@@ -220,6 +221,35 @@ def test_achieved_stage_is_monotonic_and_allows_idempotent_projection() -> None:
         require_achieved_stage_transition(current, current)
     with pytest.raises(StateTransitionError):
         require_achieved_stage_transition(AchievedStage.PR_READY, AchievedStage.CODEX_APPROVED)
+
+
+def test_step_phase_outcome_validator_freezes_the_complete_projection_matrix() -> None:
+    """Step phase/outcome 组合必须与冻结语义逐项一致，UNKNOWN 只属于 RECONCILING。"""
+    accepted = {
+        *((phase, StepOutcome.NONE) for phase in tuple(StepPhase)[:4]),
+        (StepPhase.RECONCILING, StepOutcome.NONE),
+        (StepPhase.RECONCILING, StepOutcome.UNKNOWN_REMOTE_STATE),
+        *((StepPhase.TERMINAL, outcome) for outcome in tuple(StepOutcome)[1:-1]),
+    }
+    for phase, outcome in product(StepPhase, StepOutcome):
+        if (phase, outcome) in accepted:
+            transition_rules.require_step_phase_outcome(phase, outcome)
+        else:
+            with pytest.raises(StateTransitionError):
+                transition_rules.require_step_phase_outcome(phase, outcome)
+
+
+def test_attempt_phase_outcome_validator_freezes_the_complete_projection_matrix() -> None:
+    """Attempt 非终态只能是 NONE；TERMINATED 可保留 UNKNOWN 事实但不得是 NONE。"""
+    for phase, outcome in product(AttemptPhase, AttemptOutcome):
+        accepted = (phase is not AttemptPhase.TERMINATED and outcome is AttemptOutcome.NONE) or (
+            phase is AttemptPhase.TERMINATED and outcome is not AttemptOutcome.NONE
+        )
+        if accepted:
+            transition_rules.require_attempt_phase_outcome(phase, outcome)
+        else:
+            with pytest.raises(StateTransitionError):
+                transition_rules.require_attempt_phase_outcome(phase, outcome)
 
 
 def test_executor_phase_only_transitions_accept_only_frozen_reconciling_edges() -> None:

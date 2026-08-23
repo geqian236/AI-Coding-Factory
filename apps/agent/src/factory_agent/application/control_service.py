@@ -23,6 +23,8 @@ from factory_agent.storage.sqlite.workflow_repository import SqliteWorkflowRepos
 
 LOGGER = get_logger(__name__)
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
+# 跨语言 selector 只接受 JSON/IEEE-754 可无损表达的非负整数。
+_MAX_SAFE_SELECTOR_INTEGER = 2**53 - 1
 _BLOCKING_COMMANDS = frozenset(
     {ControlCommandType.SOFT_PAUSE, ControlCommandType.IMMEDIATE_STOP, ControlCommandType.CANCEL}
 )
@@ -66,7 +68,7 @@ class ControlCommandRequest:
         if (
             any(not isinstance(value, str) or not value for value in (self.request_id, self.run_id, self.actor_id))
             or type(self.expected_state_version) is not int
-            or self.expected_state_version < 0
+            or not 0 <= self.expected_state_version <= _MAX_SAFE_SELECTOR_INTEGER
             or not isinstance(self.reason_digest, str)
             or _SHA256.fullmatch(self.reason_digest) is None
         ):

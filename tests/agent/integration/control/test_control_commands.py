@@ -1435,6 +1435,22 @@ def _connection(*, desired_state: str = "RUNNING", observed_state: str = "QUEUED
     return connection
 
 
+def _transaction_projection_snapshot(connection: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
+    """冻结状态、版本、事件、命令与 receipt，用于证明拒绝路径没有留下部分事务。"""
+    queries = {
+        "tasks": "SELECT * FROM tasks ORDER BY task_id",
+        "runs": "SELECT * FROM runs ORDER BY run_id",
+        "steps": "SELECT * FROM steps ORDER BY step_id",
+        "attempts": "SELECT * FROM attempts ORDER BY attempt_id",
+        "barriers": "SELECT * FROM phase_barriers ORDER BY barrier_id",
+        "events": "SELECT * FROM authoritative_state_events ORDER BY state_event_id",
+        "commands": "SELECT * FROM control_commands ORDER BY command_id",
+        "control_receipts": "SELECT * FROM control_command_receipt_events ORDER BY command_receipt_event_id",
+        "action_receipts": "SELECT * FROM action_receipt_events ORDER BY receipt_event_id",
+    }
+    return {name: connection.execute(sql).fetchall() for name, sql in queries.items()}
+
+
 def _service(connection: sqlite3.Connection) -> ControlService:
     """构造注入稳定时钟和 identity 的真实服务。"""
     return ControlService(
@@ -1617,6 +1633,79 @@ async def test_transition_selector_rejects_invalid_enum_time_or_nullable_before_
     await _assert_transition_selector_rejected(api_name, field, invalid)
 
 
+@pytest.mark.parametrize("invalid", [True, -1, 2**53, 2**63, [], b"version"])
+@pytest.mark.asyncio
+async def test_control_command_version_rejects_unsafe_integer_before_coordinator(invalid: object) -> None:
+    """Control command 版本必须是跨语言安全整数，拒绝时 coordinator 不得执行。"""
+    coordinator = _RecordingCoordinator()
+    service = ControlService(
+        coordinator=coordinator,
+        now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        command_id_factory=_ids("unused-command-version"),
+        receipt_id_factory=_ids("unused-receipt-version"),
+        state_event_id_factory=_ids("unused-event-version"),
+    )
+    with pytest.raises(ControlRequestError):
+        request = ControlCommandRequest(
+            request_id="request-version-boundary",
+            run_id="run-control-1",
+            command_type=ControlCommandType.SOFT_PAUSE,
+            actor_id="actor-control-1",
+            expected_state_version=invalid,  # type: ignore[arg-type]
+            reason_digest=SHA_A,
+        )
+        await service.submit(request)
+    assert coordinator.calls == 0
+
+
+def test_control_command_version_accepts_max_safe_integer() -> None:
+    """2**53-1 是 Control command selector 的可移植闭区间上界。"""
+    assert _request(expected_state_version=2**53 - 1).expected_state_version == 2**53 - 1
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        (field, invalid)
+        for field in (
+            "expected_task_state_version",
+            "expected_run_state_version",
+            "expected_barrier_state_version",
+        )
+        for invalid in (True, -1, 2**53, 2**63, [], b"version")
+    ],
+)
+@pytest.mark.asyncio
+async def test_barrier_versions_reject_unsafe_integer_before_coordinator(
+    field: str,
+    invalid: object,
+) -> None:
+    """Barrier 三路 CAS 版本必须在构造请求时稳定拒绝，不能进入事务。"""
+    coordinator = _RecordingCoordinator()
+    service = TransitionService(coordinator=coordinator, state_event_id_factory=_ids("unused-barrier-version"))
+    base = _target_close_request(planning_barrier_id="barrier-version", request_id="request-barrier-version")
+    with pytest.raises(BarrierMilestoneCommitError):
+        request = replace(base, **{field: invalid})
+        await service.commit_passed_barrier(request)
+    assert coordinator.calls == 0
+
+
+def test_barrier_versions_accept_max_safe_integer() -> None:
+    """Barrier 的 Task/Run/Barrier 三个版本都接受 2**53-1。"""
+    maximum = 2**53 - 1
+    request = replace(
+        _target_close_request(planning_barrier_id="barrier-version-max", request_id="request-version-max"),
+        expected_task_state_version=maximum,
+        expected_run_state_version=maximum,
+        expected_barrier_state_version=maximum,
+    )
+    assert (
+        request.expected_task_state_version,
+        request.expected_run_state_version,
+        request.expected_barrier_state_version,
+    ) == (maximum, maximum, maximum)
+
+
 def _request(
     *,
     request_id: str = "request-pause-1",
@@ -1741,6 +1830,222 @@ def _insert_canonical_active_authority(
             expires_at=authorization_expires_at,
         ),
     )
+
+
+@pytest.mark.parametrize("table", ["steps", "attempts"])
+@pytest.mark.asyncio
+async def test_executor_authority_rejects_nonterminal_outcome_and_rolls_back(table: str) -> None:
+    """executor 写权威必须先校验当前 Step/Attempt phase-outcome，不得提交 Run 或事件。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        connection.execute(f"UPDATE {table} SET outcome='SUCCEEDED'")  # noqa: S608
+        before = _transaction_projection_snapshot(connection)
+        with pytest.raises(WorkflowRepositoryError, match="phase/outcome"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-invalid-{table}-outcome"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id=f"request-invalid-{table}-outcome",
+            )
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("write_kind", ["step", "attempt"])
+@pytest.mark.asyncio
+async def test_guarded_wrapper_rejects_cross_projection_corruption(write_kind: str) -> None:
+    """Step/Attempt wrapper 都必须交叉校验同一 active lineage 的另一个 projection。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_canonical_active_authority(connection)
+        corrupted_table = "attempts" if write_kind == "step" else "steps"
+        connection.execute(f"UPDATE {corrupted_table} SET outcome='SUCCEEDED'")  # noqa: S608
+        before = _transaction_projection_snapshot(connection)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids(f"state-event-cross-corruption-{write_kind}"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        )
+        with pytest.raises(WorkflowRepositoryError, match="phase/outcome"):
+            if write_kind == "step":
+                await service.transition_executor_step_state(
+                    request_id="request-cross-corruption-step",
+                    run_id="run-control-1",
+                    step_id="step-control-active",
+                    attempt_id="attempt-control-lineage",
+                    expected_run_state_version=0,
+                    expected_step_state_version=0,
+                    executor_id="executor-control-lineage",
+                    fencing_token=7,
+                    control_epoch=9,
+                    candidate=StepPhase.RECONCILING,
+                )
+            else:
+                await service.transition_executor_attempt_state(
+                    request_id="request-cross-corruption-attempt",
+                    run_id="run-control-1",
+                    attempt_id="attempt-control-lineage",
+                    expected_run_state_version=0,
+                    expected_attempt_state_version=0,
+                    executor_id="executor-control-lineage",
+                    fencing_token=7,
+                    control_epoch=9,
+                    candidate=AttemptPhase.RECONCILING,
+                )
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "phase", "outcome", "ended_at"),
+    [
+        ("steps", "PENDING", "SUCCEEDED", None),
+        ("steps", "TERMINAL", "NONE", None),
+        ("steps", "TERMINAL", "UNKNOWN_REMOTE_STATE", None),
+        ("attempts", "RUNNING", "SUCCEEDED", None),
+        ("attempts", "TERMINATED", "NONE", "2026-08-17T09:00:00Z"),
+    ],
+)
+def test_observed_authority_rejects_invalid_current_phase_outcome_fact(
+    table: str,
+    phase: str,
+    outcome: str,
+    ended_at: str | None,
+) -> None:
+    """observed authority 必须扫描当前 Run 的全部 Step/Attempt，损坏组合不能降级为布尔假。"""
+    connection = _connection()
+    try:
+        _insert_active_attempt_graph(connection)
+        if table == "attempts":
+            connection.execute(
+                "UPDATE attempts SET phase=?,outcome=?,ended_at=?",
+                (phase, outcome, ended_at),
+            )
+        else:
+            connection.execute("UPDATE steps SET phase=?,outcome=?", (phase, outcome))
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError, match="phase/outcome"):
+                SqliteWorkflowRepository(unit_of_work).load_observed_state_authority(
+                    run_id="run-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                )
+        finally:
+            unit_of_work.rollback()
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("phase", "outcome", "started_at", "ended_at"),
+    [
+        ("RUNNING", "NONE", "2026-08-17T07:00:00Z", "2026-08-17T08:00:00Z"),
+        ("TERMINATED", "SUCCEEDED", "2026-08-17T07:00:00Z", None),
+        ("TERMINATED", "SUCCEEDED", "2026-08-17T07:00:00Z", "2026-08-17T09:00:00.001Z"),
+        ("TERMINATED", "SUCCEEDED", "2026-08-17T08:30:00Z", "2026-08-17T08:00:00Z"),
+    ],
+    ids=["nonterminal-ended", "terminal-ended-null", "terminal-ended-future", "terminal-ended-before-started"],
+)
+def test_observed_authority_rejects_invalid_attempt_chronology(
+    phase: str,
+    outcome: str,
+    started_at: str,
+    ended_at: str | None,
+) -> None:
+    """observed authority 必须按 authoritative now 校验每个 Attempt 的完整时间线。"""
+    connection = _connection()
+    try:
+        _insert_active_attempt_graph(connection)
+        connection.execute("UPDATE steps SET phase='TERMINAL',outcome='SUCCEEDED'")
+        connection.execute(
+            "UPDATE attempts SET phase=?,outcome=?,started_at=?,ended_at=?",
+            (phase, outcome, started_at, ended_at),
+        )
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError, match="chronology"):
+                SqliteWorkflowRepository(unit_of_work).load_observed_state_authority(
+                    run_id="run-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                )
+        finally:
+            unit_of_work.rollback()
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_observed_authority_accepts_reconciling_unknown_but_does_not_settle_terminal_unknown() -> None:
+    """Step RECONCILING/UNKNOWN 是阻断事实；Attempt TERMINATED/UNKNOWN 合法但绝不算 settled。"""
+    reconciling = _connection()
+    terminal = _connection()
+    try:
+        _insert_active_attempt_graph(
+            reconciling,
+            step_phase="RECONCILING",
+            step_outcome="UNKNOWN_REMOTE_STATE",
+            attempt_phase="RECONCILING",
+            attempt_outcome="NONE",
+        )
+        reconciling_uow = SqliteUnitOfWork(reconciling, failure_probe=lambda _point: None)
+        reconciling_uow.begin_immediate()
+        try:
+            reconciling_facts = SqliteWorkflowRepository(reconciling_uow).load_observed_state_authority(
+                run_id="run-control-1",
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            )
+        finally:
+            reconciling_uow.rollback()
+        assert reconciling_facts.unknown_remote_state is True
+        assert reconciling_facts.reconciling_fact is True
+        blocked = await TransitionService(
+            coordinator=_SqliteCoordinator(reconciling),
+            state_event_id_factory=_ids("state-event-reconciling-unknown"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).transition_control_plane_observed(
+            run_id="run-control-1",
+            expected_state_version=0,
+            candidate=RunObservedState.BLOCKED,
+            request_id="request-reconciling-unknown",
+        )
+        assert blocked.observed_state is RunObservedState.BLOCKED
+
+        _insert_active_attempt_graph(terminal)
+        terminal.execute("UPDATE steps SET phase='TERMINAL',outcome='SUCCEEDED'")
+        terminal.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='UNKNOWN_REMOTE_STATE',"
+            "started_at=NULL,ended_at='2026-08-17T09:00:00Z'"
+        )
+        terminal_uow = SqliteUnitOfWork(terminal, failure_probe=lambda _point: None)
+        terminal_uow.begin_immediate()
+        try:
+            terminal_facts = SqliteWorkflowRepository(terminal_uow).load_observed_state_authority(
+                run_id="run-control-1",
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            )
+        finally:
+            terminal_uow.rollback()
+        assert terminal_facts.unknown_remote_state is True
+        assert terminal_facts.terminated_fact is False
+    finally:
+        reconciling.close()
+        terminal.close()
 
 
 def _replace_active_execution_authorization(
@@ -2407,10 +2712,10 @@ async def test_unknown_interrupting_attempt_cannot_transition_to_stopping() -> N
     try:
         _insert_active_attempt_graph(
             connection,
-            step_phase="RUNNING",
+            step_phase="RECONCILING",
             step_outcome="UNKNOWN_REMOTE_STATE",
             attempt_phase="INTERRUPTING",
-            attempt_outcome="UNKNOWN_REMOTE_STATE",
+            attempt_outcome="NONE",
             drain_state="DRAINING",
         )
         service = TransitionService(
@@ -2982,33 +3287,48 @@ async def test_invalid_or_inactive_authority_time_rolls_back_running_transition(
 
 
 @pytest.mark.parametrize(
-    ("authorization_kind", "revoked_at"),
+    ("authorization_kind", "issued_at", "expires_at", "revoked_at"),
     [
-        ("execution", "2026-08-17T09:30:00Z"),
-        ("execution", "2026-08-17T10:30:00Z"),
-        ("intent", "2026-08-17T09:30:00Z"),
-        ("intent", "2026-08-17T10:30:00Z"),
+        ("execution", "2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T06:30:00Z"),
+        ("execution", "2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T09:30:00Z"),
+        ("execution", "2026-08-17T07:00:00Z", "2026-08-17T08:00:00Z", "2026-08-17T08:30:00Z"),
+        ("intent", "2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T06:30:00Z"),
+        ("intent", "2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T09:30:00Z"),
+        ("intent", "2026-08-17T07:00:00Z", "2026-08-17T08:00:00Z", "2026-08-17T08:30:00Z"),
     ],
-    ids=["execution-future", "execution-after-expiry", "intent-future", "intent-after-expiry"],
+    ids=[
+        "execution-before-issued",
+        "execution-future",
+        "execution-after-expiry",
+        "intent-before-issued",
+        "intent-future",
+        "intent-after-expiry",
+    ],
 )
 @pytest.mark.asyncio
 async def test_running_authority_rejects_invalid_revocation_timeline_and_rolls_back(
     authorization_kind: str,
+    issued_at: str,
+    expires_at: str,
     revoked_at: str,
 ) -> None:
-    """Execution/Intent 的未来或过期后撤销都是损坏事实，不得降级成普通 inactive。"""
+    """Execution/Intent 的倒置、未来或过期后撤销必须作为独立损坏事实拒绝。"""
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
         _insert_canonical_active_authority(connection)
         if authorization_kind == "execution":
             _replace_active_execution_authorization(
                 connection,
+                issued_at=issued_at,
+                expires_at=expires_at,
                 revoked_at=revoked_at,
                 revoke_reason="invalid-revocation-probe",
             )
         else:
             _replace_canonical_intent_authorization(
                 connection,
+                issued_at=issued_at,
+                expires_at=expires_at,
                 revoked_at=revoked_at,
                 revoke_reason="invalid-revocation-probe",
             )
@@ -3035,15 +3355,16 @@ async def test_running_authority_rejects_invalid_revocation_timeline_and_rolls_b
 
 
 @pytest.mark.parametrize(
-    ("heartbeat_at", "expires_at"),
+    ("acquired_at", "heartbeat_at", "expires_at"),
     [
-        ("2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
-        ("2026-08-17T10:00:00Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T08:58:00Z", "2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T07:00:00Z", "2026-08-17T08:30:00Z", "2026-08-17T08:00:00Z"),
     ],
-    ids=["future-heartbeat", "heartbeat-at-expiry"],
+    ids=["future-heartbeat", "heartbeat-after-expiry"],
 )
 @pytest.mark.asyncio
 async def test_running_authority_rejects_invalid_matching_lease_timeline_and_rolls_back(
+    acquired_at: str,
     heartbeat_at: str,
     expires_at: str,
 ) -> None:
@@ -3052,8 +3373,8 @@ async def test_running_authority_rejects_invalid_matching_lease_timeline_and_rol
     try:
         _insert_canonical_active_authority(connection)
         connection.execute(
-            "UPDATE resource_leases SET heartbeat_at=?,expires_at=?",
-            (heartbeat_at, expires_at),
+            "UPDATE resource_leases SET acquired_at=?,heartbeat_at=?,expires_at=?",
+            (acquired_at, heartbeat_at, expires_at),
         )
 
         with pytest.raises(WorkflowRepositoryError, match="lease time ordering"):
@@ -3273,7 +3594,7 @@ async def test_terminated_requires_known_terminal_step_and_attempt_outcomes(
             state_event_id_factory=_ids("state-event-terminal-outcome"),
             now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
         )
-        with pytest.raises(TransitionPredicateError):
+        with pytest.raises(WorkflowRepositoryError, match="phase/outcome"):
             await service.transition_control_plane_observed(
                 run_id="run-control-1",
                 expected_state_version=0,
@@ -4026,6 +4347,96 @@ async def test_passed_barrier_phase_and_milestone_commit_atomically() -> None:
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("table", "identity_column", "identity", "expected_detail"),
+    [
+        ("steps", "step_id", "step-planning-historical", "Step phase/outcome is invalid"),
+        ("attempts", "attempt_id", "attempt-planning-historical", "Attempt phase/outcome is invalid"),
+    ],
+    ids=["step-terminal-none", "attempt-terminated-none"],
+)
+@pytest.mark.asyncio
+async def test_target_close_rejects_invalid_historical_phase_outcome_and_rolls_back(
+    table: str,
+    identity_column: str,
+    identity: str,
+    expected_detail: str,
+) -> None:
+    """目标收口必须扫描同一 Run 的历史投影，终态 NONE 不能被当前 barrier 正例掩盖。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_historical_attempt_graph(connection)
+        connection.execute(
+            f"UPDATE {table} SET outcome='NONE' WHERE {identity_column}=?",  # noqa: S608
+            (identity,),
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError) as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-target-invalid-outcome-{table}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id=f"request-target-invalid-outcome-{table}",
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == expected_detail
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("started_at", "ended_at"),
+    [
+        ("2026-08-17T07:00:00Z", None),
+        ("2026-08-17T08:00:00Z", "2026-08-17T07:30:00Z"),
+        ("2026-08-17T07:00:00Z", "2026-08-17T09:00:00.001Z"),
+    ],
+    ids=["ended-null", "ended-before-started", "ended-future"],
+)
+@pytest.mark.asyncio
+async def test_target_close_rejects_invalid_terminal_attempt_chronology(
+    started_at: str,
+    ended_at: str | None,
+) -> None:
+    """目标收口必须复验历史 Attempt 时间线，并整笔回滚 barrier/Run/Task/event。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        connection.execute(
+            "UPDATE attempts SET started_at=?,ended_at=? WHERE attempt_id='attempt-planning-contract'",
+            (started_at, ended_at),
+        )
+        before = _transaction_projection_snapshot(connection)
+        with pytest.raises(BarrierMilestoneCommitError) as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-target-invalid-chronology"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-target-invalid-chronology",
+                )
+            )
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == "attempt chronology is invalid"
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
 @pytest.mark.asyncio
 async def test_target_reached_closes_run_without_selecting_successor() -> None:
     """达到 RunSpec targetStage 时必须原子收口 Run，不得把 Task 标成成功后继续执行。"""
@@ -4287,15 +4698,16 @@ async def test_target_reached_rejects_lease_without_authorization_and_rolls_back
 
 
 @pytest.mark.parametrize(
-    ("heartbeat_at", "expires_at"),
+    ("acquired_at", "heartbeat_at", "expires_at"),
     [
-        ("2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
-        ("2026-08-17T10:00:00Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T08:58:00Z", "2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T07:00:00Z", "2026-08-17T08:30:00Z", "2026-08-17T08:00:00Z"),
     ],
-    ids=["future-heartbeat", "heartbeat-at-expiry"],
+    ids=["future-heartbeat", "heartbeat-after-expiry"],
 )
 @pytest.mark.asyncio
 async def test_target_reached_rejects_invalid_matching_lease_timeline_and_rolls_back(
+    acquired_at: str,
     heartbeat_at: str,
     expires_at: str,
 ) -> None:
@@ -4307,11 +4719,12 @@ async def test_target_reached_rejects_invalid_matching_lease_timeline_and_rolls_
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert_target_close_lease(connection)
         connection.execute(
-            "UPDATE resource_leases SET heartbeat_at=?,expires_at=? WHERE resource_key='resource-target-lease-only'",
-            (heartbeat_at, expires_at),
+            "UPDATE resource_leases SET acquired_at=?,heartbeat_at=?,expires_at=? "
+            "WHERE resource_key='resource-target-lease-only'",
+            (acquired_at, heartbeat_at, expires_at),
         )
 
-        with pytest.raises(BarrierMilestoneCommitError):
+        with pytest.raises(BarrierMilestoneCommitError) as caught:
             await TransitionService(
                 coordinator=_SqliteCoordinator(connection),
                 state_event_id_factory=_ids(f"state-event-terminal-invalid-lease-{heartbeat_at}"),
@@ -4322,6 +4735,8 @@ async def test_target_reached_rejects_invalid_matching_lease_timeline_and_rolls_
                     request_id=f"request-terminal-invalid-lease-{heartbeat_at}",
                 )
             )
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == "lease time ordering is invalid"
 
         assert connection.execute(
             "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
@@ -4612,12 +5027,18 @@ async def test_target_reached_allows_self_consistent_expired_historical_authoriz
 
 
 @pytest.mark.parametrize(
-    "revoked_at",
-    ["2026-08-17T09:30:00Z", "2026-08-17T10:30:00Z"],
-    ids=["future-revocation", "revocation-after-expiry"],
+    ("issued_at", "expires_at", "revoked_at"),
+    [
+        ("2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T06:30:00Z"),
+        ("2026-08-17T07:00:00Z", "2026-08-17T10:00:00Z", "2026-08-17T09:30:00Z"),
+        ("2026-08-17T07:00:00Z", "2026-08-17T08:00:00Z", "2026-08-17T08:30:00Z"),
+    ],
+    ids=["revocation-before-issued", "future-revocation", "revocation-after-expiry"],
 )
 @pytest.mark.asyncio
 async def test_target_reached_rejects_invalid_historical_revocation_timeline(
+    issued_at: str,
+    expires_at: str,
     revoked_at: str,
 ) -> None:
     """历史授权的未来/过期后撤销是损坏事实，不能被 CONSUMED 状态掩盖后错误收口。"""
@@ -4644,8 +5065,8 @@ async def test_target_reached_rejects_invalid_historical_revocation_timeline(
                 accepted_control_command_seq=0,
                 max_uses=0,
                 consumption_state="CONSUMED",
-                issued_at="2026-08-17T08:00:00Z",
-                expires_at="2026-08-17T10:00:00Z",
+                issued_at=issued_at,
+                expires_at=expires_at,
                 revoked_at=revoked_at,
                 revoke_reason="invalid-revocation-probe",
             ),

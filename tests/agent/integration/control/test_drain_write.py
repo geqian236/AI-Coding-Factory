@@ -41,6 +41,7 @@ from tests.agent.integration.control.test_control_commands import (
     _selector_digest,
     _service,
     _SqliteCoordinator,
+    _transaction_projection_snapshot,
 )
 
 
@@ -831,7 +832,7 @@ async def test_guarded_phase_only_write_rejects_non_none_current_outcome(write_k
             now=lambda: datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
         )
 
-        with pytest.raises(StateTransitionError):
+        with pytest.raises(WorkflowRepositoryError, match="phase/outcome"):
             if write_kind == "step":
                 await service.transition_executor_step_state(
                     request_id="request-non-none-step",
@@ -919,6 +920,46 @@ async def test_normal_attempt_termination_preserves_none_drain_and_event_payload
         connection.close()
 
 
+@pytest.mark.parametrize(
+    "started_at",
+    [None, "2026-08-14T09:00:00+01:00"],
+    ids=["started-null", "offset-equivalent-to-ended-now"],
+)
+@pytest.mark.asyncio
+async def test_attempt_termination_accepts_optional_start_and_equal_now_instant(started_at: str | None) -> None:
+    """started_at 可空；带 offset 的等价瞬时与 ended_at==now 都必须合法提交。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        connection.execute("UPDATE attempts SET started_at=?", (started_at,))
+        terminated = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-optional-start"),
+            now=lambda: datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        ).terminate_executor_attempt(
+            request_id="request-optional-start",
+            run_id="run-control-1",
+            attempt_id="attempt-control-1",
+            expected_run_state_version=0,
+            expected_attempt_state_version=0,
+            executor_id="executor-control-1",
+            fencing_token=7,
+            control_epoch=9,
+            outcome=AttemptOutcome.SUCCEEDED,
+            ended_at="2026-08-14T08:00:00Z",
+            termination_reason=None,
+        )
+        assert (terminated.phase, terminated.outcome, terminated.ended_at, terminated.state_version) == (
+            AttemptPhase.TERMINATED,
+            AttemptOutcome.SUCCEEDED,
+            "2026-08-14T08:00:00Z",
+            1,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
+    finally:
+        connection.close()
+
+
 @pytest.mark.asyncio
 async def test_attempt_termination_rejects_ended_before_started_and_rolls_back() -> None:
     """ended_at 早于 started_at 时必须按 UTC 瞬时拒绝，不能留下终态或事件。"""
@@ -926,7 +967,7 @@ async def test_attempt_termination_rejects_ended_before_started_and_rolls_back()
     try:
         _insert_attempt_graph(connection)
 
-        with pytest.raises(WorkflowRepositoryError, match="precedes"):
+        with pytest.raises(WorkflowRepositoryError, match="chronology"):
             await TransitionService(
                 coordinator=_SqliteCoordinator(connection),
                 state_event_id_factory=_ids("state-event-ended-before-started"),
@@ -949,6 +990,81 @@ async def test_attempt_termination_rejects_ended_before_started_and_rolls_back()
             "SELECT phase,outcome,drain_state,ended_at,state_version FROM attempts"
         ).fetchone() == ("RUNNING", "NONE", "NONE", None, 0)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_attempt_termination_rejects_future_end_and_rolls_back_complete_transaction() -> None:
+    """ended_at 超过 authoritative now 即使只差一毫秒也必须拒绝，且不得留下任何配对写。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        before = _transaction_projection_snapshot(connection)
+        with pytest.raises(WorkflowRepositoryError, match="chronology"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-future-ended-at"),
+                now=lambda: datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+            ).terminate_executor_attempt(
+                request_id="request-future-ended-at",
+                run_id="run-control-1",
+                attempt_id="attempt-control-1",
+                expected_run_state_version=0,
+                expected_attempt_state_version=0,
+                executor_id="executor-control-1",
+                fencing_token=7,
+                control_epoch=9,
+                outcome=AttemptOutcome.FAILED,
+                ended_at="2026-08-14T08:00:00.001Z",
+                termination_reason=None,
+            )
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("write_kind", ["step", "attempt"])
+@pytest.mark.asyncio
+async def test_guarded_write_rejects_nonterminal_attempt_with_ended_at(write_kind: str) -> None:
+    """任一 guarded wrapper 都不得在非终态 Attempt 已携带 ended_at 时继续写 projection。"""
+    connection = _connection(desired_state="RUNNING", observed_state="RUNNING")
+    try:
+        _insert_attempt_graph(connection)
+        connection.execute("UPDATE attempts SET ended_at='2026-08-14T08:00:00Z'")
+        before = _transaction_projection_snapshot(connection)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids(f"state-event-nonterminal-ended-{write_kind}"),
+            now=lambda: datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        )
+        with pytest.raises(WorkflowRepositoryError, match="chronology"):
+            if write_kind == "step":
+                await service.transition_executor_step_state(
+                    request_id="request-nonterminal-ended-step",
+                    run_id="run-control-1",
+                    step_id="step-control-1",
+                    attempt_id="attempt-control-1",
+                    expected_run_state_version=0,
+                    expected_step_state_version=0,
+                    executor_id="executor-control-1",
+                    fencing_token=7,
+                    control_epoch=9,
+                    candidate=StepPhase.RECONCILING,
+                )
+            else:
+                await service.transition_executor_attempt_state(
+                    request_id="request-nonterminal-ended-attempt",
+                    run_id="run-control-1",
+                    attempt_id="attempt-control-1",
+                    expected_run_state_version=0,
+                    expected_attempt_state_version=0,
+                    executor_id="executor-control-1",
+                    fencing_token=7,
+                    control_epoch=9,
+                    candidate=AttemptPhase.RECONCILING,
+                )
+        assert _transaction_projection_snapshot(connection) == before
     finally:
         connection.close()
 
@@ -1054,7 +1170,7 @@ async def test_drain_guarded_writes_only_allow_attempt_termination() -> None:
             fencing_token=7,
             control_epoch=9,
             outcome=AttemptOutcome.INTERRUPTED,
-            ended_at="2026-08-17T09:00:00Z",
+            ended_at="2026-08-14T08:00:00Z",
             termination_reason="soft-pause",
         )
 
@@ -1067,7 +1183,7 @@ async def test_drain_guarded_writes_only_allow_attempt_termination() -> None:
         ) == (AttemptPhase.TERMINATED, AttemptOutcome.INTERRUPTED, DrainState.DRAINED, 2)
         assert connection.execute(
             "SELECT phase,outcome,drain_state,ended_at,state_version FROM attempts"
-        ).fetchone() == ("TERMINATED", "INTERRUPTED", "DRAINED", "2026-08-17T09:00:00Z", 2)
+        ).fetchone() == ("TERMINATED", "INTERRUPTED", "DRAINED", "2026-08-14T08:00:00Z", 2)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (event_count + 1,)
         event = json.loads(
             bytes(

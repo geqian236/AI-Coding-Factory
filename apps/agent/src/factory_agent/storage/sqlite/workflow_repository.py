@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from factory_agent.domain import authorization as authorization_domain
@@ -38,10 +38,12 @@ from factory_agent.state_machine.barriers import BarrierStepFacts
 from factory_agent.state_machine.predicates import KNOWN_TERMINAL_OUTCOMES
 from factory_agent.state_machine.transitions import (
     require_achieved_stage_transition,
+    require_attempt_phase_outcome,
     require_attempt_phase_transition,
     require_attempt_termination_transition,
     require_observed_transition,
     require_phase_transition,
+    require_step_phase_outcome,
     require_step_phase_transition,
     require_task_lifecycle_transition,
 )
@@ -101,6 +103,33 @@ def _lease_rows_active(rows: Sequence[Sequence[object]], *, now: datetime) -> bo
             raise WorkflowRepositoryError("lease time ordering is invalid")
         active = active or now < expires_at
     return active
+
+
+def _validate_step_projection(step: Step) -> None:
+    """把共享 Step phase/outcome 状态机错误稳定翻译为仓储不变量错误。"""
+    try:
+        require_step_phase_outcome(step.phase, step.outcome)
+    except FactoryError as exc:
+        raise WorkflowRepositoryError("Step phase/outcome is invalid") from exc
+
+
+def _validate_attempt_projection(attempt: Attempt, *, now: datetime) -> None:
+    """共享校验 Attempt phase/outcome 与 UTC 时间线，供读取权威和 termination 写端复用。"""
+    try:
+        require_attempt_phase_outcome(attempt.phase, attempt.outcome)
+    except FactoryError as exc:
+        raise WorkflowRepositoryError("Attempt phase/outcome is invalid") from exc
+
+    started_at = None if attempt.started_at is None else _rfc3339_utc(attempt.started_at, field="attempt started_at")
+    if attempt.phase is AttemptPhase.TERMINATED:
+        if attempt.ended_at is None:
+            raise WorkflowRepositoryError("attempt chronology is invalid")
+        ended_at = _rfc3339_utc(attempt.ended_at, field="attempt ended_at")
+        if ended_at > now or (started_at is not None and (started_at > ended_at or started_at > now)):
+            # authoritative now 是严格上界；不引入时钟容差，ended_at==now 才是合法边界。
+            raise WorkflowRepositoryError("attempt chronology is invalid")
+    elif attempt.ended_at is not None or (started_at is not None and started_at > now):
+        raise WorkflowRepositoryError("attempt chronology is invalid")
 
 
 def _snapshot_digest(selector: object, *, field: str) -> str:
@@ -278,6 +307,9 @@ class SqliteWorkflowRepository:
         step = self.get_step(attempt.step_id)
         if step is None or step.run_id != run.run_id:
             raise WorkflowRepositoryError("executor write lineage is inconsistent")
+        # guarded wrapper 共享同一组 projection/时间校验，不能只检查本次准备写的那张表。
+        _validate_step_projection(step)
+        _validate_attempt_projection(attempt, now=now_utc)
         active_attempt = self.get_active_attempt_for_run(run.run_id)
         if active_attempt is None or active_attempt.attempt_id != attempt.attempt_id:
             raise WorkflowRepositoryError("executor attempt is not the active run attempt")
@@ -498,6 +530,24 @@ class SqliteWorkflowRepository:
         if active_rows:
             record = dict(zip((item[0] for item in active_cursor.description), active_rows[0], strict=True))
             active_attempt = Attempt.from_record({key: record[key] for key in Attempt.__dataclass_fields__})
+        # observed 判定前扫描当前 Run 的全部执行投影；不能让一条合法 active 行掩盖历史损坏事实。
+        for (step_id,) in self._connection.execute(
+            "SELECT step_id FROM steps WHERE run_id=? ORDER BY step_id",
+            (run_id,),
+        ).fetchall():
+            step = self.get_step(str(step_id))
+            if step is None:
+                raise WorkflowRepositoryError("run Step authority is missing")
+            _validate_step_projection(step)
+        for (attempt_id,) in self._connection.execute(
+            "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
+            "WHERE s.run_id=? ORDER BY a.attempt_id",
+            (run_id,),
+        ).fetchall():
+            attempt = self.get_attempt(str(attempt_id))
+            if attempt is None:
+                raise WorkflowRepositoryError("run Attempt authority is missing")
+            _validate_attempt_projection(attempt, now=now_utc)
         lease_active = False
         heartbeat_valid = False
         authorization_active = False
@@ -1824,15 +1874,20 @@ class SqliteWorkflowRepository:
             current_outcome=authority.attempt.outcome,
             terminal_outcome=target_outcome,
         )
-        ended_instant = _rfc3339_utc(ended_at, field="attempt ended_at")
-        if authority.attempt.started_at is not None:
-            started_instant = _rfc3339_utc(authority.attempt.started_at, field="attempt started_at")
-            if ended_instant < started_instant:
-                raise WorkflowRepositoryError("attempt ended_at precedes started_at")
         if termination_reason is not None and (type(termination_reason) is not str or not termination_reason):
             raise WorkflowRepositoryError("Attempt termination reason is invalid")
         # NORMAL 保持 NONE；只有 DRAIN termination 才把配套 drain 事实推进到 DRAINED。
         terminal_drain_state = DrainState.DRAINED if mode is WriteMode.DRAIN_WRITE else DrainState.NONE
+        candidate_attempt = replace(
+            authority.attempt,
+            phase=AttemptPhase.TERMINATED,
+            outcome=target_outcome,
+            drain_state=terminal_drain_state,
+            ended_at=ended_at,
+            termination_reason=termination_reason,
+        )
+        # 写端与读端复用同一 UTC chronology，确保未来 ended_at 不会先 CAS 再靠外层补救。
+        _validate_attempt_projection(candidate_attempt, now=now.astimezone(UTC))
         row = self._task1._cas(
             table="attempts",
             identity_column="attempt_id",

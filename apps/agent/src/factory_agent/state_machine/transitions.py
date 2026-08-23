@@ -17,6 +17,7 @@ from factory_agent.domain.workflow import (
     TaskLifecycle,
 )
 from factory_agent.errors import FactoryError
+from factory_agent.state_machine.predicates import KNOWN_TERMINAL_OUTCOMES
 
 
 class StateTransitionError(FactoryError):
@@ -109,6 +110,7 @@ _EXECUTOR_STEP_PHASE_TRANSITIONS: dict[StepPhase, frozenset[StepPhase]] = {
 _EXECUTOR_ATTEMPT_PHASE_TRANSITIONS: dict[AttemptPhase, frozenset[AttemptPhase]] = {
     AttemptPhase.RUNNING: frozenset({AttemptPhase.RECONCILING}),
 }
+_STEP_NONE_OUTCOME_PHASES = frozenset({StepPhase.PENDING, StepPhase.READY, StepPhase.DISPATCHED, StepPhase.RUNNING})
 
 _PUBLISH_OR_ACCEPT_PHASES = frozenset(
     {
@@ -160,6 +162,40 @@ def require_desired_transition(current: RunDesiredState, candidate: RunDesiredSt
         _reject()
 
 
+def require_step_phase_outcome(phase: StepPhase, outcome: StepOutcome) -> None:
+    """冻结 Step phase/outcome 联合不变量，避免不同仓储入口各自推断终态语义。"""
+    try:
+        current_phase = StepPhase(phase)
+        current_outcome = StepOutcome(outcome)
+    except (TypeError, ValueError):
+        _reject()
+    if current_phase in _STEP_NONE_OUTCOME_PHASES and current_outcome is StepOutcome.NONE:
+        return
+    if current_phase is StepPhase.RECONCILING and current_outcome in {
+        StepOutcome.NONE,
+        StepOutcome.UNKNOWN_REMOTE_STATE,
+    }:
+        return
+    if current_phase is StepPhase.TERMINAL and current_outcome in KNOWN_TERMINAL_OUTCOMES:
+        return
+    _reject()
+
+
+def require_attempt_phase_outcome(phase: AttemptPhase, outcome: AttemptOutcome) -> None:
+    """冻结 Attempt phase/outcome 联合不变量；UNKNOWN 仅可作为已终止但未 settled 的事实。"""
+    try:
+        current_phase = AttemptPhase(phase)
+        current_outcome = AttemptOutcome(outcome)
+    except (TypeError, ValueError):
+        _reject()
+    if current_phase is AttemptPhase.TERMINATED:
+        if current_outcome is not AttemptOutcome.NONE:
+            return
+    elif current_outcome is AttemptOutcome.NONE:
+        return
+    _reject()
+
+
 def require_step_phase_transition(
     current: StepPhase,
     candidate: StepPhase,
@@ -173,9 +209,9 @@ def require_step_phase_transition(
         outcome = StepOutcome(current_outcome)
     except (TypeError, ValueError):
         _reject()
-    if outcome is not StepOutcome.NONE or candidate_phase not in _EXECUTOR_STEP_PHASE_TRANSITIONS.get(
-        current_phase, frozenset()
-    ):
+    require_step_phase_outcome(current_phase, outcome)
+    require_step_phase_outcome(candidate_phase, outcome)
+    if candidate_phase not in _EXECUTOR_STEP_PHASE_TRANSITIONS.get(current_phase, frozenset()):
         _reject()
 
 
@@ -192,9 +228,9 @@ def require_attempt_phase_transition(
         outcome = AttemptOutcome(current_outcome)
     except (TypeError, ValueError):
         _reject()
-    if outcome is not AttemptOutcome.NONE or candidate_phase not in _EXECUTOR_ATTEMPT_PHASE_TRANSITIONS.get(
-        current_phase, frozenset()
-    ):
+    require_attempt_phase_outcome(current_phase, outcome)
+    require_attempt_phase_outcome(candidate_phase, outcome)
+    if candidate_phase not in _EXECUTOR_ATTEMPT_PHASE_TRANSITIONS.get(current_phase, frozenset()):
         _reject()
 
 
@@ -211,11 +247,9 @@ def require_attempt_termination_transition(
         result_outcome = AttemptOutcome(terminal_outcome)
     except (TypeError, ValueError):
         _reject()
-    if (
-        current_phase is AttemptPhase.TERMINATED
-        or existing_outcome is not AttemptOutcome.NONE
-        or result_outcome is AttemptOutcome.NONE
-    ):
+    require_attempt_phase_outcome(current_phase, existing_outcome)
+    require_attempt_phase_outcome(AttemptPhase.TERMINATED, result_outcome)
+    if current_phase is AttemptPhase.TERMINATED:
         _reject()
 
 
@@ -291,11 +325,13 @@ __all__ = [
     "PhaseTransitionReason",
     "StateTransitionError",
     "require_achieved_stage_transition",
+    "require_attempt_phase_outcome",
     "require_attempt_phase_transition",
     "require_attempt_termination_transition",
     "require_desired_transition",
     "require_observed_transition",
     "require_phase_transition",
+    "require_step_phase_outcome",
     "require_step_phase_transition",
     "require_task_lifecycle_transition",
 ]
