@@ -1540,8 +1540,9 @@ def _insert_successful_design_review_step(
     attempt_id: str,
     plan_revision_id: str = "plan-control-1",
     artifact_id: str = "artifact-design-stale",
+    dependency_ids: tuple[str, ...] = (),
 ) -> None:
-    """为后继 barrier 预执行反例写入完整成功 Step、Attempt 与 Artifact。"""
+    """写入完整成功的 design Step，并允许冻结合法前驱依赖。"""
     _insert(
         connection,
         "steps",
@@ -1557,7 +1558,7 @@ def _insert_successful_design_review_step(
             "side_effect_class": "none",
             "phase": "TERMINAL",
             "outcome": "SUCCEEDED",
-            "dependency_hash": _selector_digest([]),
+            "dependency_hash": _selector_digest(list(dependency_ids)),
             "required_artifacts_digest": _selector_digest([artifact_id]),
             "success_predicate_id": "design-complete-v1",
             "timeout_ms": 30_000,
@@ -3375,6 +3376,81 @@ async def test_passed_barrier_rejects_prepassed_successor() -> None:
             "SELECT settled,passed,state_version FROM phase_barriers ORDER BY barrier_ordinal"
         ).fetchall() == [(0, 0, 0), (1, 1, 1)]
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def test_barrier_authority_directly_rejects_dependency_on_future_barrier() -> None:
+    """直接仓储 tooth 必须命中 future dependency，不能被后继预执行门禁代替。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, dependencies_by_node={"plan": ("design-review",)})
+        current_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        future_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        _insert_successful_design_review_step(
+            connection,
+            barrier_id=future_id,
+            step_id="step-design-review-direct-future-dependency",
+            attempt_id="attempt-design-review-direct-future-dependency",
+        )
+        connection.execute(
+            "UPDATE steps SET dependency_hash=? WHERE logical_node_id='plan'",
+            (_selector_digest(["design-review"]),),
+        )
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError) as caught:
+                SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                    barrier_id=current_id,
+                    run_id="run-control-1",
+                    task_id="task-control-1",
+                )
+            assert caught.value.detail == "barrier dependency points to a future barrier"
+        finally:
+            unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+def test_barrier_authority_allows_successful_predecessor_dependency() -> None:
+    """已通过前驱 barrier 的成功依赖仍可作为当前 required Step 的权威事实。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, dependencies_by_node={"design-review": ("plan",)})
+        predecessor_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        current_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
+        _insert_successful_design_review_step(
+            connection,
+            barrier_id=current_id,
+            step_id="step-design-review-predecessor-dependency",
+            attempt_id="attempt-design-review-predecessor-dependency",
+            dependency_ids=("plan",),
+        )
+        connection.execute(
+            "UPDATE phase_barriers SET settled=1,passed=1,gate_digest=?,state_version=1 WHERE barrier_id=?",
+            (SHA_A, predecessor_id),
+        )
+        connection.execute(
+            "UPDATE runs SET phase='DESIGN_REVIEWING',active_barrier_id=?,state_version=1 WHERE run_id=?",
+            (current_id, "run-control-1"),
+        )
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            authority = SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                barrier_id=current_id,
+                run_id="run-control-1",
+                task_id="task-control-1",
+            )
+            decision = evaluate_barrier(
+                authority.steps,
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+                settle_deadline_at=None,
+            )
+            assert decision.passed is True
+        finally:
+            unit_of_work.rollback()
     finally:
         connection.close()
 
