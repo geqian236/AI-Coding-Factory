@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from factory_agent.domain import authorization as authorization_domain
 from factory_agent.domain.events import payload_digest
 from factory_agent.domain.workflow import (
     AchievedStage,
@@ -29,6 +30,7 @@ from factory_agent.domain.workflow import (
 from factory_agent.errors import FactoryError
 from factory_agent.observability.logging import get_logger
 from factory_agent.policy.canonical_json import canonicalize
+from factory_agent.policy.plan_hash import is_factory_rfc3339_date_time
 from factory_agent.state_machine.barriers import BarrierStepFacts, evaluate_barrier
 from factory_agent.state_machine.milestones import MilestoneEvidence, evaluate_milestone
 from factory_agent.storage.sqlite.unit_of_work import SqliteUnitOfWork, StaleStateVersionError
@@ -42,6 +44,7 @@ from factory_agent.storage.sqlite.workflow_repository import (
 
 LOGGER = get_logger(__name__)
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
+_MAX_SAFE_SELECTOR_INTEGER = 2**53 - 1
 
 
 class TransitionPredicateError(FactoryError):
@@ -60,6 +63,45 @@ class BarrierMilestoneCommitError(FactoryError):
     """barrier lineage、gate 或下一个 phase selector 不一致时抛出。"""
 
     error_code = "BARRIER_MILESTONE_COMMIT_REJECTED"
+
+
+def _require_transition_identity(value: object) -> str:
+    """在进入 coordinator 前冻结 application identity selector。"""
+    if type(value) is not str or not value:
+        raise TransitionPredicateError("transition identity selector is invalid")
+    return value
+
+
+def _require_transition_integer(value: object) -> int:
+    """拒绝 bool、负数和超出跨语言安全整数闭集的 selector。"""
+    if type(value) is not int or not 0 <= value <= _MAX_SAFE_SELECTOR_INTEGER:
+        raise TransitionPredicateError("transition integer selector is invalid")
+    return value
+
+
+def _require_transition_ended_at(value: object) -> str:
+    """termination 时间在事务外先验证 RFC3339 与 aware 语义，仓储仍会再次校验。"""
+    if type(value) is not str or not is_factory_rfc3339_date_time(value):
+        raise TransitionPredicateError("transition ended_at selector is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value[-1:].casefold() == "z" else value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timestamp is naive")
+    except (OverflowError, TypeError, ValueError):
+        raise TransitionPredicateError("transition ended_at selector is invalid") from None
+    return value
+
+
+def _require_transition_reason(value: object) -> str | None:
+    """termination reason 按协议只允许 None 或非空字符串。"""
+    if value is not None and (type(value) is not str or not value):
+        raise TransitionPredicateError("transition termination reason is invalid")
+    return value
+
+
+def _log_identity(value: object) -> str | None:
+    """非法 selector 日志仍保留字段，但不记录非字符串 payload 原文。"""
+    return value if type(value) is str and value else None
 
 
 _STATE_001_PARTIAL_CHECKS = (
@@ -451,6 +493,9 @@ class TransitionService:
             return updated
 
         try:
+            _require_transition_identity(request_id)
+            _require_transition_identity(run_id)
+            _require_transition_integer(expected_state_version)
             try:
                 target = RunObservedState(candidate)
             except (TypeError, ValueError) as exc:
@@ -466,8 +511,8 @@ class TransitionService:
         except Exception as exc:
             LOGGER.warning(
                 "control_plane_observed_transition_rejected",
-                request_id=request_id,
-                run_id=run_id,
+                request_id=_log_identity(request_id),
+                run_id=_log_identity(run_id),
                 attempt_id=None,
                 operation="transition_control_plane_observed",
                 status="rejected",
@@ -506,7 +551,8 @@ class TransitionService:
             current = repository.get_run(run_id)
             if current is None:
                 raise WorkflowRepositoryError("run does not exist")
-            authority = repository.load_observed_state_authority(run_id=run_id, now=self._now())
+            authority_now = self._now()
+            authority = repository.load_observed_state_authority(run_id=run_id, now=authority_now)
             require_observed_target_predicates(
                 current,
                 RunObservedState.RUNNING,
@@ -519,6 +565,7 @@ class TransitionService:
                 executor_id=executor_id,
                 fencing_token=fencing_token,
                 control_epoch=control_epoch,
+                now=authority_now,
             )
             append_authoritative_state_event(
                 unit_of_work,
@@ -539,6 +586,13 @@ class TransitionService:
             return updated, mode.value
 
         try:
+            _require_transition_identity(request_id)
+            _require_transition_identity(run_id)
+            _require_transition_identity(attempt_id)
+            _require_transition_identity(executor_id)
+            _require_transition_integer(expected_state_version)
+            _require_transition_integer(fencing_token)
+            _require_transition_integer(control_epoch)
             updated, write_mode = await self._coordinator.execute(
                 operation="transition_executor_observed",
                 context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
@@ -547,9 +601,9 @@ class TransitionService:
         except Exception as exc:
             LOGGER.warning(
                 "executor_observed_transition_rejected",
-                request_id=request_id,
-                run_id=run_id,
-                attempt_id=attempt_id,
+                request_id=_log_identity(request_id),
+                run_id=_log_identity(run_id),
+                attempt_id=_log_identity(attempt_id),
                 operation="transition_executor_observed",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
@@ -596,7 +650,8 @@ class TransitionService:
                 executor_id=executor_id,
                 fencing_token=fencing_token,
                 control_epoch=control_epoch,
-                candidate=candidate,
+                candidate=target,
+                now=self._now(),
             )
             append_authoritative_state_event(
                 unit_of_work,
@@ -614,6 +669,19 @@ class TransitionService:
             return updated, mode.value
 
         try:
+            _require_transition_identity(request_id)
+            _require_transition_identity(run_id)
+            _require_transition_identity(step_id)
+            _require_transition_identity(attempt_id)
+            _require_transition_identity(executor_id)
+            _require_transition_integer(expected_run_state_version)
+            _require_transition_integer(expected_step_state_version)
+            _require_transition_integer(fencing_token)
+            _require_transition_integer(control_epoch)
+            try:
+                target = StepPhase(candidate)
+            except (TypeError, ValueError) as exc:
+                raise TransitionPredicateError("Step phase selector enum is invalid") from exc
             updated, write_mode = await self._coordinator.execute(
                 operation="transition_executor_step_state",
                 context={
@@ -627,10 +695,10 @@ class TransitionService:
         except Exception as exc:
             LOGGER.warning(
                 "executor_step_state_rejected",
-                request_id=request_id,
-                run_id=run_id,
-                step_id=step_id,
-                attempt_id=attempt_id,
+                request_id=_log_identity(request_id),
+                run_id=_log_identity(run_id),
+                step_id=_log_identity(step_id),
+                attempt_id=_log_identity(attempt_id),
                 operation="transition_executor_step_state",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
@@ -676,7 +744,8 @@ class TransitionService:
                 executor_id=executor_id,
                 fencing_token=fencing_token,
                 control_epoch=control_epoch,
-                candidate=candidate,
+                candidate=target,
+                now=self._now(),
             )
             append_authoritative_state_event(
                 unit_of_work,
@@ -694,6 +763,18 @@ class TransitionService:
             return updated, mode.value, authority.step.step_id
 
         try:
+            _require_transition_identity(request_id)
+            _require_transition_identity(run_id)
+            _require_transition_identity(attempt_id)
+            _require_transition_identity(executor_id)
+            _require_transition_integer(expected_run_state_version)
+            _require_transition_integer(expected_attempt_state_version)
+            _require_transition_integer(fencing_token)
+            _require_transition_integer(control_epoch)
+            try:
+                target = AttemptPhase(candidate)
+            except (TypeError, ValueError) as exc:
+                raise TransitionPredicateError("Attempt phase selector enum is invalid") from exc
             updated, write_mode, step_id = await self._coordinator.execute(
                 operation="transition_executor_attempt_state",
                 context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
@@ -702,10 +783,10 @@ class TransitionService:
         except Exception as exc:
             LOGGER.warning(
                 "executor_attempt_state_rejected",
-                request_id=request_id,
-                run_id=run_id,
+                request_id=_log_identity(request_id),
+                run_id=_log_identity(run_id),
                 step_id=None,
-                attempt_id=attempt_id,
+                attempt_id=_log_identity(attempt_id),
                 operation="transition_executor_attempt_state",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
@@ -753,9 +834,10 @@ class TransitionService:
                 executor_id=executor_id,
                 fencing_token=fencing_token,
                 control_epoch=control_epoch,
-                outcome=outcome,
-                ended_at=ended_at,
-                termination_reason=termination_reason,
+                outcome=target_outcome,
+                ended_at=target_ended_at,
+                termination_reason=target_reason,
+                now=self._now(),
             )
             append_authoritative_state_event(
                 unit_of_work,
@@ -777,6 +859,20 @@ class TransitionService:
             return updated, mode.value, authority.step.step_id
 
         try:
+            _require_transition_identity(request_id)
+            _require_transition_identity(run_id)
+            _require_transition_identity(attempt_id)
+            _require_transition_identity(executor_id)
+            _require_transition_integer(expected_run_state_version)
+            _require_transition_integer(expected_attempt_state_version)
+            _require_transition_integer(fencing_token)
+            _require_transition_integer(control_epoch)
+            try:
+                target_outcome = AttemptOutcome(outcome)
+            except (TypeError, ValueError) as exc:
+                raise TransitionPredicateError("Attempt outcome selector enum is invalid") from exc
+            target_ended_at = _require_transition_ended_at(ended_at)
+            target_reason = _require_transition_reason(termination_reason)
             updated, write_mode, step_id = await self._coordinator.execute(
                 operation="terminate_executor_attempt",
                 context={"request_id": request_id, "run_id": run_id, "attempt_id": attempt_id},
@@ -785,10 +881,10 @@ class TransitionService:
         except Exception as exc:
             LOGGER.warning(
                 "executor_attempt_termination_rejected",
-                request_id=request_id,
-                run_id=run_id,
+                request_id=_log_identity(request_id),
+                run_id=_log_identity(run_id),
                 step_id=None,
-                attempt_id=attempt_id,
+                attempt_id=_log_identity(attempt_id),
                 operation="terminate_executor_attempt",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
@@ -1044,7 +1140,11 @@ class TransitionService:
                         terminated_fact=terminal_authority.terminated_fact,
                     ),
                 )
-            except (TransitionPredicateError, WorkflowRepositoryError) as exc:
+            except (
+                authorization_domain.AuthorizationContractError,
+                TransitionPredicateError,
+                WorkflowRepositoryError,
+            ) as exc:
                 # 权威事实不完整时，不能先写 barrier 再依赖事务回滚来掩盖非法终局。
                 raise BarrierMilestoneCommitError("target termination authority is incomplete") from exc
         elif not next_selector_valid:

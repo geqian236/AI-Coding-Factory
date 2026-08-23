@@ -102,6 +102,11 @@ def _same_request(command: ControlCommand, request: ControlCommandRequest) -> bo
     )
 
 
+def _receipt_log_identity(value: object) -> str | None:
+    """selector 非法时保留日志字段但不展开非字符串 payload。"""
+    return value if type(value) is str and value else None
+
+
 class ControlService:
     """通过唯一 writer 接受命令；后续完成/失败只追加 receipt。"""
 
@@ -316,43 +321,48 @@ class ControlService:
         """追加 COMPLETED/FAILED receipt；不修改原命令或既有 receipt。"""
         started = time.monotonic()
         try:
-            receipt_phase = ControlCommandReceiptPhase(phase)
-        except (TypeError, ValueError) as exc:
-            raise ControlRequestError("receipt phase is invalid") from exc
-        if receipt_phase is ControlCommandReceiptPhase.ACKNOWLEDGED:
-            raise ControlRequestError("acknowledgement is created only by command acceptance")
-        # 类型先于正则校验，确保 int/bytes/list 都映射为稳定请求错误而非泄漏 TypeError。
-        if evidence_digest is not None and (
-            type(evidence_digest) is not str or _SHA256.fullmatch(evidence_digest) is None
-        ):
-            raise ControlRequestError("receipt evidence digest is invalid")
-
-        def command(unit_of_work: SqliteUnitOfWork) -> ControlReceiptEvent:
-            controls = SqliteControlRepository(unit_of_work)
-            accepted = controls.get_command(command_id)
-            if accepted is None:
-                raise ControlCommandNotFoundError("control command does not exist")
-            receipts = controls.list_receipts(command_id)
-            if len(receipts) != 1 or receipts[0].phase is not ControlCommandReceiptPhase.ACKNOWLEDGED:
-                # receipt 链只能从唯一 ACK 进入一个终态，终态后不允许竞争追加。
-                raise ControlRequestError("control command receipt is already terminal or incomplete")
-            if (
-                receipts[0].attempt_id != accepted.acknowledged_attempt_id
-                or attempt_id != accepted.acknowledged_attempt_id
+            # receipt selector 在 coordinator 前冻结，拒绝空串、bytes/list 和 bool 等 Python 宽松类型。
+            if type(command_id) is not str or not command_id:
+                raise ControlRequestError("receipt command identity is invalid")
+            if attempt_id is not None and (type(attempt_id) is not str or not attempt_id):
+                raise ControlRequestError("receipt attempt identity is invalid")
+            try:
+                receipt_phase = ControlCommandReceiptPhase(phase)
+            except (TypeError, ValueError) as exc:
+                raise ControlRequestError("receipt phase is invalid") from exc
+            if receipt_phase is ControlCommandReceiptPhase.ACKNOWLEDGED:
+                raise ControlRequestError("acknowledgement is created only by command acceptance")
+            # 类型先于正则校验，确保 int/bytes/list 都映射为稳定请求错误而非泄漏 TypeError。
+            if evidence_digest is not None and (
+                type(evidence_digest) is not str or _SHA256.fullmatch(evidence_digest) is None
             ):
-                # 完成/失败 receipt 必须沿 command 接受时锁定的 Attempt identity 追加。
-                raise ControlRequestError("control receipt attempt lineage is inconsistent")
-            return controls.append_receipt(
-                receipt_id=self._receipt_id_factory(),
-                command_id=command_id,
-                phase=receipt_phase,
-                attempt_id=attempt_id,
-                state_event_id=None,
-                evidence_digest=evidence_digest,
-                created_at=self._now().isoformat(),
-            )
+                raise ControlRequestError("receipt evidence digest is invalid")
 
-        try:
+            def command(unit_of_work: SqliteUnitOfWork) -> ControlReceiptEvent:
+                controls = SqliteControlRepository(unit_of_work)
+                accepted = controls.get_command(command_id)
+                if accepted is None:
+                    raise ControlCommandNotFoundError("control command does not exist")
+                receipts = controls.list_receipts(command_id)
+                if len(receipts) != 1 or receipts[0].phase is not ControlCommandReceiptPhase.ACKNOWLEDGED:
+                    # receipt 链只能从唯一 ACK 进入一个终态，终态后不允许竞争追加。
+                    raise ControlRequestError("control command receipt is already terminal or incomplete")
+                if (
+                    receipts[0].attempt_id != accepted.acknowledged_attempt_id
+                    or attempt_id != accepted.acknowledged_attempt_id
+                ):
+                    # 完成/失败 receipt 必须沿 command 接受时锁定的 Attempt identity 追加。
+                    raise ControlRequestError("control receipt attempt lineage is inconsistent")
+                return controls.append_receipt(
+                    receipt_id=self._receipt_id_factory(),
+                    command_id=command_id,
+                    phase=receipt_phase,
+                    attempt_id=attempt_id,
+                    state_event_id=None,
+                    evidence_digest=evidence_digest,
+                    created_at=self._now().isoformat(),
+                )
+
             receipt = await self._coordinator.execute(
                 operation="control_receipt_append",
                 context={"request_id": None, "command_id": command_id},
@@ -361,8 +371,8 @@ class ControlService:
         except Exception as exc:
             LOGGER.warning(
                 "control_receipt_append_rejected",
-                command_id=command_id,
-                attempt_id=attempt_id,
+                command_id=_receipt_log_identity(command_id),
+                attempt_id=_receipt_log_identity(attempt_id),
                 operation="control_receipt_append",
                 status="rejected",
                 duration_ms=round((time.monotonic() - started) * 1000, 3),

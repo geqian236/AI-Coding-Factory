@@ -29,6 +29,8 @@ from factory_agent.domain import authorization as authorization_domain
 from factory_agent.domain.control import ControlCommandReceiptPhase, ControlCommandType
 from factory_agent.domain.workflow import (
     AchievedStage,
+    AttemptOutcome,
+    AttemptPhase,
     PhaseBarrier,
     RunObservedState,
     RunPhase,
@@ -122,6 +124,23 @@ class _SqliteCoordinator:
             raise
 
 
+class _RecordingCoordinator:
+    """记录应用 selector 是否越过校验边界进入事务 coordinator。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute[ResultT](
+        self,
+        *,
+        operation: str,
+        context: Mapping[str, object],
+        command: Callable[[Any], ResultT],
+    ) -> ResultT:
+        self.calls += 1
+        raise AssertionError(f"invalid selector reached coordinator: {operation}")
+
+
 def _ids(prefix: str) -> Callable[[], str]:
     """返回稳定递增 identity 工厂，避免测试依赖随机数。"""
     values: Iterator[int] = iter(range(1, 100))
@@ -153,7 +172,13 @@ def _canonical_intent_authorization_record(
     *,
     authorization_id: str = "intent-control-1",
     task_id: str = "task-control-1",
+    project_id: str = "project-control-1",
+    target_stage: str = "CODEX_APPROVED",
     stage_capability_map_version: str = "stage-capability-map.v1",
+    issued_at: str = "2026-08-17T07:00:00Z",
+    expires_at: str = "2026-08-17T10:00:00Z",
+    revoked_at: str | None = None,
+    revoke_reason: str | None = None,
 ) -> dict[str, object]:
     """生成可由 UoW canonical getter 完整复验的 IntentAuthorization 持久投影。"""
     contract: dict[str, object] = {
@@ -161,11 +186,11 @@ def _canonical_intent_authorization_record(
         "taskId": task_id,
         "userId": "user-control-1",
         "requirementDigest": _authorization_snapshot("factory.authorization.intent.requirement.v1", "1"),
-        "projectId": "project-control-1",
+        "projectId": project_id,
         "repositoryId": "repo-control-1",
         "repositoryBindingDigest": _authorization_snapshot("factory.authorization.intent.repository-binding.v1", "2"),
         "baselineDigest": _authorization_snapshot("factory.authorization.intent.baseline.v1", "3"),
-        "targetStage": "CODEX_APPROVED",
+        "targetStage": target_stage,
         "stageCapabilityMapVersion": stage_capability_map_version,
         "allowedCapabilitySetDigest": _authorization_snapshot(
             "factory.authorization.intent.allowed-capability-set.v1", "4"
@@ -179,10 +204,10 @@ def _canonical_intent_authorization_record(
         "repairLoopLimit": 1,
         "autoReplanLimit": 1,
         "attemptLimit": 3,
-        "issuedAt": "2026-08-17T07:00:00Z",
-        "expiresAt": "2026-08-17T10:00:00Z",
-        "revokedAt": None,
-        "revokeReason": None,
+        "issuedAt": issued_at,
+        "expiresAt": expires_at,
+        "revokedAt": revoked_at,
+        "revokeReason": revoke_reason,
     }
     parsed = authorization_domain.parse_intent_authorization(contract)
     return {
@@ -215,6 +240,29 @@ def _canonical_intent_authorization_record(
     }
 
 
+def _replace_canonical_intent_authorization(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    """同步替换 Intent canonical bytes 与全部投影，确保反例只漂移跨实体条件。"""
+    record = _canonical_intent_authorization_record(**overrides)  # type: ignore[arg-type]
+    columns = tuple(name for name in record if name != "intent_authorization_id")
+    assignments = ",".join(f'"{name}"=?' for name in columns)
+    connection.execute(
+        f'UPDATE "intent_authorizations" SET {assignments} WHERE intent_authorization_id=?',  # noqa: S608
+        (*[record[name] for name in columns], record["intent_authorization_id"]),
+    )
+
+
+def _align_target_stage_authority(connection: sqlite3.Connection, target_stage: str) -> None:
+    """同步 Task 与 canonical Intent target，避免终局测试被无关 target 漂移遮挡。"""
+    connection.execute(
+        "UPDATE tasks SET target_stage=? WHERE task_id='task-control-1'",
+        (target_stage,),
+    )
+    _replace_canonical_intent_authorization(connection, target_stage=target_stage)
+
+
 def _canonical_execution_authorization_record(
     connection: sqlite3.Connection,
     *,
@@ -234,8 +282,14 @@ def _canonical_execution_authorization_record(
     plan_revision_digest_value: str | None = None,
     stage_capability_map_version: str | None = None,
     node_capability_map_version: str | None = None,
+    run_id: str = "run-control-1",
+    idempotency_marker: str = "d",
+    max_uses: int = 1,
+    consumption_state: str = "AVAILABLE",
     issued_at: str = "2026-08-17T08:59:00Z",
     expires_at: str = "2026-08-17T10:00:00Z",
+    revoked_at: str | None = None,
+    revoke_reason: str | None = None,
 ) -> dict[str, object]:
     """绑定当前 Plan/Run/Step/Attempt，生成真实 canonical ExecutionAuthorization。"""
     plan_row = connection.execute(
@@ -267,26 +321,28 @@ def _canonical_execution_authorization_record(
         "nodeCapabilityMapDigest": _authorization_snapshot(
             "factory.authorization.execution.node-capability-map.v1", "a"
         ),
-        "runId": "run-control-1",
+        "runId": run_id,
         "stepId": step_id,
         "attemptId": attempt_id,
         "nodeType": node_type,
         "executorId": executor_id,
         "resourceFingerprint": _authorization_snapshot("factory.authorization.execution.resource-fingerprint.v1", "b"),
         "capabilityScopeDigest": _authorization_snapshot("factory.authorization.execution.capability-scope.v1", "c"),
-        "idempotencyKey": _authorization_snapshot("factory.authorization.execution.idempotency-key.v1", "d"),
+        "idempotencyKey": _authorization_snapshot(
+            "factory.authorization.execution.idempotency-key.v1", idempotency_marker
+        ),
         "inputBindings": bindings,
         "actionCapability": action_capability,
         "actionPolicySnapshotDigest": _authorization_snapshot("factory.authorization.execution.action-policy.v1", "e"),
         "fencingToken": fencing_token,
         "controlEpoch": control_epoch,
         "acceptedControlCommandSeq": accepted_control_command_seq,
-        "maxUses": 1,
-        "consumptionState": "AVAILABLE",
+        "maxUses": max_uses,
+        "consumptionState": consumption_state,
         "issuedAt": issued_at,
         "expiresAt": expires_at,
-        "revokedAt": None,
-        "revokeReason": None,
+        "revokedAt": revoked_at,
+        "revokeReason": revoke_reason,
     }
     parsed = authorization_domain.parse_execution_authorization(contract)
     return {
@@ -706,51 +762,24 @@ def _insert_target_close_lease(connection: sqlite3.Connection) -> None:
 
 
 def _insert_target_close_authorization(connection: sqlite3.Connection) -> None:
-    """插入独立 AVAILABLE 授权但不插入 lease，验证授权路径不会依赖 lease 查询。"""
-    plan_row = connection.execute(
-        "SELECT semantic_plan_hash,plan_revision_digest FROM plan_revisions WHERE plan_revision_id=?",
-        ("plan-control-1",),
-    ).fetchone()
-    assert plan_row is not None
+    """插入可被 canonical getter 复验的 AVAILABLE 授权，不依赖 lease 查询。"""
     _insert(
         connection,
         "execution_authorizations",
-        {
-            "execution_authorization_id": "auth-target-auth-only",
-            "intent_authorization_id": "intent-control-1",
-            "plan_revision_id": "plan-control-1",
-            # AVAILABLE 正例必须是真实的当前 PlanRevision 合同，避免测试只因伪造摘要而阻断。
-            "semantic_plan_hash": canonicalize(plan_row[0]),
-            "plan_revision_digest": canonicalize(plan_row[1]),
-            "stage_capability_map_version": "stage-capability-map.v1",
-            "stage_capability_map_digest": b"stage",
-            "node_capability_map_version": "node-capability-map.v1",
-            "node_capability_map_digest": b"node",
-            "run_id": "run-control-1",
-            "step_id": "step-planning-contract",
-            "attempt_id": "attempt-planning-contract",
-            "node_type": "PLAN",
-            "executor_id": "executor-planning-contract",
-            "resource_fingerprint": b"resource",
-            "capability_scope_digest": b"scope",
-            "idempotency_key": b"idempotency-auth-only",
-            "input_bindings": b"bindings",
-            "action_capability": "repo.read",
-            "action_policy_snapshot_digest": b"policy",
-            "fencing_token": 1,
-            "control_epoch": 1,
-            "accepted_control_command_seq": 0,
-            "max_uses": 1,
-            "consumption_state": "AVAILABLE",
-            "issued_at": "2026-08-17T08:00:00Z",
-            "expires_at": "2026-08-17T10:00:00Z",
-            "revoked_at": None,
-            "revoke_reason": None,
-            "contract_schema_id": "execution-authorization.v1",
-            "contract_schema_version": 1,
-            "canonical_contract": b"{}",
-            "canonical_contract_digest": b"contract",
-        },
+        _canonical_execution_authorization_record(
+            connection,
+            authorization_id="auth-target-auth-only",
+            step_id="step-planning-contract",
+            attempt_id="attempt-planning-contract",
+            node_type="PLAN",
+            executor_id="executor-planning-contract",
+            action_capability="repo.read",
+            fencing_token=1,
+            control_epoch=1,
+            accepted_control_command_seq=0,
+            issued_at="2026-08-17T08:00:00Z",
+            expires_at="2026-08-17T10:00:00Z",
+        ),
     )
 
 
@@ -761,23 +790,28 @@ def _insert_intent_authorization_copy(
     intent_id: str,
     task_id: str,
 ) -> None:
-    """复制 FK 完整的意图授权，并切换绑定 ID/Task，供 lineage 变异夹具使用。"""
-    cursor = connection.execute(
-        "SELECT intent_authorization_id,task_id,user_id,requirement_digest,project_id,"
-        "repository_id,repository_binding_digest,baseline_digest,target_stage,"
-        "stage_capability_map_version,allowed_capability_set_digest,target_binding_digest,"
-        "risk_ceiling,estimated_cost_alert_digest,autonomous_execution_budget_ms,"
-        "repair_loop_limit,auto_replan_limit,attempt_limit,issued_at,expires_at,revoked_at,"
-        "revoke_reason,contract_schema_id,contract_schema_version,canonical_contract,"
-        "canonical_contract_digest FROM intent_authorizations WHERE intent_authorization_id=?",
+    """从来源 selector 重建 canonical Intent，避免复制后留下伪 canonical bytes。"""
+    source = connection.execute(
+        "SELECT project_id,target_stage,stage_capability_map_version,issued_at,expires_at,"
+        "revoked_at,revoke_reason FROM intent_authorizations WHERE intent_authorization_id=?",
         (source_id,),
+    ).fetchone()
+    assert source is not None
+    _insert(
+        connection,
+        "intent_authorizations",
+        _canonical_intent_authorization_record(
+            authorization_id=intent_id,
+            task_id=task_id,
+            project_id=str(source[0]),
+            target_stage=str(source[1]),
+            stage_capability_map_version=str(source[2]),
+            issued_at=str(source[3]),
+            expires_at=str(source[4]),
+            revoked_at=None if source[5] is None else str(source[5]),
+            revoke_reason=None if source[6] is None else str(source[6]),
+        ),
     )
-    row = cursor.fetchone()
-    assert row is not None
-    values = dict(zip((item[0] for item in cursor.description or ()), row, strict=True))
-    values["intent_authorization_id"] = intent_id
-    values["task_id"] = task_id
-    _insert(connection, "intent_authorizations", values)
 
 
 def _insert_second_intent_authorization(connection: sqlite3.Connection) -> None:
@@ -1035,48 +1069,34 @@ def _insert_historical_target_authorization(
     attempt_id: str,
     active: bool,
 ) -> None:
-    """把授权完整绑定到旧 Step/Attempt，再切换为历史失效或当前有效状态。"""
-    _insert_target_close_authorization(connection)
-    plan_row = connection.execute(
-        "SELECT intent_authorization_id,semantic_plan_hash,plan_revision_digest "
-        "FROM plan_revisions WHERE plan_revision_id=?",
-        (plan_revision_id,),
-    ).fetchone()
-    assert plan_row is not None
-    state = "AVAILABLE" if active else "CONSUMED"
-    max_uses = 1 if active else 0
-    issued_at = "2026-08-17T08:00:00Z" if active else "2026-08-17T06:00:00Z"
-    expires_at = "2026-08-17T10:00:00Z" if active else "2026-08-17T07:00:00Z"
-    revoked_at = None if active else "2026-08-17T07:30:00Z"
-    revoke_reason = None if active else "superseded-by-replan"
-    connection.execute(
-        "UPDATE execution_authorizations SET intent_authorization_id=?,plan_revision_id=?,"
-        "semantic_plan_hash=?,plan_revision_digest=?,step_id=?,attempt_id=?,executor_id=?,"
-        "fencing_token=?,control_epoch=?,consumption_state=?,max_uses=?,issued_at=?,expires_at=?,"
-        "revoked_at=?,revoke_reason=? WHERE execution_authorization_id=?",
-        (
-            plan_row[0],
-            plan_revision_id,
-            canonicalize(plan_row[1]),
-            canonicalize(plan_row[2]),
-            step_id,
-            attempt_id,
-            "executor-planning-historical",
-            11,
-            4,
-            state,
-            max_uses,
-            issued_at,
-            expires_at,
-            revoked_at,
-            revoke_reason,
-            "auth-target-auth-only",
+    """直接生成绑定旧 Step/Attempt 的 canonical 历史授权，避免伪投影遮挡终局校验。"""
+    _insert(
+        connection,
+        "execution_authorizations",
+        _canonical_execution_authorization_record(
+            connection,
+            authorization_id="auth-target-auth-only",
+            plan_revision_id=plan_revision_id,
+            step_id=step_id,
+            attempt_id=attempt_id,
+            node_type="PLAN",
+            executor_id="executor-planning-historical",
+            action_capability="repo.read",
+            fencing_token=11,
+            control_epoch=4,
+            accepted_control_command_seq=0,
+            max_uses=1 if active else 0,
+            consumption_state="AVAILABLE" if active else "CONSUMED",
+            issued_at="2026-08-17T08:00:00Z" if active else "2026-08-17T06:00:00Z",
+            expires_at="2026-08-17T10:00:00Z" if active else "2026-08-17T07:00:00Z",
+            revoked_at=None if active else "2026-08-17T06:30:00Z",
+            revoke_reason=None if active else "superseded-by-replan",
         ),
     )
 
 
 def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
-    """插入自洽的另一 Task PlanRevision/Step/Attempt，隔离 plan.task_id 单条件漂移。"""
+    """插入 canonical 的另一 Task Plan，并仅让该 Plan 与当前 Run 的 Task 不一致。"""
     _insert(
         connection,
         "tasks",
@@ -1096,12 +1116,6 @@ def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
             "intake_digest": SHA_A,
         },
     )
-    _insert_intent_authorization_copy(
-        connection,
-        source_id="intent-control-1",
-        intent_id="intent-control-3",
-        task_id="task-control-2",
-    )
     plan_cursor = connection.execute("SELECT * FROM plan_revisions WHERE plan_revision_id=?", ("plan-control-1",))
     plan_row = plan_cursor.fetchone()
     assert plan_row is not None
@@ -1109,10 +1123,8 @@ def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
     run_spec = json.loads(bytes(plan_values["canonical_run_spec"]).decode("utf-8"))
     revision = json.loads(bytes(plan_values["canonical_plan_revision"]).decode("utf-8"))
     run_spec["taskId"] = "task-control-2"
-    run_spec["intentAuthorizationId"] = "intent-control-3"
     revision["planRevisionId"] = "plan-control-other-task"
     revision["taskId"] = "task-control-2"
-    revision["intentAuthorizationId"] = "intent-control-3"
     for document in (run_spec, revision):
         node_collection = document["workPlan"]["nodes"] if document is run_spec else document["nodes"]
         plan_node = next(node for node in node_collection if node["logicalNodeId"] == "plan")
@@ -1129,7 +1141,7 @@ def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
         {
             "plan_revision_id": other_plan_revision_id,
             "task_id": "task-control-2",
-            "intent_authorization_id": "intent-control-3",
+            "intent_authorization_id": "intent-control-1",
             "semantic_plan_hash": revision["semanticPlanHash"],
             "plan_revision_digest": other_plan_digest,
             "canonical_run_spec": canonical_run_spec,
@@ -1240,31 +1252,27 @@ def _insert_other_task_plan_graph(connection: sqlite3.Connection) -> None:
             "created_at": "2026-08-17T06:30:00Z",
         },
     )
-    _insert_target_close_authorization(connection)
-    connection.execute(
-        "UPDATE execution_authorizations SET intent_authorization_id=?,plan_revision_id=?,"
-        "semantic_plan_hash=?,plan_revision_digest=?,step_id=?,attempt_id=?,node_type=?,executor_id=?,"
-        "fencing_token=?,control_epoch=?,accepted_control_command_seq=?,consumption_state=?,max_uses=?,"
-        "issued_at=?,expires_at=?,revoked_at=?,revoke_reason=? WHERE execution_authorization_id=?",
-        (
-            "intent-control-3",
-            other_plan_revision_id,
-            canonicalize(revision["semanticPlanHash"]),
-            canonicalize(other_plan_digest),
-            other_step_id,
-            other_attempt_id,
-            "PLAN",
-            "executor-planning-other-task",
-            13,
-            5,
-            0,
-            "CONSUMED",
-            0,
-            "2026-08-17T06:00:00Z",
-            "2026-08-17T07:00:00Z",
-            "2026-08-17T07:30:00Z",
-            "superseded-by-task-lineage-probe",
-            "auth-target-auth-only",
+    _insert(
+        connection,
+        "execution_authorizations",
+        _canonical_execution_authorization_record(
+            connection,
+            authorization_id="auth-target-auth-only",
+            plan_revision_id=other_plan_revision_id,
+            step_id=other_step_id,
+            attempt_id=other_attempt_id,
+            node_type="PLAN",
+            executor_id="executor-planning-other-task",
+            action_capability="repo.read",
+            fencing_token=13,
+            control_epoch=5,
+            accepted_control_command_seq=0,
+            max_uses=0,
+            consumption_state="CONSUMED",
+            issued_at="2026-08-17T06:00:00Z",
+            expires_at="2026-08-17T07:00:00Z",
+            revoked_at="2026-08-17T06:30:00Z",
+            revoke_reason="superseded-by-task-lineage-probe",
         ),
     )
 
@@ -1295,7 +1303,7 @@ def _prepare_inactive_authorization_lineage_mutation(
     if mutation not in _LINEAGE_MUTATIONS:
         raise AssertionError(f"未知授权 lineage 变异：{mutation}")
     _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-    connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+    _align_target_stage_authority(connection, "DESIGN_APPROVED")
     planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
     if mutation in {"run_id", "step_run"}:
         _insert_secondary_run_graph(connection)
@@ -1303,85 +1311,61 @@ def _prepare_inactive_authorization_lineage_mutation(
         _insert_other_task_plan_graph(connection)
         return planning_barrier_id
     old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
-    _insert_historical_target_authorization(
-        connection,
-        plan_revision_id=old_plan_revision_id,
-        step_id=old_step_id,
-        attempt_id=old_attempt_id,
-        active=False,
-    )
+    options: dict[str, object] = {
+        "authorization_id": "auth-target-auth-only",
+        "plan_revision_id": old_plan_revision_id,
+        "step_id": old_step_id,
+        "attempt_id": old_attempt_id,
+        "node_type": "PLAN",
+        "executor_id": "executor-planning-historical",
+        "action_capability": "repo.read",
+        "fencing_token": 11,
+        "control_epoch": 4,
+        "accepted_control_command_seq": 0,
+        "max_uses": 0,
+        "consumption_state": "CONSUMED",
+        "issued_at": "2026-08-17T06:00:00Z",
+        "expires_at": "2026-08-17T07:00:00Z",
+        "revoked_at": "2026-08-17T06:30:00Z",
+        "revoke_reason": "superseded-by-replan",
+    }
     if mutation == "run_id":
-        connection.execute(
-            "UPDATE execution_authorizations SET run_id=? WHERE execution_authorization_id=?",
-            ("run-control-2", "auth-target-auth-only"),
-        )
+        options["run_id"] = "run-control-2"
     elif mutation == "step_attempt":
-        connection.execute(
-            "UPDATE execution_authorizations SET attempt_id=?,executor_id=?,fencing_token=?,control_epoch=?,"
-            "accepted_control_command_seq=? WHERE execution_authorization_id=?",
-            ("attempt-planning-contract", "executor-planning-contract", 1, 1, 0, "auth-target-auth-only"),
+        options.update(
+            {
+                "attempt_id": "attempt-planning-contract",
+                "executor_id": "executor-planning-contract",
+                "fencing_token": 1,
+                "control_epoch": 1,
+            }
         )
     elif mutation == "step_run":
         connection.execute("UPDATE steps SET run_id=? WHERE step_id=?", ("run-control-2", old_step_id))
     elif mutation == "plan_revision":
-        current_plan_row = connection.execute(
-            "SELECT intent_authorization_id,semantic_plan_hash,plan_revision_digest "
-            "FROM plan_revisions WHERE plan_revision_id=?",
-            ("plan-control-1",),
-        ).fetchone()
-        assert current_plan_row is not None
-        connection.execute(
-            "UPDATE execution_authorizations SET plan_revision_id=?,intent_authorization_id=?,"
-            "semantic_plan_hash=?,plan_revision_digest=? WHERE execution_authorization_id=?",
-            (
-                "plan-control-1",
-                current_plan_row[0],
-                canonicalize(current_plan_row[1]),
-                canonicalize(current_plan_row[2]),
-                "auth-target-auth-only",
-            ),
-        )
+        options["plan_revision_id"] = "plan-control-1"
     elif mutation == "intent_authorization":
         _insert_second_intent_authorization(connection)
-        connection.execute(
-            "UPDATE execution_authorizations SET intent_authorization_id=? WHERE execution_authorization_id=?",
-            ("intent-control-2", "auth-target-auth-only"),
-        )
+        options["intent_authorization_id"] = "intent-control-2"
     elif mutation == "semantic_plan_hash":
-        connection.execute(
-            "UPDATE execution_authorizations SET semantic_plan_hash=? WHERE execution_authorization_id=?",
-            (b"mutated-semantic-plan-hash", "auth-target-auth-only"),
-        )
+        options["semantic_plan_digest"] = "sha256:" + "b" * 64
     elif mutation == "plan_revision_digest":
-        connection.execute(
-            "UPDATE execution_authorizations SET plan_revision_digest=? WHERE execution_authorization_id=?",
-            (b"mutated-plan-revision-digest", "auth-target-auth-only"),
-        )
+        options["plan_revision_digest_value"] = "sha256:" + "b" * 64
     elif mutation == "node_type":
-        connection.execute(
-            "UPDATE execution_authorizations SET node_type=? WHERE execution_authorization_id=?",
-            ("IMPLEMENT", "auth-target-auth-only"),
-        )
+        options["node_type"] = "DESIGN_REVIEW"
     elif mutation == "executor_id":
-        connection.execute(
-            "UPDATE execution_authorizations SET executor_id=? WHERE execution_authorization_id=?",
-            ("executor-planning-contract", "auth-target-auth-only"),
-        )
+        options["executor_id"] = "executor-planning-contract"
     elif mutation == "fencing_token":
-        connection.execute(
-            "UPDATE execution_authorizations SET fencing_token=? WHERE execution_authorization_id=?",
-            (1, "auth-target-auth-only"),
-        )
+        options["fencing_token"] = 1
     elif mutation == "control_epoch":
-        connection.execute(
-            "UPDATE execution_authorizations SET control_epoch=? WHERE execution_authorization_id=?",
-            (1, "auth-target-auth-only"),
-        )
+        options["control_epoch"] = 1
     elif mutation == "control_seq":
-        connection.execute(
-            "UPDATE execution_authorizations SET accepted_control_command_seq=? WHERE execution_authorization_id=?",
-            (1, "auth-target-auth-only"),
-        )
+        options["accepted_control_command_seq"] = 1
+    _insert(
+        connection,
+        "execution_authorizations",
+        _canonical_execution_authorization_record(connection, **options),  # type: ignore[arg-type]
+    )
     return planning_barrier_id
 
 
@@ -1460,6 +1444,177 @@ def _service(connection: sqlite3.Connection) -> ControlService:
         receipt_id_factory=_ids("receipt"),
         state_event_id_factory=_ids("state-event"),
     )
+
+
+_TRANSITION_SELECTOR_CASES: dict[str, dict[str, object]] = {
+    "transition_control_plane_observed": {
+        "run_id": "run-control-1",
+        "expected_state_version": 0,
+        "candidate": RunObservedState.BLOCKED,
+        "request_id": "request-selector-1",
+    },
+    "transition_executor_observed": {
+        "run_id": "run-control-1",
+        "attempt_id": "attempt-control-1",
+        "expected_state_version": 0,
+        "executor_id": "executor-control-1",
+        "fencing_token": 7,
+        "control_epoch": 9,
+        "request_id": "request-selector-1",
+    },
+    "transition_executor_step_state": {
+        "request_id": "request-selector-1",
+        "run_id": "run-control-1",
+        "step_id": "step-control-1",
+        "attempt_id": "attempt-control-1",
+        "expected_run_state_version": 0,
+        "expected_step_state_version": 0,
+        "executor_id": "executor-control-1",
+        "fencing_token": 7,
+        "control_epoch": 9,
+        "candidate": StepPhase.RECONCILING,
+    },
+    "transition_executor_attempt_state": {
+        "request_id": "request-selector-1",
+        "run_id": "run-control-1",
+        "attempt_id": "attempt-control-1",
+        "expected_run_state_version": 0,
+        "expected_attempt_state_version": 0,
+        "executor_id": "executor-control-1",
+        "fencing_token": 7,
+        "control_epoch": 9,
+        "candidate": AttemptPhase.RECONCILING,
+    },
+    "terminate_executor_attempt": {
+        "request_id": "request-selector-1",
+        "run_id": "run-control-1",
+        "attempt_id": "attempt-control-1",
+        "expected_run_state_version": 0,
+        "expected_attempt_state_version": 0,
+        "executor_id": "executor-control-1",
+        "fencing_token": 7,
+        "control_epoch": 9,
+        "outcome": AttemptOutcome.SUCCEEDED,
+        "ended_at": "2026-08-14T08:00:00+00:00",
+        "termination_reason": None,
+    },
+}
+_TRANSITION_ID_FIELDS = {
+    "transition_control_plane_observed": ("request_id", "run_id"),
+    "transition_executor_observed": ("request_id", "run_id", "attempt_id", "executor_id"),
+    "transition_executor_step_state": (
+        "request_id",
+        "run_id",
+        "step_id",
+        "attempt_id",
+        "executor_id",
+    ),
+    "transition_executor_attempt_state": ("request_id", "run_id", "attempt_id", "executor_id"),
+    "terminate_executor_attempt": ("request_id", "run_id", "attempt_id", "executor_id"),
+}
+_TRANSITION_NUMBER_FIELDS = {
+    "transition_control_plane_observed": ("expected_state_version",),
+    "transition_executor_observed": ("expected_state_version", "fencing_token", "control_epoch"),
+    "transition_executor_step_state": (
+        "expected_run_state_version",
+        "expected_step_state_version",
+        "fencing_token",
+        "control_epoch",
+    ),
+    "transition_executor_attempt_state": (
+        "expected_run_state_version",
+        "expected_attempt_state_version",
+        "fencing_token",
+        "control_epoch",
+    ),
+    "terminate_executor_attempt": (
+        "expected_run_state_version",
+        "expected_attempt_state_version",
+        "fencing_token",
+        "control_epoch",
+    ),
+}
+
+
+async def _assert_transition_selector_rejected(
+    api_name: str,
+    field: str,
+    invalid: object,
+) -> None:
+    """调用真实 application API，并证明非法 selector 未进入 coordinator。"""
+    coordinator = _RecordingCoordinator()
+    service = TransitionService(
+        coordinator=coordinator,
+        state_event_id_factory=lambda: "unused-state-event",
+    )
+    arguments = dict(_TRANSITION_SELECTOR_CASES[api_name])
+    arguments[field] = invalid
+
+    with pytest.raises(FactoryError) as caught:
+        await getattr(service, api_name)(**arguments)
+
+    assert caught.value.error_code == "STATE_PREDICATE_REJECTED"
+    assert coordinator.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("api_name", "field", "invalid"),
+    [
+        (api_name, field, invalid)
+        for api_name, fields in _TRANSITION_ID_FIELDS.items()
+        for field in fields
+        for invalid in ("", b"identity", ["identity"])
+    ],
+)
+@pytest.mark.asyncio
+async def test_transition_selector_rejects_invalid_identity_before_coordinator(
+    api_name: str,
+    field: str,
+    invalid: object,
+) -> None:
+    await _assert_transition_selector_rejected(api_name, field, invalid)
+
+
+@pytest.mark.parametrize(
+    ("api_name", "field", "invalid"),
+    [
+        (api_name, field, invalid)
+        for api_name, fields in _TRANSITION_NUMBER_FIELDS.items()
+        for field in fields
+        for invalid in (True, -1, 2**53)
+    ],
+)
+@pytest.mark.asyncio
+async def test_transition_selector_rejects_invalid_number_before_coordinator(
+    api_name: str,
+    field: str,
+    invalid: object,
+) -> None:
+    await _assert_transition_selector_rejected(api_name, field, invalid)
+
+
+@pytest.mark.parametrize(
+    ("api_name", "field", "invalid"),
+    [
+        ("transition_control_plane_observed", "candidate", "NOT_AN_OBSERVED_STATE"),
+        ("transition_executor_step_state", "candidate", "NOT_A_STEP_PHASE"),
+        ("transition_executor_attempt_state", "candidate", "NOT_AN_ATTEMPT_PHASE"),
+        ("terminate_executor_attempt", "outcome", "NOT_AN_ATTEMPT_OUTCOME"),
+        ("terminate_executor_attempt", "ended_at", b"2026-08-14T08:00:00Z"),
+        ("terminate_executor_attempt", "ended_at", "2026-08-14T08:00:00"),
+        ("terminate_executor_attempt", "ended_at", "not-a-time"),
+        ("terminate_executor_attempt", "termination_reason", b"reason"),
+        ("terminate_executor_attempt", "termination_reason", []),
+        ("terminate_executor_attempt", "termination_reason", ""),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transition_selector_rejects_invalid_enum_time_or_nullable_before_coordinator(
+    api_name: str,
+    field: str,
+    invalid: object,
+) -> None:
+    await _assert_transition_selector_rejected(api_name, field, invalid)
 
 
 def _request(
@@ -1617,7 +1772,52 @@ def _replace_active_execution_authorization(
 
 def _mutate_active_authority_lineage(connection: sqlite3.Connection, mutation: str) -> None:
     """每个分支只漂移一个已持久 selector，辅助行仅满足 FK，不改变当前权威指针。"""
-    if mutation == "task_active_run":
+    if mutation == "intent_project":
+        _insert(connection, "projects", {"project_id": "project-control-other"})
+        _replace_canonical_intent_authorization(connection, project_id="project-control-other")
+    elif mutation == "intent_target":
+        _replace_canonical_intent_authorization(connection, target_stage="DESIGN_APPROVED")
+    elif mutation == "run_spec_target":
+        required_digest = _insert_plan_revision_for_barrier(
+            connection,
+            required_node_ids=("plan",),
+            plan_revision_id="plan-control-target-drift",
+            spec_revision=2,
+            run_spec_target_stage="DESIGN_APPROVED",
+        )
+        barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="PLANNING",
+            barrier_ordinal=0,
+            plan_revision_id="plan-control-target-drift",
+        )
+        _insert(
+            connection,
+            "phase_barriers",
+            {
+                "barrier_id": barrier_id,
+                "run_id": "run-control-1",
+                "plan_revision_id": "plan-control-target-drift",
+                "business_phase": "PLANNING",
+                "barrier_ordinal": 0,
+                "required_node_set_digest": required_digest,
+                "settle_timeout_ms": 30_000,
+                "settle_deadline_at": None,
+                "pass_predicate_id": "planning-approved-v1",
+                "settled": 0,
+                "passed": 0,
+                "gate_digest": None,
+                "state_version": 0,
+            },
+        )
+        connection.execute("UPDATE runs SET active_barrier_id=? WHERE run_id='run-control-1'", (barrier_id,))
+        connection.execute(
+            "UPDATE steps SET plan_revision_id='plan-control-target-drift',barrier_id=? "
+            "WHERE step_id='step-control-active'",
+            (barrier_id,),
+        )
+        _replace_active_execution_authorization(connection, plan_revision_id="plan-control-target-drift")
+    elif mutation == "task_active_run":
         connection.execute("UPDATE tasks SET active_run_id=NULL WHERE task_id='task-control-1'")
     elif mutation == "task_active_plan":
         connection.execute("UPDATE tasks SET active_plan_revision_id=NULL WHERE task_id='task-control-1'")
@@ -1994,6 +2194,38 @@ async def test_request_id_is_idempotent_and_receipts_are_append_only() -> None:
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [(field, invalid) for field in ("command_id", "attempt_id") for invalid in ("", b"identity", ["identity"])],
+)
+@pytest.mark.asyncio
+async def test_control_receipt_selector_rejects_before_coordinator(
+    field: str,
+    invalid: object,
+) -> None:
+    """receipt identity 不合法时不得开启事务或产生任何 receipt。"""
+    coordinator = _RecordingCoordinator()
+    service = ControlService(
+        coordinator=coordinator,
+        now=lambda: datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        command_id_factory=_ids("unused-command"),
+        receipt_id_factory=_ids("unused-receipt"),
+        state_event_id_factory=_ids("unused-event"),
+    )
+    arguments: dict[str, object] = {
+        "command_id": "command-control-1",
+        "phase": ControlCommandReceiptPhase.COMPLETED,
+        "attempt_id": "attempt-control-1",
+        "evidence_digest": SHA_A,
+    }
+    arguments[field] = invalid
+
+    with pytest.raises(ControlRequestError):
+        await service.append_receipt(**arguments)  # type: ignore[arg-type]
+
+    assert coordinator.calls == 0
+
+
 @pytest.mark.parametrize("evidence_digest", [7, b"sha256:" + b"a" * 64, [SHA_A]])
 @pytest.mark.asyncio
 async def test_control_receipt_non_string_evidence_digest_maps_to_request_error(
@@ -2332,9 +2564,41 @@ async def test_running_transition_rejects_noncanonical_execution_authorization_p
         connection.close()
 
 
+@pytest.mark.asyncio
+async def test_running_transition_rejects_terminal_task_authority_and_rolls_back() -> None:
+    """当前 Task 已进入终态时，executor 不得再把同一 Run 推进为 RUNNING。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        connection.execute("UPDATE tasks SET lifecycle='SUCCEEDED' WHERE task_id='task-control-1'")
+
+        with pytest.raises(WorkflowRepositoryError, match="active authorization lineage"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-terminal-task-authority"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id="request-terminal-task-authority",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
+        "intent_project",
+        "intent_target",
+        "run_spec_target",
         "task_active_run",
         "task_active_plan",
         "step_run",
@@ -2384,6 +2648,110 @@ async def test_running_transition_rejects_each_active_authority_lineage_drift(mu
             0,
         )
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_running_transition_rejects_duplicate_active_stable_action_key() -> None:
+    """同 Attempt/capability/idempotency key 的双活动授权必须歧义拒绝。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        _insert(
+            connection,
+            "execution_authorizations",
+            _canonical_execution_authorization_record(
+                connection,
+                authorization_id="auth-control-lineage-duplicate",
+                step_id="step-control-active",
+                attempt_id="attempt-control-lineage",
+                node_type="PLAN",
+                executor_id="executor-control-lineage",
+                action_capability="repo.read",
+            ),
+        )
+
+        with pytest.raises(WorkflowRepositoryError, match="stable action key"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-duplicate-stable-action"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id="request-duplicate-stable-action",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("node_type", "base_capability", "action_capability", "idempotency_marker"),
+    [
+        ("IMPLEMENT", "repo.read", "worktree.write", "d"),
+        ("PLAN", "repo.read", "repo.read", "f"),
+    ],
+    ids=["different-capability", "different-idempotency-key"],
+)
+@pytest.mark.asyncio
+async def test_running_transition_ors_distinct_active_stable_action_keys(
+    node_type: str,
+    base_capability: str,
+    action_capability: str,
+    idempotency_marker: str,
+) -> None:
+    """capability 或 canonical idempotency key 不同的活动授权允许按 OR 聚合。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        connection.execute(
+            "UPDATE steps SET node_type=? WHERE step_id='step-control-active'",
+            (node_type,),
+        )
+        _replace_active_execution_authorization(
+            connection,
+            node_type=node_type,
+            action_capability=base_capability,
+        )
+        _insert(
+            connection,
+            "execution_authorizations",
+            _canonical_execution_authorization_record(
+                connection,
+                authorization_id="auth-control-lineage-distinct",
+                step_id="step-control-active",
+                attempt_id="attempt-control-lineage",
+                node_type=node_type,
+                executor_id="executor-control-lineage",
+                action_capability=action_capability,
+                idempotency_marker=idempotency_marker,
+            ),
+        )
+
+        updated = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-distinct-stable-action"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).transition_executor_observed(
+            run_id="run-control-1",
+            attempt_id="attempt-control-lineage",
+            expected_state_version=0,
+            executor_id="executor-control-lineage",
+            fencing_token=7,
+            control_epoch=9,
+            request_id=f"request-distinct-stable-action-{idempotency_marker}",
+        )
+
+        assert (updated.observed_state, updated.state_version) == (RunObservedState.RUNNING, 1)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
     finally:
         connection.close()
 
@@ -2609,6 +2977,226 @@ async def test_invalid_or_inactive_authority_time_rolls_back_running_transition(
 
         assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("authorization_kind", "revoked_at"),
+    [
+        ("execution", "2026-08-17T09:30:00Z"),
+        ("execution", "2026-08-17T10:30:00Z"),
+        ("intent", "2026-08-17T09:30:00Z"),
+        ("intent", "2026-08-17T10:30:00Z"),
+    ],
+    ids=["execution-future", "execution-after-expiry", "intent-future", "intent-after-expiry"],
+)
+@pytest.mark.asyncio
+async def test_running_authority_rejects_invalid_revocation_timeline_and_rolls_back(
+    authorization_kind: str,
+    revoked_at: str,
+) -> None:
+    """Execution/Intent 的未来或过期后撤销都是损坏事实，不得降级成普通 inactive。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        if authorization_kind == "execution":
+            _replace_active_execution_authorization(
+                connection,
+                revoked_at=revoked_at,
+                revoke_reason="invalid-revocation-probe",
+            )
+        else:
+            _replace_canonical_intent_authorization(
+                connection,
+                revoked_at=revoked_at,
+                revoke_reason="invalid-revocation-probe",
+            )
+
+        with pytest.raises(WorkflowRepositoryError, match="revocation time"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-revocation-{authorization_kind}-{revoked_at}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id=f"request-revocation-{authorization_kind}-{revoked_at}",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_at", "expires_at"),
+    [
+        ("2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T10:00:00Z", "2026-08-17T10:00:00Z"),
+    ],
+    ids=["future-heartbeat", "heartbeat-at-expiry"],
+)
+@pytest.mark.asyncio
+async def test_running_authority_rejects_invalid_matching_lease_timeline_and_rolls_back(
+    heartbeat_at: str,
+    expires_at: str,
+) -> None:
+    """匹配 lease 的未来心跳或 heartbeat>=expires 是损坏事实，必须抛仓储错误并回滚。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        connection.execute(
+            "UPDATE resource_leases SET heartbeat_at=?,expires_at=?",
+            (heartbeat_at, expires_at),
+        )
+
+        with pytest.raises(WorkflowRepositoryError, match="lease time ordering"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-invalid-lease-{heartbeat_at}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id=f"request-invalid-lease-{heartbeat_at}",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_running_authority_validates_every_matching_lease_before_or() -> None:
+    """一条活动 lease 不能用 OR 短路掩盖同 selector 下另一条未来心跳损坏行。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        _insert(
+            connection,
+            "resource_leases",
+            {
+                "resource_key": "resource-control-lineage-corrupt",
+                "owner_executor_id": "executor-control-lineage",
+                "fencing_token": 7,
+                "control_epoch": 9,
+                "acquired_at": "2026-08-17T08:58:00Z",
+                "heartbeat_at": "2026-08-17T09:00:00.001Z",
+                "expires_at": "2026-08-17T10:00:00Z",
+                "state_version": 0,
+            },
+        )
+
+        with pytest.raises(WorkflowRepositoryError, match="lease time ordering"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-all-matching-leases"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id="request-all-matching-leases",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("lease_mutation", ["missing", "owner", "token", "epoch", "expired"])
+@pytest.mark.asyncio
+async def test_running_authority_requires_current_matching_active_lease(lease_mutation: str) -> None:
+    """缺失、selector 错配或已过期 lease 都不能授权当前 executor 推进 RUNNING。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        if lease_mutation == "missing":
+            connection.execute("DELETE FROM resource_leases")
+        elif lease_mutation == "owner":
+            connection.execute("UPDATE resource_leases SET owner_executor_id='executor-other'")
+        elif lease_mutation == "token":
+            connection.execute("UPDATE resource_leases SET fencing_token=8")
+        elif lease_mutation == "epoch":
+            connection.execute("UPDATE resource_leases SET control_epoch=10")
+        elif lease_mutation == "expired":
+            connection.execute("UPDATE resource_leases SET expires_at='2026-08-17T09:00:00Z'")
+        else:  # pragma: no cover - 参数表属于测试自身闭集。
+            raise AssertionError(f"unknown lease mutation: {lease_mutation}")
+
+        with pytest.raises(TransitionPredicateError):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-lease-selector-{lease_mutation}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).transition_executor_observed(
+                run_id="run-control-1",
+                attempt_id="attempt-control-lineage",
+                expected_state_version=0,
+                executor_id="executor-control-lineage",
+                fencing_token=7,
+                control_epoch=9,
+                request_id=f"request-lease-selector-{lease_mutation}",
+            )
+
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_running_authority_allows_multiple_valid_matching_leases() -> None:
+    """同 owner/token/epoch 的多条合法活动 lease 可按 OR 汇总，资源映射仍留给 Task 4/5。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        _insert_canonical_active_authority(connection)
+        _insert(
+            connection,
+            "resource_leases",
+            {
+                "resource_key": "resource-control-lineage-secondary",
+                "owner_executor_id": "executor-control-lineage",
+                "fencing_token": 7,
+                "control_epoch": 9,
+                "acquired_at": "2026-08-17T08:55:00Z",
+                "heartbeat_at": "2026-08-17T08:59:30Z",
+                "expires_at": "2026-08-17T10:00:00Z",
+                "state_version": 0,
+            },
+        )
+
+        updated = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-multiple-matching-leases"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).transition_executor_observed(
+            run_id="run-control-1",
+            attempt_id="attempt-control-lineage",
+            expected_state_version=0,
+            executor_id="executor-control-lineage",
+            fencing_token=7,
+            control_epoch=9,
+            request_id="request-multiple-matching-leases",
+        )
+
+        assert (updated.observed_state, updated.state_version) == (RunObservedState.RUNNING, 1)
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (1,)
     finally:
         connection.close()
 
@@ -3444,7 +4032,7 @@ async def test_target_reached_closes_run_without_selecting_successor() -> None:
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         service = TransitionService(
             coordinator=_SqliteCoordinator(connection),
@@ -3487,7 +4075,7 @@ async def test_target_reached_rejects_precreated_successor_step_and_rolls_back()
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         design_barrier_id = _derived_barrier_id(connection, business_phase="DESIGN_REVIEWING", barrier_ordinal=1)
         _insert(
@@ -3558,7 +4146,7 @@ async def test_target_reached_rejects_active_authorization_and_lease_and_rolls_b
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert(
             connection,
@@ -3664,7 +4252,7 @@ async def test_target_reached_rejects_lease_without_authorization_and_rolls_back
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert_target_close_lease(connection)
         service = TransitionService(
@@ -3698,13 +4286,97 @@ async def test_target_reached_rejects_lease_without_authorization_and_rolls_back
         connection.close()
 
 
+@pytest.mark.parametrize(
+    ("heartbeat_at", "expires_at"),
+    [
+        ("2026-08-17T09:00:00.001Z", "2026-08-17T10:00:00Z"),
+        ("2026-08-17T10:00:00Z", "2026-08-17T10:00:00Z"),
+    ],
+    ids=["future-heartbeat", "heartbeat-at-expiry"],
+)
+@pytest.mark.asyncio
+async def test_target_reached_rejects_invalid_matching_lease_timeline_and_rolls_back(
+    heartbeat_at: str,
+    expires_at: str,
+) -> None:
+    """终局也必须验证已终止 Attempt 的每条匹配 lease，不能把损坏时间当作已失效。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_target_close_lease(connection)
+        connection.execute(
+            "UPDATE resource_leases SET heartbeat_at=?,expires_at=? WHERE resource_key='resource-target-lease-only'",
+            (heartbeat_at, expires_at),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-terminal-invalid-lease-{heartbeat_at}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id=f"request-terminal-invalid-lease-{heartbeat_at}",
+                )
+            )
+
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_allows_valid_expired_matching_lease() -> None:
+    """时间自洽且已过期的匹配 lease 是合法 inactive 历史事实，不阻断目标收口。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        _insert_target_close_lease(connection)
+        connection.execute(
+            "UPDATE resource_leases SET acquired_at='2026-08-17T07:00:00Z',"
+            "heartbeat_at='2026-08-17T07:30:00Z',expires_at='2026-08-17T08:00:00Z' "
+            "WHERE resource_key='resource-target-lease-only'"
+        )
+
+        result = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-terminal-expired-lease"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).commit_passed_barrier(
+            _target_close_request(
+                planning_barrier_id=planning_barrier_id,
+                request_id="request-terminal-expired-lease",
+            )
+        )
+
+        assert result.run.observed_state is RunObservedState.TERMINATED
+        assert result.task.lifecycle.value == "SUCCEEDED"
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (3,)
+    finally:
+        connection.close()
+
+
 @pytest.mark.asyncio
 async def test_target_reached_rejects_authorization_without_lease_and_rolls_back() -> None:
     """独立 AVAILABLE 授权本身也必须阻断目标收口，不能依赖 lease 分支。"""
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert_target_close_authorization(connection)
         service = TransitionService(
@@ -3745,7 +4417,7 @@ async def test_target_reached_rejects_cross_run_authorization_and_rolls_back() -
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         _insert_secondary_run_graph(connection)
         old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
@@ -3802,7 +4474,7 @@ async def test_target_reached_rejects_reverse_mismatched_authorization_and_rolls
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
         _insert_historical_target_authorization(
@@ -3889,7 +4561,7 @@ async def test_target_reached_rejects_each_inactive_authorization_lineage_mutati
             "SELECT consumption_state,max_uses,revoked_at FROM execution_authorizations "
             "WHERE execution_authorization_id=?",
             ("auth-target-auth-only",),
-        ).fetchone() == ("CONSUMED", 0, "2026-08-17T07:30:00Z")
+        ).fetchone() == ("CONSUMED", 0, "2026-08-17T06:30:00Z")
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
@@ -3901,7 +4573,7 @@ async def test_target_reached_allows_self_consistent_expired_historical_authoriz
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
         _insert_historical_target_authorization(
@@ -3933,8 +4605,121 @@ async def test_target_reached_allows_self_consistent_expired_historical_authoriz
             "SELECT consumption_state,max_uses,revoked_at FROM execution_authorizations "
             "WHERE execution_authorization_id=?",
             ("auth-target-auth-only",),
-        ).fetchone() == ("CONSUMED", 0, "2026-08-17T07:30:00Z")
+        ).fetchone() == ("CONSUMED", 0, "2026-08-17T06:30:00Z")
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (3,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "revoked_at",
+    ["2026-08-17T09:30:00Z", "2026-08-17T10:30:00Z"],
+    ids=["future-revocation", "revocation-after-expiry"],
+)
+@pytest.mark.asyncio
+async def test_target_reached_rejects_invalid_historical_revocation_timeline(
+    revoked_at: str,
+) -> None:
+    """历史授权的未来/过期后撤销是损坏事实，不能被 CONSUMED 状态掩盖后错误收口。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert(
+            connection,
+            "execution_authorizations",
+            _canonical_execution_authorization_record(
+                connection,
+                authorization_id="auth-target-invalid-revocation",
+                plan_revision_id=old_plan_revision_id,
+                step_id=old_step_id,
+                attempt_id=old_attempt_id,
+                node_type="PLAN",
+                executor_id="executor-planning-historical",
+                action_capability="repo.read",
+                fencing_token=11,
+                control_epoch=4,
+                accepted_control_command_seq=0,
+                max_uses=0,
+                consumption_state="CONSUMED",
+                issued_at="2026-08-17T08:00:00Z",
+                expires_at="2026-08-17T10:00:00Z",
+                revoked_at=revoked_at,
+                revoke_reason="invalid-revocation-probe",
+            ),
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-terminal-revocation-{revoked_at}"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id=f"request-terminal-revocation-{revoked_at}",
+                )
+            )
+
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_reached_rejects_noncanonical_historical_authorization() -> None:
+    """历史授权 canonical bytes 损坏时必须整体回滚，不能信任仍看似自洽的 SQL selector。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
+        _insert_historical_target_authorization(
+            connection,
+            plan_revision_id=old_plan_revision_id,
+            step_id=old_step_id,
+            attempt_id=old_attempt_id,
+            active=False,
+        )
+        connection.execute(
+            "UPDATE execution_authorizations SET canonical_contract=x'7b7d' "
+            "WHERE execution_authorization_id='auth-target-auth-only'"
+        )
+
+        with pytest.raises(BarrierMilestoneCommitError):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-terminal-noncanonical-auth"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-terminal-noncanonical-auth",
+                )
+            )
+
+        assert connection.execute(
+            "SELECT settled,passed,state_version FROM phase_barriers WHERE barrier_id=?", (planning_barrier_id,)
+        ).fetchone() == (0, 0, 0)
+        assert connection.execute("SELECT observed_state,state_version FROM runs").fetchone() == ("QUEUED", 0)
+        assert connection.execute("SELECT lifecycle,achieved_stage,state_version FROM tasks").fetchone() == (
+            "ACTIVE",
+            "NONE",
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
     finally:
         connection.close()
 
@@ -3945,7 +4730,7 @@ async def test_target_reached_rejects_active_stale_plan_authorization_and_rolls_
     connection = _connection()
     try:
         _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
-        connection.execute("UPDATE tasks SET target_stage=? WHERE task_id=?", ("DESIGN_APPROVED", "task-control-1"))
+        _align_target_stage_authority(connection, "DESIGN_APPROVED")
         planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
         old_plan_revision_id, old_step_id, old_attempt_id = _insert_historical_attempt_graph(connection)
         _insert_historical_target_authorization(

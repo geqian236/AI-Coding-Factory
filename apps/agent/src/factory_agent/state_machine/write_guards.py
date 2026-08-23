@@ -68,6 +68,7 @@ class WriteGuardContext:
     expected_control_epoch: int
     attempt_drain_state: DrainState
     blocking_command_attempt_id: str | None
+    lease_active: bool
 
     def __post_init__(self) -> None:
         """拒绝空 identity、负数与 bool/int 混淆，避免宽松比较绕过 fencing。"""
@@ -94,6 +95,7 @@ class WriteGuardContext:
             or not self.attempt_executor_id
             or not isinstance(self.expected_executor_id, str)
             or not self.expected_executor_id
+            or type(self.lease_active) is not bool
             or any(type(value) is not int or value < 0 for value in numeric_fields)
         ):
             raise WriteGuardError("write guard context is invalid")
@@ -109,6 +111,7 @@ def _normal_write_allowed(context: WriteGuardContext) -> bool:
         and context.attempt_control_epoch == context.expected_control_epoch
         and context.run_state_version == context.expected_run_state_version
         and context.attempt_drain_state is DrainState.NONE
+        and context.lease_active
     )
 
 
@@ -121,6 +124,7 @@ def _drain_write_allowed(context: WriteGuardContext) -> bool:
         and context.attempt_control_epoch == context.expected_control_epoch
         and context.run_state_version == context.expected_run_state_version
         and context.attempt_drain_state is DrainState.DRAINING
+        and context.lease_active
     )
 
 

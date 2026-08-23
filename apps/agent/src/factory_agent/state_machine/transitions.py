@@ -7,9 +7,13 @@ from typing import NoReturn
 
 from factory_agent.domain.workflow import (
     AchievedStage,
+    AttemptOutcome,
+    AttemptPhase,
     RunDesiredState,
     RunObservedState,
     RunPhase,
+    StepOutcome,
+    StepPhase,
     TaskLifecycle,
 )
 from factory_agent.errors import FactoryError
@@ -97,6 +101,15 @@ _DESIRED_TRANSITIONS: dict[RunDesiredState, frozenset[RunDesiredState]] = {
     RunDesiredState.CANCELLED: frozenset(),
 }
 
+# executor 的 phase-only wrapper 只承担本任务真实需要的 reconciliation 边；
+# terminal 必须由同时写 outcome/drain/time 的专用操作完成，其他调度边继续留在其权威写端。
+_EXECUTOR_STEP_PHASE_TRANSITIONS: dict[StepPhase, frozenset[StepPhase]] = {
+    StepPhase.RUNNING: frozenset({StepPhase.RECONCILING}),
+}
+_EXECUTOR_ATTEMPT_PHASE_TRANSITIONS: dict[AttemptPhase, frozenset[AttemptPhase]] = {
+    AttemptPhase.RUNNING: frozenset({AttemptPhase.RECONCILING}),
+}
+
 _PUBLISH_OR_ACCEPT_PHASES = frozenset(
     {
         RunPhase.PUBLISHING_PR,
@@ -144,6 +157,65 @@ def require_desired_transition(current: RunDesiredState, candidate: RunDesiredSt
     except (TypeError, ValueError):
         _reject()
     if candidate_state not in _DESIRED_TRANSITIONS[current_state]:
+        _reject()
+
+
+def require_step_phase_transition(
+    current: StepPhase,
+    candidate: StepPhase,
+    *,
+    current_outcome: StepOutcome,
+) -> None:
+    """冻结 executor Step phase-only 边；自环、倒退、终态和异常 outcome 均拒绝。"""
+    try:
+        current_phase = StepPhase(current)
+        candidate_phase = StepPhase(candidate)
+        outcome = StepOutcome(current_outcome)
+    except (TypeError, ValueError):
+        _reject()
+    if outcome is not StepOutcome.NONE or candidate_phase not in _EXECUTOR_STEP_PHASE_TRANSITIONS.get(
+        current_phase, frozenset()
+    ):
+        _reject()
+
+
+def require_attempt_phase_transition(
+    current: AttemptPhase,
+    candidate: AttemptPhase,
+    *,
+    current_outcome: AttemptOutcome,
+) -> None:
+    """冻结普通 Attempt phase-only 边；TERMINATED 必须走专用 termination 语义。"""
+    try:
+        current_phase = AttemptPhase(current)
+        candidate_phase = AttemptPhase(candidate)
+        outcome = AttemptOutcome(current_outcome)
+    except (TypeError, ValueError):
+        _reject()
+    if outcome is not AttemptOutcome.NONE or candidate_phase not in _EXECUTOR_ATTEMPT_PHASE_TRANSITIONS.get(
+        current_phase, frozenset()
+    ):
+        _reject()
+
+
+def require_attempt_termination_transition(
+    current: AttemptPhase,
+    *,
+    current_outcome: AttemptOutcome,
+    terminal_outcome: AttemptOutcome,
+) -> None:
+    """只允许合法非终态/NONE Attempt 一次进入带非 NONE outcome 的 TERMINATED。"""
+    try:
+        current_phase = AttemptPhase(current)
+        existing_outcome = AttemptOutcome(current_outcome)
+        result_outcome = AttemptOutcome(terminal_outcome)
+    except (TypeError, ValueError):
+        _reject()
+    if (
+        current_phase is AttemptPhase.TERMINATED
+        or existing_outcome is not AttemptOutcome.NONE
+        or result_outcome is AttemptOutcome.NONE
+    ):
         _reject()
 
 
@@ -219,8 +291,11 @@ __all__ = [
     "PhaseTransitionReason",
     "StateTransitionError",
     "require_achieved_stage_transition",
+    "require_attempt_phase_transition",
+    "require_attempt_termination_transition",
     "require_desired_transition",
     "require_observed_transition",
     "require_phase_transition",
+    "require_step_phase_transition",
     "require_task_lifecycle_transition",
 ]

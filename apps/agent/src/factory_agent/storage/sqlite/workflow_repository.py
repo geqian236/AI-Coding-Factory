@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from factory_agent.domain import authorization as authorization_domain
 from factory_agent.domain.artifacts import Artifact
 from factory_agent.domain.control import ControlCommandType
 from factory_agent.domain.plans import PlanRevisionBundle
@@ -37,8 +38,11 @@ from factory_agent.state_machine.barriers import BarrierStepFacts
 from factory_agent.state_machine.predicates import KNOWN_TERMINAL_OUTCOMES
 from factory_agent.state_machine.transitions import (
     require_achieved_stage_transition,
+    require_attempt_phase_transition,
+    require_attempt_termination_transition,
     require_observed_transition,
     require_phase_transition,
+    require_step_phase_transition,
     require_task_lifecycle_transition,
 )
 from factory_agent.state_machine.write_guards import (
@@ -77,9 +81,26 @@ def _authorization_time_active(record: Mapping[str, object], *, now: datetime) -
     if issued_at >= expires_at:
         raise WorkflowRepositoryError("authorization time interval is invalid")
     revoked_at = record.get("revoked_at")
-    if revoked_at is not None and _rfc3339_utc(revoked_at, field="authorization revoked_at") < issued_at:
-        raise WorkflowRepositoryError("authorization revocation time is invalid")
-    return revoked_at is None and issued_at <= now < expires_at
+    if revoked_at is not None:
+        revoked_instant = _rfc3339_utc(revoked_at, field="authorization revoked_at")
+        if revoked_instant < issued_at or revoked_instant > now or revoked_instant > expires_at:
+            # 撤销必须已经发生且落在授权闭区间内；未来或过期后撤销属于损坏事实。
+            raise WorkflowRepositoryError("authorization revocation time is invalid")
+        return False
+    return issued_at <= now < expires_at
+
+
+def _lease_rows_active(rows: Sequence[Sequence[object]], *, now: datetime) -> bool:
+    """验证全部匹配 lease 的 UTC 时间后再 OR，禁止活动行短路掩盖另一条损坏事实。"""
+    active = False
+    for acquired_wire, heartbeat_wire, expires_wire in rows:
+        acquired_at = _rfc3339_utc(acquired_wire, field="lease acquired_at")
+        heartbeat_at = _rfc3339_utc(heartbeat_wire, field="lease heartbeat_at")
+        expires_at = _rfc3339_utc(expires_wire, field="lease expires_at")
+        if acquired_at > heartbeat_at or heartbeat_at > now or heartbeat_at >= expires_at:
+            raise WorkflowRepositoryError("lease time ordering is invalid")
+        active = active or now < expires_at
+    return active
 
 
 def _snapshot_digest(selector: object, *, field: str) -> str:
@@ -127,6 +148,14 @@ class ExecutorWriteAuthority:
     step: Step
     attempt: Attempt
     guard: WriteGuardContext
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorizationAuthority:
+    """一条已闭合 canonical/lineage/time 的授权事实及其稳定 action key。"""
+
+    active: bool
+    stable_action_key: tuple[str, str, bytes]
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,8 +265,12 @@ class SqliteWorkflowRepository:
         expected_executor_id: str,
         expected_fencing_token: int,
         expected_control_epoch: int,
+        now: datetime,
     ) -> ExecutorWriteAuthority:
-        """从 owner transaction 内的 projection 构造不可由 executor 回填的写保护上下文。"""
+        """同一 owner transaction 内闭合 selector、latest blocker 与 matching lease。"""
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise WorkflowRepositoryError("executor write authority clock is invalid")
+        now_utc = now.astimezone(UTC)
         run = self.get_run(run_id)
         attempt = self.get_attempt(attempt_id)
         if run is None or attempt is None:
@@ -250,25 +283,31 @@ class SqliteWorkflowRepository:
             raise WorkflowRepositoryError("executor attempt is not the active run attempt")
 
         blocking_command_attempt_id: str | None = None
-        if attempt.interrupt_command_id is not None:
-            command = self._connection.execute(
-                "SELECT run_id,command_type,acknowledged_attempt_id FROM control_commands WHERE command_id=?",
-                (attempt.interrupt_command_id,),
-            ).fetchone()
-            blocking_types = {
+        if attempt.drain_state is DrainState.DRAINING:
+            blocking_types = (
                 ControlCommandType.SOFT_PAUSE.value,
                 ControlCommandType.IMMEDIATE_STOP.value,
                 ControlCommandType.CANCEL.value,
-            }
+            )
+            latest_blocking_command = self._connection.execute(
+                "SELECT command_id,run_id,acknowledged_attempt_id FROM control_commands "
+                "WHERE run_id=? AND command_type IN (?,?,?) ORDER BY command_seq DESC LIMIT 1",
+                (run.run_id, *blocking_types),
+            ).fetchone()
             if (
-                command is None
-                or command[0] != run.run_id
-                or command[1] not in blocking_types
-                or command[2] != attempt.attempt_id
+                latest_blocking_command is None
+                or attempt.interrupt_command_id != latest_blocking_command[0]
+                or latest_blocking_command[1] != run.run_id
+                or latest_blocking_command[2] != attempt.attempt_id
             ):
-                # interrupt latch 必须反查同 Run 且明确确认当前 Attempt 的阻断命令。
-                raise WorkflowRepositoryError("attempt blocking command lineage is inconsistent")
-            blocking_command_attempt_id = str(command[2])
+                # 仅比较最高 blocking command_seq；后续 RESUME 不是阻断命令，不会使旧 Attempt 失去收尾权。
+                raise WorkflowRepositoryError("attempt latest blocking command lineage is inconsistent")
+            blocking_command_attempt_id = str(latest_blocking_command[2])
+        elif attempt.interrupt_command_id is not None:
+            raise WorkflowRepositoryError("attempt blocking command latch is inconsistent")
+
+        # matching 仅限 owner/token/epoch；resourceFingerprint 绑定和 lease 生命周期仍属于 Task 4/5。
+        lease_active = self._matching_lease_active(active_attempt=attempt, now=now_utc)
 
         guard = WriteGuardContext(
             run_desired_state=run.desired_state,
@@ -285,25 +324,18 @@ class SqliteWorkflowRepository:
             expected_control_epoch=expected_control_epoch,
             attempt_drain_state=attempt.drain_state,
             blocking_command_attempt_id=blocking_command_attempt_id,
+            lease_active=lease_active,
         )
         return ExecutorWriteAuthority(run=run, step=step, attempt=attempt, guard=guard)
 
     def _matching_lease_active(self, *, active_attempt: Attempt, now: datetime) -> bool:
-        """逐行解析匹配 lease 的 UTC 时间，禁止依赖 SQLite 文本字典序比较 offset。"""
+        """仅按 owner/token/epoch 读取匹配 lease；资源映射仍明确属于 Task 4/5。"""
         rows = self._connection.execute(
             "SELECT acquired_at,heartbeat_at,expires_at FROM resource_leases "
             "WHERE owner_executor_id=? AND fencing_token=? AND control_epoch=? ORDER BY resource_key",
             (active_attempt.executor_id, active_attempt.fencing_token, active_attempt.control_epoch),
         ).fetchall()
-        active = False
-        for acquired_wire, heartbeat_wire, expires_wire in rows:
-            acquired_at = _rfc3339_utc(acquired_wire, field="lease acquired_at")
-            heartbeat_at = _rfc3339_utc(heartbeat_wire, field="lease heartbeat_at")
-            expires_at = _rfc3339_utc(expires_wire, field="lease expires_at")
-            if acquired_at > heartbeat_at or acquired_at >= expires_at:
-                raise WorkflowRepositoryError("lease time ordering is invalid")
-            active = active or (heartbeat_at <= now < expires_at)
-        return active
+        return _lease_rows_active(rows, now=now)
 
     def _active_authorization_valid(
         self,
@@ -312,14 +344,10 @@ class SqliteWorkflowRepository:
         active_attempt: Attempt,
         now: datetime,
     ) -> bool:
-        """复用 UoW canonical getter，再闭合 Task/Run/Plan/Step/Attempt/Intent 权威链。"""
+        """完整校验当前 Attempt 的每条授权，再按稳定 action key 汇总活动事实。"""
         task = self.get_task(run.task_id)
         if task is None:
             raise WorkflowRepositoryError("active authorization task is missing")
-        step_row = self._connection.execute(
-            "SELECT run_id,plan_revision_id,node_type FROM steps WHERE step_id=?",
-            (active_attempt.step_id,),
-        ).fetchone()
         authorization_ids = tuple(
             str(row[0])
             for row in self._connection.execute(
@@ -328,56 +356,121 @@ class SqliteWorkflowRepository:
                 (active_attempt.attempt_id,),
             ).fetchall()
         )
-        authorization_active = False
+        authorities: list[_AuthorizationAuthority] = []
         for authorization_id in authorization_ids:
-            # getter 会逐字节重验 canonical contract 与全部 SQL projection；异常不得降级为 False。
+            authorities.append(
+                self._validate_authorization_authority(
+                    authorization_id=authorization_id,
+                    run=run,
+                    task=task,
+                    now=now,
+                    expected_attempt=active_attempt,
+                    require_current_plan=True,
+                )
+            )
+        self._reject_duplicate_active_authorization_keys(authorities)
+        return any(authority.active for authority in authorities)
+
+    @staticmethod
+    def _reject_duplicate_active_authorization_keys(authorities: Sequence[_AuthorizationAuthority]) -> None:
+        """同 Attempt/capability/canonical key 的双活动行语义歧义，必须整体拒绝。"""
+        stable_keys: set[tuple[str, str, bytes]] = set()
+        for authority in authorities:
+            if not authority.active:
+                continue
+            if authority.stable_action_key in stable_keys:
+                raise WorkflowRepositoryError("duplicate active authorization stable action key")
+            stable_keys.add(authority.stable_action_key)
+
+    def _validate_authorization_authority(
+        self,
+        *,
+        authorization_id: str,
+        run: Run,
+        task: Task,
+        now: datetime,
+        expected_attempt: Attempt | None,
+        require_current_plan: bool,
+    ) -> _AuthorizationAuthority:
+        """共享校验活动/历史授权；历史仅豁免 active Plan 指针，不豁免 canonical 与 lineage。"""
+        try:
+            # UoW getter 会逐字节重验 canonical contract 与全部 SQL projection，损坏不能降级为 inactive。
             authorization = self._unit_of_work.authorization.get_execution_authorization(authorization_id)
             if authorization is None:
-                raise WorkflowRepositoryError("active execution authorization disappeared")
+                raise WorkflowRepositoryError("execution authorization disappeared")
             intent = self._unit_of_work.authorization.get_intent_authorization(
                 str(authorization["intent_authorization_id"])
             )
-            if intent is None:
-                raise WorkflowRepositoryError("active intent authorization is missing")
-            # Plan getter 会通过 PlanRevisionBundle 重验双 canonical blob 与全部 selector。
             plan = self._task1.get_plan_revision(str(authorization["plan_revision_id"]))
-            lineage_valid = (
-                step_row is not None
-                and plan is not None
-                and task.active_run_id == run.run_id
-                and task.active_plan_revision_id == authorization["plan_revision_id"]
-                and authorization["run_id"] == run.run_id
-                and authorization["step_id"] == active_attempt.step_id
-                and authorization["attempt_id"] == active_attempt.attempt_id
-                and step_row[0] == run.run_id
-                and step_row[1] == authorization["plan_revision_id"]
-                and plan["task_id"] == task.task_id
-                and plan["intent_authorization_id"] == authorization["intent_authorization_id"]
-                and intent["task_id"] == task.task_id
-                and _snapshot_digest(authorization["semantic_plan_hash"], field="semantic plan")
-                == plan["semantic_plan_hash"]
-                and _snapshot_digest(authorization["plan_revision_digest"], field="plan revision")
-                == plan["plan_revision_digest"]
-                and authorization["stage_capability_map_version"] == plan["stage_capability_map_version"]
-                and intent["stage_capability_map_version"] == plan["stage_capability_map_version"]
-                and authorization["node_capability_map_version"] == plan["node_capability_map_version"]
-                and authorization["node_type"] == step_row[2]
-                and authorization["executor_id"] == active_attempt.executor_id
-                and authorization["fencing_token"] == active_attempt.fencing_token
-                and authorization["control_epoch"] == active_attempt.control_epoch
-                and authorization["accepted_control_command_seq"] == active_attempt.accepted_control_command_seq
-            )
-            if not lineage_valid:
-                # catalog/manifest digest 与 resourceFingerprint↔lease 属于 Task 4；本节点只闭合已有身份链。
-                raise WorkflowRepositoryError("active authorization lineage is invalid")
-            authorization_active = authorization_active or (
+            step = self.get_step(str(authorization["step_id"]))
+            attempt = self.get_attempt(str(authorization["attempt_id"]))
+            if intent is None or plan is None or step is None or attempt is None:
+                raise WorkflowRepositoryError("authorization authority is missing")
+            # 由领域 hydrator 读取 RunSpec target；catalog/manifest 与资源绑定仍明确留给 Task 4/5。
+            plan_bundle = PlanRevisionBundle.from_persistence_record(plan)
+        except authorization_domain.AuthorizationContractError:
+            # canonical/projection 损坏保留冻结的 INVALID_AUTHORIZATION_CONTRACT 分类，事务仍由 coordinator 回滚。
+            raise
+        except WorkflowRepositoryError:
+            raise
+        except FactoryError as exc:
+            raise WorkflowRepositoryError("authorization canonical authority is invalid") from exc
+
+        lineage_valid = (
+            task.lifecycle is TaskLifecycle.ACTIVE
+            and task.active_run_id == run.run_id
+            and run.task_id == task.task_id
+            and authorization["run_id"] == run.run_id
+            and authorization["step_id"] == step.step_id
+            and authorization["attempt_id"] == attempt.attempt_id
+            and step.run_id == run.run_id
+            and attempt.step_id == step.step_id
+            and step.plan_revision_id == authorization["plan_revision_id"]
+            and plan["task_id"] == task.task_id
+            and plan["intent_authorization_id"] == authorization["intent_authorization_id"]
+            and intent["task_id"] == task.task_id
+            and intent["project_id"] == task.project_id
+            and intent["target_stage"] == task.target_stage.value
+            and plan_bundle.run_spec["targetStage"] == intent["target_stage"]
+            and _snapshot_digest(authorization["semantic_plan_hash"], field="semantic plan")
+            == plan["semantic_plan_hash"]
+            and _snapshot_digest(authorization["plan_revision_digest"], field="plan revision")
+            == plan["plan_revision_digest"]
+            and authorization["stage_capability_map_version"] == plan["stage_capability_map_version"]
+            and intent["stage_capability_map_version"] == plan["stage_capability_map_version"]
+            and authorization["node_capability_map_version"] == plan["node_capability_map_version"]
+            and authorization["node_type"] == step.node_type
+            and authorization["executor_id"] == attempt.executor_id
+            and authorization["fencing_token"] == attempt.fencing_token
+            and authorization["control_epoch"] == attempt.control_epoch
+            and authorization["accepted_control_command_seq"] == attempt.accepted_control_command_seq
+            and (not require_current_plan or task.active_plan_revision_id == authorization["plan_revision_id"])
+            and (expected_attempt is None or expected_attempt.attempt_id == attempt.attempt_id)
+        )
+        if not lineage_valid:
+            label = "active" if require_current_plan else "historical"
+            raise WorkflowRepositoryError(f"{label} authorization lineage is invalid")
+
+        # 时间即使对 CONSUMED/已撤销行也必须完整解析，防止损坏历史事实被状态短路掩盖。
+        authorization_time_active = _authorization_time_active(authorization, now=now)
+        intent_time_active = _authorization_time_active(intent, now=now)
+        idempotency_key = authorization["idempotency_key"]
+        if not isinstance(idempotency_key, bytes):
+            raise WorkflowRepositoryError("authorization idempotency key is invalid")
+        return _AuthorizationAuthority(
+            active=(
                 authorization["consumption_state"] == "AVAILABLE"
                 and type(authorization["max_uses"]) is int
                 and authorization["max_uses"] > 0
-                and _authorization_time_active(authorization, now=now)
-                and _authorization_time_active(intent, now=now)
-            )
-        return authorization_active
+                and authorization_time_active
+                and intent_time_active
+            ),
+            stable_action_key=(
+                attempt.attempt_id,
+                str(authorization["action_capability"]),
+                idempotency_key,
+            ),
+        )
 
     def load_observed_state_authority(
         self,
@@ -431,70 +524,32 @@ class SqliteWorkflowRepository:
                 now=now_utc,
             )
         else:
-            # Attempt 已收口时，反向枚举 run/step/attempt 三种授权关联，不能先按 run_id 过滤掉漂移行。
-            authorization_cursor = self._connection.execute(
-                "SELECT ea.* FROM execution_authorizations AS ea WHERE ea.run_id=? "
-                "UNION SELECT ea.* FROM execution_authorizations AS ea "
+            # Attempt 已收口时仍复用 canonical 校验器；仅允许合法失效授权按历史 Plan 收口。
+            task = self.get_task(run.task_id)
+            if task is None:
+                raise WorkflowRepositoryError("terminal authorization task is missing")
+            authorization_rows = self._connection.execute(
+                "SELECT ea.execution_authorization_id FROM execution_authorizations AS ea WHERE ea.run_id=? "
+                "UNION SELECT ea.execution_authorization_id FROM execution_authorizations AS ea "
                 "JOIN steps AS s ON s.step_id=ea.step_id WHERE s.run_id=? "
-                "UNION SELECT ea.* FROM execution_authorizations AS ea "
+                "UNION SELECT ea.execution_authorization_id FROM execution_authorizations AS ea "
                 "JOIN attempts AS a ON a.attempt_id=ea.attempt_id "
                 "JOIN steps AS s ON s.step_id=a.step_id WHERE s.run_id=?",
                 (run_id, run_id, run_id),
-            )
-            authorization_rows = authorization_cursor.fetchall()
-            authorization_columns = tuple(item[0] for item in authorization_cursor.description or ())
-            for authorization_row in authorization_rows:
-                authorization = dict(zip(authorization_columns, authorization_row, strict=True))
-                authorization_time_active = _authorization_time_active(authorization, now=now_utc)
-                step_row = self._connection.execute(
-                    "SELECT run_id,plan_revision_id,node_type FROM steps WHERE step_id=?",
-                    (authorization["step_id"],),
-                ).fetchone()
-                attempt_row = self._connection.execute(
-                    "SELECT step_id,executor_id,fencing_token,control_epoch,accepted_control_command_seq "
-                    "FROM attempts WHERE attempt_id=?",
-                    (authorization["attempt_id"],),
-                ).fetchone()
-                plan_row = self._connection.execute(
-                    "SELECT task_id,intent_authorization_id,semantic_plan_hash,plan_revision_digest "
-                    "FROM plan_revisions WHERE plan_revision_id=?",
-                    (authorization["plan_revision_id"],),
-                ).fetchone()
-                try:
-                    plan_contract_valid = (
-                        plan_row is not None
-                        and authorization["intent_authorization_id"] == plan_row[1]
-                        and authorization["semantic_plan_hash"] == canonicalize(plan_row[2])
-                        and authorization["plan_revision_digest"] == canonicalize(plan_row[3])
-                    )
-                except (FactoryError, TypeError, ValueError):
-                    plan_contract_valid = False
-                lineage_valid = (
-                    step_row is not None
-                    and attempt_row is not None
-                    and plan_row is not None
-                    and authorization["run_id"] == run_id
-                    and step_row[0] == run_id
-                    and authorization["step_id"] == attempt_row[0]
-                    and authorization["plan_revision_id"] == step_row[1]
-                    and plan_row[0] == run.task_id
-                    and plan_contract_valid
-                    and authorization["node_type"] == step_row[2]
-                    and authorization["executor_id"] == attempt_row[1]
-                    and authorization["fencing_token"] == attempt_row[2]
-                    and authorization["control_epoch"] == attempt_row[3]
-                    and authorization["accepted_control_command_seq"] == attempt_row[4]
+            ).fetchall()
+            historical_authorities = tuple(
+                self._validate_authorization_authority(
+                    authorization_id=str(row[0]),
+                    run=run,
+                    task=task,
+                    now=now_utc,
+                    expected_attempt=None,
+                    require_current_plan=False,
                 )
-                if not lineage_valid:
-                    # 任一授权身份漂移都要 fail closed，避免损坏行被状态过滤器静默忽略。
-                    authorization_active = True
-                    continue
-                if (
-                    authorization["consumption_state"] == "AVAILABLE"
-                    and authorization["revoked_at"] is None
-                    and authorization_time_active
-                ):
-                    authorization_active = True
+                for row in authorization_rows
+            )
+            self._reject_duplicate_active_authorization_keys(historical_authorities)
+            authorization_active = any(authority.active for authority in historical_authorities)
             lease_rows = self._connection.execute(
                 "SELECT l.acquired_at,l.heartbeat_at,l.expires_at FROM resource_leases AS l "
                 "JOIN attempts AS a "
@@ -504,13 +559,7 @@ class SqliteWorkflowRepository:
                 "JOIN steps AS s ON s.step_id=a.step_id WHERE s.run_id=? ORDER BY l.resource_key",
                 (run_id,),
             ).fetchall()
-            for acquired_wire, heartbeat_wire, expires_wire in lease_rows:
-                acquired_at = _rfc3339_utc(acquired_wire, field="lease acquired_at")
-                heartbeat_at = _rfc3339_utc(heartbeat_wire, field="lease heartbeat_at")
-                expires_at = _rfc3339_utc(expires_wire, field="lease expires_at")
-                if acquired_at > heartbeat_at or acquired_at >= expires_at:
-                    raise WorkflowRepositoryError("lease time ordering is invalid")
-                lease_active = lease_active or (heartbeat_at <= now_utc < expires_at)
+            lease_active = _lease_rows_active(lease_rows, now=now_utc)
             heartbeat_valid = lease_active
         unknown_remote_state = (
             self._connection.execute(
@@ -1634,6 +1683,7 @@ class SqliteWorkflowRepository:
         executor_id: str,
         fencing_token: int,
         control_epoch: int,
+        now: datetime,
     ) -> tuple[Run, ExecutorWriteAuthority, WriteMode]:
         """用仓储权威上下文授权唯一 executor QUEUED→RUNNING 写。"""
         authority = self.load_executor_write_authority(
@@ -1643,6 +1693,7 @@ class SqliteWorkflowRepository:
             expected_executor_id=executor_id,
             expected_fencing_token=fencing_token,
             expected_control_epoch=control_epoch,
+            now=now,
         )
         if authority.run.observed_state is not RunObservedState.QUEUED:
             raise WorkflowRepositoryError("executor RUNNING projection requires QUEUED run")
@@ -1666,6 +1717,7 @@ class SqliteWorkflowRepository:
         fencing_token: int,
         control_epoch: int,
         candidate: StepPhase,
+        now: datetime,
     ) -> tuple[Step, ExecutorWriteAuthority, WriteMode]:
         """NORMAL_WRITE guard 与 Step CAS 绑定在同一 UoW。"""
         authority = self.load_executor_write_authority(
@@ -1675,6 +1727,7 @@ class SqliteWorkflowRepository:
             expected_executor_id=executor_id,
             expected_fencing_token=fencing_token,
             expected_control_epoch=control_epoch,
+            now=now,
         )
         if authority.step.step_id != step_id:
             raise WorkflowRepositoryError("executor Step selector is outside the active Attempt lineage")
@@ -1683,6 +1736,12 @@ class SqliteWorkflowRepository:
             target = StepPhase(candidate)
         except (TypeError, ValueError) as exc:
             raise WorkflowRepositoryError("executor Step target phase is invalid") from exc
+        # phase-only 写入口只开放冻结的 executor 有向边，outcome/终态必须由专用原子操作维护。
+        require_step_phase_transition(
+            authority.step.phase,
+            target,
+            current_outcome=authority.step.outcome,
+        )
         updated = self._task1.compare_and_set_step(
             step_id=step_id,
             expected_state_version=expected_step_state_version,
@@ -1701,6 +1760,7 @@ class SqliteWorkflowRepository:
         fencing_token: int,
         control_epoch: int,
         candidate: AttemptPhase,
+        now: datetime,
     ) -> tuple[Attempt, ExecutorWriteAuthority, WriteMode]:
         """普通 Attempt projection 只允许 NORMAL_WRITE，终止必须走独立入口。"""
         authority = self.load_executor_write_authority(
@@ -1710,14 +1770,18 @@ class SqliteWorkflowRepository:
             expected_executor_id=executor_id,
             expected_fencing_token=fencing_token,
             expected_control_epoch=control_epoch,
+            now=now,
         )
         mode = require_write(authority.guard, WriteOperation.ATTEMPT_STATE)
         try:
             target = AttemptPhase(candidate)
         except (TypeError, ValueError) as exc:
             raise WorkflowRepositoryError("executor Attempt target phase is invalid") from exc
-        if target is AttemptPhase.TERMINATED:
-            raise WorkflowRepositoryError("Attempt termination requires the dedicated guarded operation")
+        require_attempt_phase_transition(
+            authority.attempt.phase,
+            target,
+            current_outcome=authority.attempt.outcome,
+        )
         updated = self._task1.compare_and_set_attempt(
             attempt_id=attempt_id,
             expected_state_version=expected_attempt_state_version,
@@ -1738,6 +1802,7 @@ class SqliteWorkflowRepository:
         outcome: AttemptOutcome,
         ended_at: str,
         termination_reason: str | None,
+        now: datetime,
     ) -> tuple[Attempt, ExecutorWriteAuthority, WriteMode]:
         """NORMAL/DRAIN_WRITE 均可原子写入 Attempt 终止闭集。"""
         authority = self.load_executor_write_authority(
@@ -1747,17 +1812,27 @@ class SqliteWorkflowRepository:
             expected_executor_id=executor_id,
             expected_fencing_token=fencing_token,
             expected_control_epoch=control_epoch,
+            now=now,
         )
         mode = require_write(authority.guard, WriteOperation.ATTEMPT_TERMINATION)
         try:
             target_outcome = AttemptOutcome(outcome)
         except (TypeError, ValueError) as exc:
             raise WorkflowRepositoryError("Attempt termination outcome is invalid") from exc
-        if target_outcome is AttemptOutcome.NONE:
-            raise WorkflowRepositoryError("Attempt termination requires a terminal outcome")
-        _rfc3339_utc(ended_at, field="attempt ended_at")
-        if termination_reason is not None and (not isinstance(termination_reason, str) or not termination_reason):
+        require_attempt_termination_transition(
+            authority.attempt.phase,
+            current_outcome=authority.attempt.outcome,
+            terminal_outcome=target_outcome,
+        )
+        ended_instant = _rfc3339_utc(ended_at, field="attempt ended_at")
+        if authority.attempt.started_at is not None:
+            started_instant = _rfc3339_utc(authority.attempt.started_at, field="attempt started_at")
+            if ended_instant < started_instant:
+                raise WorkflowRepositoryError("attempt ended_at precedes started_at")
+        if termination_reason is not None and (type(termination_reason) is not str or not termination_reason):
             raise WorkflowRepositoryError("Attempt termination reason is invalid")
+        # NORMAL 保持 NONE；只有 DRAIN termination 才把配套 drain 事实推进到 DRAINED。
+        terminal_drain_state = DrainState.DRAINED if mode is WriteMode.DRAIN_WRITE else DrainState.NONE
         row = self._task1._cas(
             table="attempts",
             identity_column="attempt_id",
@@ -1766,7 +1841,7 @@ class SqliteWorkflowRepository:
             changes={
                 "phase": AttemptPhase.TERMINATED.value,
                 "outcome": target_outcome.value,
-                "drain_state": DrainState.DRAINED.value,
+                "drain_state": terminal_drain_state.value,
                 "ended_at": ended_at,
                 "termination_reason": termination_reason,
             },
@@ -1795,12 +1870,13 @@ class SqliteWorkflowRepository:
         if len(successor_ids) > 1:
             # 多个直接后继代表持久事实已经歧义，不能任选一行伪装成幂等重放。
             raise WorkflowRepositoryError("predecessor has multiple direct successors")
+        exact_replay = False
         if successor_ids:
             successor = self.get_attempt(successor_ids[0])
             if successor == candidate:
-                # 同一 candidate 的 scheduler 重放不产生第二行，也不重复消费 freshness。
-                return
-            raise WorkflowRepositoryError("predecessor already has a different successor")
+                exact_replay = True
+            else:
+                raise WorkflowRepositoryError("predecessor already has a different successor")
 
         run_id_row = self._connection.execute(
             "SELECT s.run_id FROM steps AS s WHERE s.step_id=?",
@@ -1811,14 +1887,26 @@ class SqliteWorkflowRepository:
         run = self.get_run(str(run_id_row[0]))
         if run is None:
             raise WorkflowRepositoryError("attempt run lineage is missing")
-        other_active = self._connection.execute(
-            "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-            "WHERE s.run_id=? AND a.attempt_id<>? "
-            "AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' LIMIT 1",
-            (run.run_id, stored_previous.attempt_id),
-        ).fetchone()
+        if exact_replay:
+            # 幂等重放也先扫描全 Run；只排除 predecessor 与已确认完全相同的 candidate。
+            other_active = self._connection.execute(
+                "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
+                "WHERE s.run_id=? AND a.attempt_id NOT IN (?,?) "
+                "AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' LIMIT 1",
+                (run.run_id, stored_previous.attempt_id, candidate.attempt_id),
+            ).fetchone()
+        else:
+            other_active = self._connection.execute(
+                "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
+                "WHERE s.run_id=? AND a.attempt_id<>? "
+                "AND a.phase<>'TERMINATED' AND a.drain_state<>'DRAINED' LIMIT 1",
+                (run.run_id, stored_previous.attempt_id),
+            ).fetchone()
         if other_active is not None:
             raise WorkflowRepositoryError("another active attempt already exists for the run")
+        if exact_replay:
+            # 同一 candidate 的 scheduler 重放不产生第二行，也不重复消费 freshness。
+            return
         try:
             require_new_attempt_dispatch(
                 observed_state=run.observed_state,
