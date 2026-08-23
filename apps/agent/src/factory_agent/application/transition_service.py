@@ -65,6 +65,18 @@ class BarrierMilestoneCommitError(FactoryError):
     error_code = "BARRIER_MILESTONE_COMMIT_REJECTED"
 
 
+def _barrier_authority_utc(value: object) -> datetime:
+    """把事务入口唯一取到的服务端时刻校验并规范为 UTC，非法值稳定映射为应用错误。"""
+    if not isinstance(value, datetime):
+        raise BarrierMilestoneCommitError("barrier authority clock is invalid")
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("barrier authority clock is naive")
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        raise BarrierMilestoneCommitError("barrier authority clock is invalid") from None
+
+
 def _require_transition_identity(value: object) -> str:
     """在进入 coordinator 前冻结 application identity selector。"""
     if type(value) is not str or not value:
@@ -912,6 +924,8 @@ class TransitionService:
         request: BarrierMilestoneRequest,
     ) -> BarrierMilestoneResult:
         """在 owner transaction 内核对 lineage/gate，并登记三组 CAS↔event。"""
+        # 事务内只读取一次权威时刻，gate 与 terminal authority 复用同一瞬时，避免 expiry TOCTOU。
+        authority_now = _barrier_authority_utc(self._now())
         repository = SqliteWorkflowRepository(unit_of_work)
         current_task = repository.get_task(request.task_id)
         current_run = repository.get_run(request.run_id)
@@ -1013,7 +1027,7 @@ class TransitionService:
             barrier_decision = evaluate_barrier(
                 authority.steps,
                 # 超时只能由服务端注入时钟决定，request.now 仅为兼容字段，绝不参与授权。
-                now=self._now(),
+                now=authority_now,
                 settle_deadline_at=settle_deadline,
             )
         except WorkflowRepositoryError as exc:
@@ -1118,7 +1132,7 @@ class TransitionService:
                 # 目标收口不能只依赖 observed 状态转换图；同一写事务内重算所有 Step、Attempt、receipt、授权与 lease。
                 terminal_authority = repository.load_observed_state_authority(
                     run_id=current_run.run_id,
-                    now=self._now(),
+                    now=authority_now,
                 )
                 require_observed_target_predicates(
                     current_run,

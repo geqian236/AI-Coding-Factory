@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 from factory_agent.application.control_service import ControlCommandRequest
@@ -45,6 +45,21 @@ from tests.agent.integration.control.test_control_commands import (
     _SqliteCoordinator,
     _transaction_projection_snapshot,
 )
+
+_DISPATCH_AUTHORITY_NOW = datetime(2026, 8, 17, 10, 0, tzinfo=UTC)
+
+
+class _BrokenOffsetTimezone(tzinfo):
+    """制造 utcoffset 转换异常，验证 scheduler 时钟边界稳定 fail closed。"""
+
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        raise ValueError("broken test offset")
+
+    def dst(self, value: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, value: datetime | None) -> str | None:
+        return "BROKEN"
 
 
 def _guard_context(**overrides: object) -> WriteGuardContext:
@@ -400,17 +415,232 @@ def _prepare_drained_predecessor(connection: sqlite3.Connection) -> tuple[Attemp
     return previous, candidate
 
 
-def _commit_superseding_attempt(connection: object, previous: Attempt, candidate: Attempt) -> None:
+def _commit_superseding_attempt(
+    connection: object,
+    previous: Attempt,
+    candidate: Attempt,
+    *,
+    now: datetime = _DISPATCH_AUTHORITY_NOW,
+) -> None:
     """在 BEGIN IMMEDIATE owner transaction 内提交 scheduler 后继写。"""
     unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)  # type: ignore[arg-type]
     unit_of_work.begin_immediate()
     try:
-        SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(previous, candidate)
+        SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(previous, candidate, now=now)
         unit_of_work.precommit()
         unit_of_work.commit()
     except BaseException:
         unit_of_work.rollback()
         raise
+
+
+def _corrupt_scheduler_attempt(
+    connection: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    corrupt_candidate: bool,
+    corruption: str,
+) -> None:
+    """只污染 scheduler 应在共享权威扫描中拒绝的一项 Attempt 事实。"""
+    if corruption == "drained-null":
+        if corrupt_candidate:
+            connection.execute(
+                "UPDATE attempts SET phase='TERMINATED',outcome='SUCCEEDED',drain_state='DRAINED',"
+                "interrupt_command_id=NULL,started_at='2026-08-17T09:00:00Z',"
+                "ended_at='2026-08-17T09:30:00Z' WHERE attempt_id=?",
+                (attempt_id,),
+            )
+        else:
+            connection.execute("UPDATE attempts SET interrupt_command_id=NULL WHERE attempt_id=?", (attempt_id,))
+    elif corruption == "terminal-outcome-none":
+        connection.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='NONE',"
+            "drain_state=?,interrupt_command_id=?,ended_at='2026-08-17T09:30:00Z' WHERE attempt_id=?",
+            (
+                "NONE" if corrupt_candidate else "DRAINED",
+                None if corrupt_candidate else "command-drain-lineage-1",
+                attempt_id,
+            ),
+        )
+    elif corruption == "started-after-ended":
+        connection.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='SUCCEEDED',"
+            "drain_state=?,interrupt_command_id=?,started_at='2026-08-17T09:30:00Z',"
+            "ended_at='2026-08-17T09:00:00Z' WHERE attempt_id=?",
+            (
+                "NONE" if corrupt_candidate else "DRAINED",
+                None if corrupt_candidate else "command-drain-lineage-1",
+                attempt_id,
+            ),
+        )
+    elif corruption == "ended-after-now":
+        connection.execute(
+            "UPDATE attempts SET phase='TERMINATED',outcome='SUCCEEDED',"
+            "drain_state=?,interrupt_command_id=?,started_at='2026-08-17T09:00:00Z',"
+            "ended_at='2026-08-17T10:00:00.001Z' WHERE attempt_id=?",
+            (
+                "NONE" if corrupt_candidate else "DRAINED",
+                None if corrupt_candidate else "command-drain-lineage-1",
+                attempt_id,
+            ),
+        )
+    else:
+        raise AssertionError(f"未知 scheduler authority 反例：{corruption}")
+
+
+@pytest.mark.parametrize(
+    ("replay", "corrupt_candidate"),
+    [(False, False), (True, False), (True, True)],
+    ids=["fresh-predecessor", "exact-replay-predecessor", "exact-replay-candidate"],
+)
+@pytest.mark.parametrize(
+    "corruption",
+    ["drained-null", "terminal-outcome-none", "started-after-ended", "ended-after-now"],
+)
+def test_superseding_attempt_rejects_corrupt_run_attempt_authority(
+    replay: bool,
+    corrupt_candidate: bool,
+    corruption: str,
+) -> None:
+    """fresh/replay 都须校验 predecessor 与 candidate 的 drain、outcome 和时间线。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        if replay:
+            _commit_superseding_attempt(connection, previous, candidate)
+        target_attempt_id = candidate.attempt_id if corrupt_candidate else previous.attempt_id
+        _corrupt_scheduler_attempt(
+            connection,
+            attempt_id=target_attempt_id,
+            corrupt_candidate=corrupt_candidate,
+            corruption=corruption,
+        )
+        repository = SqliteWorkflowRepository(SqliteUnitOfWork(connection, failure_probe=lambda _point: None))
+        authoritative_previous = repository.get_attempt(previous.attempt_id)
+        authoritative_candidate = repository.get_attempt(candidate.attempt_id) if replay else candidate
+        assert authoritative_previous is not None
+        assert authoritative_candidate is not None
+        before = _transaction_projection_snapshot(connection)
+
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError):
+                SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(
+                    authoritative_previous,
+                    authoritative_candidate,
+                    now=_DISPATCH_AUTHORITY_NOW,
+                )
+        finally:
+            unit_of_work.rollback()
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+def test_superseding_attempt_exact_replay_rejects_corrupt_predecessor_before_return() -> None:
+    """已存在 exact candidate 时仍须先拒绝 predecessor 的 DRAINED/null，不能提前 return。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        _insert(connection, "attempts", _attempt_record(candidate))
+        connection.execute("UPDATE attempts SET interrupt_command_id=NULL WHERE attempt_id='attempt-control-1'")
+        repository = SqliteWorkflowRepository(SqliteUnitOfWork(connection, failure_probe=lambda _point: None))
+        authoritative_previous = repository.get_attempt(previous.attempt_id)
+        authoritative_candidate = repository.get_attempt(candidate.attempt_id)
+        assert authoritative_previous is not None
+        assert authoritative_candidate is not None
+        before = _transaction_projection_snapshot(connection)
+
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError):
+                SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(
+                    authoritative_previous,
+                    authoritative_candidate,
+                    now=_DISPATCH_AUTHORITY_NOW,
+                )
+        finally:
+            unit_of_work.rollback()
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("corrupt_role", ["predecessor-draining", "candidate-running"])
+def test_superseding_attempt_exact_replay_rechecks_common_dispatch_invariants(corrupt_role: str) -> None:
+    """共享 projection 合法也不等于可重派；replay 前仍须重验 fully-drained 与 fresh CREATED。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        _commit_superseding_attempt(connection, previous, candidate)
+        if corrupt_role == "predecessor-draining":
+            connection.execute(
+                "UPDATE attempts SET phase='RUNNING',outcome='NONE',drain_state='DRAINING',"
+                "ended_at=NULL WHERE attempt_id='attempt-control-1'"
+            )
+        else:
+            connection.execute(
+                "UPDATE attempts SET phase='RUNNING',outcome='NONE',started_at='2026-08-17T09:30:00Z' "
+                "WHERE attempt_id='attempt-control-2'"
+            )
+        repository = SqliteWorkflowRepository(SqliteUnitOfWork(connection, failure_probe=lambda _point: None))
+        authoritative_previous = repository.get_attempt(previous.attempt_id)
+        authoritative_candidate = repository.get_attempt(candidate.attempt_id)
+        assert authoritative_previous is not None
+        assert authoritative_candidate is not None
+        before = _transaction_projection_snapshot(connection)
+
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError):
+                SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(
+                    authoritative_previous,
+                    authoritative_candidate,
+                    now=_DISPATCH_AUTHORITY_NOW,
+                )
+        finally:
+            unit_of_work.rollback()
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        "2026-08-17T10:00:00Z",
+        datetime(2026, 8, 17, 10, 0),
+        datetime(2026, 8, 17, 10, 0, tzinfo=_BrokenOffsetTimezone()),
+    ],
+    ids=["not-datetime", "naive", "offset-conversion-error"],
+)
+def test_superseding_attempt_rejects_invalid_dispatch_clock(invalid_now: object) -> None:
+    """scheduler 必须显式提供可转换为 UTC 的 aware datetime，仓储不得回退墙钟。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError, match="attempt dispatch clock is invalid"):
+                SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(
+                    previous,
+                    candidate,
+                    now=invalid_now,  # type: ignore[arg-type]
+                )
+        finally:
+            unit_of_work.rollback()
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -702,7 +932,7 @@ def test_superseding_attempt_rejects_running_candidate_before_insert() -> None:
                 state_version=0,
             )
             with pytest.raises(WorkflowRepositoryError):
-                repository.append_superseding_attempt(previous, candidate)
+                repository.append_superseding_attempt(previous, candidate, now=_DISPATCH_AUTHORITY_NOW)
             unit_of_work.rollback()
         except BaseException:
             if connection.in_transaction:
@@ -745,7 +975,7 @@ def test_superseding_attempt_rejects_malformed_authoritative_candidate(malformed
             else:
                 candidate = replace(candidate, accepted_control_command_seq=previous.accepted_control_command_seq)
             with pytest.raises(WorkflowRepositoryError):
-                repository.append_superseding_attempt(previous, candidate)
+                repository.append_superseding_attempt(previous, candidate, now=_DISPATCH_AUTHORITY_NOW)
             unit_of_work.rollback()
         except BaseException:
             if connection.in_transaction:
@@ -761,16 +991,21 @@ def test_superseding_attempt_exact_candidate_replay_is_idempotent() -> None:
     connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
     try:
         previous, candidate = _prepare_drained_predecessor(connection)
+        before = _transaction_projection_snapshot(connection)
 
         _commit_superseding_attempt(connection, previous, candidate)
+        after_fresh = _transaction_projection_snapshot(connection)
+        assert len(after_fresh["attempts"]) == len(before["attempts"]) + 1
+        assert after_fresh["events"] == before["events"]
         _commit_superseding_attempt(connection, previous, candidate)
+        assert _transaction_projection_snapshot(connection) == after_fresh
 
         assert connection.execute(
             "SELECT attempt_id,supersedes_attempt_id,phase,fencing_token,control_epoch,"
-            "accepted_control_command_seq FROM attempts ORDER BY attempt_id"
+            "accepted_control_command_seq,state_version FROM attempts ORDER BY attempt_id"
         ).fetchall() == [
-            ("attempt-control-1", None, "TERMINATED", 7, 9, 0),
-            ("attempt-control-2", "attempt-control-1", "CREATED", 8, 10, 1),
+            ("attempt-control-1", None, "TERMINATED", 7, 9, 0, 0),
+            ("attempt-control-2", "attempt-control-1", "CREATED", 8, 10, 1, 0),
         ]
     finally:
         connection.close()

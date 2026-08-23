@@ -7,7 +7,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +139,47 @@ class _RecordingCoordinator:
     ) -> ResultT:
         self.calls += 1
         raise AssertionError(f"invalid selector reached coordinator: {operation}")
+
+
+class _RecordingClock:
+    """按序返回权威时刻并记录调用，直接验证事务入口是否只取时一次。"""
+
+    def __init__(self, *values: object) -> None:
+        if not values:
+            raise AssertionError("recording clock requires at least one value")
+        self._values = values
+        self.calls: list[object] = []
+
+    def __call__(self) -> datetime:
+        value = self._values[min(len(self.calls), len(self._values) - 1)]
+        self.calls.append(value)
+        return value  # type: ignore[return-value]
+
+
+class _InvalidOffsetTimezone(tzinfo):
+    """返回 RFC 不允许的 offset，验证权威时钟拒绝无效 aware datetime。"""
+
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        return timedelta(hours=24)
+
+    def dst(self, value: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, value: datetime | None) -> str | None:
+        return "INVALID"
+
+
+class _BrokenOffsetTimezone(tzinfo):
+    """让 utcoffset 转换抛错，验证异常不会越过应用时钟边界。"""
+
+    def utcoffset(self, value: datetime | None) -> timedelta | None:
+        raise ValueError("broken test offset")
+
+    def dst(self, value: datetime | None) -> timedelta | None:
+        return None
+
+    def tzname(self, value: datetime | None) -> str | None:
+        return "BROKEN"
 
 
 def _ids(prefix: str) -> Callable[[], str]:
@@ -890,6 +931,20 @@ def _target_close_request(*, planning_barrier_id: str, request_id: str) -> Barri
         steps=(),
         milestone_evidence=MilestoneEvidence(True, 0, False, True, 0),
     )
+
+
+def _prepare_target_close_expiry_boundary(connection: sqlite3.Connection) -> str:
+    """构造只由 matching lease 的严格 expiry 边界决定能否收口的完整事实图。"""
+    _insert_passing_planning_graph(connection, run_spec_target_stage="DESIGN_APPROVED")
+    _align_target_stage_authority(connection, "DESIGN_APPROVED")
+    planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    _insert_target_close_lease(connection)
+    connection.execute(
+        "UPDATE resource_leases SET acquired_at='2026-08-17T08:00:00Z',"
+        "heartbeat_at='2026-08-17T08:30:00Z',expires_at='2026-08-17T09:00:00Z' "
+        "WHERE resource_key='resource-target-lease-only'"
+    )
+    return planning_barrier_id
 
 
 def _insert_secondary_run_graph(connection: sqlite3.Connection) -> tuple[str, str]:
@@ -4713,6 +4768,109 @@ async def test_target_reached_rejects_active_authorization_and_lease_and_rolls_b
             "SELECT state_version FROM resource_leases WHERE resource_key=?", ("resource-target-close",)
         ).fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_target_close_uses_one_authority_instant_across_expiry_boundary() -> None:
+    """gate 与 terminal authority 必须复用同一瞬时，不能跨 expiry 产生 TOCTOU 提交。"""
+    connection = _connection()
+    try:
+        planning_barrier_id = _prepare_target_close_expiry_boundary(connection)
+        before_expiry = datetime(2026, 8, 17, 8, 59, 59, 999999, tzinfo=UTC)
+        expiry_boundary = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        clock = _RecordingClock(before_expiry, expiry_boundary)
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="target termination authority is incomplete"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-single-authority-now"),
+                now=clock,
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-single-authority-now",
+                )
+            )
+
+        assert clock.calls == [before_expiry]
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("at_expiry", [False, True], ids=["before-expiry-active", "at-expiry-inactive"])
+@pytest.mark.asyncio
+async def test_target_close_expiry_boundary_uses_exactly_one_clock_read(at_expiry: bool) -> None:
+    """严格 now < expires 为 active；边界相等即 inactive，且两条路径都只能读取一次时钟。"""
+    connection = _connection()
+    try:
+        planning_barrier_id = _prepare_target_close_expiry_boundary(connection)
+        authority_now = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        if not at_expiry:
+            authority_now = datetime(2026, 8, 17, 8, 59, 59, 999999, tzinfo=UTC)
+        clock = _RecordingClock(authority_now)
+        before = _transaction_projection_snapshot(connection)
+        service = TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids(f"state-event-expiry-boundary-{at_expiry}"),
+            now=clock,
+        )
+        request = _target_close_request(
+            planning_barrier_id=planning_barrier_id,
+            request_id=f"request-expiry-boundary-{at_expiry}",
+        )
+
+        if at_expiry:
+            result = await service.commit_passed_barrier(request)
+            assert result.run.observed_state is RunObservedState.TERMINATED
+            assert result.task.lifecycle.value == "SUCCEEDED"
+            assert connection.execute("SELECT count(*) FROM authoritative_state_events").fetchone() == (3,)
+        else:
+            with pytest.raises(BarrierMilestoneCommitError, match="target termination authority is incomplete"):
+                await service.commit_passed_barrier(request)
+            assert _transaction_projection_snapshot(connection) == before
+        assert clock.calls == [authority_now]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        datetime(2026, 8, 17, 9, 0),
+        "2026-08-17T09:00:00Z",
+        datetime(2026, 8, 17, 9, 0, tzinfo=_InvalidOffsetTimezone()),
+        datetime(2026, 8, 17, 9, 0, tzinfo=_BrokenOffsetTimezone()),
+    ],
+    ids=["naive", "not-datetime", "invalid-offset", "conversion-error"],
+)
+@pytest.mark.asyncio
+async def test_target_close_rejects_invalid_authority_clock_before_writes(invalid_now: object) -> None:
+    """非法服务端时钟必须稳定映射为 application error，并在任何 CAS/event 前整体回滚。"""
+    connection = _connection()
+    try:
+        planning_barrier_id = _prepare_target_close_expiry_boundary(connection)
+        clock = _RecordingClock(invalid_now)
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority clock is invalid"):
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-invalid-authority-clock"),
+                now=clock,
+            ).commit_passed_barrier(
+                _target_close_request(
+                    planning_barrier_id=planning_barrier_id,
+                    request_id="request-invalid-authority-clock",
+                )
+            )
+
+        assert len(clock.calls) == 1
+        assert clock.calls[0] is invalid_now
+        assert _transaction_projection_snapshot(connection) == before
     finally:
         connection.close()
 

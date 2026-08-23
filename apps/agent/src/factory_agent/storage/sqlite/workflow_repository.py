@@ -76,6 +76,18 @@ def _rfc3339_utc(value: object, *, field: str) -> datetime:
         raise WorkflowRepositoryError(f"{field} timestamp is invalid") from None
 
 
+def _attempt_dispatch_utc(value: object) -> datetime:
+    """校验 scheduler 显式注入的权威时刻；仓储禁止读取墙钟或接受 naive datetime。"""
+    if not isinstance(value, datetime):
+        raise WorkflowRepositoryError("attempt dispatch clock is invalid")
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("attempt dispatch clock is naive")
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        raise WorkflowRepositoryError("attempt dispatch clock is invalid") from None
+
+
 def _authorization_time_active(record: Mapping[str, object], *, now: datetime) -> bool:
     """按 issued <= now < expires 计算授权活性；损坏或倒置时间一律 fail closed。"""
     issued_at = _rfc3339_utc(record.get("issued_at"), field="authorization issued_at")
@@ -1969,8 +1981,15 @@ class SqliteWorkflowRepository:
         updated = Attempt.from_record({key: row[key] for key in Attempt.__dataclass_fields__})
         return updated, authority, mode
 
-    def append_superseding_attempt(self, previous: Attempt, candidate: Attempt) -> None:
+    def append_superseding_attempt(
+        self,
+        previous: Attempt,
+        candidate: Attempt,
+        *,
+        now: datetime,
+    ) -> None:
         """在 owner write transaction 内幂等追加唯一 QUEUED 后继。"""
+        authority_now = _attempt_dispatch_utc(now)
         if not self._connection.in_transaction:
             raise WorkflowRepositoryError("attempt dispatch requires an owner write transaction")
         if not isinstance(previous, Attempt) or not isinstance(candidate, Attempt):
@@ -2006,36 +2025,25 @@ class SqliteWorkflowRepository:
         run = self.get_run(str(run_id_row[0]))
         if run is None:
             raise WorkflowRepositoryError("attempt run lineage is missing")
+        # exact replay 也必须在 return 前验证 predecessor、candidate 及所有 sibling；顺序不能被幂等短路。
+        run_attempts = self._run_attempts_with_valid_drain_authority(run)
+        for persisted_attempt in run_attempts:
+            _validate_attempt_projection(persisted_attempt, now=authority_now)
         if exact_replay:
-            # 幂等重放也先扫描全 Run；只排除 predecessor 与已确认完全相同的 candidate。
-            other_active = self._connection.execute(
-                "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-                "WHERE s.run_id=? AND a.attempt_id NOT IN (?,?) "
-                "AND a.phase<>'TERMINATED' LIMIT 1",
-                (run.run_id, stored_previous.attempt_id, candidate.attempt_id),
-            ).fetchone()
+            allowed_active_ids = {stored_previous.attempt_id, candidate.attempt_id}
         else:
-            other_active = self._connection.execute(
-                "SELECT a.attempt_id FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-                "WHERE s.run_id=? AND a.attempt_id<>? "
-                "AND a.phase<>'TERMINATED' LIMIT 1",
-                (run.run_id, stored_previous.attempt_id),
-            ).fetchone()
+            allowed_active_ids = {stored_previous.attempt_id}
+        other_active = next(
+            (
+                attempt
+                for attempt in run_attempts
+                if attempt.phase is not AttemptPhase.TERMINATED and attempt.attempt_id not in allowed_active_ids
+            ),
+            None,
+        )
         if other_active is not None:
             raise WorkflowRepositoryError("another active attempt already exists for the run")
-        if exact_replay:
-            # 同一 candidate 的 scheduler 重放不产生第二行，也不重复消费 freshness。
-            return
-        try:
-            require_new_attempt_dispatch(
-                observed_state=run.observed_state,
-                new_attempt_id=candidate.attempt_id,
-                previous_attempt_id=stored_previous.attempt_id,
-            )
-        except FactoryError as exc:
-            raise WorkflowRepositoryError("new attempt dispatch state is invalid") from exc
-        if run.desired_state is not RunDesiredState.RUNNING:
-            raise WorkflowRepositoryError("new attempt dispatch requires desired RUNNING")
+        # replay 只豁免重复插入和瞬态 freshness 消费；predecessor/candidate 的不可变 dispatch 形状仍须重验。
         if (
             stored_previous.phase is not AttemptPhase.TERMINATED
             or stored_previous.drain_state is not DrainState.DRAINED
@@ -2064,6 +2072,19 @@ class SqliteWorkflowRepository:
             or candidate.outcome is not AttemptOutcome.NONE
         ):
             raise WorkflowRepositoryError("candidate must be a fresh CREATED Attempt")
+        if exact_replay:
+            # 同一 candidate 经全 Run 与共同 dispatch 校验后幂等返回，不重复消费瞬态 freshness。
+            return
+        try:
+            require_new_attempt_dispatch(
+                observed_state=run.observed_state,
+                new_attempt_id=candidate.attempt_id,
+                previous_attempt_id=stored_previous.attempt_id,
+            )
+        except FactoryError as exc:
+            raise WorkflowRepositoryError("new attempt dispatch state is invalid") from exc
+        if run.desired_state is not RunDesiredState.RUNNING:
+            raise WorkflowRepositoryError("new attempt dispatch requires desired RUNNING")
         prior_authorization = self._connection.execute(
             "SELECT MAX(fencing_token), MAX(control_epoch), MAX(accepted_control_command_seq) "
             "FROM execution_authorizations WHERE run_id=? AND step_id=?",
