@@ -701,6 +701,7 @@ def _insert_passing_planning_graph(
     next_settle_timeout_ms: int = 30_000,
     run_spec_target_stage: str = "CODEX_APPROVED",
     dependencies_by_node: Mapping[str, tuple[str, ...]] | None = None,
+    optional_nodes: tuple[tuple[str, int, str], ...] = (),
 ) -> None:
     """插入可通过 planning gate 的完整图，并允许单独污染 next barrier 持久 selector。"""
     planning_digest = _insert_plan_revision_for_barrier(
@@ -709,6 +710,7 @@ def _insert_passing_planning_graph(
         additional_barriers=(("DESIGN_REVIEWING", 1, ("design-review",), "design-approved-v1"),),
         run_spec_target_stage=run_spec_target_stage,
         dependencies_by_node=dependencies_by_node,
+        optional_nodes=optional_nodes,
     )
     design_digest = _selector_digest(["design-review"])
     planning_barrier_id = _derived_barrier_id(
@@ -1162,6 +1164,47 @@ def _insert_historical_attempt_graph(connection: sqlite3.Connection) -> tuple[st
         },
     )
     return "plan-control-old", "step-planning-historical", "attempt-planning-historical"
+
+
+def _insert_invalid_optional_planning_step(connection: sqlite3.Connection) -> str:
+    """插入当前 Plan 声明但不属于 requiredNodeIds 的坏 Step，避免测试依赖缺失 node。"""
+    step_id = "step-planning-optional-invalid"
+    planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+    _insert(
+        connection,
+        "steps",
+        {
+            "step_id": step_id,
+            "run_id": "run-control-1",
+            "plan_revision_id": "plan-control-1",
+            "barrier_id": planning_barrier_id,
+            "logical_node_id": "optional-plan",
+            "business_phase": "PLANNING",
+            "node_type": "PLAN",
+            "required": 0,
+            "side_effect_class": "none",
+            "phase": "TERMINAL",
+            "outcome": "NONE",
+            "dependency_hash": _selector_digest([]),
+            "required_artifacts_digest": _selector_digest([]),
+            "success_predicate_id": "planning-complete-v1",
+            "timeout_ms": 30_000,
+            "retry_policy_id": "no-retry-v1",
+            "idempotency_key": "step-planning-optional-invalid-v1",
+            "state_version": 0,
+        },
+    )
+    return step_id
+
+
+def _corrupt_persisted_step_phase(connection: sqlite3.Connection, *, step_id: str) -> None:
+    """仅在测试事务中绕过 CHECK 制造 raw Step enum 损坏，并立即恢复约束开关。"""
+    previous = int(connection.execute("PRAGMA ignore_check_constraints").fetchone()[0])
+    connection.execute("PRAGMA ignore_check_constraints=ON")
+    try:
+        connection.execute("UPDATE steps SET phase='CORRUPTED' WHERE step_id=?", (step_id,))
+    finally:
+        connection.execute(f"PRAGMA ignore_check_constraints={previous}")  # noqa: S608
 
 
 def _insert_historical_target_authorization(
@@ -4129,6 +4172,156 @@ async def test_non_target_barrier_rejects_invalid_historical_attempt_projection(
         connection.close()
 
 
+@pytest.mark.asyncio
+async def test_non_target_barrier_rejects_invalid_old_plan_step_projection() -> None:
+    """普通 barrier 必须扫描旧 Plan Step；TERMINAL/NONE 即使 Attempt 合法也要整笔回滚。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        _, historical_step_id, _ = _insert_historical_attempt_graph(connection)
+        connection.execute("UPDATE steps SET outcome='NONE' WHERE step_id=?", (historical_step_id,))
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="DESIGN_REVIEWING",
+            barrier_ordinal=1,
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority facts are incomplete") as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-old-plan-invalid-step"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _planning_to_design_request(
+                    request_id="request-old-plan-invalid-step",
+                    barrier_id=planning_barrier_id,
+                    next_barrier_id=design_barrier_id,
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == "Step phase/outcome is invalid"
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_non_target_barrier_rejects_invalid_current_plan_optional_step_projection() -> None:
+    """当前 Plan 的非 required Step 也属于 Run-wide 权威投影，不能被 required gate 忽略。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(
+            connection,
+            optional_nodes=(("PLANNING", 0, "optional-plan"),),
+        )
+        _insert_invalid_optional_planning_step(connection)
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="DESIGN_REVIEWING",
+            barrier_ordinal=1,
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority facts are incomplete") as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-current-plan-optional-invalid-step"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _planning_to_design_request(
+                    request_id="request-current-plan-optional-invalid-step",
+                    barrier_id=planning_barrier_id,
+                    next_barrier_id=design_barrier_id,
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == "Step phase/outcome is invalid"
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_non_target_barrier_maps_corrupt_old_plan_step_projection() -> None:
+    """旧 Plan Step raw enum 损坏必须稳定映射为仓储错误，不能泄漏领域 hydrate 异常。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        _, historical_step_id, _ = _insert_historical_attempt_graph(connection)
+        _corrupt_persisted_step_phase(connection, step_id=historical_step_id)
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="DESIGN_REVIEWING",
+            barrier_ordinal=1,
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority facts are incomplete") as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids("state-event-old-plan-corrupt-step"),
+                now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            ).commit_passed_barrier(
+                _planning_to_design_request(
+                    request_id="request-old-plan-corrupt-step",
+                    barrier_id=planning_barrier_id,
+                    next_barrier_id=design_barrier_id,
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == "Step projection is invalid"
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_non_target_barrier_allows_valid_old_plan_step_projection() -> None:
+    """合法旧 Plan TERMINAL/SUCCEEDED Step 仍可被扫描，且不阻断当前 planning barrier。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        _insert_historical_attempt_graph(connection)
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="DESIGN_REVIEWING",
+            barrier_ordinal=1,
+        )
+
+        result = await TransitionService(
+            coordinator=_SqliteCoordinator(connection),
+            state_event_id_factory=_ids("state-event-valid-old-plan-step"),
+            now=lambda: datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        ).commit_passed_barrier(
+            _planning_to_design_request(
+                request_id="request-valid-old-plan-step",
+                barrier_id=planning_barrier_id,
+                next_barrier_id=design_barrier_id,
+            )
+        )
+
+        assert result.barrier.passed is True
+        assert connection.execute(
+            "SELECT phase,active_barrier_id,state_version FROM runs WHERE run_id='run-control-1'"
+        ).fetchone() == ("DESIGN_REVIEWING", design_barrier_id, 1)
+        assert connection.execute(
+            "SELECT achieved_stage,lifecycle,outcome_version,state_version FROM tasks WHERE task_id='task-control-1'"
+        ).fetchone() == ("DESIGN_APPROVED", "ACTIVE", 1, 1)
+        assert connection.execute(
+            "SELECT aggregate_type FROM authoritative_state_events ORDER BY aggregate_type"
+        ).fetchall() == [("PHASE_BARRIER",), ("RUN",), ("TASK",)]
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "authority_now",
     [
@@ -4622,7 +4815,7 @@ async def test_target_close_rejects_invalid_historical_phase_outcome_and_rolls_b
         )
         before = _transaction_projection_snapshot(connection)
 
-        with pytest.raises(BarrierMilestoneCommitError) as caught:
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority facts are incomplete") as caught:
             await TransitionService(
                 coordinator=_SqliteCoordinator(connection),
                 state_event_id_factory=_ids(f"state-event-target-invalid-outcome-{table}"),
@@ -6915,7 +7108,7 @@ async def test_attempt_only_unknown_timeout_persists_blocked_run_event() -> None
                 "node_type": "RECONCILE_TARGET",
                 "required": 1,
                 "side_effect_class": "none",
-                "phase": "TERMINAL",
+                "phase": "RECONCILING",
                 "outcome": "NONE",
                 "dependency_hash": _selector_digest([]),
                 "required_artifacts_digest": _selector_digest([]),

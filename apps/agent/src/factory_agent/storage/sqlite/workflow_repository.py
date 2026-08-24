@@ -380,6 +380,24 @@ class SqliteWorkflowRepository:
             attempts.append(attempt)
         return tuple(attempts)
 
+    def _run_steps_with_valid_projection(self, run: Run) -> tuple[Step, ...]:
+        """扫描 Run 全部 Step，并稳定翻译 hydrate 与 phase/outcome 投影损坏。"""
+        cursor = self._connection.execute(
+            "SELECT * FROM steps WHERE run_id=? ORDER BY step_id",
+            (run.run_id,),
+        )
+        columns = tuple(item[0] for item in cursor.description)
+        steps: list[Step] = []
+        for values in cursor.fetchall():
+            record = dict(zip(columns, values, strict=True))
+            try:
+                step = Step.from_record(record)
+            except FactoryError as exc:
+                raise WorkflowRepositoryError("Step projection is invalid") from exc
+            _validate_step_projection(step)
+            steps.append(step)
+        return tuple(steps)
+
     def get_active_attempt_for_run(self, run_id: str) -> Attempt | None:
         """先验证 Run 全部 drain 权威，再仅以 phase 返回唯一活动 Attempt。"""
         run = self.get_run(run_id)
@@ -1226,7 +1244,9 @@ class SqliteWorkflowRepository:
         run = self.get_run(run_id)
         if run is None:
             raise WorkflowRepositoryError("barrier run lineage is inconsistent")
-        # 同一 Run-wide 结果先闭合 drain/projection，再仅按 phase 推导 active；后续 Step facts 也复用它。
+        # barrier 的共同前置先闭合全 Run Step，旧/当前 Plan 与 target/non-target 都不能绕过投影校验。
+        run_steps = self._run_steps_with_valid_projection(run)
+        # 同一 Run-wide Attempt 结果先闭合 drain/projection，再仅按 phase 推导 active；后续 facts 也复用它。
         run_attempts = self._run_attempts_with_valid_drain_authority(run)
         for attempt in run_attempts:
             _validate_attempt_projection(attempt, now=now_utc)
@@ -1453,13 +1473,9 @@ class SqliteWorkflowRepository:
                 for step in facts
             ]
         active_attempt_count = len(active_attempts)
-        unknown_remote_state = (
-            self._connection.execute(
-                "SELECT 1 FROM steps AS s WHERE s.run_id=? AND s.outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
-                (run_id,),
-            ).fetchone()
-            is not None
-        ) or any(attempt.outcome is AttemptOutcome.UNKNOWN_REMOTE_STATE for attempt in run_attempts)
+        unknown_remote_state = any(step.outcome is StepOutcome.UNKNOWN_REMOTE_STATE for step in run_steps) or any(
+            attempt.outcome is AttemptOutcome.UNKNOWN_REMOTE_STATE for attempt in run_attempts
+        )
         required_artifacts_committed = all(not step.required or step.required_artifacts_committed for step in facts)
         return BarrierAuthorityFacts(
             steps=tuple(facts),
