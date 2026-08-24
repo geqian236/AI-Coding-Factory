@@ -3835,6 +3835,7 @@ def test_barrier_authority_rejects_node_selector_digest_drift(drift_field: str) 
                     barrier_id=barrier_id,
                     run_id="run-control-1",
                     task_id="task-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
                 )
         finally:
             unit_of_work.rollback()
@@ -3900,6 +3901,7 @@ def test_barrier_dependency_allows_extra_committed_artifact_from_same_attempt() 
                 barrier_id=barrier_id,
                 run_id="run-control-1",
                 task_id="task-control-1",
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
             )
             decision = evaluate_barrier(
                 authority.steps,
@@ -3933,6 +3935,7 @@ def test_barrier_current_step_allows_extra_committed_artifact_from_same_attempt(
                 barrier_id=barrier_id,
                 run_id="run-control-1",
                 task_id="task-control-1",
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
             )
             decision = evaluate_barrier(
                 authority.steps,
@@ -3973,12 +3976,14 @@ def test_barrier_rejects_missing_required_artifact(authority_path: str) -> None:
                         barrier_id=barrier_id,
                         run_id="run-control-1",
                         task_id="task-control-1",
+                        now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
                     )
             else:
                 authority = repository.load_barrier_authority(
                     barrier_id=barrier_id,
                     run_id="run-control-1",
                     task_id="task-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
                 )
                 decision = evaluate_barrier(
                     authority.steps,
@@ -4061,9 +4066,136 @@ def test_barrier_authority_rejects_missing_or_failed_dependency_step(dependency_
                     barrier_id=barrier_id,
                     run_id="run-control-1",
                     task_id="task-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
                 )
         finally:
             unit_of_work.rollback()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_detail"),
+    [
+        ("terminal-none", "Attempt phase/outcome is invalid"),
+        ("ended-future", "attempt chronology is invalid"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_target_barrier_rejects_invalid_historical_attempt_projection(
+    corruption: str,
+    expected_detail: str,
+) -> None:
+    """普通 planning gate 也必须扫描同 Run 的历史/非目标 Attempt，并整笔回滚三聚合与事件。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        _, _, historical_attempt_id = _insert_historical_attempt_graph(connection)
+        if corruption == "terminal-none":
+            connection.execute("UPDATE attempts SET outcome='NONE' WHERE attempt_id=?", (historical_attempt_id,))
+        else:
+            connection.execute(
+                "UPDATE attempts SET ended_at='2026-08-17T09:00:00.001Z' WHERE attempt_id=?",
+                (historical_attempt_id,),
+            )
+        planning_barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        design_barrier_id = _derived_barrier_id(
+            connection,
+            business_phase="DESIGN_REVIEWING",
+            barrier_ordinal=1,
+        )
+        authority_now = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        clock = _RecordingClock(authority_now)
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(BarrierMilestoneCommitError, match="barrier authority facts are incomplete") as caught:
+            await TransitionService(
+                coordinator=_SqliteCoordinator(connection),
+                state_event_id_factory=_ids(f"state-event-nontarget-attempt-{corruption}"),
+                now=clock,
+            ).commit_passed_barrier(
+                _planning_to_design_request(
+                    request_id=f"request-nontarget-attempt-{corruption}",
+                    barrier_id=planning_barrier_id,
+                    next_barrier_id=design_barrier_id,
+                )
+            )
+
+        assert isinstance(caught.value.__cause__, WorkflowRepositoryError)
+        assert caught.value.__cause__.detail == expected_detail
+        assert clock.calls == [authority_now]
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "authority_now",
+    [
+        datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+        datetime.fromisoformat("2026-08-17T17:00:00+08:00"),
+    ],
+    ids=["ended-equals-now", "equivalent-offset"],
+)
+def test_barrier_authority_allows_terminal_attempt_at_equivalent_now(authority_now: datetime) -> None:
+    """历史 Attempt 的 ended_at==now 合法，带 offset 的等价权威瞬时也不得误拒绝。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        _, _, historical_attempt_id = _insert_historical_attempt_graph(connection)
+        connection.execute(
+            "UPDATE attempts SET started_at='2026-08-17T08:00:00Z',ended_at='2026-08-17T09:00:00Z' WHERE attempt_id=?",
+            (historical_attempt_id,),
+        )
+        barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            authority = SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                barrier_id=barrier_id,
+                run_id="run-control-1",
+                task_id="task-control-1",
+                now=authority_now,
+            )
+            assert authority.active_attempt_count == 0
+        finally:
+            unit_of_work.rollback()
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        "2026-08-17T09:00:00Z",
+        datetime(2026, 8, 17, 9, 0),
+        datetime(2026, 8, 17, 9, 0, tzinfo=_InvalidOffsetTimezone()),
+        datetime(2026, 8, 17, 9, 0, tzinfo=_BrokenOffsetTimezone()),
+    ],
+    ids=["not-datetime", "naive", "invalid-offset", "conversion-error"],
+)
+def test_barrier_authority_rejects_invalid_clock_without_writes(invalid_now: object) -> None:
+    """仓储 barrier 边界拒绝任意非法时钟，且不得读取墙钟或留下状态写。"""
+    connection = _connection()
+    try:
+        _insert_passing_planning_graph(connection)
+        barrier_id = _derived_barrier_id(connection, business_phase="PLANNING", barrier_ordinal=0)
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError, match="barrier authority clock is invalid"):
+                SqliteWorkflowRepository(unit_of_work).load_barrier_authority(
+                    barrier_id=barrier_id,
+                    run_id="run-control-1",
+                    task_id="task-control-1",
+                    now=invalid_now,  # type: ignore[arg-type]
+                )
+        finally:
+            unit_of_work.rollback()
+        assert _transaction_projection_snapshot(connection) == before
     finally:
         connection.close()
 
@@ -5562,6 +5694,7 @@ def test_barrier_authority_directly_rejects_dependency_on_future_barrier() -> No
                     barrier_id=current_id,
                     run_id="run-control-1",
                     task_id="task-control-1",
+                    now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
                 )
             assert caught.value.detail == "barrier dependency points to a future barrier"
         finally:
@@ -5599,6 +5732,7 @@ def test_barrier_authority_allows_successful_predecessor_dependency() -> None:
                 barrier_id=current_id,
                 run_id="run-control-1",
                 task_id="task-control-1",
+                now=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
             )
             decision = evaluate_barrier(
                 authority.steps,

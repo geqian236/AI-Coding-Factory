@@ -643,6 +643,46 @@ def test_superseding_attempt_rejects_invalid_dispatch_clock(invalid_now: object)
         connection.close()
 
 
+def _corrupt_persisted_attempt_phase(connection: sqlite3.Connection, *, attempt_id: str) -> None:
+    """仅在测试中绕过 CHECK 制造 raw enum 损坏，随后立即恢复约束开关。"""
+    previous = int(connection.execute("PRAGMA ignore_check_constraints").fetchone()[0])
+    connection.execute("PRAGMA ignore_check_constraints=ON")
+    try:
+        connection.execute("UPDATE attempts SET phase='CORRUPTED' WHERE attempt_id=?", (attempt_id,))
+    finally:
+        connection.execute(f"PRAGMA ignore_check_constraints={previous}")  # noqa: S608
+
+
+@pytest.mark.parametrize("replay", [False, True], ids=["fresh-predecessor", "exact-replay-successor"])
+def test_superseding_attempt_maps_corrupt_persisted_attempt_projection(replay: bool) -> None:
+    """fresh/replay hydrate raw enum 损坏时统一抛仓储错误，并保持行、版本和事件完全不变。"""
+    connection = _connection(desired_state="RUNNING", observed_state="QUEUED")
+    try:
+        previous, candidate = _prepare_drained_predecessor(connection)
+        if replay:
+            _commit_superseding_attempt(connection, previous, candidate)
+        _corrupt_persisted_attempt_phase(
+            connection,
+            attempt_id=candidate.attempt_id if replay else previous.attempt_id,
+        )
+        before = _transaction_projection_snapshot(connection)
+        unit_of_work = SqliteUnitOfWork(connection, failure_probe=lambda _point: None)
+        unit_of_work.begin_immediate()
+        try:
+            with pytest.raises(WorkflowRepositoryError, match="Attempt projection is invalid"):
+                SqliteWorkflowRepository(unit_of_work).append_superseding_attempt(
+                    previous,
+                    candidate,
+                    now=_DISPATCH_AUTHORITY_NOW,
+                )
+        finally:
+            unit_of_work.rollback()
+
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "case",
     [

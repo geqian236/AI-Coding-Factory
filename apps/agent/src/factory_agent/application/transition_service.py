@@ -1023,6 +1023,7 @@ class TransitionService:
                 barrier_id=current_barrier.barrier_id,
                 run_id=current_run.run_id,
                 task_id=current_task.task_id,
+                now=authority_now,
             )
             barrier_decision = evaluate_barrier(
                 authority.steps,

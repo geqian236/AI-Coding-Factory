@@ -88,6 +88,18 @@ def _attempt_dispatch_utc(value: object) -> datetime:
         raise WorkflowRepositoryError("attempt dispatch clock is invalid") from None
 
 
+def _barrier_authority_utc(value: object) -> datetime:
+    """校验 barrier 显式注入的权威时刻；仓储禁止回退墙钟或 request.now。"""
+    if not isinstance(value, datetime):
+        raise WorkflowRepositoryError("barrier authority clock is invalid")
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("barrier authority clock is naive")
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        raise WorkflowRepositoryError("barrier authority clock is invalid") from None
+
+
 def _authorization_time_active(record: Mapping[str, object], *, now: datetime) -> bool:
     """按 issued <= now < expires 计算授权活性；损坏或倒置时间一律 fail closed。"""
     issued_at = _rfc3339_utc(record.get("issued_at"), field="authorization issued_at")
@@ -279,7 +291,11 @@ class SqliteWorkflowRepository:
         row = self._task1.get_attempt(attempt_id)
         if row is None:
             return None
-        return Attempt.from_record({key: row[key] for key in Attempt.__dataclass_fields__})
+        try:
+            return Attempt.from_record({key: row[key] for key in Attempt.__dataclass_fields__})
+        except FactoryError as exc:
+            # 只在 Attempt 仓储边界稳定翻译领域 hydrate 错误，不泛化其他 getter 或吞掉数据库异常。
+            raise WorkflowRepositoryError("Attempt projection is invalid") from exc
 
     def _validate_attempt_interrupt_lineage(
         self,
@@ -1203,15 +1219,26 @@ class SqliteWorkflowRepository:
         barrier_id: str,
         run_id: str,
         task_id: str,
+        now: datetime,
     ) -> BarrierAuthorityFacts:
         """从权威表重算 barrier，拒绝空步骤和调用方自报的成功摘要。"""
+        now_utc = _barrier_authority_utc(now)
+        run = self.get_run(run_id)
+        if run is None:
+            raise WorkflowRepositoryError("barrier run lineage is inconsistent")
+        # 同一 Run-wide 结果先闭合 drain/projection，再仅按 phase 推导 active；后续 Step facts 也复用它。
+        run_attempts = self._run_attempts_with_valid_drain_authority(run)
+        for attempt in run_attempts:
+            _validate_attempt_projection(attempt, now=now_utc)
+        active_attempts = tuple(attempt for attempt in run_attempts if attempt.phase is not AttemptPhase.TERMINATED)
+        if len(active_attempts) > 1:
+            raise WorkflowRepositoryError("multiple active attempts exist for one run")
+        active_step_ids = {attempt.step_id for attempt in active_attempts}
         plan_authority = self._load_required_node_authority(
             barrier_id=barrier_id,
             run_id=run_id,
             task_id=task_id,
         )
-        # barrier/target-close 同样先扫描 Run 全部 Attempt，不能让 terminal 坏 drain 事实绕过 active 查询。
-        run_active_attempt = self.get_active_attempt_for_run(run_id)
         required_node_ids = plan_authority.required_node_ids
         barrier_revision_id = plan_authority.plan_revision_id
         barrier_phase = plan_authority.business_phase
@@ -1335,13 +1362,7 @@ class SqliteWorkflowRepository:
                     plan_node=dependency_node,
                 )
             required = declared_required
-            active_attempt = (
-                self._connection.execute(
-                    "SELECT 1 FROM attempts WHERE step_id=? AND phase<>'TERMINATED' LIMIT 1",
-                    (record["step_id"],),
-                ).fetchone()
-                is not None
-            )
+            active_attempt = record["step_id"] in active_step_ids
             unsettled_started_receipt = (
                 self._connection.execute(
                     "SELECT 1 FROM action_receipt_events AS r "
@@ -1384,12 +1405,9 @@ class SqliteWorkflowRepository:
             # 仅要求冻结清单全部提交；额外合法产物不能把已满足的 required Step 判成失败。
             required_artifact_id_set = set(required_artifact_ids)
             required_artifacts_committed = required_artifact_id_set.issubset(committed_artifact_ids)
-            attempt_unknown = (
-                self._connection.execute(
-                    "SELECT 1 FROM attempts WHERE step_id=? AND outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
-                    (record["step_id"],),
-                ).fetchone()
-                is not None
+            attempt_unknown = any(
+                attempt.step_id == record["step_id"] and attempt.outcome is AttemptOutcome.UNKNOWN_REMOTE_STATE
+                for attempt in run_attempts
             )
             if attempt_unknown:
                 # Attempt-only UNKNOWN 也必须进入 barrier 的未知闭环，不能被终止 Step 的成功投影覆盖。
@@ -1434,16 +1452,14 @@ class SqliteWorkflowRepository:
                 )
                 for step in facts
             ]
-        active_attempt_count = 0 if run_active_attempt is None else 1
+        active_attempt_count = len(active_attempts)
         unknown_remote_state = (
             self._connection.execute(
-                "SELECT 1 FROM steps AS s WHERE s.run_id=? AND s.outcome='UNKNOWN_REMOTE_STATE' "
-                "UNION ALL SELECT 1 FROM attempts AS a JOIN steps AS s ON s.step_id=a.step_id "
-                "WHERE s.run_id=? AND a.outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
-                (run_id, run_id),
+                "SELECT 1 FROM steps AS s WHERE s.run_id=? AND s.outcome='UNKNOWN_REMOTE_STATE' LIMIT 1",
+                (run_id,),
             ).fetchone()
             is not None
-        )
+        ) or any(attempt.outcome is AttemptOutcome.UNKNOWN_REMOTE_STATE for attempt in run_attempts)
         required_artifacts_committed = all(not step.required or step.required_artifacts_committed for step in facts)
         return BarrierAuthorityFacts(
             steps=tuple(facts),
