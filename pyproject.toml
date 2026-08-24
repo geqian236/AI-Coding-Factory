@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 # 时依赖并写入 uv.lock，CI 用 frozen 安装锁定版本，验收环境行为可复现。
 dependencies = [
     "jsonschema>=4.20.0",
+    "structlog>=24.4.0",
 ]
 
 [dependency-groups]

@@ -1,6 +1,6 @@
 # AI Coding Factory — Contracts v1 Protocol Reference
 
-> **状态**：Phase 0 基线已冻结，全部 spike 认证完毕（HEAD: ef9a33f）。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
+> **状态**：Phase 0 基线已冻结；本次补入 Phase 1 授权与事件合同前置（schema、catalog、策略映射与确定性测试），不实现运行时服务。SQLite 真实 ENOSPC 仍是 Phase 1 待认证实证项，故不得声称全部 spike 已认证完毕。本文档描述 `contracts/` 目录下所有语言中立合同的结构、生成规则和使用约定。
 >
 > **版本**：v1（2026-08-05）
 
@@ -32,14 +32,14 @@ contracts/
     node-pause-policy.v1.json   — 每种 nodeType 的暂停安全点策略
     stage-capability-map.v1.json — 6 个 target_stage 的渐进式 capability 集合
   schemas/
-    *.schema.json               — 13 个 JSON Schema 定义（见第 3 节）
+    *.schema.json               — 16 个 JSON Schema 定义（见第 3 节）
   testing/
     required-test-catalog.v1.json — Phase 0 冻结的 47 个必须通过的测试 ID
 ```
 
 ---
 
-## 3. 13 个 JSON Schema
+## 3. 16 个 JSON Schema
 
 | 文件 | 用途 | 生成代码 |
 |------|------|---------|
@@ -52,16 +52,35 @@ contracts/
 | `prepared-event.v2.schema.json` | Adapter 预备事件 | 是 |
 | `prepared-batch.v2.schema.json` | 事件批次（含 batchOrdinal） | 是 |
 | `durable-event.v2.schema.json` | 物化后的耐久事件（含 head 链） | 是 |
+| `authoritative-state-event.v1.schema.json` | 同一 UoW 写入的权威 `state.changed` 事件 | 是 |
 | `ipc-envelope.v1.schema.json` | Named Pipe IPC 信封（含 nonce） | 是 |
 | `runner-protocol.v1.schema.json` | Runner 生命周期协议消息 | 是 |
-| `test-receipt.v1.schema.json` | 机器可读测试回执 | 是 |
+| `test-receipt.v1.schema.json` | 机器可读测试回执 | 否（runtime-only） |
 | `compatibility-manifest.v1.schema.json` | 兼容性 Manifest（`synchronous` 固定为 `FULL`） | 否（runtime-only） |
+| `intent-authorization.v1.schema.json` | Intent 授权的不可变预算、阶段、绑定与撤销快照 | 是 |
+| `execution-authorization.v1.schema.json` | 单 capability action 的派生执行授权、fencing 与消费投影 | 是 |
 
 ### Schema 通用规则
 
 - 所有顶层对象设置 `"additionalProperties": false`（fail-closed）。
 - 数值范围满足 I-JSON/JCS（无 NaN、无 Infinity、无超范围整数）。
 - `enum` 字段使用固定字符串值，不允许自由文本。
+- `contracts/policies/authorization-snapshot-registry.v1.json` 是授权快照的 policy 真源，不是新增 schema/catalog 条目。所有 digest-backed 授权字段均为闭合 `{artifactId,schemaId,schemaVersion,digest}` 引用；`artifactId` 只定位对象，摘要固定为 `sha256(JCS/NFC([schemaId,schemaVersion,payload]))`，其中字符串先做 Unicode NFC，再按 RFC 8785/JCS 编码。
+- 每个 registry binding 固定 schemaId/schemaVersion、真实 validator 来源、闭合 payload schema 以及 required/optional 键。资源指纹 payload 按 `node-capability-map.v1.json` 对应 `nodeType` 的内嵌 `resourceFingerprintSchema` 校验；action policy payload 必须是 selected action 的确定性投影，并绑定 `nodeCapabilityMapDigest + nodeType + actionCapability`。
+- `ExecutionAuthorization.semanticPlanHash` 的 payload 不是简化摘要样本，而是 `factory_agent.policy.plan_hash.build_semantic_projection` 对完整、**post-bootstrap** RunSpec 的精确投影：`schemaVersion` 保持整数，`constraints` 保持字符串数组，并同时冻结 assumptions、scope、acceptanceCriteria、repository（mode/root/baseBranch/baseCommit）、workPlan（dagVersion/nodes/barriers）与 riskProfile。bootstrap 必须先完成并取得可信 base commit，随后才可生成首个 v1 RunSpec；`repository.mode` 保留用户来源的 `existing|new`，两种模式的 `repository.baseCommit` 都必须是 40 位小写完整 SHA，绝不接受 `null`、短 SHA 或额外 repository 字段。RunSpec/PlanRevision 的结构化 `nodeType` 字段拒绝 `BOOTSTRAP_REPOSITORY`，结构化 `businessPhase` 字段拒绝真实 `BOOTSTRAPPING_REPOSITORY`（并兼容拒绝旧误拼 `BOOTSTRAPPING`）；这不是对 `logicalNodeId/successPredicateId/passPredicateId` 等自由 ID 字符串做递归禁词。首个工作计划从 `PLAN`/`PLANNING` 开始。顶层及嵌套对象均 fail-closed；三语言 hash API 在投影/摘要前用 codegen 机械嵌入的权威 schema 校验完整 wire，合同测试从运行时投影直接取得字段集合并逐字段验证删改不能复用旧摘要。
+- `ExecutionAuthorization.planRevisionDigest` 的 payload 是完整不可变 PlanRevision 的 digest material：字段/类型和 required 集合逐项跟随 `plan-revision.v1.schema.json`，仅排除 `planRevisionDigest` 自身值与 signature。PlanRevision `nodes` 与 RunSpec `workPlan.nodes` 机械同形，固定 11 个必填字段 `logicalNodeId/businessPhase/barrierOrdinal/nodeType/required/dependsOn/sideEffectClass/requiredArtifacts/successPredicateId/timeoutMs/retryPolicyId`；PlanRevision `barriers` 与 `workPlan.barriers` 机械同形，固定 5 个必填字段 `businessPhase/barrierOrdinal/requiredNodeIds/settleTimeoutMs/passPredicateId`。旧别名 `dependencies/hasSideEffect/gate/barrierId/nodeIds` 一律拒绝；`barrierId` 只在绑定 Run 后按域分离算法派生。`parentRevisionId` 保留权威 schema 的可选性，其余必填字段（含 DAG、映射、nodes、barriers、stageMaps、createdAt）缺失即拒绝；合同测试从 schema 和运行时排除集机械比较，防止新增或遗漏字段静默漂移。
+- `semanticPlanHash` 与 `planRevisionDigest` 都必须精确匹配 `^sha256:[0-9a-f]{64}$`，并共同引用 PlanRevision 权威 schema 的同一 `sha256Digest` 定义；`sha256:` 后 64 个 `0` 仍是格式合法的摘要值。Git 的全零 sentinel 禁止规则只适用于本轮的 `baselinePayload.baseSha` 与 RunSpec `repository.baseCommit`，不得错误外推为“所有 sha256 摘要均禁止全零”。
+- `businessPhase` 的闭集由 Master Spec §7.1 的 `Run.phase` 机械取得，再排除 pre-plan 的 `CREATED`、`PREFLIGHT`、`BOOTSTRAPPING_REPOSITORY`；v1 接受的 15 个 post-bootstrap 值精确为 `PLANNING`、`DESIGN_REVIEWING`、`PREPARING_WORKSPACE`、`IMPLEMENTING`、`VERIFYING`、`CODE_REVIEWING`、`PUBLISHING_PR`、`MERGING`、`BUILDING_ARTIFACT`、`DEPLOYING_STAGING`、`ACCEPTING_STAGING`、`DEPLOYING_PRODUCTION`、`ACCEPTING_PRODUCTION`、`ROLLING_BACK`、`FINALIZING`。**v1 设计决定**：每一份 post-bootstrap RunSpec/PlanRevision（包括带 parent revision 的 child replan）均要求非空 `nodes`/`barriers`，且 `nodes[0]` 为 `PLAN`/`PLANNING`、`barriers[0]` 为 `PLANNING`；这是一项保守的 v1 收紧，而不是把“首个工作计划”的原文误称为所有重规划的唯一既有结论。该闭集不递归限制 `logicalNodeId`、`successPredicateId`、`passPredicateId` 等自由 ID 字符串。
+- registry 的 `baselinePayload` 顶层固定 `required=[baseBranch,bootstrapState]`、`optional=[baseSha,bootstrapReceiptId]`：`EXISTS` 必须带非零、40 位小写完整 `baseSha`，`bootstrapReceiptId` 可选；`BOOTSTRAP_REQUIRED` 只能带 `baseBranch + bootstrapState`，并禁止 `baseSha` 与 `bootstrapReceiptId`。repository ID、mode 与物理目录事实仍由 Intent 顶层 `repositoryId + repositoryBindingDigest` 绑定，不在 baseline payload 重复建模。新仓库 `baseBranch` 的默认/选择策略与 TaskIntakeAccepted 的 `bootstrapPending` 显式化策略尚未冻结，后续只能以明确的服务端规范化设计决定补入，不能倒推为本版本已唯一规定。
+- pre-plan bootstrap 目前只冻结 Task intake、Intent 的 `repo.bootstrap` 包络、目录合同与 action receipt 边界；它不伪造 PlanRevision-bound `ExecutionAuthorization`。bootstrap 专用 permit、消费和事务仍属于 Task 4/5 与后续 runtime，当前未实现，调用方必须 fail closed；本协议不得把该运行时能力表述为已交付。
+- Task 4 消费边界：只能解析状态为 `COMMITTED` 且不可变的 artifact；`artifactId` 解析、schema/version、validator 来源和重算 digest 必须全部匹配，否则拒绝。此处只冻结合同，尚未实现数据库状态或运行时消费逻辑。
+- `ExecutionAuthorization` 使用正确拼写 `stageCapabilityMapDigest`；历史 v1 的 `stageCapeabilityMapDigest` 不在本 schema 双拼写放行范围，后续版本必须经显式 adapter/migration 映射。
+- `ExecutionAuthorization.consumptionState` 只表示 `AVAILABLE`（`maxUses >= 1`）或 `CONSUMED`（`maxUses == 0`）；撤销和过期分别由 `revokedAt` 与 `expiresAt` 表达，不能混为消费状态。
+- 两种 Authorization 的 `revokedAt` 与 `revokeReason` 必须同时为 `null`，或同时为合法 RFC3339 时间和非空原因；未知状态、格式错误时间和半撤销对象一律拒绝。
+- `ExecutionAuthorization.inputBindings` 是闭合对象，只允许完整 `baseSha`、`candidateSha`、`contentDigest` 三个具名键；数组和同类重复绑定不属于 v1 wire format。`contentDigest` 本身是 input-content 快照引用而非裸 hash。`IMPLEMENT` 必须有 `baseSha`，`VERIFY`、`CODE_REVIEW`、`PUBLISH_PR`、`MERGE` 必须有 `candidateSha`，staging/production deploy 与 acceptance 还必须同时有 `candidateSha + contentDigest`。
+- `nodeType → actionCapability` 是 17 个分支的精确闭集，不采用“全局 action 枚举通过即放行”的弱校验；每个 action 仍须由后续 Policy Engine 做动态 scope、lease、时间和 snapshot 重算。
+
+`TestReceipt` 在 catalog 中为 `category: "runtime-only"`、`codegen: false`：它由运行时 `TestReceipt` 表示和 schema 一致性测试消费，三语言生成树不生成第四份静态类型。`CompatibilityManifest` 同样保持 runtime-only。
 
 ---
 
@@ -85,6 +104,35 @@ python contracts/codegen/generate.py --check
 | Python | `apps/agent/src/factory_agent/contracts/generated/models.py` |
 | Rust | `crates/factory-contracts/src/generated/contracts.rs` |
 
+Python 生成目标采用 `TypedDict(total=False)`：仅 JSON Schema `required` 中的字段生成
+`Required[T]`，未列入 `required` 的字段保持可省略；schema 已声明 `null` 时才额外生成
+`Optional[T]`。生成文件不启用 postponed annotations，以便 Python 运行时的
+`__required_keys__` / `__optional_keys__` 继续成为可机械核验的合同证据。
+
+写入模式把 TypeScript、Python、Rust 三个目标作为一个进程内补偿批次：每个新内容先在目标同目录创建
+`.stage`，完成 UTF-8 写入、`flush`、`fsync`、关闭句柄和精确回读；三个 stage 与现有目标的 `.rollback`
+快照都准备完成后，才按固定顺序 replace。任一 replace 失败会逆序恢复原字节或原“不存在”状态，并尽力
+清理全部临时文件；错误优先级固定为 rollback、cleanup、write。该机制不宣称断电、进程崩溃或并发写入的
+事务保证。既有目标的 permission bits 由 `stat.S_IMODE` 保存，stage 在 replace 前恢复原 mode，rollback
+副本也在恢复 replace 前还原原 mode；原不存在目标采用明确的 `0644` 默认。`chmod` 失败进入同一补偿状态机，
+不得绕过 rollback、cleanup、write 的既有优先级。
+
+生成器 CLI 的错误与 `--check` 漂移提示仅暴露固定 ASCII 分类码，不拼接路径、errno、底层异常正文或生成内容。
+catalog 读取、根/数组/条目形状异常统一为 `CODEGEN_CATALOG_LOAD_FAILED`；非法 CLI 参数由自定义
+`ArgumentParser.error` 收敛为 `CODEGEN_ARGUMENT_INVALID`，不输出 usage 或回显 argv。`--help` 是解析层成功退出，
+不启动一次不完整的 CLI 日志生命周期。
+
+模块 logger `factory.contracts.codegen` 在库式 `write_batch` 直接调用时保持原有命名 logger 配置与 `propagate`，由宿主
+决定 sink。CLI 绝不调用 `logging.basicConfig`，也不读写 root logger 的 level、handlers 或 filters；每次运行只在
+`factory.contracts.codegen` 上建立一个作用域内 **stdout** handler，临时设为 `INFO + propagate=False`。该 handler
+的 formatter 只是 `%(message)s`，并以精确 logger name filter 拒绝子 logger/外部记录；退出时 close 自有 handler，
+并完整恢复该命名 logger 原 handlers、level 与 propagate。因此重复 `main` 既不累加 handler，也不会继续写旧 stdout sink。CLI 与批次的
+start/end 日志共享同一次 32 位小写十六进制 `correlation_id`，且只输出固定 ASCII 的 `event`、
+`elapsed_ms`、`target_count`、commit/rollback/cleanup 状态与 `error_code`。批次失败的三类终态会以闭集字段传到
+`cli_end`，禁止使用含混占位值。日志 message 在发送前已组装为完整固定 ASCII，不依赖 formatter 的自定义 extra 字段，
+也不含目标路径或异常 message payload；纯 schema/hash/类型渲染 API 不发日志，
+CLI/write batch 才是日志出口。
+
 ### 4.3 catalog.v1.json 字段说明
 
 - `category: "generated"` — 需要生成代码的 schema
@@ -106,9 +154,21 @@ DEPLOY_STAGING, ACCEPT_STAGING, DEPLOY_PRODUCTION,
 ACCEPT_PRODUCTION, ROLLBACK, RECONCILE_TARGET, RESTORE_DRILL
 ```
 
-每种 nodeType 必须声明：
-- `requiredCapabilities`: 执行所需能力列表
-- `sideEffectClass`: 副作用分类（`read-only` / `local-write` / `external-write` / `destructive`）
+每种 nodeType 必须声明并冻结下列单一真源字段：
+
+- `requiredCapabilities` / `optionalCapabilities`：闭集 capability 列表；运行时不得接收模型自由填写的 capability。
+- `sideEffectClass`：实际使用的类别为 `read-only`、`local-write`、`isolated-exec`、`external-write-limited`、`external-write`、`remote-write`、`remote-observe`、`isolated-restore`。
+- `resourceFingerprintSchema`：同一 node map 内本地 `$defs` 可解析的 JSON Schema 子对象；顶层及嵌套对象 fail-closed，稳定物理身份与可变 SHA/revision/release/digest 分离。
+- `idempotencyKeyTemplate`：版本化的 `factory-action-v1` / `sha256-jcs-nfc` `actions.byCapability` 闭集。每项为 `H=sha256(JCS/NFC(["factory-action-v1", …]))` 的派发前已知输入，绝不含 attempt、token、epoch、TTL 或时间。
+- `completionFact`：版本化 `actions.byCapability` 的外部可观察 `predicateId` 与 `requiredEvidence`，不是模型自报成功；同一节点的不同外部 action 也必须有 action-local 事实，不能由一次泛化 PR 事实互相满足。
+- `authorizationConsumptionPoint`：仅 `before-capability-dispatch` 或 `with-action-started-transaction`；写能力一律采用后者，未知送达进入运行时 `UNKNOWN_STATE/RECONCILING`。
+- `retryClass`：静态重试包络仅为 `bounded-no-external-side-effect`、`local-fact-before-retry`、`external-fact-before-retry`、`one-shot-cas-reconcile-only`，与 Master Spec §17 的动态错误类别分离。
+
+合同测试逐 node/action 精确冻结 required/optional capability、side effect、授权消费点、retry class、`jcsInputFields`、`predicateId` 与 `requiredEvidence`。所有 `*Selected` 条件都必须同时具备 true-需-overlay 与 false-禁-overlay 分支；测试会自动枚举两支，并在资源指纹的根对象和每个嵌套对象注入未知字段。`target.guard.clear` 只允许作为 `RECONCILE_TARGET` 的 optional capability；`PUBLISH_PR` 的四个 action 事实保持 action-local。
+
+`DEPLOY_STAGING`、`DEPLOY_PRODUCTION`、`ACCEPT_STAGING`、`ACCEPT_PRODUCTION` 与 `ROLLBACK` 的每个 action key 都显式包含 `environment + resourceFingerprintDigest`，因此相同业务输入不能跨环境或物理目标复用 identity。若 action 无法满足精确 key/fact 合同，后续 Policy Engine 必须拒绝签发，不得退回通用自由文本。
+
+v1 `CompatibilityManifest` 已要求 `nodeCapabilityMapDigest`，唯一算法真源是 `emit_manifest.py` 的 raw-file SHA-256；语义或纯格式字节变化都会改变摘要。ExecutionAuthorization 与 Manifest 实际值的运行时核对仍属于 Task 4，本合同节点不伪装已经实现消费逻辑。
 
 `RESTORE_DRILL` 固定需要 `db.restore`、`restore.validation.instance`、`db.check`，且 resource fingerprint 必须证明目标不是生产实例。
 
@@ -117,7 +177,7 @@ ACCEPT_PRODUCTION, ROLLBACK, RECONCILE_TARGET, RESTORE_DRILL
 6 个 target_stage 的 capabilities 数组满足渐进式超集关系：
 
 ```
-DESIGN_REVIEW ⊂ CODE_REVIEW ⊂ PUBLISH_PR ⊂ MERGE ⊂ ACCEPT_STAGING ⊂ ACCEPT_PRODUCTION
+DESIGN_APPROVED ⊂ CODEX_APPROVED ⊂ PR_READY ⊂ MERGED ⊂ STAGING_ACCEPTED ⊂ PRODUCTION_ACCEPTED
 ```
 
 每个数组已排序且无重复。
@@ -161,12 +221,55 @@ DESIGN_REVIEW ⊂ CODE_REVIEW ⊂ PUBLISH_PR ⊂ MERGE ⊂ ACCEPT_STAGING ⊂ AC
 
 ---
 
-## 8. PreparedBatchV2 / DurableEventV2 身份链
+## 8. Prepared / Durable / State 事件合同边界
 
-- 物化器按 `batchOrdinal` 生成稳定 identity，逐 Task 连接 predecessor。
-- `head` 字段链式验证批次完整性。
-- 并发 CAS 和数据库事务留到 Phase 1，Phase 0 只冻结纯输入/输出与拒绝规则。
-- Adapter 输入含 `ingestEventId`，但不得预填 `taskSeq/eventId/eventDigest/head`。
+- `PreparedEventV2` 是 Adapter 提供的自描述 wire，固定 `schemaVersion=2`。其 `eventType` 只能为
+  `process.started`、`stream.segment.committed`、`stream.terminated`、`orchestrator.objective`、
+  `tool.call`、`tool.result` 六个 Durable 具体类型；benchmark/loadgen 的 coarse 类型不进入 wire。
+  `state.changed` 仅由 `AuthoritativeStateEventV1` 表示，不能伪装为 PreparedEvent。
+- PreparedEvent 必须携带 run/step/attempt、source/providerEventId、streamId、双 span、wall/monotonic
+  时间、ingestedAt、provider/adapter 版本、完整 processIdentity、frame digest、redactions 与 source
+  transport 证据。`stream.*` 必须有非空 streamId；writer 分配的 `eventId`、`taskSeq`、`runSeq`、
+  `preparedBatchId`、`batchOrdinal`、前后 event digest、payload digest、durabilityClass 与
+  redactionManifestDigest 不得出现在 PreparedEvent。
+- 事件 hash 的全部整数输入固定为 I-JSON `0..2^53-1`，boolean 不得冒充整数；writer 对
+  `taskSeq`、`batchOrdinal`、`runSeq` 使用 checked arithmetic。`processIdentity.runtime` v1 只允许
+  `local-windows|wsl-docker`：local 必须有非空 `jobObjectId` 且 WSL/container 字段为 null；
+  wsl-docker 必须有非空 `wslDistro/containerId/imageDigest` 且 `jobObjectId=null`。
+- v1 source span 的 `coordinate` 与 `mappingPrecision` 是独立维度：coordinate 仅允许
+  `provider_transport_bytes|provider_transport_chars|none`。`coordinate=none` 时 precision 必须为 `none`
+  且 start/end 为 null；transport coordinate 配 `mappingPrecision=byte` 时必须有非负且严格递增的
+  `start < endExclusive`，配 `field|frame|none` 时 start/end 必须为 null。Master 的显式正例
+  `coordinate=provider_transport_bytes, mappingPrecision=frame, start=null, endExclusive=null` 必须通过。
+  PreparedBatch segment 没有 coordinate，仍仅 byte 可携带非空递增 `sourceSpan`，field/frame/none 必须为
+  null。sanitized span 与每个 redaction byte range 同样严格递增。replacement 仅允许
+  不可逆标记 `^\[REDACTED(?::[a-z0-9._-]+)?\]$`，禁止携带原始敏感值。
+- Provider 的 `model.summary.frameRef` 形状尚未冻结；本轮 Adapter/materializer 对该类型 fail-closed，
+  不编造 ref 字段。该合同前置路由给 Provider/Task 7 后续评审。
+- `MaterializationInput` 是**非 wire** 的单 Task slice，而不是 `PreparedBatchV2`。根对象精确为
+  `{preparedBatchId, taskId, expectedTaskSeq, expectedEventDigest, events}`，并单独传入
+  `CommittedEventAnchor={committedTaskSeq, committedEventDigest}`；两组 expected/committed head 必须
+  完全相等，genesis 明确为两个 `null`。slice 内 `batchOrdinal` 唯一且严格递增（允许间隔），每个
+  event 还必须由 coordinator 显式给出 `batchOrdinal`、`runSeq`、`durabilityClass`，不允许默认值。
+- materializer 在输入前嵌入权威 Prepared schema 校验，在输出后嵌入 Durable schema 校验；它只做
+  确定性单 Task 物化与链摘要，不实现 claim、CAS、group commit 或跨 Task 存储。真实
+  PreparedBatch manifest/segments 到输入 slice 的协调属于 Task 7。Prepared lane 只允许
+  `side_effect_receipt|provider_source|derived`，必须拒绝 `state.changed` 与
+  `durabilityClass=authoritative_state`；权威状态事件只走 Task 1 独立 UoW lane。
+- `PreparedBatchV2` 是不可变 manifest：无可变 `state`，`orderedIngestIds` 唯一，genesis 的
+  `expectedTaskSeq` 显式为 `null`，`expectedEventDigest` 显式可空且只能为 `null` 或 sha256。golden
+  必须使用同一 preparedBatchId 的真实多 Task manifest 并先经 Draft7 + FormatChecker 校验。
+- `AuthoritativeStateEventV1` 固定 `eventType=state.changed`、`durabilityClass=authoritative_state`，并以
+  `scope={TASK,RUN,STEP,ATTEMPT}` 和
+  `aggregateType={TASK,RUN,PHASE_BARRIER,STEP,ATTEMPT}` 描述聚合。`runId`、`stepId`、`attemptId` 始终
+  required 且可为 `string|null`；schema 机械约束 scope 下的 const/nullability。跨字段的
+  aggregate identity 五路规则为：`TASK -> aggregateId == taskId`；`RUN -> aggregateId == runId`；
+  `PHASE_BARRIER -> aggregateId == phase_barriers.barrier_id` 且对应行
+  `phase_barriers.run_id == runId`；`STEP -> aggregateId == stepId`；
+  `ATTEMPT -> aggregateId == attemptId`。这些跨字段相等和外表 FK、
+  `stateVersion = previousStateVersion + 1` 与跨记录唯一性不能伪称为 Draft7 能力，必须在
+  Task 1 持久化 UoW 中验收。`payloadDigest == sha256(JCS(payload))` 也必须由
+  构造器/UoW 每次重算后再写入，不能把 digest pattern 校验误称为内容相等证明。
 
 ---
 
@@ -182,6 +285,9 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 - `synchronous` 固定为 `"FULL"`。
 - SQLite spike receipt 必须绑定参数 tuple、manifest schema digest、`benchmarkProfileDigest` 和环境 digest。
 - emitter、Phase 1 consumer 与 Phase 6 validator 都重算 tuple digest 并核对 receipt 输入，禁止只比较 receipt 文件名。
+- v1 `CompatibilityManifest` 已经要求 `nodeCapabilityMapDigest`。其唯一算法真源是 `tools/compat-probes/emit_manifest.py` 的 raw-file SHA-256：语义内容或纯格式字节任一变化都会改变摘要，不能用 compact/sorted JSON 私有 hash 替代。ExecutionAuthorization 与 Manifest 的实际 node map 值比对仍由 Task 4 在消费时完成。
+- `eventContractSetDigest` 的兼容性收口属于 Phase 1 Task 10；本节点只在 backlog 登记，不修改
+  CompatibilityManifest、receipt 或 Master。
 
 ---
 
@@ -197,12 +303,12 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 
 ---
 
-## 11. 门禁检查（Phase 0 总门禁）
+## 11. 门禁检查
 
-提交前必须通过 `scripts/check.ps1` 的 9 项检查：
+提交前必须通过 `scripts/check.ps1` 的 15 项检查：
 
 1. Codegen drift 检测
-2. 13 个 JSON Schema 有效性
+2. 16 个 JSON Schema 有效性
 3. Golden vectors（plan_hash + event_hash）
 4. 中文注释覆盖
 5. 无裸 print/console.log
@@ -210,7 +316,15 @@ eventBatchParameters.{maxBatchEvents, maxBatchBytes, maxBatchAgeMs,
 7. 无可控 C 盘路径
 8. Catalog 精确 47 个 ID
 9. docs/ 无占位符
+10. Ruff lint
+11. mypy strict（`apps/agent/src`）
+12. TypeScript `tsc --noEmit`
+13. TypeScript Vitest
+14. Rust contracts test
+15. bootstrap-dev `-VerifyOnly`
+
+真实 ENOSPC 认证不因上述结构性门禁通过而变为 PASS：在具备管理员卷管理权限的 Windows CI runner 上完成真实 VHD/ENOSPC 实验之前，该 Phase 1 实证项保持未完成和 `BLOCKED_UNCERTIFIED`。
 
 ---
 
-*本文档由 Task 8 生成，属于 Phase 0 基线（收口于 2026-08-05，HEAD: ef9a33f）。如需修改合同，请通过标准 PR 流程并更新相关 golden vector。*
+*本文档保留 Phase 0 冻结合同，并记录本节点新增的 Phase 1 授权与事件合同前置。授权签发、撤销、消费、动态 scope/lease/时间比较及策略引擎执行仍属于后续 Task 4/5；如需修改合同，请通过标准评审流程并更新相关测试与兼容性绑定。*

@@ -2,52 +2,498 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/prepared-event.v2.schema.json",
   "title": "PreparedEventV2",
-  "description": "耐久性分配前的预备事件（由 Adapter 填写，禁止预填 taskSeq/eventId/eventDigest/head）。",
+  "description": "Adapter 自描述的预备事件。它只携带 DurableEventV2 的共享输入字段，不含任何单写者/协调器分配字段；非 wire 的 MaterializationInput 另行补入 preparedBatchId、batchOrdinal、runSeq 与 durabilityClass。",
   "type": "object",
   "additionalProperties": false,
-  "required": ["ingestEventId", "taskId", "eventType", "sourceSeq", "payload", "preparedAt"],
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "runId",
+    "stepId",
+    "attemptId",
+    "source",
+    "ingestEventId",
+    "eventType",
+    "providerEventId",
+    "sourceSeq",
+    "streamId",
+    "sourceTransportSpan",
+    "sanitizedStreamSpan",
+    "wallTime",
+    "monotonicTimeNs",
+    "ingestedAt",
+    "providerVersion",
+    "adapterVersion",
+    "processIdentity",
+    "payload",
+    "sanitizedProviderFrameDigest",
+    "redactions"
+  ],
   "properties": {
-    "ingestEventId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Adapter 分配的摄取 ID，用于幂等去重"
+    "schemaVersion": {
+      "type": "integer",
+      "const": 2,
+      "description": "事件 schema 版本（v2）。Phase 1+ 字段集演进时升级。"
     },
     "taskId": {
       "type": "string",
       "minLength": 1,
-      "description": "所属任务 ID"
+      "description": "所属任务 ID。"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 Run ID。"
+    },
+    "stepId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 Step ID。"
+    },
+    "attemptId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "所属 Attempt ID。"
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "verifier",
+        "release",
+        "orchestrator"
+      ],
+      "description": "事件来源 actor 身份。"
+    },
+    "ingestEventId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "原始摄取 ID（来自 PreparedEventV2）。"
     },
     "eventType": {
       "type": "string",
       "enum": [
-        "stream", "provider-semantic", "tool", "state",
-        "gate", "receipt", "control", "heartbeat"
+        "process.started",
+        "stream.segment.committed",
+        "stream.terminated",
+        "orchestrator.objective",
+        "tool.call",
+        "tool.result"
       ],
-      "description": "事件类型"
+      "description": "Adapter 只能准备已明确支持的具体事件类型。state.changed 仅由 AuthoritativeStateEventV1 产生；model.summary 的 Provider frameRef 形状尚未冻结，本轮 Adapter/物化器 fail-closed。"
+    },
+    "providerEventId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Provider 事件 ID；未关联 Provider 事件时为 null。"
     },
     "sourceSeq": {
       "type": "integer",
       "minimum": 0,
-      "description": "来源端序号（用于顺序校验和去重）"
+      "maximum": 9007199254740991,
+      "description": "Provider 来源端序号（用于去重与对齐）。"
     },
-    "transportSpanDigest": {
+    "streamId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Provider stream 稳定 ID；stream.segment.committed/stream.terminated 必须为非空字符串。"
+    },
+    "sourceTransportSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coordinate",
+        "start",
+        "endExclusive",
+        "mappingPrecision"
+      ],
+      "description": "源传输 span：coordinate 表示 Provider 传输坐标轴，mappingPrecision 表示映射精度，两者相互独立。transport 坐标仅在 byte 精度下携带非空范围；field/frame/none 精度不携带 offset。",
+      "properties": {
+        "coordinate": {
+          "type": "string",
+          "enum": [
+            "provider_transport_bytes",
+            "provider_transport_chars",
+            "none"
+          ],
+          "description": "Provider 原始传输坐标轴；不得使用 mappingPrecision 的 byte/field/frame 名称冒充坐标。"
+        },
+        "start": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "transport 坐标且 mappingPrecision=byte 时的起始偏移；其他组合必须为 null。"
+        },
+        "endExclusive": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "transport 坐标且 mappingPrecision=byte 时的结束偏移（不含）；其他组合必须为 null。"
+        },
+        "mappingPrecision": {
+          "type": "string",
+          "enum": [
+            "byte",
+            "field",
+            "frame",
+            "none"
+          ],
+          "description": "精度（§10.4）：credential 默认不高于 field/frame；stream.segment.* 一般为 byte 或 frame。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "coordinate": {"enum": ["provider_transport_bytes", "provider_transport_chars"]},
+              "mappingPrecision": {"const": "byte"}
+            },
+            "required": ["coordinate", "mappingPrecision"]
+          },
+          "then": {
+            "properties": {
+              "start": {"type": "integer"},
+              "endExclusive": {"type": "integer"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "coordinate": {"enum": ["provider_transport_bytes", "provider_transport_chars"]},
+              "mappingPrecision": {"enum": ["field", "frame", "none"]}
+            },
+            "required": ["coordinate", "mappingPrecision"]
+          },
+          "then": {
+            "properties": {
+              "start": {"type": "null"},
+              "endExclusive": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "coordinate": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "coordinate"
+            ]
+          },
+          "then": {
+            "properties": {
+              "start": {
+                "type": "null"
+              },
+              "endExclusive": {
+                "type": "null"
+              },
+              "mappingPrecision": {
+                "const": "none"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sanitizedStreamSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segmentId",
+        "start",
+        "endExclusive"
+      ],
+      "description": "脱敏后 span：精确指向持久化脱敏字节。脱敏改变长度时不得与 sourceTransportSpan 冒充同一坐标。",
+      "properties": {
+        "segmentId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "自描述脱敏 stream segment ID（指向 stream_segments 表）。"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "脱敏 segment 内字节偏移（不含）。"
+        },
+        "endExclusive": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "脱敏 segment 内字节偏移（不含）。"
+        }
+      }
+    },
+    "wallTime": {
       "type": "string",
-      "minLength": 1,
-      "description": "传输 span 摘要（用于 STREAM-002 完整性检查）"
+      "format": "date-time",
+      "description": "RFC3339 接收 wall time（仅用于显示，不能参与排序）。"
+    },
+    "monotonicTimeNs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "单调时钟纳秒。"
+    },
+    "ingestedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "完整 frame 闭合后写入脱敏器的时刻（首字节到闭合仅记录 frame_assembly_ms 不写入）。"
+    },
+    "providerVersion": {
+      "type": "string",
+      "description": "Provider CLI 上报版本。"
+    },
+    "adapterVersion": {
+      "type": "string",
+      "description": "Adapter 自身 semver 版本。"
+    },
+    "processIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executorId",
+        "hostId",
+        "runtime",
+        "executableDigest",
+        "pid",
+        "processStartTime",
+        "jobObjectId",
+        "wslDistro",
+        "containerId",
+        "imageDigest"
+      ],
+      "description": "受管进程身份（§10.1）：runtime 仅为 local-windows 或 wsl-docker，并按分支提供完整进程证据。",
+      "properties": {
+        "executorId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "执行者稳定 ID。"
+        },
+        "hostId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "主机指纹。"
+        },
+        "runtime": {
+          "type": "string",
+          "enum": [
+            "local-windows",
+            "wsl-docker"
+          ],
+          "description": "运行时类型。"
+        },
+        "executableDigest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "description": "可执行文件 SHA-256（完整）。"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "进程 PID。"
+        },
+        "processStartTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "进程启动 wall time。"
+        },
+        "jobObjectId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "Windows Job Object ID（local-windows 必填；wsl-docker 必须为 null）。"
+        },
+        "wslDistro": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "WSL distro 名（wsl-docker 必填；local-windows 必须为 null）。"
+        },
+        "containerId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "容器 ID（wsl-docker 必填；local-windows 必须为 null）。"
+        },
+        "imageDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "容器镜像 digest（wsl-docker 必填；local-windows 必须为 null）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "local-windows"
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "jobObjectId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "wslDistro": {
+                "type": "null"
+              },
+              "containerId": {
+                "type": "null"
+              },
+              "imageDigest": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "runtime": {
+                "const": "wsl-docker"
+              }
+            },
+            "required": [
+              "runtime"
+            ]
+          },
+          "then": {
+            "properties": {
+              "jobObjectId": {
+                "type": "null"
+              },
+              "wslDistro": {
+                "type": "string",
+                "minLength": 1
+              },
+              "containerId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "imageDigest": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
     },
     "payload": {
       "type": "object",
-      "description": "事件负载（已脱敏）"
+      "description": "事件负载（已脱敏，未脱敏原文不得落盘）。"
     },
-    "payloadDigest": {
-      "type": "string",
-      "minLength": 1,
-      "description": "负载内容摘要（SHA-256 hex）"
+    "sanitizedProviderFrameDigest": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "已脱敏 Provider frame 的 SHA-256；原始 frame 在脱敏后立即丢弃。"
     },
-    "preparedAt": {
-      "type": "string",
-      "format": "date-time",
-      "description": "预备时间"
+    "redactions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "patternId",
+          "byteRange",
+          "replacement"
+        ],
+        "properties": {
+          "patternId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "命中的脱敏规则 ID。"
+          },
+          "byteRange": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "start",
+              "endExclusive"
+            ],
+            "properties": {
+              "start": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "endExclusive": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "replacement": {
+            "type": "string",
+            "pattern": "^\\[REDACTED(?::[a-z0-9._-]+)?\\]$",
+            "description": "替换值（[REDACTED] / [REDACTED:uncertain] / 类型化标记）。"
+          }
+        }
+      },
+      "description": "本事件命中脱敏点列表（不含原文、低熵 hash 或可推断秘密长度的 redaction manifest）。"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "stream.segment.committed",
+              "stream.terminated"
+            ]
+          }
+        },
+        "required": [
+          "eventType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "streamId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "streamId"
+        ]
+      }
+    }
+  ]
 }

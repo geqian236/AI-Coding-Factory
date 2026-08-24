@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import sys
+from collections.abc import Callable, Mapping
 
 # ── 敏感字段检测正则（Key 名匹配，大小写不敏感）────────────────────────────
 _SENSITIVE_KEY_PATTERN: re.Pattern[str] = re.compile(
@@ -56,29 +57,31 @@ _SENSITIVE_KEY_PATTERN: re.Pattern[str] = re.compile(
 #   eyJ             → JWT（base64 编码的 header 必以 eyJ 开头）
 # 使用 ``re.IGNORECASE`` 兼顾大小写变体（如 ``AKIA`` / ``akia``）。
 _SENSITIVE_VALUE_PATTERN: re.Pattern[str] = re.compile(
-    r"(sk-[A-Za-z0-9_\-]+)"
-    r"|(gh[opsu]_[A-Za-z0-9]+)"
-    r"|(github_pat_[A-Za-z0-9_]+)"
-    r"|(Bearer\s+[A-Za-z0-9._\-]+)"
-    r"|(AKIA[0-9A-Z]{16})"
-    r"|(xox[baprs]-[A-Za-z0-9\-]+)"
-    r"|(-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*)"
-    r"|(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)",
+    r"(?<![A-Za-z0-9])(sk-[A-Za-z0-9_\-]+)"
+    r"|(?<![A-Za-z0-9])(gh[opsu]_[A-Za-z0-9]+)"
+    r"|(?<![A-Za-z0-9])(github_pat_[A-Za-z0-9_]+)"
+    r"|(?<![A-Za-z0-9])(Bearer\s+[A-Za-z0-9._\-]+)"
+    r"|(?<![A-Za-z0-9])(AKIA[0-9A-Z]{16})"
+    r"|(?<![A-Za-z0-9])(xox[baprs]-[A-Za-z0-9\-]+)"
+    r"|(?<![A-Za-z0-9])(-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]*)"
+    r"|(?<![A-Za-z0-9])(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)",
     re.IGNORECASE,
 )
 
 # 关联 ID 字段名集合（强制要求出现在结构化记录中）
-_CORRELATION_FIELDS: frozenset[str] = frozenset({
-    "request_id",
-    "task_id",
-    "run_id",
-    "step_id",
-    "attempt_id",
-    "trace_id",
-    "module",
-    "operation",
-    "duration_ms",
-})
+_CORRELATION_FIELDS: frozenset[str] = frozenset(
+    {
+        "request_id",
+        "task_id",
+        "run_id",
+        "step_id",
+        "attempt_id",
+        "trace_id",
+        "module",
+        "operation",
+        "duration_ms",
+    }
+)
 
 _REDACTED = "[REDACTED]"
 # 显式 token 脱敏后的占位前缀，方便人眼区分「已脱敏」与「原文保留」。
@@ -112,15 +115,24 @@ def _mask_token(token: str) -> str:
     # 例如 github_pat_ 必须先于 ghu_ 匹配
     named_prefixes = (
         "github_pat_",
-        "sk-live-", "sk-test-", "sk-",
-        "ghp_", "gho_", "ghs_", "ghu_",
-        "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-",
+        "sk-live-",
+        "sk-test-",
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "xoxs-",
     )
     lower = token.lower()
     for p in named_prefixes:
         if lower.startswith(p):
             prefix = token[: len(p)]  # 保留原始大小写
-            body = token[len(p):]
+            body = token[len(p) :]
             if len(body) <= 9:
                 # body 太短，整段掩码为 [REDACTED]（保留前缀）
                 return f"{prefix}{_REDACTED}"
@@ -133,7 +145,7 @@ def _mask_token(token: str) -> str:
     # Bearer 头
     if lower.startswith("bearer"):
         prefix = token[: len("Bearer")]
-        rest = token[len("Bearer"):].lstrip()
+        rest = token[len("Bearer") :].lstrip()
         if len(rest) <= 8:
             return f"{prefix} {_REDACTED}"
         return f"{prefix} {rest[:2]}{_MASK_PREFIX}{rest[-4:]}"
@@ -186,6 +198,8 @@ def _redact_value(key: str, value: object) -> object:
         return [_redact_value_in_container(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_value_in_container(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return [_redact_value_in_container(item) for item in sorted(value, key=repr)]
     return value
 
 
@@ -206,15 +220,23 @@ def _redact_value_in_container(item: object) -> object:
     Returns:
         脱敏后的元素。
     """
-    if isinstance(item, dict):
-        return _redact_dict(item)
+    if isinstance(item, Mapping):
+        return _redact_mapping(item)
     if isinstance(item, str):
         return _scan_str(item)
     if isinstance(item, list):
         return [_redact_value_in_container(sub) for sub in item]
     if isinstance(item, tuple):
         return tuple(_redact_value_in_container(sub) for sub in item)
+    if isinstance(item, set | frozenset):
+        return [_redact_value_in_container(sub) for sub in sorted(item, key=repr)]
     return item
+
+
+def _redact_mapping(data: Mapping[object, object]) -> dict[str, object]:
+    """递归脱敏任意 Mapping；非字符串 key 先转为日志 JSON 可表达的字符串。"""
+    normalized = {_scan_str(str(key)): value for key, value in data.items()}
+    return _redact_dict(normalized)
 
 
 def _redact_dict(data: dict[str, object]) -> dict[str, object]:
@@ -246,12 +268,14 @@ def _redact_dict(data: dict[str, object]) -> dict[str, object]:
             result[k] = _REDACTED
             continue
         # 外层 key 不敏感：按 value 类型分支
-        if isinstance(v, dict):
-            result[k] = _redact_dict(v)
+        if isinstance(v, Mapping):
+            result[k] = _redact_mapping(v)
         elif isinstance(v, list):
             result[k] = [_redact_value_list_element(x) for x in v]
         elif isinstance(v, tuple):
             result[k] = tuple(_redact_value_list_element(x) for x in v)
+        elif isinstance(v, set | frozenset):
+            result[k] = [_redact_value_list_element(x) for x in sorted(v, key=repr)]
         else:
             result[k] = _redact_value(k, v)
     return result
@@ -260,13 +284,33 @@ def _redact_dict(data: dict[str, object]) -> dict[str, object]:
 def _redact_value_list_element(elem: object) -> object:
     """递归脱敏 list/tuple 元素。dict 走 ``_redact_dict``，str 走 ``_scan_str``，
     嵌套 list/tuple 递归。"""
-    if isinstance(elem, dict):
-        return _redact_dict(elem)
+    if isinstance(elem, Mapping):
+        return _redact_mapping(elem)
     if isinstance(elem, list):
         return [_redact_value_list_element(x) for x in elem]
     if isinstance(elem, tuple):
         return tuple(_redact_value_list_element(x) for x in elem)
+    if isinstance(elem, set | frozenset):
+        return [_redact_value_list_element(x) for x in sorted(elem, key=repr)]
     return _redact_value("", elem)
+
+
+def structlog_processor_chain(
+    *,
+    renderer: Callable[[object, str, dict[str, object]], object],
+) -> tuple[Callable[..., object], ...]:
+    """返回生产 structlog processor 链，统一复用本模块递归脱敏规则。
+
+    Phase 1 的 scheduler 会把事务生命周期写成结构化事件；这里不引入第二套日志
+    脱敏实现。structlog 调用方负责声明自己的稳定字段集合，本链路只递归脱敏，
+    再交给调用方指定的 renderer（测试用 LogCapture，生产用 JSONRenderer）。
+    """
+
+    def _redact_processor(_logger: object, _method_name: str, event_dict: dict[str, object]) -> dict[str, object]:
+        return _redact_dict(event_dict)
+
+    setattr(_redact_processor, "__factory_agent_processor__", True)
+    return (_redact_processor, renderer)
 
 
 class _JsonFormatter(logging.Formatter):
@@ -288,9 +332,9 @@ class _JsonFormatter(logging.Formatter):
         """
         # 基础字段
         entry: dict[str, object] = {
-            "ts":        self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level":     record.levelname,
-            "message":   record.getMessage(),
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "message": record.getMessage(),
         }
 
         # 关联字段：从 record.__dict__ 提取，缺失则为 None
@@ -298,9 +342,7 @@ class _JsonFormatter(logging.Formatter):
             entry[field] = getattr(record, field, None)
 
         # extra 字段（非内置 LogRecord 属性）
-        _builtin = frozenset(logging.LogRecord(
-            "", 0, "", 0, "", (), None
-        ).__dict__.keys()) | {"message", "asctime"}
+        _builtin = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()) | {"message", "asctime"}
         for k, v in record.__dict__.items():
             if k not in _builtin and k not in _CORRELATION_FIELDS:
                 entry[k] = v

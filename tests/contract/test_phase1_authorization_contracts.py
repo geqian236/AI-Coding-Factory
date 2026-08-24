@@ -1,0 +1,4449 @@
+"""Phase 1 授权合同测试：冻结 schema、策略字段和三语言生成物的 fail-closed 边界。"""
+
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import jsonschema
+import pytest
+from factory_agent.policy import plan_hash
+from factory_agent.policy.canonical_json import canonicalize
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCHEMAS_DIR = REPO_ROOT / "contracts" / "schemas"
+CATALOG_PATH = REPO_ROOT / "contracts" / "codegen" / "catalog.v1.json"
+POLICY_PATH = REPO_ROOT / "contracts" / "policies" / "node-capability-map.v1.json"
+# raw-file golden 与 CompatibilityManifest v1 使用同一算法；精确策略表负责定位字段漂移。
+EXPECTED_NODE_POLICY_RAW_FILE_SHA256 = (
+    "sha256:25da2cbe791024fbe31475f45c2302d84c5da3b53cafeae2f3c791551d8abff5"
+)
+SNAPSHOT_REGISTRY_PATH = REPO_ROOT / "contracts" / "policies" / "authorization-snapshot-registry.v1.json"
+RUN_SPEC_SCHEMA_PATH = SCHEMAS_DIR / "run-spec.v1.schema.json"
+PREPARED_EVENT_SCHEMA_PATH = SCHEMAS_DIR / "prepared-event.v2.schema.json"
+DURABLE_EVENT_SCHEMA_PATH = SCHEMAS_DIR / "durable-event.v2.schema.json"
+PREPARED_BATCH_SCHEMA_PATH = SCHEMAS_DIR / "prepared-batch.v2.schema.json"
+AUTHORITATIVE_STATE_EVENT_SCHEMA_PATH = (
+    SCHEMAS_DIR / "authoritative-state-event.v1.schema.json"
+)
+PLAN_REVISION_SCHEMA_PATH = SCHEMAS_DIR / "plan-revision.v1.schema.json"
+PLAN_HASH_GOLDEN_PATH = REPO_ROOT / "contracts" / "golden" / "plan-hash.v1.json"
+MASTER_SPEC_PATH = REPO_ROOT / "docs" / "superpowers" / "specs" / "2026-08-03-ai-coding-factory-master-design.md"
+MANIFEST_SCHEMA_PATH = REPO_ROOT / "contracts" / "schemas" / "compatibility-manifest.v1.schema.json"
+EMIT_MANIFEST_PATH = REPO_ROOT / "tools" / "compat-probes" / "emit_manifest.py"
+CODEGEN_PATH = REPO_ROOT / "contracts" / "codegen" / "generate.py"
+GENERATED_PYTHON_MODELS_PATH = (
+    REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py"
+)
+EVENT_CONTRACT_TOUCHED_TEXT_PATHS = (
+    "apps/agent/src/factory_agent/contracts/generated/models.py",
+    "apps/agent/src/factory_agent/domain/events.py",
+    "contracts/codegen/catalog.v1.json",
+    "contracts/codegen/generate.py",
+    "contracts/golden/event-hash.v2.json",
+    "contracts/golden/prepared-batch.v2.json",
+    "contracts/schemas/authoritative-state-event.v1.schema.json",
+    "contracts/schemas/durable-event.v2.schema.json",
+    "contracts/schemas/prepared-batch.v2.schema.json",
+    "contracts/schemas/prepared-event.v2.schema.json",
+    "crates/factory-contracts/src/event.rs",
+    "crates/factory-contracts/src/generated/contracts.rs",
+    "crates/factory-contracts/tests/event_vectors.rs",
+    "docs/operations/PHASE_1_BACKLOG.md",
+    "docs/protocols/contracts-v1.md",
+    "packages/factory-contracts/src/event.test.ts",
+    "packages/factory-contracts/src/event.ts",
+    "packages/factory-contracts/src/generated/contracts.ts",
+    "tests/contract/test_event_hash_vectors.py",
+    "tests/contract/test_phase1_authorization_contracts.py",
+    "tests/contract/test_schema_catalog.py",
+)
+
+# 跨语言只接受可移植的 RFC3339 子集；完整日历与 offset 语义由各端同名 format 检查器复核。
+FACTORY_RFC3339_DATE_TIME_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-5][0-9]"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
+)
+
+
+def _post_bootstrap_business_phases_from_master_spec() -> tuple[str, ...]:
+    """机械提取 Master Spec §7.1 的 Run.phase，再排除明确的 pre-plan 状态。"""
+    master_spec = MASTER_SPEC_PATH.read_text(encoding="utf-8")
+    phase_block = re.search(
+        r"`Run\.phase` 使用以下业务枚举：\s*```text\s*(?P<phases>.*?)\s*```",
+        master_spec,
+        flags=re.DOTALL,
+    )
+    assert phase_block is not None, "Master Spec §7.1 Run.phase 枚举块缺失"
+    all_phases = tuple(
+        phase.strip()
+        for phase in phase_block.group("phases").splitlines()
+        if phase.strip()
+    )
+    return tuple(
+        phase
+        for phase in all_phases
+        if phase not in {"CREATED", "PREFLIGHT", "BOOTSTRAPPING_REPOSITORY"}
+    )
+
+AUTHORIZATION_SCHEMA_FILES = {
+    "IntentAuthorization": "intent-authorization.v1.schema.json",
+    "ExecutionAuthorization": "execution-authorization.v1.schema.json",
+}
+
+REQUIRED_INTENT_FIELDS = {
+    "intentAuthorizationId",
+    "taskId",
+    "userId",
+    "requirementDigest",
+    "projectId",
+    "repositoryId",
+    "repositoryBindingDigest",
+    "baselineDigest",
+    "targetStage",
+    "stageCapabilityMapVersion",
+    "allowedCapabilitySetDigest",
+    "targetBindingDigest",
+    "riskCeiling",
+    "estimatedCostAlertDigest",
+    "autonomousExecutionBudgetMs",
+    "repairLoopLimit",
+    "autoReplanLimit",
+    "attemptLimit",
+    "issuedAt",
+    "expiresAt",
+    "revokedAt",
+    "revokeReason",
+}
+
+REQUIRED_EXECUTION_FIELDS = {
+    "executionAuthorizationId",
+    "intentAuthorizationId",
+    "planRevisionId",
+    "semanticPlanHash",
+    "planRevisionDigest",
+    "stageCapabilityMapVersion",
+    "stageCapabilityMapDigest",
+    "nodeCapabilityMapVersion",
+    "nodeCapabilityMapDigest",
+    "runId",
+    "stepId",
+    "attemptId",
+    "nodeType",
+    "executorId",
+    "resourceFingerprint",
+    "capabilityScopeDigest",
+    "idempotencyKey",
+    "inputBindings",
+    "actionCapability",
+    "actionPolicySnapshotDigest",
+    "fencingToken",
+    "controlEpoch",
+    "acceptedControlCommandSeq",
+    "maxUses",
+    "consumptionState",
+    "issuedAt",
+    "expiresAt",
+    "revokedAt",
+    "revokeReason",
+}
+
+INTENT_SNAPSHOT_FIELDS = (
+    "requirementDigest",
+    "repositoryBindingDigest",
+    "baselineDigest",
+    "allowedCapabilitySetDigest",
+    "targetBindingDigest",
+    "estimatedCostAlertDigest",
+)
+
+EXECUTION_SNAPSHOT_FIELDS = (
+    "semanticPlanHash",
+    "planRevisionDigest",
+    "stageCapabilityMapDigest",
+    "nodeCapabilityMapDigest",
+    "resourceFingerprint",
+    "capabilityScopeDigest",
+    "idempotencyKey",
+    "actionPolicySnapshotDigest",
+)
+
+# 授权 wire format 的每个快照字段都固定到 registry 中唯一的 schemaId/version。
+# artifactId 仅是不可变对象定位符，不能替代 payload 内容摘要，也不进入摘要输入。
+SNAPSHOT_SCHEMA_IDS = {
+    "IntentAuthorization.requirementDigest": "factory.authorization.intent.requirement.v1",
+    "IntentAuthorization.repositoryBindingDigest": "factory.authorization.intent.repository-binding.v1",
+    "IntentAuthorization.baselineDigest": "factory.authorization.intent.baseline.v1",
+    "IntentAuthorization.allowedCapabilitySetDigest": "factory.authorization.intent.allowed-capability-set.v1",
+    "IntentAuthorization.targetBindingDigest": "factory.authorization.intent.target-binding.v1",
+    "IntentAuthorization.estimatedCostAlertDigest": "factory.authorization.intent.estimated-cost-alert.v1",
+    "ExecutionAuthorization.semanticPlanHash": "factory.authorization.execution.semantic-plan.v1",
+    "ExecutionAuthorization.planRevisionDigest": "factory.authorization.execution.plan-revision.v1",
+    "ExecutionAuthorization.stageCapabilityMapDigest": "factory.authorization.execution.stage-capability-map.v1",
+    "ExecutionAuthorization.nodeCapabilityMapDigest": "factory.authorization.execution.node-capability-map.v1",
+    "ExecutionAuthorization.resourceFingerprint": "factory.authorization.execution.resource-fingerprint.v1",
+    "ExecutionAuthorization.capabilityScopeDigest": "factory.authorization.execution.capability-scope.v1",
+    "ExecutionAuthorization.idempotencyKey": "factory.authorization.execution.idempotency-key.v1",
+    "ExecutionAuthorization.actionPolicySnapshotDigest": "factory.authorization.execution.action-policy.v1",
+    "ExecutionAuthorization.inputBindings.contentDigest": "factory.authorization.execution.input-content.v1",
+}
+SNAPSHOT_SCHEMA_VERSION = "1"
+
+FROZEN_POLICY_FIELDS = {
+    "resourceFingerprintSchema",
+    "idempotencyKeyTemplate",
+    "completionFact",
+    "authorizationConsumptionPoint",
+    "retryClass",
+}
+
+RETRY_CLASSES = {
+    "bounded-no-external-side-effect",
+    "local-fact-before-retry",
+    "external-fact-before-retry",
+    "one-shot-cas-reconcile-only",
+}
+
+AUTHORIZATION_CONSUMPTION_POINTS = {
+    "before-capability-dispatch",
+    "with-action-started-transaction",
+}
+
+# 17 种 node 的五个派发字段是独立审计基线；逐字段比较可直接定位同步漂移，
+# 不能只断言值属于一个宽泛合法集合。
+EXPECTED_NODE_POLICY_ROWS = (
+    ("PLAN", ("repo.read",), (), "read-only", "before-capability-dispatch", "bounded-no-external-side-effect"),
+    ("DESIGN_REVIEW", ("repo.read",), (), "read-only", "before-capability-dispatch", "bounded-no-external-side-effect"),
+    (
+        "BOOTSTRAP_REPOSITORY",
+        ("repo.bootstrap", "git.local_commit"),
+        (),
+        "local-write",
+        "with-action-started-transaction",
+        "local-fact-before-retry",
+    ),
+    (
+        "IMPLEMENT",
+        ("repo.read", "worktree.write", "git.local_commit"),
+        (),
+        "local-write",
+        "with-action-started-transaction",
+        "local-fact-before-retry",
+    ),
+    (
+        "VERIFY",
+        ("repo.read", "test.exec.isolated"),
+        ("network.egress.scoped",),
+        "isolated-exec",
+        "before-capability-dispatch",
+        "bounded-no-external-side-effect",
+    ),
+    ("CODE_REVIEW", ("repo.read",), (), "read-only", "before-capability-dispatch", "bounded-no-external-side-effect"),
+    (
+        "ATTEST_REVIEW",
+        ("repo.read", "check.publish"),
+        (),
+        "external-write-limited",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "PUBLISH_PR",
+        ("git.push", "pr.create", "pr.update", "forge.observe.scoped"),
+        (),
+        "external-write",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "MERGE",
+        ("forge.observe.scoped", "repo.merge"),
+        (),
+        "external-write",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "BUILD_ARTIFACT",
+        ("build.exec.isolated",),
+        ("registry.push", "registry.observe.scoped"),
+        "isolated-exec",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "DEPLOY_STAGING",
+        ("ssh.exec.scoped", "remote.write.scoped"),
+        ("db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"),
+        "remote-write",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "ACCEPT_STAGING",
+        (
+            "http.check.scoped",
+            "network.egress.scoped",
+            "remote.observe.scoped",
+            "container.inspect.scoped",
+            "log.read.scoped",
+        ),
+        ("db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"),
+        "remote-observe",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "DEPLOY_PRODUCTION",
+        ("ssh.exec.scoped", "remote.write.scoped"),
+        ("db.backup", "db.migrate", "nginx.switch", "traffic.switch.scoped"),
+        "remote-write",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "ACCEPT_PRODUCTION",
+        (
+            "http.check.scoped",
+            "network.egress.scoped",
+            "remote.observe.scoped",
+            "container.inspect.scoped",
+            "log.read.scoped",
+        ),
+        ("db.read", "db.check", "acceptance.fixture.write", "service.restart.scoped"),
+        "remote-observe",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "ROLLBACK",
+        ("rollback", "ssh.exec.scoped", "remote.write.scoped"),
+        ("db.restore", "nginx.switch", "traffic.switch.scoped"),
+        "remote-write",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "RESTORE_DRILL",
+        ("db.restore", "restore.validation.instance", "db.check"),
+        (),
+        "isolated-restore",
+        "with-action-started-transaction",
+        "external-fact-before-retry",
+    ),
+    (
+        "RECONCILE_TARGET",
+        (),
+        (
+            "remote.observe.scoped",
+            "container.inspect.scoped",
+            "log.read.scoped",
+            "db.read",
+            "db.check",
+            "registry.observe.scoped",
+            "target.guard.clear",
+        ),
+        "remote-observe",
+        "with-action-started-transaction",
+        "one-shot-cas-reconcile-only",
+    ),
+)
+EXPECTED_NODE_POLICY = {
+    node_type: {
+        "requiredCapabilities": required,
+        "optionalCapabilities": optional,
+        "sideEffectClass": side_effect,
+        "authorizationConsumptionPoint": consumption_point,
+        "retryClass": retry_class,
+    }
+    for (
+        node_type,
+        required,
+        optional,
+        side_effect,
+        consumption_point,
+        retry_class,
+    ) in EXPECTED_NODE_POLICY_ROWS
+}
+
+# ExecutionAuthorization 与 node map 共用上面的 capability 真源，避免单独维护第二份集合。
+EXPECTED_ACTIONS_BY_NODE = {
+    node_type: set(expected["requiredCapabilities"]) | set(expected["optionalCapabilities"])
+    for node_type, expected in EXPECTED_NODE_POLICY.items()
+}
+
+# 有环境语义的 action 必须同时绑定环境与完整资源指纹摘要，防止相同业务输入在
+# staging/production 或不同物理目标间得到同一 action identity。
+ENVIRONMENT_ACTION_PREFIX = ("environment", "resourceFingerprintDigest")
+
+# 每个 action 的三个安全字段逐项冻结。重复项按语义共享 tuple，但 capability 键仍显式
+# 列出，因此失败信息能够精确落到 node/action/field，而不是只报告整文件哈希变化。
+EXPECTED_ACTION_POLICY = {
+    "PLAN": {
+        "repo.read": (
+            ("nodeType", "stepId", "requirementDigest", "parentRevisionOrGenesis", "plannerContractDigest"),
+            "plan-artifacts-committed-v1",
+            (
+                "run-spec-schema-valid",
+                "plan-revision-schema-valid",
+                "dual-hash-recomputed",
+                "required-artifacts-committed",
+            ),
+        )
+    },
+    "DESIGN_REVIEW": {
+        "repo.read": (
+            ("repositoryId", "planRevisionDigest", "rubricDigest", "reviewerVersion"),
+            "design-review-passed-v1",
+            ("review-receipt-binds-plan-revision", "no-blocking-finding", "review-artifact-committed"),
+        )
+    },
+    "BOOTSTRAP_REPOSITORY": {
+        capability: (
+            ("targetResourceFingerprintDigest", "bootstrapPlanDigest"),
+            "bootstrap-commit-matches-v1",
+            ("d-volume-empty-no-git-precondition", "repository-identity", "head-and-tree-match", "local-commit-exact"),
+        )
+        for capability in ("repo.bootstrap", "git.local_commit")
+    },
+    "IMPLEMENT": {
+        capability: (
+            ("repoId", "baseSha", "logicalNodeId", "implementationInputDigest"),
+            "candidate-commit-matches-v1",
+            ("candidate-sha", "candidate-tree", "allowed-paths-only", "artifacts-committed"),
+        )
+        for capability in ("repo.read", "worktree.write", "git.local_commit")
+    },
+    "VERIFY": {
+        "repo.read": (
+            ("repoId", "candidateSha", "testPlanDigest", "commandIdsDigest", "verifierImageDigest"),
+            "verification-receipts-pass-v1",
+            ("candidate-input-bound", "container-exit-observed", "required-checks-pass"),
+        ),
+        "test.exec.isolated": (
+            ("repoId", "candidateSha", "testPlanDigest", "commandIdsDigest", "verifierImageDigest"),
+            "verification-receipts-pass-v1",
+            ("candidate-input-bound", "container-exit-observed", "required-checks-pass"),
+        ),
+        "network.egress.scoped": (
+            (
+                "repoId",
+                "candidateSha",
+                "testPlanDigest",
+                "commandIdsDigest",
+                "verifierImageDigest",
+                "egressPolicyDigest",
+            ),
+            "verification-receipts-pass-v1",
+            ("candidate-input-bound", "egress-policy-bound", "container-exit-observed", "required-checks-pass"),
+        ),
+    },
+    "CODE_REVIEW": {
+        "repo.read": (
+            ("repositoryId", "candidateSha", "rubricDigest", "reviewerVersion"),
+            "codex-review-passed-v1",
+            (
+                "receipt-binds-candidate-sha",
+                "receipt-binds-rubric",
+                "no-open-blocker-or-high",
+                "review-artifact-committed",
+            ),
+        )
+    },
+    "ATTEST_REVIEW": {
+        capability: (
+            (
+                "repositoryId",
+                "fixedCheckName",
+                "expectedAppId",
+                "reviewedHeadSha",
+                "codexReceiptDigest",
+                "rubricDigest",
+            ),
+            "attestation-check-matches-v1",
+            (
+                "remote-check-name",
+                "source-app-id",
+                "reviewed-head-sha",
+                "codex-receipt-digest",
+                "rubric-digest",
+                "check-conclusion",
+            ),
+        )
+        for capability in ("repo.read", "check.publish")
+    },
+    "PUBLISH_PR": {
+        "git.push": (
+            ("repositoryId", "remoteRef", "candidateSha"),
+            "pushed-ref-matches-candidate-v1",
+            ("remote-ref-equals-candidate", "remote-ref-name", "push-receipt-binds-candidate"),
+        ),
+        "pr.create": (
+            ("repositoryId", "headSha", "targetBranch"),
+            "created-pr-matches-candidate-v1",
+            ("head-base-pr-identity", "created-pr-id", "created-pr-head-equals-candidate"),
+        ),
+        "pr.update": (
+            ("repositoryId", "prId", "expectedHeadSha", "desiredDraftReadyState", "metadataDigest"),
+            "updated-pr-state-matches-v1",
+            ("pr-id", "expected-head-matches-candidate", "ready-state-no-drift", "metadata-digest-matches"),
+        ),
+        "forge.observe.scoped": (
+            ("repositoryId", "prId", "expectedHeadSha", "evidenceQuerySetDigest"),
+            "published-pr-observation-matches-v1",
+            (
+                "head-base-pr-identity",
+                "required-actions-checks-attestation-pass",
+                "ready-state-no-drift",
+                "observation-query-binds-pr",
+            ),
+        ),
+    },
+    "MERGE": {
+        capability: (
+            ("prId", "expectedReviewedHeadSha", "expectedBaseSha", "mergeMethod"),
+            "protected-squash-merge-matches-v1",
+            (
+                "strict-up-to-date-transaction",
+                "unique-parent-equals-base",
+                "tree-equals-reviewed-tree",
+                "receipt-and-remote-sha-match",
+            ),
+        )
+        for capability in ("forge.observe.scoped", "repo.merge")
+    },
+    "BUILD_ARTIFACT": {
+        "build.exec.isolated": (
+            ("repoId", "candidateSha", "buildPlanDigest", "builderImageDigest", "platform"),
+            "build-artifact-matches-v1",
+            ("oci-digest", "platform-match", "sbom-committed", "provenance-committed"),
+        ),
+        **{
+            capability: (
+                ("registryRepository", "imageDigest"),
+                "build-artifact-matches-v1",
+                (
+                    "oci-digest",
+                    "platform-match",
+                    "sbom-committed",
+                    "provenance-committed",
+                    "registry-manifest-readable-by-digest",
+                ),
+            )
+            for capability in ("registry.push", "registry.observe.scoped")
+        },
+    },
+    "DEPLOY_STAGING": {
+        "ssh.exec.scoped": (
+            ENVIRONMENT_ACTION_PREFIX
+            + ("serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "direct-target-fact"),
+        ),
+        "remote.write.scoped": (
+            ENVIRONMENT_ACTION_PREFIX
+            + ("serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "direct-target-fact"),
+        ),
+        "db.backup": (
+            ENVIRONMENT_ACTION_PREFIX + ("databaseProfileRevision", "releaseId", "backupPlanDigest"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "backup-target-fact"),
+        ),
+        "db.migrate": (
+            ENVIRONMENT_ACTION_PREFIX + ("databaseProfileRevision", "migrationChecksum", "releaseId"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "migration-target-fact"),
+        ),
+        "nginx.switch": (
+            ENVIRONMENT_ACTION_PREFIX + ("serverProfileRevision", "releaseId", "upstreamConfigHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "upstream-target-fact"),
+        ),
+        "traffic.switch.scoped": (
+            ENVIRONMENT_ACTION_PREFIX + ("trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "traffic-target-fact"),
+        ),
+    },
+    "ACCEPT_STAGING": {
+        **{
+            capability: (
+                ENVIRONMENT_ACTION_PREFIX + ("releaseId", "acceptancePlanDigest", "checkId"),
+                "acceptance-blocking-pass-v1",
+                ("target-identity-match", "all-blocking-non-skipped", "evidence-committed", "fixture-cleanup-proof"),
+            )
+            for capability in (
+                "http.check.scoped",
+                "network.egress.scoped",
+                "remote.observe.scoped",
+                "container.inspect.scoped",
+                "log.read.scoped",
+            )
+        },
+        **{
+            capability: (
+                ENVIRONMENT_ACTION_PREFIX
+                + ("databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"),
+                "acceptance-blocking-pass-v1",
+                ("target-identity-match", "all-blocking-non-skipped", "database-evidence", "fixture-cleanup-proof"),
+            )
+            for capability in ("db.read", "db.check")
+        },
+        "acceptance.fixture.write": (
+            ENVIRONMENT_ACTION_PREFIX + ("releaseId", "fixtureDigest"),
+            "acceptance-blocking-pass-v1",
+            ("target-identity-match", "all-blocking-non-skipped", "fixture-cleanup-proof", "evidence-committed"),
+        ),
+        "service.restart.scoped": (
+            ENVIRONMENT_ACTION_PREFIX + ("releaseId", "restartPlanDigest"),
+            "acceptance-blocking-pass-v1",
+            ("target-identity-match", "all-blocking-non-skipped", "restart-observed", "evidence-committed"),
+        ),
+    },
+    "DEPLOY_PRODUCTION": {
+        "ssh.exec.scoped": (
+            ENVIRONMENT_ACTION_PREFIX
+            + ("serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "direct-production-target-fact"),
+        ),
+        "remote.write.scoped": (
+            ENVIRONMENT_ACTION_PREFIX
+            + ("serverPhysicalFingerprintDigest", "releaseId", "deployPlanDigest", "stepSeq", "inputHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "direct-production-target-fact"),
+        ),
+        "db.backup": (
+            ENVIRONMENT_ACTION_PREFIX + ("databaseProfileRevision", "releaseId", "backupPlanDigest"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "backup-production-target-fact"),
+        ),
+        "db.migrate": (
+            ENVIRONMENT_ACTION_PREFIX + ("databaseProfileRevision", "migrationChecksum", "releaseId"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "migration-production-target-fact"),
+        ),
+        "nginx.switch": (
+            ENVIRONMENT_ACTION_PREFIX + ("serverProfileRevision", "releaseId", "upstreamConfigHash"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "upstream-production-target-fact"),
+        ),
+        "traffic.switch.scoped": (
+            ENVIRONMENT_ACTION_PREFIX + ("trafficAdapterFingerprintDigest", "releaseId", "trafficPlanDigest"),
+            "deploy-plan-observed-complete-v1",
+            ("planned-step-journal-completed-fsync", "traffic-production-target-fact"),
+        ),
+    },
+    "ACCEPT_PRODUCTION": {
+        **{
+            capability: (
+                ENVIRONMENT_ACTION_PREFIX + ("releaseId", "acceptancePlanDigest", "checkId"),
+                "production-acceptance-blocking-pass-v1",
+                (
+                    "target-identity-match",
+                    "active-release-digest-match",
+                    "git-sha-and-config-hash-match",
+                    "codex-evidence-receipt",
+                    "all-blocking-non-skipped",
+                    "fixture-cleanup-proof",
+                ),
+            )
+            for capability in (
+                "http.check.scoped",
+                "network.egress.scoped",
+                "remote.observe.scoped",
+                "container.inspect.scoped",
+                "log.read.scoped",
+            )
+        },
+        **{
+            capability: (
+                ENVIRONMENT_ACTION_PREFIX
+                + ("databaseFingerprintDigest", "releaseId", "acceptancePlanDigest", "checkId"),
+                "production-acceptance-blocking-pass-v1",
+                (
+                    "target-identity-match",
+                    "active-release-digest-match",
+                    "git-sha-and-config-hash-match",
+                    "codex-evidence-receipt",
+                    "database-evidence",
+                    "fixture-cleanup-proof",
+                ),
+            )
+            for capability in ("db.read", "db.check")
+        },
+        "acceptance.fixture.write": (
+            ENVIRONMENT_ACTION_PREFIX + ("releaseId", "fixtureDigest"),
+            "production-acceptance-blocking-pass-v1",
+            (
+                "target-identity-match",
+                "active-release-digest-match",
+                "git-sha-and-config-hash-match",
+                "codex-evidence-receipt",
+                "fixture-cleanup-proof",
+            ),
+        ),
+        "service.restart.scoped": (
+            ENVIRONMENT_ACTION_PREFIX + ("releaseId", "restartPlanDigest"),
+            "production-acceptance-blocking-pass-v1",
+            (
+                "target-identity-match",
+                "active-release-digest-match",
+                "git-sha-and-config-hash-match",
+                "codex-evidence-receipt",
+                "restart-observed",
+            ),
+        ),
+    },
+    "ROLLBACK": {
+        **{
+            capability: (
+                ENVIRONMENT_ACTION_PREFIX + ("failedReleaseId", "goodReleaseDigest", "rollbackPlanHash"),
+                "rollback-observed-accepted-v1",
+                (
+                    "old-release-digest-or-upstream-restored",
+                    "database-allowed-version",
+                    "blocking-rollback-acceptance-pass",
+                    "receipt-match",
+                ),
+            )
+            for capability in ("rollback", "ssh.exec.scoped", "remote.write.scoped")
+        },
+        "db.restore": (
+            ENVIRONMENT_ACTION_PREFIX + ("databaseProfileRevision", "goodReleaseDigest", "rollbackPlanHash"),
+            "rollback-observed-accepted-v1",
+            (
+                "old-release-digest-or-upstream-restored",
+                "database-allowed-version",
+                "blocking-rollback-acceptance-pass",
+                "receipt-match",
+            ),
+        ),
+        "nginx.switch": (
+            ENVIRONMENT_ACTION_PREFIX + ("serverProfileRevision", "goodReleaseDigest", "upstreamConfigHash"),
+            "rollback-observed-accepted-v1",
+            (
+                "old-release-digest-or-upstream-restored",
+                "database-allowed-version",
+                "blocking-rollback-acceptance-pass",
+                "receipt-match",
+            ),
+        ),
+        "traffic.switch.scoped": (
+            ENVIRONMENT_ACTION_PREFIX + ("trafficAdapterFingerprintDigest", "goodReleaseDigest", "rollbackPlanHash"),
+            "rollback-observed-accepted-v1",
+            (
+                "old-release-digest-or-upstream-restored",
+                "database-allowed-version",
+                "blocking-rollback-acceptance-pass",
+                "receipt-match",
+            ),
+        ),
+    },
+    "RESTORE_DRILL": {
+        capability: (
+            ("databaseProfileRevision", "backupIdOrSampleDigest", "validationInstanceIdentity", "drillPlanDigest"),
+            "restore-drill-receipt-and-destroy-v1",
+            ("section-16-2-binding", "rto-rpo-evidence", "expiry-evidence", "forced-destroy-receipt"),
+        )
+        for capability in ("db.restore", "restore.validation.instance", "db.check")
+    },
+    "RECONCILE_TARGET": {
+        **{
+            capability: (
+                ("resourceFingerprintDigest", "reconciliationPlanDigest", "evidenceQuerySetDigest"),
+                "reconciliation-known-state-v1",
+                ("stable-resource-fingerprint-match", "target-observation-evidence", "known-state-classification"),
+            )
+            for capability in (
+                "remote.observe.scoped",
+                "container.inspect.scoped",
+                "log.read.scoped",
+                "db.read",
+                "db.check",
+                "registry.observe.scoped",
+            )
+        },
+        "target.guard.clear": (
+            (
+                "resourceFingerprintDigest",
+                "originalReasonEvidenceDigest",
+                "reconciliationPlanDigest",
+                "userIdentity",
+                "expectedGuardVersion",
+            ),
+            "reconciliation-known-state-v1",
+            (
+                "stable-resource-fingerprint-match",
+                "intervention-required-to-open-cas",
+                "clear-receipt-digest",
+                "known-state-classification",
+            ),
+        ),
+    },
+}
+
+EXPECTED_CANDIDATE_SHA_NODES = {"VERIFY", "CODE_REVIEW", "PUBLISH_PR", "MERGE"}
+EXPECTED_CANDIDATE_AND_CONTENT_NODES = {
+    "DEPLOY_STAGING",
+    "ACCEPT_STAGING",
+    "DEPLOY_PRODUCTION",
+    "ACCEPT_PRODUCTION",
+}
+
+# 幂等键只能由派发前已知的稳定输入构造；这些运行时可变值会破坏重试/接管收敛。
+FORBIDDEN_IDEMPOTENCY_INPUT_FIELDS = {
+    "attemptId",
+    "fencingToken",
+    "controlEpoch",
+    "acceptedControlCommandSeq",
+    "acceptedControlCommandSequence",
+    "issuedAt",
+    "expiresAt",
+    "ttl",
+    "time",
+    "timestamp",
+}
+
+
+# 每个 nodeType 都使用可通过本文件本地 $defs 解析的最小资源指纹样本，避免仅凭
+# 字符串或注释宣称策略可执行。样本中的可选 overlay 均选择最危险的已启用分支。
+FINGERPRINT_SAMPLES = {
+    "PLAN": {"repositoryId": "repo-1", "physicalRootIdentity": "volume-d:repo-root"},
+    "DESIGN_REVIEW": {"repositoryId": "repo-1", "physicalRootIdentity": "volume-d:repo-root"},
+    "BOOTSTRAP_REPOSITORY": {
+        "volumeIdentity": "volume-d",
+        "canonicalRoot": "D:/factory/new-repository",
+        "mode": "new",
+    },
+    "IMPLEMENT": {"repoId": "repo-1", "worktreePhysicalIdentity": "volume-d:worktree-1"},
+    "VERIFY": {
+        "repoId": "repo-1",
+        "checkoutIdentity": "isolated-checkout-1",
+        "verifierImageDigest": "sha256:" + "a" * 64,
+        "networkEgressSelected": True,
+        "egressPolicyDigest": "sha256:" + "b" * 64,
+    },
+    "CODE_REVIEW": {"repositoryId": "repo-1", "physicalRootIdentity": "volume-d:repo-root"},
+    "ATTEST_REVIEW": {"forge": "github", "repositoryId": "repo-1"},
+    "PUBLISH_PR": {"forge": "github", "repositoryId": "repo-1"},
+    "MERGE": {"forge": "github", "repositoryId": "repo-1"},
+    "BUILD_ARTIFACT": {
+        "repoId": "repo-1",
+        "builderImageDigest": "sha256:" + "c" * 64,
+        "platform": "linux/amd64",
+        "registrySelected": True,
+        "registry": {"host": "registry.example", "repository": "factory/app"},
+    },
+    "DEPLOY_STAGING": {
+        "environment": "STAGING",
+        "serverPhysical": {"hostKey": "staging-host", "remoteRoot": "/srv/factory"},
+        "databaseSelected": True,
+        "trafficSelected": True,
+        "databasePhysical": {"clusterIdentity": "staging-cluster", "databaseIdentity": "factory"},
+        "trafficAdapter": {"adapterIdentity": "staging-nginx"},
+    },
+    "ACCEPT_STAGING": {
+        "environment": "STAGING",
+        "serverPhysical": {"hostKey": "staging-host", "remoteRoot": "/srv/factory"},
+        "releaseIdentity": {"releaseId": "release-1", "containerIdentity": "container-1"},
+        "endpointPolicyDigest": "sha256:" + "d" * 64,
+        "databaseSelected": True,
+        "databasePhysical": {"clusterIdentity": "staging-cluster", "databaseIdentity": "factory"},
+    },
+    "DEPLOY_PRODUCTION": {
+        "environment": "PRODUCTION",
+        "serverPhysical": {"hostKey": "production-host", "remoteRoot": "/srv/factory"},
+        "databaseSelected": True,
+        "trafficSelected": True,
+        "databasePhysical": {"clusterIdentity": "production-cluster", "databaseIdentity": "factory"},
+        "trafficAdapter": {"adapterIdentity": "production-nginx"},
+    },
+    "ACCEPT_PRODUCTION": {
+        "environment": "PRODUCTION",
+        "serverPhysical": {"hostKey": "production-host", "remoteRoot": "/srv/factory"},
+        "releaseIdentity": {"releaseId": "release-1", "containerIdentity": "container-1"},
+        "endpointPolicyDigest": "sha256:" + "e" * 64,
+        "databaseSelected": True,
+        "databasePhysical": {"clusterIdentity": "production-cluster", "databaseIdentity": "factory"},
+    },
+    "ROLLBACK": {
+        "environment": "STAGING",
+        "serverPhysical": {"hostKey": "staging-host", "remoteRoot": "/srv/factory"},
+        "databaseSelected": True,
+        "trafficSelected": True,
+        "databasePhysical": {"clusterIdentity": "staging-cluster", "databaseIdentity": "factory"},
+        "trafficAdapter": {"adapterIdentity": "staging-nginx"},
+    },
+    "RESTORE_DRILL": {
+        "sourceDatabasePhysical": {"clusterIdentity": "prod-cluster", "databaseIdentity": "factory"},
+        "validationInstanceIdentity": "restore-drill-1",
+        "validationEnvironment": "NON_PRODUCTION",
+        "sourceAndValidationDistinct": True,
+    },
+    "RECONCILE_TARGET": {
+        "targetKind": "server",
+        "server": {"hostKey": "staging-host", "remoteRoot": "/srv/factory"},
+        "guardFingerprint": {"hostKey": "staging-host", "remoteRoot": "/srv/factory"},
+    },
+}
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    """以 UTF-8 读取单份合同；测试失败必须定位到真实文件。"""
+    with path.open(encoding="utf-8") as source:
+        return json.load(source)
+
+
+def _is_rfc3339_date_time(value: object) -> bool:
+    """复用生产标准库 RFC3339 checker，测试不得私自复制一套日期语义。"""
+    return plan_hash.is_factory_rfc3339_date_time(value)
+
+
+def _authorization_format_checker() -> jsonschema.FormatChecker:
+    """复用生产 format checker，确保 schema 合同测试与 hash API 日期语义一致。"""
+    return plan_hash.factory_format_checker()
+
+
+def _snapshot_ref(binding_key: str, digest_character: str) -> dict[str, str]:
+    """构造闭合快照引用；artifactId 是定位符，摘要域只绑定 schema 与 payload。"""
+    return {
+        "artifactId": "artifact-" + binding_key.rsplit(".", maxsplit=1)[-1],
+        "schemaId": SNAPSHOT_SCHEMA_IDS[binding_key],
+        "schemaVersion": SNAPSHOT_SCHEMA_VERSION,
+        "digest": "sha256:" + digest_character * 64,
+    }
+
+
+def _raw_file_sha256(path: Path) -> str:
+    """复用 CompatibilityManifest v1 的文件字节摘要语义，不重造 JSON 私有哈希。"""
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _snapshot_payload_digest(schema_id: str, schema_version: str, payload: object) -> str:
+    """按冻结 NFC+RFC8785/JCS 域分离规则重算快照 payload 摘要。"""
+    return "sha256:" + hashlib.sha256(canonicalize([schema_id, schema_version, payload])).hexdigest()
+
+
+def _assert_snapshot_ref_matches_payload(ref: dict[str, str], payload: object) -> None:
+    """模拟 Task 4 的纯合同不变量：ref 声明必须等于可重算 payload 摘要。"""
+    expected = _snapshot_payload_digest(ref["schemaId"], ref["schemaVersion"], payload)
+    assert ref["digest"] == expected, "snapshot ref digest 与 schema/version/payload 重算值不一致"
+
+
+def _assert_raw_file_digest_matches(actual_digest: str, path: Path) -> None:
+    """模拟 Task 4 的纯合同不变量：v1 Manifest 只能接受目标文件的原始字节摘要。"""
+    assert actual_digest == _raw_file_sha256(path), "raw-file SHA-256 digest 与冻结文件不一致"
+
+
+def _load_emit_manifest_module() -> ModuleType:
+    """加载既有 emitter，以真实 v1 实现作为 raw-file SHA-256 的唯一算法真源。"""
+    spec = importlib.util.spec_from_file_location("phase1_emit_manifest", EMIT_MANIFEST_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_codegen_module() -> ModuleType:
+    """按真实脚本路径加载 codegen，直接验证 validator schema 失败不会被注释吞没。"""
+    spec = importlib.util.spec_from_file_location("phase1_contract_codegen", CODEGEN_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_generated_python_models() -> ModuleType:
+    """从生成物原路径加载模块，直接检查 TypedDict 的真实 required/optional 语义。"""
+    spec = importlib.util.spec_from_file_location(
+        "phase1_generated_contract_models",
+        GENERATED_PYTHON_MODELS_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _assert_rejected(schema: dict[str, Any], instance: dict[str, Any]) -> None:
+    """用真实 Draft7Validator 断言不可信对象被 schema 拒绝。"""
+    errors = list(
+        jsonschema.Draft7Validator(
+            schema,
+            format_checker=_authorization_format_checker(),
+        ).iter_errors(instance)
+    )
+    assert errors, f"应被拒绝的合同对象意外通过: {instance}"
+
+
+def _assert_accepted(schema: dict[str, Any], instance: dict[str, Any]) -> None:
+    """用真实 Draft7Validator 断言完整冻结对象可以通过，不把拒绝测试误写成假绿。"""
+    errors = list(
+        jsonschema.Draft7Validator(
+            schema,
+            format_checker=_authorization_format_checker(),
+        ).iter_errors(instance)
+    )
+    assert not errors, f"应被接受的合同对象被拒绝: {errors}"
+
+
+def _assert_all_object_schemas_fail_closed(schema: dict[str, Any], root_schema: dict[str, Any] | None = None) -> None:
+    """递归检查授权 object 都闭合；snapshotRef 的本地 $ref 也必须实际闭合。"""
+    root_schema = root_schema or schema
+    if schema.get("type") == "object":
+        refs = [
+            item.get("$ref")
+            for item in schema.get("allOf", [])
+            if isinstance(item, dict) and isinstance(item.get("$ref"), str)
+        ]
+        closes_through_snapshot_ref = (
+            "#/$defs/snapshotRef" in refs
+            and root_schema.get("$defs", {}).get("snapshotRef", {}).get("additionalProperties") is False
+        )
+        assert schema.get("additionalProperties") is False or closes_through_snapshot_ref, schema
+    for value in schema.values():
+        if isinstance(value, dict):
+            _assert_all_object_schemas_fail_closed(value, root_schema)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _assert_all_object_schemas_fail_closed(item, root_schema)
+
+
+def _is_known_retry_class(value: object) -> bool:
+    """只接受策略 map 冻结的静态重试包络，不能误把 §17 动态错误类当静态策略。"""
+    return isinstance(value, str) and value in RETRY_CLASSES
+
+
+def _valid_intent_authorization() -> dict[str, Any]:
+    """构造完整 IntentAuthorization 基准，覆盖 §6.2 的用户授权包络。"""
+    return {
+        "intentAuthorizationId": "intent-001",
+        "taskId": "task-001",
+        "userId": "user-001",
+        "requirementDigest": _snapshot_ref("IntentAuthorization.requirementDigest", "1"),
+        "projectId": "project-001",
+        "repositoryId": "repo-001",
+        "repositoryBindingDigest": _snapshot_ref("IntentAuthorization.repositoryBindingDigest", "2"),
+        "baselineDigest": _snapshot_ref("IntentAuthorization.baselineDigest", "3"),
+        "targetStage": "CODEX_APPROVED",
+        "stageCapabilityMapVersion": "1",
+        "allowedCapabilitySetDigest": _snapshot_ref("IntentAuthorization.allowedCapabilitySetDigest", "4"),
+        "targetBindingDigest": _snapshot_ref("IntentAuthorization.targetBindingDigest", "5"),
+        "riskCeiling": "medium",
+        "estimatedCostAlertDigest": _snapshot_ref("IntentAuthorization.estimatedCostAlertDigest", "6"),
+        "autonomousExecutionBudgetMs": 3_600_000,
+        "repairLoopLimit": 3,
+        "autoReplanLimit": 2,
+        "attemptLimit": 4,
+        "issuedAt": "2026-08-10T00:00:00Z",
+        "expiresAt": "2026-08-11T00:00:00Z",
+        "revokedAt": None,
+        "revokeReason": None,
+    }
+
+
+def _minimum_input_bindings(node_type: str) -> dict[str, Any]:
+    """为每类节点构造最小冻结输入，避免测试用无关字段掩盖授权条件。"""
+    if node_type == "IMPLEMENT":
+        return {"baseSha": "a" * 40}
+    if node_type in EXPECTED_CANDIDATE_SHA_NODES:
+        return {"candidateSha": "b" * 40}
+    if node_type in EXPECTED_CANDIDATE_AND_CONTENT_NODES:
+        return {
+            "candidateSha": "b" * 40,
+            "contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c"),
+        }
+    return {"contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c")}
+
+
+def _valid_execution_authorization(
+    *,
+    node_type: str = "PUBLISH_PR",
+    action_capability: str = "pr.create",
+    input_bindings: dict[str, Any] | list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """构造可变节点/action 的基准授权；默认覆盖 PR 副作用的 candidate 绑定。"""
+    return {
+        "executionAuthorizationId": "execution-001",
+        "intentAuthorizationId": "intent-001",
+        "planRevisionId": "plan-001",
+        "semanticPlanHash": _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "3"),
+        "planRevisionDigest": _snapshot_ref("ExecutionAuthorization.planRevisionDigest", "4"),
+        "nodeType": node_type,
+        "stageCapabilityMapVersion": "1",
+        "stageCapabilityMapDigest": _snapshot_ref("ExecutionAuthorization.stageCapabilityMapDigest", "5"),
+        "nodeCapabilityMapVersion": "1",
+        "nodeCapabilityMapDigest": _snapshot_ref("ExecutionAuthorization.nodeCapabilityMapDigest", "6"),
+        "runId": "run-001",
+        "stepId": "step-001",
+        "attemptId": "attempt-001",
+        "executorId": "executor-001",
+        "fencingToken": 1,
+        "controlEpoch": 1,
+        "acceptedControlCommandSeq": 1,
+        "resourceFingerprint": _snapshot_ref("ExecutionAuthorization.resourceFingerprint", "7"),
+        "capabilityScopeDigest": _snapshot_ref("ExecutionAuthorization.capabilityScopeDigest", "9"),
+        "idempotencyKey": _snapshot_ref("ExecutionAuthorization.idempotencyKey", "a"),
+        "inputBindings": (input_bindings if input_bindings is not None else _minimum_input_bindings(node_type)),
+        "actionCapability": action_capability,
+        "actionPolicySnapshotDigest": _snapshot_ref("ExecutionAuthorization.actionPolicySnapshotDigest", "c"),
+        "maxUses": 1,
+        "consumptionState": "AVAILABLE",
+        "issuedAt": "2026-08-10T00:00:00Z",
+        "expiresAt": "2026-08-10T01:00:00Z",
+        "revokedAt": None,
+        "revokeReason": None,
+    }
+
+
+def _registry_payload_validator(registry: dict[str, Any], binding: dict[str, Any]) -> jsonschema.Draft7Validator:
+    """在测试中真实执行 registry 的 payload schema，而不是只检查说明字符串。"""
+    wrapper = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$defs": registry["$defs"],
+        "allOf": [binding["payloadSchema"]],
+    }
+    return jsonschema.Draft7Validator(wrapper, format_checker=_authorization_format_checker())
+
+
+def _registry_payload_schema(registry: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    """解析 registry 内部 payload $ref，供 required/optional 与 validator 来源逐项核验。"""
+    ref = binding["payloadSchema"]
+    assert set(ref) == {"$ref"}
+    assert isinstance(ref["$ref"], str) and ref["$ref"].startswith("#/$defs/")
+    return registry["$defs"][ref["$ref"].removeprefix("#/$defs/")]
+
+
+def _complete_run_spec_for_semantic_snapshot() -> dict[str, Any]:
+    """构造完整 RunSpec，确保快照测试直接使用运行时语义投影而非缩小样本。"""
+    return {
+        "schemaVersion": 1,
+        "taskId": "task-001",
+        "goal": "完成授权摘要合同闭环",
+        "assumptions": ["合同目录可作为唯一协议源"],
+        "scope": {
+            "include": ["contracts/policies/authorization-snapshot-registry.v1.json"],
+            "exclude": ["runtime source"],
+        },
+        "constraints": ["摘要必须使用 NFC + RFC8785/JCS"],
+        "acceptanceCriteria": ["字段漂移必须 fail-closed"],
+        "targetStage": "CODEX_APPROVED",
+        "repository": {
+            "mode": "existing",
+            "root": "D:/codex项目/AI-Coding-Factory",
+            "baseBranch": "main",
+            "baseCommit": "a" * 40,
+        },
+        "workPlan": {
+            "dagVersion": 1,
+            "nodes": [
+                {
+                    "logicalNodeId": "node-plan-001",
+                    "businessPhase": "PLANNING",
+                    "barrierOrdinal": 0,
+                    "nodeType": "PLAN",
+                    "required": True,
+                    "dependsOn": [],
+                    "sideEffectClass": "read-only",
+                    "requiredArtifacts": [],
+                    "successPredicateId": "plan-created-v1",
+                    "timeoutMs": 1_000,
+                    "retryPolicyId": "no-retry",
+                }
+            ],
+            "barriers": [
+                {
+                    "businessPhase": "PLANNING",
+                    "barrierOrdinal": 0,
+                    "requiredNodeIds": ["node-plan-001"],
+                    "settleTimeoutMs": 1_000,
+                    "passPredicateId": "planning-complete-v1",
+                }
+            ],
+        },
+        "riskProfile": {"level": "low", "reasons": ["仅修改静态合同"]},
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "intentAuthorizationId": "intent-001",
+        "semanticPlanHash": "sha256:" + "e" * 64,
+    }
+
+
+def _complete_plan_revision_for_snapshot() -> dict[str, Any]:
+    """构造完整 PlanRevision，覆盖 digest material 的所有 schema 字段与谱系。"""
+    semantic_plan_hash = plan_hash.semantic_plan_hash(_complete_run_spec_for_semantic_snapshot())
+    return {
+        "planRevisionId": "plan-001",
+        "parentRevisionId": "plan-000",
+        "taskId": "task-001",
+        "specRevision": 1,
+        "intentAuthorizationId": "intent-001",
+        "semanticPlanHash": semantic_plan_hash,
+        "planRevisionDigest": "sha256:" + "f" * 64,
+        "dagVersion": 1,
+        "nodeCapabilityMapVersion": "1",
+        "stageCapabilityMapVersion": "1",
+        "nodes": [
+            {
+                "logicalNodeId": "node-plan-001",
+                "businessPhase": "PLANNING",
+                "barrierOrdinal": 0,
+                "nodeType": "PLAN",
+                "required": True,
+                "dependsOn": [],
+                "sideEffectClass": "read-only",
+                "requiredArtifacts": [],
+                "successPredicateId": "plan-created-v1",
+                "timeoutMs": 1_000,
+                "retryPolicyId": "no-retry",
+            }
+        ],
+        "barriers": [
+            {
+                "businessPhase": "PLANNING",
+                "barrierOrdinal": 0,
+                "requiredNodeIds": ["node-plan-001"],
+                "settleTimeoutMs": 1_000,
+                "passPredicateId": "planning-complete-v1",
+            }
+        ],
+        "stageMaps": {"CODEX_APPROVED": ["node-plan-001"]},
+        "createdAt": "2026-08-10T00:00:00Z",
+    }
+
+
+def _run_spec_for_new_repository_post_bootstrap() -> dict[str, Any]:
+    """构造 bootstrap 完成后的首个 RunSpec：new 保留用户来源，baseCommit 已可信固定。
+
+    bootstrap 前只有 Task intake 与 Intent 的 repo.bootstrap 包络；它不是 RunSpec，
+    也不得被投影或进入任何 PlanRevision 摘要。此纯合同样本只覆盖已有可信提交后的
+    PLANNING 起点，运行时 permit/消费事务仍由后续任务 fail closed 实现。
+    """
+    run_spec = _complete_run_spec_for_semantic_snapshot()
+    run_spec["repository"] = {
+        "mode": "new",
+        "root": "D:/codex项目/new-factory",
+        "baseBranch": "main",
+        "baseCommit": "b" * 40,
+    }
+    return run_spec
+
+
+def _mutate_schema_valid_value(value: object, schema: dict[str, object]) -> object:
+    """在不改变字段类型/枚举约束的前提下构造不同值，验证每个字段均进入摘要。"""
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list):
+        return next(candidate for candidate in enum_values if candidate != value)
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, str):
+        if re.fullmatch(r"sha256:[a-f0-9]{64}", value):
+            return "sha256:" + ("0" if value[-1] != "0" else "1") * 64
+        if schema.get("format") == "date-time":
+            return "2026-08-10T00:00:01Z"
+        return value + "-drift"
+    if isinstance(value, list):
+        assert value, "测试样本必须为每个待变更数组提供至少一个合法元素"
+        return [*copy.deepcopy(value), copy.deepcopy(value[-1])]
+    if isinstance(value, dict):
+        changed = copy.deepcopy(value)
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for field, field_schema in properties.items():
+                if isinstance(field, str) and isinstance(field_schema, dict) and field in changed:
+                    changed[field] = _mutate_schema_valid_value(changed[field], field_schema)
+                    return changed
+    raise AssertionError(f"无法为 schema-valid 变更构造样本: {value!r}")
+
+
+def _selected_action_policy_snapshot(
+    policy_map: dict[str, Any],
+    *,
+    node_type: str,
+    action_capability: str,
+    node_capability_map_digest: str | None = None,
+) -> dict[str, Any]:
+    """从 node map 的已选 action 投影快照，避免把整组 action 当成可互换的证据。"""
+    node_policy = policy_map["nodeTypes"][node_type]
+    action_key = node_policy["idempotencyKeyTemplate"]["actions"]["byCapability"][action_capability]
+    action_fact = node_policy["completionFact"]["actions"]["byCapability"][action_capability]
+    return {
+        "nodeCapabilityMapDigest": node_capability_map_digest or _raw_file_sha256(POLICY_PATH),
+        "nodeType": node_type,
+        "actionCapability": action_capability,
+        "idempotencyKeyTemplate": {
+            "version": node_policy["idempotencyKeyTemplate"]["version"],
+            "hashAlgorithm": node_policy["idempotencyKeyTemplate"]["hashAlgorithm"],
+            "jcsInputFields": action_key["jcsInputFields"],
+        },
+        "completionFact": action_fact,
+        "authorizationConsumptionPoint": node_policy["authorizationConsumptionPoint"],
+        "retryClass": node_policy["retryClass"],
+    }
+
+
+def _assert_action_snapshot_matches_node_map(payload: dict[str, Any], policy_map: dict[str, Any]) -> None:
+    """证明 action 快照同时绑定 map digest、nodeType 与 selected action 的确定性投影。"""
+    node_type = payload.get("nodeType")
+    action_capability = payload.get("actionCapability")
+    assert isinstance(node_type, str) and node_type in policy_map["nodeTypes"], node_type
+    actions = policy_map["nodeTypes"][node_type]["idempotencyKeyTemplate"]["actions"]["byCapability"]
+    assert isinstance(action_capability, str) and action_capability in actions, action_capability
+    expected = _selected_action_policy_snapshot(
+        policy_map,
+        node_type=node_type,
+        action_capability=action_capability,
+    )
+    assert payload == expected, "action policy snapshot 与冻结 node map 投影不一致"
+
+
+def _snapshot_payload_samples(policy_map: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """提供每个 registry payload schema 的最小有效样本，确保验证器可实际运行。"""
+    semantic_plan_payload = plan_hash.build_semantic_projection(_complete_run_spec_for_semantic_snapshot())
+    plan_revision = _complete_plan_revision_for_snapshot()
+    plan_revision_payload = {
+        field: value for field, value in plan_revision.items() if field not in plan_hash._DIGEST_EXCLUDED_FIELDS
+    }
+    return {
+        "IntentAuthorization.requirementDigest": {
+            "requirementText": "为仓库增加可验证的授权合同",
+            "normalizationVersion": "nfc-jcs-v1",
+        },
+        "IntentAuthorization.repositoryBindingDigest": {
+            "repositoryId": "repo-001",
+            "canonicalRemote": "https://example.invalid/factory.git",
+            "physicalRootIdentity": "volume-d:factory",
+            "mode": "existing",
+        },
+        "IntentAuthorization.baselineDigest": {
+            "baseBranch": "main",
+            "baseSha": "a" * 40,
+            "bootstrapState": "EXISTS",
+        },
+        "IntentAuthorization.allowedCapabilitySetDigest": {
+            "targetStage": "CODEX_APPROVED",
+            "capabilities": ["repo.read", "worktree.write"],
+        },
+        "IntentAuthorization.targetBindingDigest": {
+            "targetKind": "repository",
+            "projectId": "project-001",
+        },
+        "IntentAuthorization.estimatedCostAlertDigest": {
+            "currency": "CNY",
+            "alertThreshold": 100,
+            "hardStopThreshold": 200,
+        },
+        "ExecutionAuthorization.semanticPlanHash": semantic_plan_payload,
+        "ExecutionAuthorization.planRevisionDigest": plan_revision_payload,
+        "ExecutionAuthorization.stageCapabilityMapDigest": {
+            "mapVersion": "1",
+            "targetStage": "CODEX_APPROVED",
+            "capabilities": ["repo.read", "worktree.write"],
+        },
+        "ExecutionAuthorization.nodeCapabilityMapDigest": {
+            "mapVersion": "1",
+            "rawFileDigest": _raw_file_sha256(POLICY_PATH),
+        },
+        "ExecutionAuthorization.resourceFingerprint": {
+            "nodeType": "PUBLISH_PR",
+            "fingerprint": FINGERPRINT_SAMPLES["PUBLISH_PR"],
+        },
+        "ExecutionAuthorization.capabilityScopeDigest": {
+            "capabilities": ["pr.create"],
+            "resourceFingerprintDigest": "sha256:" + "2" * 64,
+        },
+        "ExecutionAuthorization.idempotencyKey": {
+            "nodeType": "PUBLISH_PR",
+            "actionCapability": "pr.create",
+            "inputBindingsDigest": "sha256:" + "3" * 64,
+        },
+        "ExecutionAuthorization.actionPolicySnapshotDigest": _selected_action_policy_snapshot(
+            policy_map,
+            node_type="PUBLISH_PR",
+            action_capability="pr.create",
+        ),
+        "ExecutionAuthorization.inputBindings.contentDigest": {
+            "contentKind": "release-material",
+            "mediaType": "application/json",
+            "byteLength": 128,
+        },
+    }
+
+
+def test_authorization_snapshot_registry_is_closed_and_not_in_codegen() -> None:
+    """快照 registry 必须是闭合 policy，且不能伪装成新增 codegen schema。"""
+    assert SNAPSHOT_REGISTRY_PATH.exists(), f"授权快照 registry 缺失: {SNAPSHOT_REGISTRY_PATH}"
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    assert set(registry) == {
+        "$schema",
+        "$id",
+        "title",
+        "description",
+        "version",
+        "canonicalizer",
+        "snapshotRefSchema",
+        "artifactResolution",
+        "$defs",
+        "snapshotBindings",
+    }
+    assert registry["canonicalizer"] == {
+        "unicodeNormalization": "NFC",
+        "serialization": "RFC8785/JCS",
+        "digestAlgorithm": "sha256",
+        "domainSeparatedInput": "[schemaId,schemaVersion,payload]",
+        "digestExpression": "sha256(JCS/NFC([schemaId,schemaVersion,payload]))",
+    }
+    assert registry["artifactResolution"] == {
+        "requiredState": "COMMITTED",
+        "immutable": True,
+        "mustResolveArtifactId": True,
+        "mustMatch": [
+            "schemaId",
+            "schemaVersion",
+            "validatorSource",
+            "recomputedDigest",
+        ],
+        "rejectOnMismatch": True,
+    }
+
+    ref_schema = registry["snapshotRefSchema"]
+    jsonschema.Draft7Validator.check_schema(ref_schema)
+    _assert_accepted(
+        ref_schema,
+        _snapshot_ref("IntentAuthorization.requirementDigest", "1"),
+    )
+    invalid_ref = _snapshot_ref("IntentAuthorization.requirementDigest", "1")
+    invalid_ref["unapproved"] = "blocked"
+    _assert_rejected(ref_schema, invalid_ref)
+
+    assert set(registry["snapshotBindings"]) == set(SNAPSHOT_SCHEMA_IDS)
+    for binding_key, schema_id in SNAPSHOT_SCHEMA_IDS.items():
+        binding = registry["snapshotBindings"][binding_key]
+        assert set(binding) == {
+            "schemaId",
+            "schemaVersion",
+            "validator",
+            "payloadSchema",
+            "payloadKeys",
+        }, binding_key
+        assert binding["schemaId"] == schema_id
+        assert binding["schemaVersion"] == SNAPSHOT_SCHEMA_VERSION
+        assert set(binding["validator"]) >= {"kind", "source"}
+        assert set(binding["payloadKeys"]) == {"required", "optional"}
+
+    catalog = _load_json(CATALOG_PATH)
+    assert all(
+        entry["schemaPath"] != "contracts/policies/authorization-snapshot-registry.v1.json"
+        for entry in catalog["schemas"]
+    )
+
+
+def test_snapshot_registry_payload_validators_are_executable_and_fail_closed() -> None:
+    """registry 的每个 payload schema 都须实际执行，并拒绝未知字段。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    samples = _snapshot_payload_samples(_load_json(POLICY_PATH))
+
+    for binding_key, sample in samples.items():
+        binding = registry["snapshotBindings"][binding_key]
+        validator = _registry_payload_validator(registry, binding)
+        assert not list(validator.iter_errors(sample)), binding_key
+
+        unknown = copy.deepcopy(sample)
+        unknown["unapproved"] = "blocked"
+        assert list(validator.iter_errors(unknown)), binding_key
+
+        if binding_key == "ExecutionAuthorization.semanticPlanHash":
+            for collection in ("nodes", "barriers"):
+                bootstrap_phase = copy.deepcopy(sample)
+                bootstrap_phase["workPlan"][collection][0]["businessPhase"] = "BOOTSTRAPPING_REPOSITORY"
+                assert list(validator.iter_errors(bootstrap_phase)), f"{binding_key}:{collection}"
+        if binding_key == "ExecutionAuthorization.planRevisionDigest":
+            for collection in ("nodes", "barriers"):
+                bootstrap_phase = copy.deepcopy(sample)
+                bootstrap_phase[collection][0]["businessPhase"] = "BOOTSTRAPPING_REPOSITORY"
+                assert list(validator.iter_errors(bootstrap_phase)), f"{binding_key}:{collection}"
+            for invalid_created_at in ("2026-02-30T00:00:00Z", "2026-01-01T00:00:00"):
+                invalid_date = copy.deepcopy(sample)
+                invalid_date["createdAt"] = invalid_created_at
+                assert list(validator.iter_errors(invalid_date)), invalid_created_at
+
+        payload_schema = _registry_payload_schema(registry, binding)
+        assert set(binding["payloadKeys"]["required"]) == set(payload_schema.get("required", [])), binding_key
+        assert set(binding["payloadKeys"]["optional"]) == (
+            set(payload_schema.get("properties", {})) - set(payload_schema.get("required", []))
+        ), binding_key
+
+        validator_source = binding["validator"]["source"]
+        validator_kind = binding["validator"]["kind"]
+        if validator_kind == "json-schema":
+            assert validator_source == ("authorization-snapshot-registry.v1.json" + binding["payloadSchema"]["$ref"]), (
+                binding_key
+            )
+        else:
+            source_path = validator_source.split("#", maxsplit=1)[0]
+            assert (REPO_ROOT / source_path).exists(), binding_key
+
+    # 资源指纹的内层不是占位 dict；它必须使用 node map 中按 nodeType 选择的真实 validator。
+    resource_payload = samples["ExecutionAuthorization.resourceFingerprint"]
+    policy_map = _load_json(POLICY_PATH)
+    resource_schema = policy_map["nodeTypes"][resource_payload["nodeType"]]["resourceFingerprintSchema"]
+    assert not _validate_fingerprint_schema_with_local_defs(
+        policy_map,
+        resource_schema,
+        resource_payload["fingerprint"],
+    )
+    resource_extra = copy.deepcopy(resource_payload["fingerprint"])
+    resource_extra["unapprovedOverlay"] = "blocked"
+    assert _validate_fingerprint_schema_with_local_defs(policy_map, resource_schema, resource_extra)
+
+    # baseline 的条件字段由同一 registry schema 约束：EXISTS 绑定真实 SHA，待 bootstrap 禁止伪造 SHA/receipt。
+    baseline_key = "IntentAuthorization.baselineDigest"
+    baseline_binding = registry["snapshotBindings"][baseline_key]
+    baseline_validator = _registry_payload_validator(registry, baseline_binding)
+    assert baseline_binding["payloadKeys"] == {
+        "required": ["baseBranch", "bootstrapState"],
+        "optional": ["baseSha", "bootstrapReceiptId"],
+    }
+    valid_baselines = (
+        ("existing-no-receipt", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS"}),
+        (
+            "existing-with-receipt",
+            {
+                "baseBranch": "main",
+                "baseSha": "a" * 40,
+                "bootstrapState": "EXISTS",
+                "bootstrapReceiptId": "receipt-001",
+            },
+        ),
+        ("bootstrap-required", {"baseBranch": "main", "bootstrapState": "BOOTSTRAP_REQUIRED"}),
+    )
+    for name, baseline in valid_baselines:
+        assert not list(baseline_validator.iter_errors(baseline)), name
+
+    invalid_baselines = (
+        ("missing-branch", {"baseSha": "a" * 40, "bootstrapState": "EXISTS"}),
+        ("missing-state", {"baseBranch": "main", "baseSha": "a" * 40}),
+        ("unknown-state", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "UNKNOWN"}),
+        ("unknown-field", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "forged": True}),
+        ("exists-missing-sha", {"baseBranch": "main", "bootstrapState": "EXISTS"}),
+        ("exists-null-sha", {"baseBranch": "main", "baseSha": None, "bootstrapState": "EXISTS"}),
+        ("exists-empty-sha", {"baseBranch": "main", "baseSha": "", "bootstrapState": "EXISTS"}),
+        ("exists-short-sha", {"baseBranch": "main", "baseSha": "a" * 39, "bootstrapState": "EXISTS"}),
+        ("exists-long-sha", {"baseBranch": "main", "baseSha": "a" * 41, "bootstrapState": "EXISTS"}),
+        ("exists-uppercase-sha", {"baseBranch": "main", "baseSha": "A" * 40, "bootstrapState": "EXISTS"}),
+        ("exists-nonhex-sha", {"baseBranch": "main", "baseSha": "g" * 40, "bootstrapState": "EXISTS"}),
+        ("exists-zero-sentinel", {"baseBranch": "main", "baseSha": "0" * 40, "bootstrapState": "EXISTS"}),
+        ("bootstrap-real-sha", {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "BOOTSTRAP_REQUIRED"}),
+        (
+            "bootstrap-zero-sentinel",
+            {"baseBranch": "main", "baseSha": "0" * 40, "bootstrapState": "BOOTSTRAP_REQUIRED"},
+        ),
+        (
+            "bootstrap-receipt",
+            {"baseBranch": "main", "bootstrapState": "BOOTSTRAP_REQUIRED", "bootstrapReceiptId": "receipt-001"},
+        ),
+        (
+            "bootstrap-sha-and-receipt",
+            {
+                "baseBranch": "main",
+                "baseSha": "a" * 40,
+                "bootstrapState": "BOOTSTRAP_REQUIRED",
+                "bootstrapReceiptId": "receipt-001",
+            },
+        ),
+        (
+            "receipt-empty",
+            {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "bootstrapReceiptId": ""},
+        ),
+        (
+            "receipt-nonstring",
+            {"baseBranch": "main", "baseSha": "a" * 40, "bootstrapState": "EXISTS", "bootstrapReceiptId": 1},
+        ),
+    )
+    for name, baseline in invalid_baselines:
+        assert list(baseline_validator.iter_errors(baseline)), name
+
+    for name, baseline in valid_baselines:
+        ref = _snapshot_ref(baseline_key, name)
+        ref["digest"] = _snapshot_payload_digest(
+            baseline_binding["schemaId"], baseline_binding["schemaVersion"], baseline
+        )
+        for field in sorted(baseline):
+            changed = copy.deepcopy(baseline)
+            if field == "baseBranch":
+                changed[field] = "release"
+            elif field == "baseSha":
+                changed[field] = "b" * 40
+            elif field == "bootstrapReceiptId":
+                changed[field] = "receipt-002"
+            else:
+                # 改变 state 时同时切换条件字段，证明每个实际字段都参与 baseline 快照而不伪造中间态。
+                if baseline[field] == "EXISTS":
+                    changed = {"baseBranch": baseline["baseBranch"], "bootstrapState": "BOOTSTRAP_REQUIRED"}
+                else:
+                    changed = {"baseBranch": baseline["baseBranch"], "baseSha": "b" * 40, "bootstrapState": "EXISTS"}
+            assert not list(baseline_validator.iter_errors(changed)), f"{name}:{field}"
+            with pytest.raises(AssertionError, match="重算值不一致"):
+                _assert_snapshot_ref_matches_payload(ref, changed)
+
+    # Master §7.1 是业务阶段真源：去掉三个 pre-plan 状态后必须精确剩余 15 项，并镜像到四个结构化位置。
+    post_bootstrap_phases = _post_bootstrap_business_phases_from_master_spec()
+    assert post_bootstrap_phases == (
+        "PLANNING",
+        "DESIGN_REVIEWING",
+        "PREPARING_WORKSPACE",
+        "IMPLEMENTING",
+        "VERIFYING",
+        "CODE_REVIEWING",
+        "PUBLISHING_PR",
+        "MERGING",
+        "BUILDING_ARTIFACT",
+        "DEPLOYING_STAGING",
+        "ACCEPTING_STAGING",
+        "DEPLOYING_PRODUCTION",
+        "ACCEPTING_PRODUCTION",
+        "ROLLING_BACK",
+        "FINALIZING",
+    )
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    semantic_payload_schema = _registry_payload_schema(
+        registry, registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    )
+    revision_payload_schema = _registry_payload_schema(
+        registry, registry["snapshotBindings"]["ExecutionAuthorization.planRevisionDigest"]
+    )
+    phase_schemas = (
+        run_spec_schema["properties"]["workPlan"]["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        run_spec_schema["properties"]["workPlan"]["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        plan_revision_schema["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        plan_revision_schema["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        semantic_payload_schema["properties"]["workPlan"]["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        semantic_payload_schema["properties"]["workPlan"]["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+        revision_payload_schema["properties"]["nodes"]["items"]["properties"]["businessPhase"],
+        revision_payload_schema["properties"]["barriers"]["items"]["properties"]["businessPhase"],
+    )
+    for phase_schema in phase_schemas:
+        assert phase_schema["type"] == "string"
+        assert tuple(phase_schema["enum"]) == post_bootstrap_phases
+
+
+def test_semantic_plan_snapshot_matches_runtime_projection_and_observes_each_field() -> None:
+    """真实 RunSpec 投影必须完整入 registry，逐字段删改都不能复用旧摘要。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding_key = "ExecutionAuthorization.semanticPlanHash"
+    binding = registry["snapshotBindings"][binding_key]
+    payload_schema = _registry_payload_schema(registry, binding)
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    run_spec = _complete_run_spec_for_semantic_snapshot()
+    _assert_accepted(run_spec_schema, run_spec)
+
+    # 不手抄字段表：直接以运行时 build_semantic_projection 的实际输出作为集合真源。
+    projection = plan_hash.build_semantic_projection(run_spec)
+    assert payload_schema["type"] == "object"
+    assert payload_schema["additionalProperties"] is False
+    assert set(payload_schema["properties"]) == set(projection)
+    assert set(payload_schema["required"]) == set(projection)
+    assert set(binding["payloadKeys"]["required"]) == set(projection)
+    assert binding["payloadKeys"]["optional"] == []
+
+    # 叶子字段复用 RunSpec schema；两个嵌套对象也只能包含运行时投影明确纳入的键。
+    for field, value in projection.items():
+        source_schema = run_spec_schema["properties"][field]
+        registered_schema = payload_schema["properties"][field]
+        if field not in {"repository", "workPlan"}:
+            assert registered_schema == source_schema, field
+            continue
+        assert registered_schema["type"] == "object", field
+        assert registered_schema["additionalProperties"] is False, field
+        assert set(registered_schema["properties"]) == set(value), field
+        assert set(registered_schema["required"]) == set(value), field
+        for nested_field in value:
+            assert registered_schema["properties"][nested_field] == source_schema["properties"][nested_field]
+
+    validator = _registry_payload_validator(registry, binding)
+    assert not list(validator.iter_errors(projection)), "真实 semantic projection 不得被 registry 拒绝"
+    ref = _snapshot_ref(binding_key, "semantic")
+    ref["digest"] = _snapshot_payload_digest(binding["schemaId"], binding["schemaVersion"], projection)
+    _assert_snapshot_ref_matches_payload(ref, projection)
+    baseline_hash = plan_hash.semantic_plan_hash(run_spec)
+
+    for field in sorted(projection):
+        missing = copy.deepcopy(projection)
+        missing.pop(field)
+        assert list(validator.iter_errors(missing)), f"缺失语义字段 {field} 不得通过"
+
+        changed_run_spec = copy.deepcopy(run_spec)
+        if field == "repository":
+            # new 是用户来源，不是无可信提交的中间态；两种来源都必须绑定 full SHA。
+            changed_run_spec[field] = {
+                **changed_run_spec[field],
+                "mode": "new",
+                "baseCommit": "b" * 40,
+            }
+        else:
+            changed_run_spec[field] = _mutate_schema_valid_value(
+                changed_run_spec[field], run_spec_schema["properties"][field]
+            )
+        _assert_accepted(run_spec_schema, changed_run_spec)
+        changed_projection = plan_hash.build_semantic_projection(changed_run_spec)
+        assert not list(validator.iter_errors(changed_projection)), f"变更后的 {field} 仍应是合法 projection"
+        assert plan_hash.semantic_plan_hash(changed_run_spec) != baseline_hash, field
+        with pytest.raises(AssertionError, match="重算值不一致"):
+            _assert_snapshot_ref_matches_payload(ref, changed_projection)
+
+    nested_extra = copy.deepcopy(projection)
+    nested_extra["repository"]["unapproved"] = "blocked"
+    assert list(validator.iter_errors(nested_extra))
+
+
+def test_repository_base_commit_requires_full_sha_for_both_modes_and_registry_is_same_source() -> None:
+    """首个 RunSpec 只能在 bootstrap 后产生，existing/new 都必须携带 full SHA。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    payload_schema = _registry_payload_schema(registry, binding)
+    registry_validator = _registry_payload_validator(registry, binding)
+
+    existing = _complete_run_spec_for_semantic_snapshot()
+    new = _run_spec_for_new_repository_post_bootstrap()
+
+    # mode 是用户来源，两个来源的首个 RunSpec 都已处在 bootstrap 后的可信 SHA 状态。
+    for valid_run_spec in (existing, new):
+        _assert_accepted(run_spec_schema, valid_run_spec)
+        projection = plan_hash.build_semantic_projection(valid_run_spec)
+        assert not list(registry_validator.iter_errors(projection))
+
+    # registry 不能复制一份近似字段表；repository 子合同必须和 RunSpec 精确同源。
+    assert payload_schema["properties"]["repository"] == run_spec_schema["properties"]["repository"]
+
+    missing_base_commit = copy.deepcopy(new)
+    missing_base_commit["repository"].pop("baseCommit")
+    existing_null = copy.deepcopy(existing)
+    existing_null["repository"]["baseCommit"] = None
+    empty_base_commit = copy.deepcopy(new)
+    empty_base_commit["repository"]["baseCommit"] = ""
+    short_base_commit = copy.deepcopy(existing)
+    short_base_commit["repository"]["baseCommit"] = "a" * 39
+    long_base_commit = copy.deepcopy(existing)
+    long_base_commit["repository"]["baseCommit"] = "a" * 41
+    uppercase_base_commit = copy.deepcopy(new)
+    uppercase_base_commit["repository"]["baseCommit"] = "A" * 40
+    wrong_mode = copy.deepcopy(new)
+    wrong_mode["repository"]["mode"] = "bootstrap"
+    repository_extra = copy.deepcopy(new)
+    repository_extra["repository"]["unapproved"] = "blocked"
+
+    for invalid_run_spec in (
+        missing_base_commit,
+        existing_null,
+        empty_base_commit,
+        short_base_commit,
+        long_base_commit,
+        uppercase_base_commit,
+        wrong_mode,
+        repository_extra,
+    ):
+        _assert_rejected(run_spec_schema, invalid_run_spec)
+
+
+def test_created_at_uses_shared_ascii_pattern_and_rfc3339_golden() -> None:
+    """RunSpec/PlanRevision 的日期 wire 先经同一 pattern 收口，再由 format 校验日历语义。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    golden = _load_json(PLAN_HASH_GOLDEN_PATH)["rfc3339DateTime"]
+
+    for schema in (run_spec_schema, plan_revision_schema):
+        created_at = schema["properties"]["createdAt"]
+        assert created_at["type"] == "string"
+        assert created_at["format"] == "date-time"
+        assert created_at["pattern"] == FACTORY_RFC3339_DATE_TIME_PATTERN
+
+    for case in golden["valid"]:
+        run_spec = _complete_run_spec_for_semantic_snapshot()
+        run_spec["createdAt"] = case["value"]
+        revision = _complete_plan_revision_for_snapshot()
+        revision["createdAt"] = case["value"]
+        _assert_accepted(run_spec_schema, run_spec)
+        _assert_accepted(plan_revision_schema, revision)
+
+    for case in golden["invalid"]:
+        run_spec = _complete_run_spec_for_semantic_snapshot()
+        run_spec["createdAt"] = case["value"]
+        revision = _complete_plan_revision_for_snapshot()
+        revision["createdAt"] = case["value"]
+        _assert_rejected(run_spec_schema, run_spec)
+        _assert_rejected(plan_revision_schema, revision)
+
+
+def test_snapshot_refs_recompute_and_detect_real_post_bootstrap_payload_changes() -> None:
+    """两个摘要 ref 都绑定真实 payload；变化后旧 ref 必须失配，不能伪造 bootstrap 转换。"""
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    semantic_binding = registry["snapshotBindings"]["ExecutionAuthorization.semanticPlanHash"]
+    semantic_validator = _registry_payload_validator(registry, semantic_binding)
+    revision_binding = registry["snapshotBindings"]["ExecutionAuthorization.planRevisionDigest"]
+
+    run_spec = _run_spec_for_new_repository_post_bootstrap()
+    _assert_accepted(run_spec_schema, run_spec)
+    projection = plan_hash.build_semantic_projection(run_spec)
+    assert not list(semantic_validator.iter_errors(projection))
+    semantic_ref = _snapshot_ref("ExecutionAuthorization.semanticPlanHash", "planning-001")
+    semantic_ref["digest"] = _snapshot_payload_digest(
+        semantic_binding["schemaId"], semantic_binding["schemaVersion"], projection
+    )
+    _assert_snapshot_ref_matches_payload(semantic_ref, projection)
+
+    changed_run_spec = copy.deepcopy(run_spec)
+    changed_run_spec["repository"]["baseCommit"] = "c" * 40
+    _assert_accepted(run_spec_schema, changed_run_spec)
+    changed_projection = plan_hash.build_semantic_projection(changed_run_spec)
+    assert not list(semantic_validator.iter_errors(changed_projection))
+    assert changed_projection != projection
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(semantic_ref, changed_projection)
+
+    revision = _complete_plan_revision_for_snapshot()
+    revision["semanticPlanHash"] = plan_hash.semantic_plan_hash(run_spec)
+    revision["planRevisionDigest"] = plan_hash.plan_revision_digest(revision)
+    _assert_accepted(plan_revision_schema, revision)
+    material = {key: value for key, value in revision.items() if key not in plan_hash._DIGEST_EXCLUDED_FIELDS}
+    revision_ref = _snapshot_ref("ExecutionAuthorization.planRevisionDigest", "planning-001")
+    revision_ref["digest"] = _snapshot_payload_digest(
+        revision_binding["schemaId"], revision_binding["schemaVersion"], material
+    )
+    _assert_snapshot_ref_matches_payload(revision_ref, material)
+
+    changed_revision = copy.deepcopy(revision)
+    changed_revision["semanticPlanHash"] = plan_hash.semantic_plan_hash(changed_run_spec)
+    changed_revision["planRevisionDigest"] = plan_hash.plan_revision_digest(changed_revision)
+    changed_material = {
+        key: value for key, value in changed_revision.items() if key not in plan_hash._DIGEST_EXCLUDED_FIELDS
+    }
+    assert changed_material != material
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(revision_ref, changed_material)
+
+
+def test_plan_revision_snapshot_is_complete_digest_material_and_observes_each_field() -> None:
+    """PlanRevision 快照只排除自身摘要/签名，其他 schema 字段均必须进入 digest material。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding_key = "ExecutionAuthorization.planRevisionDigest"
+    binding = registry["snapshotBindings"][binding_key]
+    payload_schema = _registry_payload_schema(registry, binding)
+    plan_revision_schema = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    run_spec_schema = _load_json(RUN_SPEC_SCHEMA_PATH)
+    revision = _complete_plan_revision_for_snapshot()
+    _assert_accepted(plan_revision_schema, revision)
+
+    # PlanRevision 不能再维护一份有损 DAG wire：节点与 barrier 必须逐字机械复用 RunSpec，
+    # registry 的 semantic/revision 两份摘要 material 也必须镜像同一结构。
+    run_work_plan = run_spec_schema["properties"]["workPlan"]["properties"]
+    semantic_payload = registry["$defs"]["semanticPlanPayload"]["properties"]["workPlan"]["properties"]
+    revision_payload = registry["$defs"]["planRevisionPayload"]["properties"]
+    for field in ("nodes", "barriers"):
+        expected_fragment = run_work_plan[field]
+        assert plan_revision_schema["properties"][field] == expected_fragment, field
+        assert semantic_payload[field] == expected_fragment, field
+        assert revision_payload[field] == expected_fragment, field
+
+    assert plan_revision_schema["properties"]["signature"] == {"type": "string", "minLength": 1}
+    assert "signature" not in plan_revision_schema["required"]
+    assert "planRevisionDigest" in plan_revision_schema["required"]
+    sha256_digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    assert plan_revision_schema["$defs"]["sha256Digest"] == sha256_digest
+    for digest_field in ("semanticPlanHash", "planRevisionDigest"):
+        digest_property = plan_revision_schema["properties"][digest_field]
+        assert digest_property["type"] == "string"
+        assert digest_property["allOf"] == [{"$ref": "#/$defs/sha256Digest"}]
+
+    # 排除集直接来自运行时摘要实现；PlanRevision schema 是 payload 字段和类型的唯一合同来源。
+    excluded_fields = set(plan_hash._DIGEST_EXCLUDED_FIELDS)
+    assert excluded_fields == {"planRevisionDigest", "signature"}
+    expected_properties = set(plan_revision_schema["properties"]) - excluded_fields
+    expected_required = set(plan_revision_schema["required"]) - excluded_fields
+    expected_optional = expected_properties - expected_required
+    assert payload_schema["type"] == "object"
+    assert payload_schema["additionalProperties"] is False
+    assert set(payload_schema["properties"]) == expected_properties
+    assert set(payload_schema["required"]) == expected_required
+    assert set(binding["payloadKeys"]["required"]) == expected_required
+    assert set(binding["payloadKeys"]["optional"]) == expected_optional
+    for field in expected_properties:
+        assert payload_schema["properties"][field] == plan_revision_schema["properties"][field], field
+
+    # semanticPlanHash 进入 material，planRevisionDigest 仍只在完整 wire 校验阶段出现，二者均复用同一格式定义。
+    assert payload_schema["properties"]["semanticPlanHash"] == plan_revision_schema["properties"]["semanticPlanHash"]
+
+    material = {field: value for field, value in revision.items() if field not in excluded_fields}
+    assert set(material) == expected_properties
+    validator = _registry_payload_validator(registry, binding)
+    assert not list(validator.iter_errors(material)), "完整 PlanRevision digest material 不得被 registry 拒绝"
+    ref = _snapshot_ref(binding_key, "revision")
+    ref["digest"] = _snapshot_payload_digest(binding["schemaId"], binding["schemaVersion"], material)
+    _assert_snapshot_ref_matches_payload(ref, material)
+    baseline_digest = plan_hash.plan_revision_digest(revision)
+
+    for field in sorted(material):
+        missing = copy.deepcopy(material)
+        missing.pop(field)
+        if field in expected_required:
+            assert list(validator.iter_errors(missing)), f"缺失 PlanRevision 必填字段 {field} 不得通过"
+        else:
+            # parentRevisionId 在权威 PlanRevision schema 中仍是可选字段，registry 不得擅自收紧。
+            assert not list(validator.iter_errors(missing)), f"可选 PlanRevision 字段 {field} 不得被擅自要求"
+
+        changed_revision = copy.deepcopy(revision)
+        changed_revision[field] = _mutate_schema_valid_value(
+            changed_revision[field], plan_revision_schema["properties"][field]
+        )
+        _assert_accepted(plan_revision_schema, changed_revision)
+        changed_material = {
+            name: value for name, value in changed_revision.items() if name not in excluded_fields
+        }
+        assert not list(validator.iter_errors(changed_material)), f"变更后的 {field} 仍应是合法 digest material"
+        assert plan_hash.plan_revision_digest(changed_revision) != baseline_digest, field
+        with pytest.raises(AssertionError, match="重算值不一致"):
+            _assert_snapshot_ref_matches_payload(ref, changed_material)
+
+    for excluded_field in sorted(excluded_fields):
+        extra = copy.deepcopy(material)
+        extra[excluded_field] = revision.get(excluded_field, "signature-001")
+        assert list(validator.iter_errors(extra)), f"registry 不得把 {excluded_field} 重新纳入 material"
+
+    signed_revision = {**revision, "signature": "signature-001"}
+    rewritten_digest = {**revision, "planRevisionDigest": "sha256:" + "0" * 64}
+    zero_digest_wire = {
+        **revision,
+        "semanticPlanHash": "sha256:" + "0" * 64,
+        "planRevisionDigest": "sha256:" + "0" * 64,
+    }
+    _assert_accepted(plan_revision_schema, zero_digest_wire)
+    assert plan_hash.plan_revision_digest(signed_revision) == baseline_digest
+    assert plan_hash.plan_revision_digest(rewritten_digest) == baseline_digest
+
+
+def test_authorization_schemas_use_fixed_closed_snapshot_refs() -> None:
+    """两份授权 schema 的 digest-backed 字段必须改为固定 schemaId/version 的闭合引用。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    intent_schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["IntentAuthorization"])
+    execution_schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"])
+
+    fields_by_schema = {
+        "IntentAuthorization": (intent_schema, INTENT_SNAPSHOT_FIELDS),
+        "ExecutionAuthorization": (execution_schema, EXECUTION_SNAPSHOT_FIELDS),
+    }
+    for authorization_name, (schema, fields) in fields_by_schema.items():
+        for field in fields:
+            binding_key = f"{authorization_name}.{field}"
+            prop = schema["properties"][field]
+            assert prop["type"] == "object", binding_key
+            assert prop["xSnapshotRegistryEntry"] == binding_key
+            assert registry["snapshotBindings"][binding_key]["schemaId"] == SNAPSHOT_SCHEMA_IDS[binding_key]
+
+    content_binding_key = "ExecutionAuthorization.inputBindings.contentDigest"
+    content_prop = execution_schema["properties"]["inputBindings"]["properties"]["contentDigest"]
+    assert content_prop["type"] == "object"
+    assert content_prop["xSnapshotRegistryEntry"] == content_binding_key
+
+    valid_intent = _valid_intent_authorization()
+    _assert_accepted(intent_schema, valid_intent)
+    # artifactId 是地址，不参与 JCS/NFC payload 摘要；切换地址但保留 digest 在 wire schema 中合法。
+    alternate_artifact = copy.deepcopy(valid_intent)
+    alternate_artifact["requirementDigest"]["artifactId"] = "artifact-replicated-requirement"
+    _assert_accepted(intent_schema, alternate_artifact)
+
+    for binding_key in SNAPSHOT_SCHEMA_IDS:
+        if binding_key.startswith("IntentAuthorization."):
+            schema = intent_schema
+            instance = copy.deepcopy(valid_intent)
+            field_path = binding_key.split(".", maxsplit=1)[1]
+        elif binding_key == content_binding_key:
+            schema = execution_schema
+            instance = _valid_execution_authorization(
+                node_type="DEPLOY_STAGING",
+                action_capability="ssh.exec.scoped",
+            )
+        else:
+            schema = execution_schema
+            instance = _valid_execution_authorization()
+            field_path = binding_key.split(".", maxsplit=1)[1]
+
+        wrong_schema = copy.deepcopy(instance)
+        if binding_key == content_binding_key:
+            wrong_ref = wrong_schema["inputBindings"]["contentDigest"]
+        else:
+            wrong_ref = wrong_schema[field_path]
+        wrong_ref["schemaId"] = "factory.authorization.unapproved.v1"
+        _assert_rejected(schema, wrong_schema)
+
+        wrong_version = copy.deepcopy(instance)
+        if binding_key == content_binding_key:
+            wrong_ref = wrong_version["inputBindings"]["contentDigest"]
+        else:
+            wrong_ref = wrong_version[field_path]
+        wrong_ref["schemaVersion"] = "2"
+        _assert_rejected(schema, wrong_version)
+
+        extra_ref = copy.deepcopy(instance)
+        if binding_key == content_binding_key:
+            wrong_ref = extra_ref["inputBindings"]["contentDigest"]
+        else:
+            wrong_ref = extra_ref[field_path]
+        wrong_ref["unapproved"] = "blocked"
+        _assert_rejected(schema, extra_ref)
+
+
+def test_snapshot_digest_domain_separation_detects_content_and_schema_drift() -> None:
+    """artifactId 不改变 payload digest；内容或 schemaId/version 改变后复算值必须不同。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding_key = "IntentAuthorization.requirementDigest"
+    binding = registry["snapshotBindings"][binding_key]
+    payload = _snapshot_payload_samples(_load_json(POLICY_PATH))[binding_key]
+    ref = _snapshot_ref(binding_key, "0")
+    ref["digest"] = _snapshot_payload_digest(binding["schemaId"], binding["schemaVersion"], payload)
+    _assert_snapshot_ref_matches_payload(ref, payload)
+
+    alternate_artifact = copy.deepcopy(ref)
+    alternate_artifact["artifactId"] = "artifact-replicated-requirement"
+    assert alternate_artifact["digest"] == ref["digest"]
+
+    changed_payload = copy.deepcopy(payload)
+    changed_payload["requirementText"] = "同一需求但内容已经漂移"
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(ref, changed_payload)
+
+    changed_schema_id = "factory.authorization.intent.requirement.v2"
+    wrong_schema_ref = copy.deepcopy(ref)
+    wrong_schema_ref["schemaId"] = changed_schema_id
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(wrong_schema_ref, payload)
+
+    wrong_version_ref = copy.deepcopy(ref)
+    wrong_version_ref["schemaVersion"] = "2"
+    with pytest.raises(AssertionError, match="重算值不一致"):
+        _assert_snapshot_ref_matches_payload(wrong_version_ref, payload)
+
+
+def test_action_snapshot_binds_raw_node_map_digest_node_and_selected_action() -> None:
+    """action snapshot 必须是单个 selected action 的投影，不能脱离 node map/node/action 复用。"""
+    registry = _load_json(SNAPSHOT_REGISTRY_PATH)
+    binding = registry["snapshotBindings"]["ExecutionAuthorization.actionPolicySnapshotDigest"]
+    assert binding["validator"] == {
+        "kind": "deterministic-action-projection",
+        "source": "contracts/policies/node-capability-map.v1.json",
+        "nodeTypeFrom": "ExecutionAuthorization.nodeType",
+        "actionCapabilityFrom": "ExecutionAuthorization.actionCapability",
+        "projectionFields": [
+            "idempotencyKeyTemplate.actions.byCapability[{actionCapability}]",
+            "completionFact.actions.byCapability[{actionCapability}]",
+            "authorizationConsumptionPoint",
+            "retryClass",
+        ],
+    }
+    policy_map = _load_json(POLICY_PATH)
+    payload = _selected_action_policy_snapshot(
+        policy_map,
+        node_type="PUBLISH_PR",
+        action_capability="pr.create",
+    )
+    _assert_action_snapshot_matches_node_map(payload, policy_map)
+
+    wrong_map_digest = copy.deepcopy(payload)
+    wrong_map_digest["nodeCapabilityMapDigest"] = "sha256:" + "0" * 64
+    with pytest.raises(AssertionError):
+        _assert_action_snapshot_matches_node_map(wrong_map_digest, policy_map)
+
+    wrong_node = copy.deepcopy(payload)
+    wrong_node["nodeType"] = "CODE_REVIEW"
+    with pytest.raises(AssertionError):
+        _assert_action_snapshot_matches_node_map(wrong_node, policy_map)
+
+    wrong_action = copy.deepcopy(payload)
+    wrong_action["actionCapability"] = "git.push"
+    with pytest.raises(AssertionError):
+        _assert_action_snapshot_matches_node_map(wrong_action, policy_map)
+
+    drifted_map = copy.deepcopy(policy_map)
+    drifted_map["nodeTypes"]["PUBLISH_PR"]["completionFact"]["actions"]["byCapability"]["pr.create"]["predicateId"] = (
+        "drifted-pr-create-fact-v1"
+    )
+    with pytest.raises(AssertionError):
+        _assert_action_snapshot_matches_node_map(payload, drifted_map)
+
+
+def test_compatibility_manifest_v1_uses_emitters_raw_file_node_map_digest() -> None:
+    """CompatibilityManifest v1 的 node map 摘要唯一真源是 emitter 的 raw-file SHA-256。"""
+    manifest_schema = _load_json(MANIFEST_SCHEMA_PATH)
+    assert "nodeCapabilityMapDigest" in manifest_schema["required"]
+    emitter = _load_emit_manifest_module()
+    expected = _raw_file_sha256(POLICY_PATH)
+    assert expected == EXPECTED_NODE_POLICY_RAW_FILE_SHA256
+    assert emitter._sha256_file(POLICY_PATH) == expected
+    _assert_raw_file_digest_matches(expected, POLICY_PATH)
+
+    raw = POLICY_PATH.read_bytes()
+    format_only = b"\n" + raw
+    assert json.loads(format_only.decode("utf-8")) == _load_json(POLICY_PATH)
+    assert "sha256:" + hashlib.sha256(format_only).hexdigest() != expected
+
+    semantic_drift = copy.deepcopy(_load_json(POLICY_PATH))
+    semantic_drift["nodeTypes"]["PLAN"]["retryClass"] = "local-fact-before-retry"
+    semantic_bytes = json.dumps(semantic_drift, ensure_ascii=False, indent=2).encode("utf-8")
+    assert "sha256:" + hashlib.sha256(semantic_bytes).hexdigest() != expected
+
+    wrong_digest = "sha256:" + "f" * 64
+    with pytest.raises(AssertionError, match="冻结文件不一致"):
+        _assert_raw_file_digest_matches(wrong_digest, POLICY_PATH)
+
+
+def test_authorization_schema_files_are_registered_for_codegen() -> None:
+    """两份授权 schema 必须存在且只由 catalog 驱动三语言生成。"""
+    catalog = _load_json(CATALOG_PATH)
+    entries = {entry["name"]: entry for entry in catalog["schemas"]}
+
+    for name, filename in AUTHORIZATION_SCHEMA_FILES.items():
+        schema_path = SCHEMAS_DIR / filename
+        assert schema_path.exists(), f"{name} schema 缺失: {schema_path}"
+        entry = entries.get(name)
+        assert entry is not None, f"catalog 未注册 {name}"
+        assert entry["schemaPath"] == f"contracts/schemas/{filename}"
+        assert entry["codegen"] is True
+        assert entry["category"] == "generated"
+
+
+def test_generated_python_typed_dict_keys_exactly_match_schema_required_fields() -> None:
+    """所有 codegen schema 的 Python TypedDict 都只把 schema required 字段标为 Required。"""
+    catalog = _load_json(CATALOG_PATH)
+    models = _load_generated_python_models()
+
+    for entry in catalog["schemas"]:
+        if entry.get("codegen") is not True:
+            continue
+        schema = _load_json(REPO_ROOT / entry["schemaPath"])
+        definition_key = entry.get("definitionKey")
+        if definition_key:
+            definitions = schema.get("definitions", schema.get("$defs", {}))
+            target = definitions[definition_key]
+        else:
+            target = schema
+        expected_required = frozenset(target.get("required", []))
+        expected_optional = frozenset(target.get("properties", {})) - expected_required
+        typed_dict = getattr(models, entry["name"])
+        assert typed_dict.__required_keys__ == expected_required, entry["name"]
+        assert typed_dict.__optional_keys__ == expected_optional, entry["name"]
+
+
+def test_authorization_schemas_freeze_complete_required_fields_and_fail_closed() -> None:
+    """授权合同必须覆盖 §6.2/§11 字段并禁止额外输入。"""
+    intent_schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["IntentAuthorization"])
+    execution_schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"])
+
+    assert intent_schema["type"] == "object"
+    assert intent_schema["additionalProperties"] is False
+    assert REQUIRED_INTENT_FIELDS <= set(intent_schema["required"])
+    _assert_all_object_schemas_fail_closed(intent_schema)
+    assert execution_schema["type"] == "object"
+    assert execution_schema["additionalProperties"] is False
+    assert REQUIRED_EXECUTION_FIELDS <= set(execution_schema["required"])
+    _assert_all_object_schemas_fail_closed(execution_schema)
+
+
+def test_intent_authorization_schema_rejects_missing_unknown_and_i_json_overflow() -> None:
+    """IntentAuthorization 缺字段、未知 stage、额外字段和不安全整数必须被拒绝。"""
+    schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["IntentAuthorization"])
+    valid = _valid_intent_authorization()
+    assert not list(
+        jsonschema.Draft7Validator(
+            schema,
+            format_checker=_authorization_format_checker(),
+        ).iter_errors(valid)
+    )
+
+    # 每一个 required 字段缺失都必须 fail-closed，不能只覆盖一个示例字段。
+    for field in sorted(REQUIRED_INTENT_FIELDS):
+        missing_field = copy.deepcopy(valid)
+        missing_field.pop(field)
+        _assert_rejected(schema, missing_field)
+
+    # 每个快照引用都拒绝大写十六进制和不完整长度，确保内容寻址不会静默归一化。
+    for field in INTENT_SNAPSHOT_FIELDS:
+        uppercase_digest = copy.deepcopy(valid)
+        uppercase_digest[field]["digest"] = "sha256:" + "A" * 64
+        _assert_rejected(schema, uppercase_digest)
+
+        short_digest = copy.deepcopy(valid)
+        short_digest[field]["digest"] = "sha256:" + "a" * 63
+        _assert_rejected(schema, short_digest)
+
+    unknown_stage = copy.deepcopy(valid)
+    unknown_stage["targetStage"] = "SUPERUSER_APPROVED"
+    _assert_rejected(schema, unknown_stage)
+
+    unknown_risk = copy.deepcopy(valid)
+    unknown_risk["riskCeiling"] = "unbounded"
+    _assert_rejected(schema, unknown_risk)
+
+    plan_revision_leak = copy.deepcopy(valid)
+    plan_revision_leak["planRevisionId"] = "plan-001"
+    _assert_rejected(schema, plan_revision_leak)
+
+    double_hash_leak = copy.deepcopy(valid)
+    double_hash_leak["semanticPlanHash"] = "sha256:" + "f" * 64
+    _assert_rejected(schema, double_hash_leak)
+
+    i_json_overflow = copy.deepcopy(valid)
+    i_json_overflow["autonomousExecutionBudgetMs"] = 9_007_199_254_740_992
+    _assert_rejected(schema, i_json_overflow)
+
+
+def test_authorization_schemas_freeze_revocation_pair_and_timestamp_format() -> None:
+    """撤销时间/原因只能成对出现，并拒绝不符合 RFC3339 的授权时间。"""
+    cases = (
+        (
+            _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["IntentAuthorization"]),
+            _valid_intent_authorization,
+        ),
+        (
+            _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"]),
+            _valid_execution_authorization,
+        ),
+    )
+    for schema, factory in cases:
+        unrevoked = factory()
+        _assert_accepted(schema, unrevoked)
+
+        revoked = copy.deepcopy(unrevoked)
+        revoked["revokedAt"] = "2026-08-10T00:30:00Z"
+        revoked["revokeReason"] = "用户取消"
+        _assert_accepted(schema, revoked)
+
+        reason_without_time = copy.deepcopy(unrevoked)
+        reason_without_time["revokeReason"] = "无撤销时间"
+        _assert_rejected(schema, reason_without_time)
+
+        time_without_reason = copy.deepcopy(unrevoked)
+        time_without_reason["revokedAt"] = "2026-08-10T00:30:00Z"
+        _assert_rejected(schema, time_without_reason)
+
+        illegal_issued_at = copy.deepcopy(unrevoked)
+        illegal_issued_at["issuedAt"] = "2026-02-30T25:61:00Z"
+        _assert_rejected(schema, illegal_issued_at)
+
+        illegal_expires_at = copy.deepcopy(unrevoked)
+        illegal_expires_at["expiresAt"] = "not-a-rfc3339-time"
+        _assert_rejected(schema, illegal_expires_at)
+
+
+def test_execution_authorization_schema_rejects_wrong_binding_unknown_enum_and_extra_field() -> None:
+    """副作用授权必须绑定 candidate，且未知状态、额外键和缺 fencing 均 fail-closed。"""
+    schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"])
+    valid = _valid_execution_authorization()
+    assert not list(
+        jsonschema.Draft7Validator(
+            schema,
+            format_checker=_authorization_format_checker(),
+        ).iter_errors(valid)
+    )
+
+    # 派生授权的全部 required 字段缺失均应被拒绝，包含 lease、消费与撤销投影。
+    for field in sorted(REQUIRED_EXECUTION_FIELDS):
+        missing_field = copy.deepcopy(valid)
+        missing_field.pop(field)
+        _assert_rejected(schema, missing_field)
+
+    for field in EXECUTION_SNAPSHOT_FIELDS:
+        uppercase_digest = copy.deepcopy(valid)
+        uppercase_digest[field]["digest"] = "sha256:" + "B" * 64
+        _assert_rejected(schema, uppercase_digest)
+
+        short_digest = copy.deepcopy(valid)
+        short_digest[field]["digest"] = "sha256:" + "b" * 63
+        _assert_rejected(schema, short_digest)
+
+    wrong_side_effect_binding = copy.deepcopy(valid)
+    wrong_side_effect_binding["inputBindings"]["candidateSha"] = "not-a-commit-sha"
+    _assert_rejected(schema, wrong_side_effect_binding)
+
+    # contentDigest 仅对部署/验收等 content-bound 节点存在；使用该合法最小对象检查其 ref 格式。
+    content_bound = _valid_execution_authorization(
+        node_type="DEPLOY_STAGING",
+        action_capability="ssh.exec.scoped",
+    )
+    uppercase_content_digest = copy.deepcopy(content_bound)
+    uppercase_content_digest["inputBindings"]["contentDigest"]["digest"] = "sha256:" + "C" * 64
+    _assert_rejected(schema, uppercase_content_digest)
+
+    short_content_digest = copy.deepcopy(content_bound)
+    short_content_digest["inputBindings"]["contentDigest"]["digest"] = "sha256:" + "c" * 63
+    _assert_rejected(schema, short_content_digest)
+
+    unknown_consumption_state = copy.deepcopy(valid)
+    unknown_consumption_state["consumptionState"] = "SUCCEEDED_WITH_UNKNOWN_STATE"
+    _assert_rejected(schema, unknown_consumption_state)
+
+    for obsolete_state in ("REVOKED", "EXPIRED"):
+        obsolete_consumption_state = copy.deepcopy(valid)
+        obsolete_consumption_state["consumptionState"] = obsolete_state
+        _assert_rejected(schema, obsolete_consumption_state)
+
+    available_without_uses = copy.deepcopy(valid)
+    available_without_uses["maxUses"] = 0
+    _assert_rejected(schema, available_without_uses)
+
+    consumed_with_remaining_uses = copy.deepcopy(valid)
+    consumed_with_remaining_uses["consumptionState"] = "CONSUMED"
+    consumed_with_remaining_uses["maxUses"] = 1
+    _assert_rejected(schema, consumed_with_remaining_uses)
+
+    old_stage_digest_spelling = copy.deepcopy(valid)
+    old_stage_digest_spelling["stageCapeabilityMapDigest"] = "sha256:" + "e" * 64
+    _assert_rejected(schema, old_stage_digest_spelling)
+
+    unknown_node_type = copy.deepcopy(valid)
+    unknown_node_type["nodeType"] = "UNFROZEN_NODE"
+    _assert_rejected(schema, unknown_node_type)
+
+    unknown_action = copy.deepcopy(valid)
+    unknown_action["actionCapability"] = "repo.destroy"
+    _assert_rejected(schema, unknown_action)
+
+    invalid_resource_fingerprint_digest = copy.deepcopy(valid)
+    invalid_resource_fingerprint_digest["resourceFingerprint"]["digest"] = "sha256:" + "D" * 64
+    _assert_rejected(schema, invalid_resource_fingerprint_digest)
+
+    resource_fingerprint_extra = copy.deepcopy(valid)
+    resource_fingerprint_extra["resourceFingerprint"]["unapprovedOverlay"] = "blocked"
+    _assert_rejected(schema, resource_fingerprint_extra)
+
+    input_binding_extra = copy.deepcopy(valid)
+    input_binding_extra["inputBindings"]["unapprovedOverlay"] = "blocked"
+    _assert_rejected(schema, input_binding_extra)
+
+    missing_fencing = copy.deepcopy(valid)
+    missing_fencing.pop("fencingToken")
+    _assert_rejected(schema, missing_fencing)
+
+
+def test_execution_authorization_node_actions_and_minimum_input_bindings_are_exact() -> None:
+    """nodeType/action 与最低 SHA/digest 输入必须和冻结策略逐项一致，不能用全局 action 误放行。"""
+    schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"])
+    policy_node_types = _load_json(POLICY_PATH)["nodeTypes"]
+    expected_actions = set().union(*EXPECTED_ACTIONS_BY_NODE.values())
+
+    assert set(schema["properties"]["nodeType"]["enum"]) == set(EXPECTED_ACTIONS_BY_NODE)
+    assert set(schema["properties"]["actionCapability"]["enum"]) == expected_actions
+    assert set(policy_node_types) == set(EXPECTED_ACTIONS_BY_NODE)
+
+    for node_type, expected_for_node in EXPECTED_ACTIONS_BY_NODE.items():
+        policy_actions = set(policy_node_types[node_type]["requiredCapabilities"]) | set(
+            policy_node_types[node_type]["optionalCapabilities"]
+        )
+        assert policy_actions == expected_for_node, node_type
+        for action_capability in sorted(expected_for_node):
+            _assert_accepted(
+                schema,
+                _valid_execution_authorization(
+                    node_type=node_type,
+                    action_capability=action_capability,
+                ),
+            )
+
+        unapproved_action = next(iter(sorted(expected_actions - expected_for_node)))
+        _assert_rejected(
+            schema,
+            _valid_execution_authorization(
+                node_type=node_type,
+                action_capability=unapproved_action,
+            ),
+        )
+
+
+def test_publish_pr_completion_facts_remain_action_local() -> None:
+    """PUBLISH_PR 的 push/create/update/observe 不能共用泛化完成事实，避免错误 receipt 互相满足。"""
+    actions = _load_json(POLICY_PATH)["nodeTypes"]["PUBLISH_PR"]["completionFact"]["actions"]["byCapability"]
+    expected_predicates = {
+        "git.push": "pushed-ref-matches-candidate-v1",
+        "pr.create": "created-pr-matches-candidate-v1",
+        "pr.update": "updated-pr-state-matches-v1",
+        "forge.observe.scoped": "published-pr-observation-matches-v1",
+    }
+    assert set(actions) == set(expected_predicates)
+    assert {action["predicateId"] for action in actions.values()} == set(expected_predicates.values())
+    assert "remote-ref-equals-candidate" in actions["git.push"]["requiredEvidence"]
+    assert "head-base-pr-identity" in actions["pr.create"]["requiredEvidence"]
+    assert "ready-state-no-drift" in actions["pr.update"]["requiredEvidence"]
+    assert "required-actions-checks-attestation-pass" in actions["forge.observe.scoped"]["requiredEvidence"]
+
+
+def test_execution_authorization_rejects_ambiguous_or_underbound_inputs() -> None:
+    """输入绑定改为闭合对象；副作用节点不得用错误 SHA、仅内容摘要或重复数组绕过。"""
+    schema = _load_json(SCHEMAS_DIR / AUTHORIZATION_SCHEMA_FILES["ExecutionAuthorization"])
+
+    implementation_without_base = _valid_execution_authorization(
+        node_type="IMPLEMENT",
+        action_capability="worktree.write",
+        input_bindings={"contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c")},
+    )
+    _assert_rejected(schema, implementation_without_base)
+
+    for node_type in EXPECTED_CANDIDATE_SHA_NODES:
+        only_base = _valid_execution_authorization(
+            node_type=node_type,
+            action_capability=sorted(EXPECTED_ACTIONS_BY_NODE[node_type])[0],
+            input_bindings={"baseSha": "a" * 40},
+        )
+        _assert_rejected(schema, only_base)
+
+    publish_only_content = _valid_execution_authorization(
+        node_type="PUBLISH_PR",
+        action_capability="pr.create",
+        input_bindings={"contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c")},
+    )
+    _assert_rejected(schema, publish_only_content)
+
+    code_review_only_base = _valid_execution_authorization(
+        node_type="CODE_REVIEW",
+        action_capability="repo.read",
+        input_bindings={"baseSha": "a" * 40},
+    )
+    _assert_rejected(schema, code_review_only_base)
+
+    for node_type in EXPECTED_CANDIDATE_AND_CONTENT_NODES:
+        action_capability = sorted(EXPECTED_ACTIONS_BY_NODE[node_type])[0]
+        candidate_only = _valid_execution_authorization(
+            node_type=node_type,
+            action_capability=action_capability,
+            input_bindings={"candidateSha": "b" * 40},
+        )
+        _assert_rejected(schema, candidate_only)
+        content_only = _valid_execution_authorization(
+            node_type=node_type,
+            action_capability=action_capability,
+            input_bindings={"contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c")},
+        )
+        _assert_rejected(schema, content_only)
+
+    duplicate_candidate_bindings = _valid_execution_authorization(
+        input_bindings=[
+            {"kind": "CANDIDATE_SHA", "value": "b" * 40},
+            {"kind": "CANDIDATE_SHA", "value": "c" * 40},
+        ],
+    )
+    _assert_rejected(schema, duplicate_candidate_bindings)
+
+    plan_with_merge = _valid_execution_authorization(
+        node_type="PLAN",
+        action_capability="repo.merge",
+        input_bindings={"contentDigest": _snapshot_ref("ExecutionAuthorization.inputBindings.contentDigest", "c")},
+    )
+    _assert_rejected(schema, plan_with_merge)
+
+
+def _assert_action_policy_exact(node_types: dict[str, Any], node_type: str, capability: str) -> None:
+    """逐字段核对单个 action，失败信息必须直接指出 node/action/field。"""
+    expected_fields, expected_predicate, expected_evidence = EXPECTED_ACTION_POLICY[node_type][capability]
+    node_policy = node_types[node_type]
+    actual_key = node_policy["idempotencyKeyTemplate"]["actions"]["byCapability"][capability]
+    actual_fact = node_policy["completionFact"]["actions"]["byCapability"][capability]
+    assert tuple(actual_key["jcsInputFields"]) == expected_fields, f"{node_type}/{capability}/jcsInputFields"
+    assert actual_fact["predicateId"] == expected_predicate, f"{node_type}/{capability}/predicateId"
+    assert tuple(actual_fact["requiredEvidence"]) == expected_evidence, f"{node_type}/{capability}/requiredEvidence"
+
+
+def _assert_node_policy_exact(node_types: dict[str, Any]) -> None:
+    """冻结 17 个 node 与全部 action 的精确策略，而非仅检查字段存在或值合法。"""
+    assert set(node_types) == set(EXPECTED_NODE_POLICY), "nodeTypes/exact-set"
+    assert set(EXPECTED_ACTION_POLICY) == set(EXPECTED_NODE_POLICY), "expected-action-policy/exact-node-set"
+    for node_type, expected in EXPECTED_NODE_POLICY.items():
+        node_policy = node_types[node_type]
+        for field, expected_value in expected.items():
+            actual_value = node_policy[field]
+            if field in {"requiredCapabilities", "optionalCapabilities"}:
+                actual_value = tuple(actual_value)
+            assert actual_value == expected_value, f"{node_type}/{field}"
+
+        expected_actions = EXPECTED_ACTIONS_BY_NODE[node_type]
+        action_keys = node_policy["idempotencyKeyTemplate"]["actions"]["byCapability"]
+        action_facts = node_policy["completionFact"]["actions"]["byCapability"]
+        assert set(action_keys) == expected_actions, f"{node_type}/idempotency-actions"
+        assert set(action_facts) == expected_actions, f"{node_type}/completion-actions"
+        assert set(EXPECTED_ACTION_POLICY[node_type]) == expected_actions, f"{node_type}/expected-action-set"
+        for capability in sorted(expected_actions):
+            _assert_action_policy_exact(node_types, node_type, capability)
+
+
+def test_node_capability_map_matches_exact_node_and_action_policy_tables() -> None:
+    """精确表同时冻结 capability、side effect、消费点、retry 与 action 事实。"""
+    node_types = _load_json(POLICY_PATH)["nodeTypes"]
+    _assert_node_policy_exact(node_types)
+
+    guard_locations = [
+        (node_type, field)
+        for node_type, node_policy in node_types.items()
+        for field in ("requiredCapabilities", "optionalCapabilities")
+        if "target.guard.clear" in node_policy[field]
+    ]
+    assert guard_locations == [("RECONCILE_TARGET", "optionalCapabilities")]
+
+
+def test_exact_policy_tables_reject_review_merge_and_publish_mutations() -> None:
+    """复现审查 mutation，证明同步改 key/fact 或换合法枚举值也会被精确表拒绝。"""
+    original = _load_json(POLICY_PATH)["nodeTypes"]
+
+    code_review = copy.deepcopy(original)
+    review_node = code_review["CODE_REVIEW"]
+    review_node["requiredCapabilities"] = ["repo.merge"]
+    for container_path in (
+        ("idempotencyKeyTemplate", "actions", "byCapability"),
+        ("completionFact", "actions", "byCapability"),
+    ):
+        container = review_node
+        for part in container_path:
+            container = container[part]
+        container["repo.merge"] = container.pop("repo.read")
+    with pytest.raises(AssertionError, match="CODE_REVIEW/requiredCapabilities"):
+        _assert_node_policy_exact(code_review)
+
+    merge_retry = copy.deepcopy(original)
+    merge_retry["MERGE"]["retryClass"] = "bounded-no-external-side-effect"
+    with pytest.raises(AssertionError, match="MERGE/retryClass"):
+        _assert_node_policy_exact(merge_retry)
+
+    for field in ("jcsInputFields", "predicateId", "requiredEvidence"):
+        publish = copy.deepcopy(original)
+        if field == "jcsInputFields":
+            publish["PUBLISH_PR"]["idempotencyKeyTemplate"]["actions"]["byCapability"]["pr.create"][field] = [
+                "repositoryId",
+                "targetBranch",
+            ]
+        else:
+            publish["PUBLISH_PR"]["completionFact"]["actions"]["byCapability"]["pr.create"][field] = (
+                "mutated-v1" if field == "predicateId" else ["created-pr-id"]
+            )
+        with pytest.raises(AssertionError, match=f"PUBLISH_PR/pr.create/{field}"):
+            _assert_action_policy_exact(publish, "PUBLISH_PR", "pr.create")
+
+
+def test_node_capability_map_freezes_all_runtime_policy_fields() -> None:
+    """17 种 nodeType 均必须给出可机械执行、闭集且可识别的运行时策略字段。"""
+    node_types = _load_json(POLICY_PATH)["nodeTypes"]
+    assert len(node_types) == 17
+
+    for node_type, node_policy in node_types.items():
+        missing = FROZEN_POLICY_FIELDS - set(node_policy)
+        assert not missing, f"{node_type}: 缺少冻结运行时字段 {sorted(missing)}"
+        for field in FROZEN_POLICY_FIELDS:
+            assert node_policy[field], f"{node_type}: {field} 不得为空"
+        assert _is_known_retry_class(node_policy["retryClass"]), (
+            f"{node_type}: 未知 retryClass {node_policy['retryClass']}"
+        )
+        assert node_policy["authorizationConsumptionPoint"] in AUTHORIZATION_CONSUMPTION_POINTS, (
+            f"{node_type}: 未知 authorizationConsumptionPoint {node_policy['authorizationConsumptionPoint']}"
+        )
+        fingerprint_schema = node_policy["resourceFingerprintSchema"]
+        assert isinstance(fingerprint_schema, dict)
+        jsonschema.Draft7Validator.check_schema(fingerprint_schema)
+        assert fingerprint_schema.get("type") == "object"
+        assert fingerprint_schema.get("additionalProperties") is False
+        assert fingerprint_schema.get("required"), f"{node_type}: 指纹 schema 必须声明 required"
+        assert fingerprint_schema.get("properties"), f"{node_type}: 指纹 schema 必须声明 properties"
+        assert fingerprint_schema.get("allOf"), f"{node_type}: 指纹 schema 必须内嵌条件"
+
+        key_template = node_policy["idempotencyKeyTemplate"]
+        assert isinstance(key_template, dict)
+        assert set(key_template) == {"version", "hashAlgorithm", "actions"}
+        assert key_template["version"] == "factory-action-v1"
+        assert key_template["hashAlgorithm"] == "sha256-jcs-nfc"
+        assert set(key_template["actions"]) == {"byCapability"}
+        action_keys = key_template["actions"]["byCapability"]
+        assert isinstance(action_keys, dict) and action_keys
+
+        completion_fact = node_policy["completionFact"]
+        assert isinstance(completion_fact, dict)
+        assert set(completion_fact) == {"version", "actions"}
+        assert completion_fact["version"] == "v1"
+        assert set(completion_fact["actions"]) == {"byCapability"}
+        action_facts = completion_fact["actions"]["byCapability"]
+        assert set(action_keys) == set(action_facts), f"{node_type}: 每个可派发 action 必须恰有一个幂等键定义和完成事实"
+
+        # required/optional capability 都可能构成实际 action；可选项一旦进入 scope 同样不能
+        # 使用通用字符串放行，因此都需要各自的 key/fact 模板。
+        expected_actions = set(node_policy["requiredCapabilities"]) | set(node_policy["optionalCapabilities"])
+        assert expected_actions == set(action_keys), f"{node_type}: actions/byCapability 未覆盖完整 capability 集"
+        for capability, action_key in action_keys.items():
+            assert isinstance(capability, str) and capability
+            assert set(action_key) == {"jcsInputFields"}
+            input_fields = action_key["jcsInputFields"]
+            assert isinstance(input_fields, list) and input_fields
+            assert len(input_fields) == len(set(input_fields))
+            assert not (set(input_fields) & FORBIDDEN_IDEMPOTENCY_INPUT_FIELDS), (
+                f"{node_type}/{capability}: 幂等键不得包含 Attempt、token、epoch、TTL 或时间"
+            )
+
+            action_fact = action_facts[capability]
+            assert set(action_fact) == {"predicateId", "requiredEvidence"}
+            assert isinstance(action_fact["predicateId"], str) and action_fact["predicateId"]
+            evidence = action_fact["requiredEvidence"]
+            assert isinstance(evidence, list) and evidence
+            assert len(evidence) == len(set(evidence))
+
+    transient_retry = copy.deepcopy(node_types["PLAN"])
+    transient_retry["retryClass"] = "TRANSIENT"
+    assert not _is_known_retry_class(transient_retry["retryClass"]), (
+        "静态 retryClass 不得放行 §17 动态 TRANSIENT 错误类"
+    )
+
+
+def test_node_policy_environment_and_reconcile_constraints_are_fail_closed() -> None:
+    """staging/production、恢复演练和目标核对的资源指纹条件必须在 map 内可机械验证。"""
+    node_types = _load_json(POLICY_PATH)["nodeTypes"]
+
+    assert node_types["DEPLOY_STAGING"]["resourceFingerprintSchema"]["properties"]["environment"] == {
+        "const": "STAGING"
+    }
+    assert node_types["DEPLOY_PRODUCTION"]["resourceFingerprintSchema"]["properties"]["environment"] == {
+        "const": "PRODUCTION"
+    }
+    assert node_types["ACCEPT_STAGING"]["resourceFingerprintSchema"]["properties"]["environment"] == {
+        "const": "STAGING"
+    }
+    assert node_types["ACCEPT_PRODUCTION"]["resourceFingerprintSchema"]["properties"]["environment"] == {
+        "const": "PRODUCTION"
+    }
+
+    restore_schema = node_types["RESTORE_DRILL"]["resourceFingerprintSchema"]
+    assert restore_schema["properties"]["validationEnvironment"] == {"const": "NON_PRODUCTION"}
+    assert "validationInstanceIdentity" in restore_schema["required"]
+    assert "sourceDatabasePhysical" in restore_schema["required"]
+
+    reconcile_schema = node_types["RECONCILE_TARGET"]["resourceFingerprintSchema"]
+    assert reconcile_schema["properties"]["targetKind"]["enum"] == [
+        "server",
+        "database",
+        "registry",
+    ]
+    assert "oneOf" in reconcile_schema
+    assert "guardFingerprint" in reconcile_schema["required"]
+
+    for node_type in (
+        "BOOTSTRAP_REPOSITORY",
+        "IMPLEMENT",
+        "ATTEST_REVIEW",
+        "PUBLISH_PR",
+        "MERGE",
+        "BUILD_ARTIFACT",
+        "DEPLOY_STAGING",
+        "ACCEPT_STAGING",
+        "DEPLOY_PRODUCTION",
+        "ACCEPT_PRODUCTION",
+        "ROLLBACK",
+        "RESTORE_DRILL",
+        "RECONCILE_TARGET",
+    ):
+        assert node_types[node_type]["authorizationConsumptionPoint"] == ("with-action-started-transaction")
+
+
+def _test_action_identity(node_policy: dict[str, Any], capability: str, inputs: dict[str, str]) -> str:
+    """按策略声明字段构造测试 identity，验证环境域分离而不冒充尚未实现的 runtime。"""
+    key_template = node_policy["idempotencyKeyTemplate"]
+    fields = key_template["actions"]["byCapability"][capability]["jcsInputFields"]
+    material = [key_template["version"], capability, [[field, inputs[field]] for field in fields]]
+    return "sha256:" + hashlib.sha256(canonicalize(material)).hexdigest()
+
+
+def test_environment_actions_bind_fingerprint_and_domain_separate_stage_from_production() -> None:
+    """部署、验收与回滚的每个 action identity 都绑定环境和完整资源指纹摘要。"""
+    node_types = _load_json(POLICY_PATH)["nodeTypes"]
+    environment_nodes = (
+        "DEPLOY_STAGING",
+        "DEPLOY_PRODUCTION",
+        "ACCEPT_STAGING",
+        "ACCEPT_PRODUCTION",
+        "ROLLBACK",
+    )
+    for node_type in environment_nodes:
+        actions = node_types[node_type]["idempotencyKeyTemplate"]["actions"]["byCapability"]
+        for capability, action in actions.items():
+            fields = action["jcsInputFields"]
+            assert "environment" in fields, f"{node_type}/{capability}/environment"
+            assert "resourceFingerprintDigest" in fields, f"{node_type}/{capability}/resourceFingerprintDigest"
+
+    for staging, production, capability in (
+        ("DEPLOY_STAGING", "DEPLOY_PRODUCTION", "ssh.exec.scoped"),
+        ("ACCEPT_STAGING", "ACCEPT_PRODUCTION", "http.check.scoped"),
+    ):
+        staging_policy = node_types[staging]
+        production_policy = node_types[production]
+        staging_fields = staging_policy["idempotencyKeyTemplate"]["actions"]["byCapability"][capability][
+            "jcsInputFields"
+        ]
+        production_fields = production_policy["idempotencyKeyTemplate"]["actions"]["byCapability"][capability][
+            "jcsInputFields"
+        ]
+        assert staging_fields == production_fields
+        common_inputs = {field: f"same-{field}" for field in staging_fields}
+        staging_inputs = {
+            **common_inputs,
+            "environment": "STAGING",
+            "resourceFingerprintDigest": "sha256:" + "a" * 64,
+        }
+        production_inputs = {
+            **common_inputs,
+            "environment": "PRODUCTION",
+            "resourceFingerprintDigest": "sha256:" + "b" * 64,
+        }
+        assert _test_action_identity(staging_policy, capability, staging_inputs) != (
+            _test_action_identity(production_policy, capability, production_inputs)
+        )
+
+
+def test_every_environment_action_key_binding_deletion_mutation_is_rejected() -> None:
+    """逐 action 删除 environment 或资源指纹摘要，证明部署、验收、回滚门禁均会定位。"""
+    original = _load_json(POLICY_PATH)["nodeTypes"]
+    for node_type in (
+        "DEPLOY_STAGING",
+        "DEPLOY_PRODUCTION",
+        "ACCEPT_STAGING",
+        "ACCEPT_PRODUCTION",
+        "ROLLBACK",
+    ):
+        actions = original[node_type]["idempotencyKeyTemplate"]["actions"]["byCapability"]
+        for capability in actions:
+            for field in ENVIRONMENT_ACTION_PREFIX:
+                mutated = copy.deepcopy(original)
+                fields = mutated[node_type]["idempotencyKeyTemplate"]["actions"]["byCapability"][capability][
+                    "jcsInputFields"
+                ]
+                fields.remove(field)
+                with pytest.raises(
+                    AssertionError,
+                    match=rf"{node_type}/{re.escape(capability)}/jcsInputFields",
+                ):
+                    _assert_action_policy_exact(mutated, node_type, capability)
+
+
+def _collect_refs(value: object) -> list[str]:
+    """递归提取本地策略 JSON 中的 $ref，防止 schema 悄悄依赖外部或未知定义。"""
+    if isinstance(value, dict):
+        refs = [value["$ref"]] if isinstance(value.get("$ref"), str) else []
+        for child in value.values():
+            refs.extend(_collect_refs(child))
+        return refs
+    if isinstance(value, list):
+        return [ref for child in value for ref in _collect_refs(child)]
+    return []
+
+
+def _validate_fingerprint_schema_with_local_defs(
+    policy_map: dict, fingerprint_schema: dict, instance: dict
+) -> list[jsonschema.ValidationError]:
+    """以 node map 自身的本地 $defs 解析资源指纹，证明策略不是裸 ID 占位。"""
+    wrapper = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$defs": policy_map["$defs"],
+        "allOf": [fingerprint_schema],
+    }
+    return list(jsonschema.Draft7Validator(wrapper).iter_errors(instance))
+
+
+def _object_paths(value: object, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """枚举实例中每个对象路径，使 nested $defs 也接受未知字段 mutation。"""
+    if not isinstance(value, dict):
+        return []
+    paths = [path]
+    for key, child in value.items():
+        paths.extend(_object_paths(child, (*path, key)))
+    return paths
+
+
+def _assert_recursive_unknown_fields_rejected(policy_map: dict[str, Any]) -> None:
+    """对每个根对象和嵌套对象注入 extra，要求资源指纹 schema 全路径拒绝。"""
+    local_defs = policy_map["$defs"]
+    for node_type, instance in FINGERPRINT_SAMPLES.items():
+        schema = policy_map["nodeTypes"][node_type]["resourceFingerprintSchema"]
+        for path in _object_paths(instance):
+            mutated = copy.deepcopy(instance)
+            cursor = mutated
+            for part in path:
+                cursor = cursor[part]
+            cursor["unapprovedNestedOverlay"] = "blocked"
+            errors = _validate_fingerprint_schema_with_local_defs(policy_map, schema, mutated)
+            location = ".".join(path) or "<root>"
+            assert errors, f"{node_type}/{location}: 资源指纹放行了未知字段"
+
+    used_object_defs = {
+        ref.removeprefix("#/$defs/")
+        for node in policy_map["nodeTypes"].values()
+        for ref in _collect_refs(node["resourceFingerprintSchema"])
+        if local_defs.get(ref.removeprefix("#/$defs/"), {}).get("type") == "object"
+    }
+    assert used_object_defs == {
+        "serverPhysical",
+        "databasePhysical",
+        "trafficAdapter",
+        "registry",
+        "releaseIdentity",
+    }
+
+
+def test_node_fingerprint_schemas_resolve_locally_and_reject_extra_fields() -> None:
+    """每种 node 指纹都解析本地定义，并在根对象与每个 nested object 拒绝 extra。"""
+    policy_map = _load_json(POLICY_PATH)
+    local_defs = policy_map["$defs"]
+    assert isinstance(local_defs, dict) and local_defs
+
+    for node_type, instance in FINGERPRINT_SAMPLES.items():
+        schema = policy_map["nodeTypes"][node_type]["resourceFingerprintSchema"]
+        for ref in _collect_refs(schema):
+            assert ref.startswith("#/$defs/"), f"{node_type}: 禁止外部或未知 $ref {ref}"
+            assert ref.removeprefix("#/$defs/") in local_defs, f"{node_type}: $ref 未指向本文件定义 {ref}"
+        errors = _validate_fingerprint_schema_with_local_defs(policy_map, schema, instance)
+        assert not errors, f"{node_type}: 有效资源指纹未通过: {errors}"
+
+    _assert_recursive_unknown_fields_rejected(policy_map)
+
+
+def test_nested_definition_extra_field_mutation_is_rejected() -> None:
+    """放开 serverPhysical 的 additionalProperties 必须被嵌套注入门禁定位。"""
+    policy_map = _load_json(POLICY_PATH)
+    policy_map["$defs"]["serverPhysical"]["additionalProperties"] = True
+    with pytest.raises(
+        AssertionError,
+        match=r"DEPLOY_STAGING/serverPhysical: 资源指纹放行了未知字段",
+    ):
+        _assert_recursive_unknown_fields_rejected(policy_map)
+
+
+def _selection_constraints(value: object) -> list[tuple[str, bool, tuple[str, ...]]]:
+    """递归提取 *Selected=true/false 对应的 overlay 必需或禁止约束。"""
+    if isinstance(value, list):
+        return [row for child in value for row in _selection_constraints(child)]
+    if not isinstance(value, dict):
+        return []
+
+    rows: list[tuple[str, bool, tuple[str, ...]]] = []
+    condition_properties = value.get("if", {}).get("properties", {})
+    selected_rules = [
+        (name, rule["const"])
+        for name, rule in condition_properties.items()
+        if name.endswith("Selected") and isinstance(rule, dict) and isinstance(rule.get("const"), bool)
+    ]
+    if selected_rules:
+        assert len(selected_rules) == 1
+        selector, selected = selected_rules[0]
+        if selected:
+            overlays = tuple(value.get("then", {}).get("required", ()))
+        else:
+            overlays = tuple(value.get("then", {}).get("not", {}).get("required", ()))
+        rows.append((selector, selected, overlays))
+
+    for child in value.values():
+        rows.extend(_selection_constraints(child))
+    return rows
+
+
+def _assert_selection_overlays_fail_closed(policy_map: dict[str, Any]) -> None:
+    """穷举每个 selection 的 true 缺 overlay 与 false 携带 overlay 两类拒绝路径。"""
+    for node_type, node_policy in policy_map["nodeTypes"].items():
+        schema = node_policy["resourceFingerprintSchema"]
+        selectors = {name for name in schema.get("properties", {}) if name.endswith("Selected")}
+        constraints = _selection_constraints(schema)
+        actual_pairs = {(selector, selected) for selector, selected, _ in constraints}
+        expected_pairs = {(selector, selected) for selector in selectors for selected in (True, False)}
+        assert actual_pairs == expected_pairs, f"{node_type}/selection-branches"
+
+        for selector in sorted(selectors):
+            overlays_by_value = {
+                selected: overlays
+                for selected_selector, selected, overlays in constraints
+                if selected_selector == selector
+            }
+            assert overlays_by_value[True], f"{node_type}/{selector}=true/overlay"
+            assert overlays_by_value[True] == overlays_by_value[False], f"{node_type}/{selector}/true-false-overlay"
+            overlays = overlays_by_value[True]
+            for overlay in overlays:
+                true_missing = copy.deepcopy(FINGERPRINT_SAMPLES[node_type])
+                true_missing[selector] = True
+                true_missing.pop(overlay, None)
+                errors = _validate_fingerprint_schema_with_local_defs(policy_map, schema, true_missing)
+                assert errors, f"{node_type}/{selector}=true/{overlay}/missing"
+
+                false_with_overlay = copy.deepcopy(FINGERPRINT_SAMPLES[node_type])
+                false_with_overlay[selector] = False
+                assert overlay in false_with_overlay, f"{node_type}/{selector}=false/{overlay}/sample"
+                errors = _validate_fingerprint_schema_with_local_defs(policy_map, schema, false_with_overlay)
+                assert errors, f"{node_type}/{selector}=false/{overlay}/present"
+
+            false_without_overlays = copy.deepcopy(FINGERPRINT_SAMPLES[node_type])
+            false_without_overlays[selector] = False
+            for overlay in overlays:
+                false_without_overlays.pop(overlay, None)
+            errors = _validate_fingerprint_schema_with_local_defs(policy_map, schema, false_without_overlays)
+            assert not errors, f"{node_type}/{selector}=false/without-overlay: {errors}"
+
+
+def test_optional_capability_selection_branches_are_exhaustively_fail_closed() -> None:
+    """自动枚举所有 selection，穷举 true 缺 overlay 与 false 携带 overlay。"""
+    policy_map = _load_json(POLICY_PATH)
+    _assert_selection_overlays_fail_closed(policy_map)
+
+
+def test_every_selection_branch_deletion_mutation_is_rejected() -> None:
+    """逐一删除 true/false 条件，证明 ACCEPT_STAGING DB 与全部 false 分支不再假绿。"""
+    original = _load_json(POLICY_PATH)
+    for node_type, node_policy in original["nodeTypes"].items():
+        schema = node_policy["resourceFingerprintSchema"]
+        for index, condition in enumerate(schema.get("allOf", [])):
+            if not _selection_constraints(condition):
+                continue
+            mutated = copy.deepcopy(original)
+            del mutated["nodeTypes"][node_type]["resourceFingerprintSchema"]["allOf"][index]
+            with pytest.raises(
+                AssertionError,
+                match=rf"{node_type}/selection-branches",
+            ):
+                _assert_selection_overlays_fail_closed(mutated)
+
+
+def test_generated_authorization_types_are_current_in_all_languages() -> None:
+    """catalog 变更后必须由同一生成器更新 Python、TypeScript 和 Rust，禁止手写副本。"""
+    result = subprocess.run(
+        [sys.executable, str(CODEGEN_PATH), "--check"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    assert result.returncode == 0, f"授权合同生成物发生漂移：\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    generated_sources = {
+        "TypeScript": REPO_ROOT / "packages" / "factory-contracts" / "src" / "generated" / "contracts.ts",
+        "Python": REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py",
+        "Rust": REPO_ROOT / "crates" / "factory-contracts" / "src" / "generated" / "contracts.rs",
+    }
+    for language, path in generated_sources.items():
+        content = path.read_text(encoding="utf-8")
+        assert "IntentAuthorization" in content, f"{language} 未生成 IntentAuthorization"
+        assert "ExecutionAuthorization" in content, f"{language} 未生成 ExecutionAuthorization"
+
+
+def test_codegen_validator_schema_parser_is_fail_closed() -> None:
+    """validator schema 解析不得把任一不可信输入降级成 ERROR 注释或空 schema。"""
+    codegen = _load_codegen_module()
+
+    # 同一节点循环避免 pytest 参数节点数量成为合同测试本身的脆弱耦合。
+    cases = (
+        (b"\xff", "VALIDATOR_SCHEMA_INVALID_UTF8"),
+        (b"\xef\xbb\xbf{}", "VALIDATOR_SCHEMA_INVALID_UTF8"),
+        (b"{", "VALIDATOR_SCHEMA_INVALID_JSON"),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":NaN}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":Infinity}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":-Infinity}',
+            "VALIDATOR_SCHEMA_INVALID_JSON",
+        ),
+        (b"null", "VALIDATOR_SCHEMA_ROOT_NOT_OBJECT"),
+        (b"[]", "VALIDATOR_SCHEMA_ROOT_NOT_OBJECT"),
+        (b'{"$schema":7}', "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7"),
+        (b'{"type":"object"}', "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7"),
+        (
+            b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}',
+            "VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","type":7}',
+            "VALIDATOR_SCHEMA_INVALID_DRAFT7",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","type":"string","type":"number"}',
+            "VALIDATOR_SCHEMA_DUPLICATE_KEY",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","properties":{"nested":{"format":"unknown-format"}}}',
+            "VALIDATOR_SCHEMA_UNKNOWN_FORMAT",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"https://example.invalid/schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"file:///D:/outside/schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+        (
+            b'{"$schema":"http://json-schema.org/draft-07/schema#","$ref":"other.schema.json"}',
+            "VALIDATOR_SCHEMA_EXTERNAL_REF",
+        ),
+    )
+    for raw, expected_error in cases:
+        with pytest.raises(codegen.ValidatorSchemaError) as error:
+            codegen.parse_validator_schema(raw)
+        assert str(error.value) == expected_error
+
+    # 嵌入层是独立的第二道边界；即使上游误传非有限浮点，也不得生成非标准 JSON。
+    for non_finite in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(codegen.ValidatorSchemaError) as error:
+            codegen._embedded_schema_json({"minimum": non_finite})
+        assert str(error.value) == "VALIDATOR_SCHEMA_INVALID_JSON"
+
+    # `properties` 内的字段名不是 schema keyword；不能因用户字段名叫 format/$ref 而误拒绝。
+    property_named_keyword = codegen.parse_validator_schema(
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"format":{"type":"string"},"$ref":{"type":"string"}}}'
+    )
+    assert set(property_named_keyword["properties"]) == {"format", "$ref"}
+
+
+def test_codegen_validator_schema_missing_file_and_partial_write_are_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """缺失 schema 或批次写入中断时，都不得留下部分生成树。"""
+    codegen = _load_codegen_module()
+    writes: list[object] = []
+    caplog.set_level(logging.INFO, logger="factory.contracts.codegen")
+
+    def _assert_no_temporary_residue(directory: Path) -> None:
+        """批次失败、补偿或清理后，同目录不得遗留本次 stage/rollback 文件。"""
+        residue = [
+            path
+            for path in directory.rglob("*")
+            if path.is_file()
+            and (path.name.endswith(".stage") or path.name.endswith(".rollback"))
+        ]
+        assert residue == [], f"不得遗留 stage/rollback 临时文件: {residue}"
+
+    def _make_batch_targets(
+        directory: Path,
+        originals: tuple[bytes | None, bytes | None, bytes | None],
+    ) -> tuple[Path, Path, Path]:
+        """建立三目标快照；None 精确表示该目标在提交前不存在。"""
+        directory.mkdir()
+        targets = tuple(directory / name for name in ("contracts.ts", "models.py", "contracts.rs"))
+        for target, original in zip(targets, originals, strict=True):
+            if original is not None:
+                target.write_bytes(original)
+        return targets
+
+    def _parse_cli_codegen_logs(stdout: str) -> tuple[list[dict[str, str]], list[str]]:
+        """从 CLI stdout 拆出固定 ASCII 日志与用户消息，并对每条日志做完整形状校验。"""
+        pattern = re.compile(
+            r"^CODEGEN event=(?P<event>[a-z_]+) "
+            r"correlation_id=(?P<correlation_id>[0-9a-f]{32}) "
+            r"elapsed_ms=(?P<elapsed_ms>[0-9]+) "
+            r"target_count=(?P<target_count>[0-9]+) "
+            r"commit_status=(?P<commit_status>[a-z_]+) "
+            r"rollback_status=(?P<rollback_status>[a-z_]+) "
+            r"cleanup_status=(?P<cleanup_status>[a-z_]+) "
+            r"error_code=(?P<error_code>NONE|CODEGEN_[A-Z_]+)$"
+        )
+        parsed: list[dict[str, str]] = []
+        user_lines: list[str] = []
+        for line in stdout.splitlines():
+            if not line.startswith("CODEGEN "):
+                user_lines.append(line)
+                continue
+            match = pattern.fullmatch(line)
+            assert match is not None, f"CLI 日志必须匹配固定 ASCII 形状: {line!r}"
+            parsed.append(match.groupdict())
+        return parsed, user_lines
+
+    # 正式日志先冻结成功批次的关联性与固定字段；禁止 message 或格式化输出携带目标路径。
+    logged_success_directory = tmp_path / "logged-success-SECRET"
+    logged_success_targets = _make_batch_targets(
+        logged_success_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    caplog.clear()
+    codegen.write_batch(
+        tuple((target, f"new-{index}\n") for index, target in enumerate(logged_success_targets))
+    )
+    success_log_records = [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ]
+    assert [getattr(record, "event", None) for record in success_log_records] == [
+        "batch_start",
+        "batch_end",
+    ]
+    correlation_ids = {getattr(record, "correlation_id", None) for record in success_log_records}
+    assert len(correlation_ids) == 1
+    correlation_id = correlation_ids.pop()
+    assert isinstance(correlation_id, str) and re.fullmatch(r"[0-9a-f]{32}", correlation_id)
+    start_log, end_log = success_log_records
+    assert start_log.target_count == end_log.target_count == 3
+    assert start_log.elapsed_ms == 0
+    assert isinstance(end_log.elapsed_ms, int) and end_log.elapsed_ms >= 0
+    assert (start_log.commit_status, start_log.rollback_status, start_log.cleanup_status) == (
+        "pending",
+        "not_required",
+        "pending",
+    )
+    assert (end_log.commit_status, end_log.rollback_status, end_log.cleanup_status) == (
+        "completed",
+        "not_required",
+        "completed",
+    )
+    assert start_log.error_code == end_log.error_code == "NONE"
+    rendered_logs = "\n".join(
+        logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record)
+        for record in success_log_records
+    )
+    assert rendered_logs.isascii()
+    assert "SECRET" not in rendered_logs
+    assert str(logged_success_directory) not in rendered_logs
+    _assert_no_temporary_residue(logged_success_directory)
+
+    # 嵌入调用方传入的关联 ID 也属于不可信输入；非法值必须替换，绝不能直接进入日志。
+    untrusted_correlation_directory = tmp_path / "untrusted-correlation"
+    untrusted_correlation_targets = _make_batch_targets(
+        untrusted_correlation_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    untrusted_correlation_id = r"D:\codex项目\SECRET\caller-correlation"
+    caplog.clear()
+    codegen.write_batch(
+        tuple(
+            (target, f"new-{index}\n")
+            for index, target in enumerate(untrusted_correlation_targets)
+        ),
+        correlation_id=untrusted_correlation_id,
+    )
+    untrusted_id_records = [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ]
+    assert len({record.correlation_id for record in untrusted_id_records}) == 1
+    assert all(
+        re.fullmatch(r"[0-9a-f]{32}", record.correlation_id) for record in untrusted_id_records
+    )
+    untrusted_id_rendered = "\n".join(
+        logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record)
+        for record in untrusted_id_records
+    )
+    assert "SECRET" not in untrusted_id_rendered
+    assert untrusted_correlation_id not in untrusted_id_rendered
+    _assert_no_temporary_residue(untrusted_correlation_directory)
+
+    # CLI 日志只能在命名 logger 的作用域内接管；root/宿主和外部日志必须完全不受影响。
+    cli_logged_directory = tmp_path / "cli-logged-success-SECRET"
+    cli_logged_targets = tuple(
+        cli_logged_directory / name for name in ("contracts.ts", "models.py", "contracts.rs")
+    )
+    first_stdout = io.StringIO()
+    second_stdout = io.StringIO()
+    exception_stdout = io.StringIO()
+    host_stdout = io.StringIO()
+    prior_codegen_stdout = io.StringIO()
+    root_logger = logging.getLogger()
+    named_logger = codegen._LOGGER
+    foreign_logger = logging.getLogger("foreign.component")
+    child_logger = logging.getLogger("factory.contracts.codegen.child")
+    saved_root_handlers = list(root_logger.handlers)
+    saved_root_level = root_logger.level
+    saved_root_filters = list(root_logger.filters)
+    saved_named_handlers = list(named_logger.handlers)
+    saved_named_level = named_logger.level
+    saved_named_propagate = named_logger.propagate
+    saved_foreign_handlers = list(foreign_logger.handlers)
+    saved_foreign_level = foreign_logger.level
+    saved_foreign_propagate = foreign_logger.propagate
+    saved_child_handlers = list(child_logger.handlers)
+    saved_child_level = child_logger.level
+    saved_child_propagate = child_logger.propagate
+
+    host_handler = logging.StreamHandler(host_stdout)
+    host_handler.setFormatter(logging.Formatter("HOST %(name)s %(levelname)s %(message)s"))
+    root_filter = logging.Filter("root-snapshot")
+    prior_codegen_handler = logging.StreamHandler(prior_codegen_stdout)
+    root_logger.handlers = [host_handler]
+    root_logger.filters = [root_filter]
+    root_logger.setLevel(logging.WARNING)
+    named_logger.handlers = [prior_codegen_handler]
+    named_logger.setLevel(logging.ERROR)
+    named_logger.propagate = True
+    foreign_logger.handlers = []
+    foreign_logger.setLevel(logging.INFO)
+    foreign_logger.propagate = True
+    child_logger.handlers = []
+    child_logger.setLevel(logging.NOTSET)
+    child_logger.propagate = True
+
+    root_snapshot = (
+        tuple(root_logger.handlers),
+        root_logger.level,
+        tuple(root_logger.filters),
+    )
+    named_snapshot = (
+        tuple(named_logger.handlers),
+        named_logger.level,
+        named_logger.propagate,
+    )
+    root_states_during_batch: list[tuple[tuple[logging.Handler, ...], int, tuple[logging.Filter, ...]]] = []
+    named_handlers_during_batch: list[logging.Handler] = []
+    original_write_batch = codegen.write_batch
+
+    def _forbid_basic_config(*args: object, **kwargs: object) -> None:
+        """basicConfig 会污染 root logger，CLI 任何路径都不得调用。"""
+        del args, kwargs
+        raise AssertionError("CLI 不得调用 logging.basicConfig")
+
+    def _write_batch_with_foreign_logs(
+        outputs: tuple[tuple[Path, str], ...],
+        *,
+        correlation_id: str,
+    ) -> None:
+        """在 CLI 作用域内发出外部/子 logger 记录，验证精确名称过滤与 root 隔离。"""
+        root_states_during_batch.append(
+            (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters))
+        )
+        assert named_logger.level == logging.INFO
+        assert named_logger.propagate is False
+        assert len(named_logger.handlers) == 1
+        named_handlers_during_batch.append(named_logger.handlers[0])
+        foreign_logger.info("FOREIGN_INFO")
+        foreign_logger.warning("FOREIGN_WARNING")
+        child_logger.warning("CHILD_WARNING")
+        original_write_batch(outputs, correlation_id=correlation_id)
+
+    def _raise_inside_cli_scope(check_mode: bool) -> int:
+        """在 CLI logger 已接管后抛出未捕获异常，锁定 finally 恢复与句柄关闭。"""
+        del check_mode
+        assert named_logger.level == logging.INFO
+        assert named_logger.propagate is False
+        assert len(named_logger.handlers) == 1
+        named_handlers_during_batch.append(named_logger.handlers[0])
+        raise RuntimeError("CLI_SCOPE_TEST_FAILURE")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen.logging, "basicConfig", _forbid_basic_config)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(codegen, "TS_OUT", cli_logged_targets[0])
+            patch.setattr(codegen, "PY_OUT", cli_logged_targets[1])
+            patch.setattr(codegen, "RS_OUT", cli_logged_targets[2])
+            patch.setattr(codegen, "write_batch", _write_batch_with_foreign_logs)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            patch.setattr(codegen.sys, "stdout", first_stdout)
+            assert codegen.main() == 0
+            first_run_output = first_stdout.getvalue()
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+
+            patch.setattr(codegen.sys, "stdout", second_stdout)
+            assert codegen.main() == 0
+            assert first_stdout.getvalue() == first_run_output
+            second_run_output = second_stdout.getvalue()
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+
+            # 未捕获异常也必须执行作用域 finally，且不能让前两次 handler 重新写入旧 sink。
+            patch.setattr(codegen, "_run_codegen_cli", _raise_inside_cli_scope)
+            patch.setattr(codegen.sys, "stdout", exception_stdout)
+            with pytest.raises(RuntimeError, match="^CLI_SCOPE_TEST_FAILURE$"):
+                codegen.main()
+            assert first_stdout.getvalue() == first_run_output
+            assert second_stdout.getvalue() == second_run_output
+            assert exception_stdout.getvalue() == ""
+            assert (tuple(root_logger.handlers), root_logger.level, tuple(root_logger.filters)) == root_snapshot
+            assert (tuple(named_logger.handlers), named_logger.level, named_logger.propagate) == named_snapshot
+    finally:
+        root_logger.handlers = saved_root_handlers
+        root_logger.setLevel(saved_root_level)
+        root_logger.filters = saved_root_filters
+        named_logger.handlers = saved_named_handlers
+        named_logger.setLevel(saved_named_level)
+        named_logger.propagate = saved_named_propagate
+        foreign_logger.handlers = saved_foreign_handlers
+        foreign_logger.setLevel(saved_foreign_level)
+        foreign_logger.propagate = saved_foreign_propagate
+        child_logger.handlers = saved_child_handlers
+        child_logger.setLevel(saved_child_level)
+        child_logger.propagate = saved_child_propagate
+        host_handler.close()
+        prior_codegen_handler.close()
+
+    assert root_states_during_batch == [root_snapshot, root_snapshot]
+    assert len(named_handlers_during_batch) == 3
+    assert named_handlers_during_batch[0] is not named_handlers_during_batch[1]
+    assert named_handlers_during_batch[1] is not named_handlers_during_batch[2]
+    for cli_handler in named_handlers_during_batch:
+        assert isinstance(cli_handler, logging.StreamHandler)
+        assert cli_handler.formatter is not None
+        assert cli_handler.formatter._fmt == "%(message)s"
+        assert len(cli_handler.filters) == 1
+        assert cli_handler._closed is True
+    for rendered_run in (first_run_output, second_run_output):
+        assert rendered_run.count("CODEGEN event=cli_start") == 1
+        assert rendered_run.count("CODEGEN event=batch_start") == 1
+        assert rendered_run.count("CODEGEN event=batch_end") == 1
+        assert rendered_run.count("CODEGEN event=cli_end") == 1
+        assert rendered_run.count("[DONE] 三语言类型文件生成完成。") == 1
+        codegen_lines = [line for line in rendered_run.splitlines() if line.startswith("CODEGEN ")]
+        assert len(codegen_lines) == 4
+        assert all(line.isascii() for line in codegen_lines)
+        assert "FOREIGN" not in rendered_run
+        assert "CHILD" not in rendered_run
+        assert "SECRET" not in rendered_run
+    host_output = host_stdout.getvalue()
+    assert host_output.count("HOST foreign.component INFO FOREIGN_INFO") == 2
+    assert host_output.count("HOST foreign.component WARNING FOREIGN_WARNING") == 2
+    assert "factory.contracts.codegen" not in host_output
+    assert "CHILD_WARNING" not in host_output
+    assert prior_codegen_stdout.getvalue() == ""
+    assert capsys.readouterr().err == ""
+    _assert_no_temporary_residue(cli_logged_directory)
+
+    # 非法 argv 不得由 argparse 输出 usage 或回显参数正文；help 也不得留下孤立 cli_start。
+    invalid_argument = r"--SECRET-D:\codex项目\private-argument"
+    capsys.readouterr()
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen.sys, "argv", ["generate.py", invalid_argument])
+        patch.setattr(
+            codegen,
+            "load_catalog",
+            lambda: (_ for _ in ()).throw(AssertionError("非法参数后不得加载 catalog")),
+        )
+        assert codegen.main() == 2
+    invalid_argument_output = capsys.readouterr()
+    invalid_argument_logs, invalid_argument_user_lines = _parse_cli_codegen_logs(
+        invalid_argument_output.out
+    )
+    assert invalid_argument_user_lines == []
+    assert invalid_argument_output.err == "[ERROR] CODEGEN_ARGUMENT_INVALID\n"
+    assert "SECRET" not in invalid_argument_output.out + invalid_argument_output.err
+    assert invalid_argument not in invalid_argument_output.out + invalid_argument_output.err
+    assert [record["event"] for record in invalid_argument_logs] == ["cli_start", "cli_end"]
+    assert len({record["correlation_id"] for record in invalid_argument_logs}) == 1
+    assert invalid_argument_logs[-1]["error_code"] == "CODEGEN_ARGUMENT_INVALID"
+
+    capsys.readouterr()
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen.sys, "argv", ["generate.py", "--help"])
+        with pytest.raises(SystemExit) as help_exit:
+            codegen.main()
+    assert help_exit.value.code == 0
+    assert [
+        record for record in caplog.records if record.name == "factory.contracts.codegen"
+    ] == []
+    capsys.readouterr()
+
+    # mode 合同通过 seam 使用合成值，避免把 Windows chmod 行为误当成 POSIX 验证。
+    mode_success_directory = tmp_path / "mode-success"
+    mode_success_targets = _make_batch_targets(
+        mode_success_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    synthetic_modes = dict(zip(mode_success_targets, (0o640, 0o600, 0o664), strict=True))
+    mode_success_chmods: list[tuple[str, int]] = []
+
+    def _read_synthetic_mode(path: Path) -> int:
+        return synthetic_modes[Path(path)]
+
+    def _record_mode_chmod(path: Path, mode: int) -> None:
+        mode_success_chmods.append((Path(path).suffix, mode))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", _read_synthetic_mode)
+        patch.setattr(codegen, "_chmod_file", _record_mode_chmod)
+        codegen.write_batch(
+            tuple((target, f"new-{index}\n") for index, target in enumerate(mode_success_targets))
+        )
+    assert mode_success_chmods == [
+        (".stage", 0o640),
+        (".stage", 0o600),
+        (".stage", 0o664),
+    ]
+    _assert_no_temporary_residue(mode_success_directory)
+
+    mode_absent_directory = tmp_path / "mode-absent"
+    mode_absent_targets = _make_batch_targets(
+        mode_absent_directory,
+        (None, b"old-python", b"old-rust"),
+    )
+    absent_modes = {mode_absent_targets[1]: 0o600, mode_absent_targets[2]: 0o640}
+    mode_absent_chmods: list[tuple[str, int]] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: absent_modes[Path(path)])
+        patch.setattr(
+            codegen,
+            "_chmod_file",
+            lambda path, mode: mode_absent_chmods.append((Path(path).suffix, mode)),
+        )
+        codegen.write_batch(
+            tuple((target, f"new-{index}\n") for index, target in enumerate(mode_absent_targets))
+        )
+    assert mode_absent_chmods == [(".stage", 0o644), (".stage", 0o600), (".stage", 0o640)]
+    _assert_no_temporary_residue(mode_absent_directory)
+
+    mode_rollback_directory = tmp_path / "mode-rollback"
+    mode_rollback_targets = _make_batch_targets(
+        mode_rollback_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    mode_rollback_originals = tuple(target.read_bytes() for target in mode_rollback_targets)
+    rollback_modes = dict(zip(mode_rollback_targets, (0o640, 0o600, 0o664), strict=True))
+    mode_rollback_operations: list[tuple[str, str, int]] = []
+    mode_commit_attempts: list[Path] = []
+
+    def _record_rollback_mode_chmod(path: Path, mode: int) -> None:
+        """与 replace 共用顺序台账，确认 stage/rollback 都先 chmod 再替换。"""
+        mode_rollback_operations.append(("chmod", Path(path).suffix, mode))
+
+    def _fail_second_mode_commit(source: Path, destination: Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in mode_rollback_targets:
+            mode_commit_attempts.append(destination_path)
+            mode_rollback_operations.append(
+                ("replace", source_path.suffix, mode_rollback_targets.index(destination_path))
+            )
+            if len(mode_commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\mode-second-commit")
+        elif source_path.suffix == ".rollback" and destination_path in mode_rollback_targets:
+            mode_rollback_operations.append(
+                ("replace", source_path.suffix, mode_rollback_targets.index(destination_path))
+            )
+        os.replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: rollback_modes[Path(path)])
+        patch.setattr(codegen, "_chmod_file", _record_rollback_mode_chmod)
+        patch.setattr(codegen, "_replace_file", _fail_second_mode_commit)
+        with pytest.raises(codegen.CodegenWriteError, match="^CODEGEN_WRITE_FAILED$"):
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(mode_rollback_targets)
+                )
+            )
+    assert mode_rollback_operations == [
+        ("chmod", ".stage", 0o640),
+        ("replace", ".stage", 0),
+        ("chmod", ".stage", 0o600),
+        ("replace", ".stage", 1),
+        ("chmod", ".rollback", 0o640),
+        ("replace", ".rollback", 0),
+    ]
+    assert tuple(target.read_bytes() for target in mode_rollback_targets) == mode_rollback_originals
+    _assert_no_temporary_residue(mode_rollback_directory)
+
+    mode_chmod_failure_directory = tmp_path / "mode-chmod-failure"
+    mode_chmod_failure_targets = _make_batch_targets(
+        mode_chmod_failure_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    mode_chmod_failure_originals = tuple(
+        target.read_bytes() for target in mode_chmod_failure_targets
+    )
+    chmod_failure_modes = dict(
+        zip(mode_chmod_failure_targets, (0o640, 0o600, 0o664), strict=True)
+    )
+    chmod_stage_attempts = 0
+
+    def _fail_second_stage_chmod(path: Path, mode: int) -> None:
+        nonlocal chmod_stage_attempts
+        if Path(path).suffix == ".stage":
+            chmod_stage_attempts += 1
+            if chmod_stage_attempts == 2:
+                raise OSError(r"D:\codex项目\SECRET\mode-chmod-failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            codegen,
+            "_read_file_mode",
+            lambda path: chmod_failure_modes[Path(path)],
+        )
+        patch.setattr(codegen, "_chmod_file", _fail_second_stage_chmod)
+        with pytest.raises(codegen.CodegenWriteError, match="^CODEGEN_WRITE_FAILED$"):
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(mode_chmod_failure_targets)
+                )
+            )
+    assert chmod_stage_attempts == 2
+    assert (
+        tuple(target.read_bytes() for target in mode_chmod_failure_targets)
+        == mode_chmod_failure_originals
+    )
+    _assert_no_temporary_residue(mode_chmod_failure_directory)
+
+    def _assert_failed_batch_log(
+        error_code: str,
+        commit_status: str,
+        rollback_status: str,
+        cleanup_status: str,
+    ) -> None:
+        """失败批次也必须完整闭合日志，且只含固定字段与脱敏错误码。"""
+        records = [
+            record for record in caplog.records if record.name == "factory.contracts.codegen"
+        ]
+        assert [getattr(record, "event", None) for record in records] == [
+            "batch_start",
+            "batch_end",
+        ]
+        assert len({record.correlation_id for record in records}) == 1
+        assert re.fullmatch(r"[0-9a-f]{32}", records[0].correlation_id)
+        end_record = records[-1]
+        assert end_record.levelno == logging.ERROR
+        assert end_record.target_count == 3
+        assert isinstance(end_record.elapsed_ms, int) and end_record.elapsed_ms >= 0
+        assert (
+            end_record.commit_status,
+            end_record.rollback_status,
+            end_record.cleanup_status,
+            end_record.error_code,
+        ) == (commit_status, rollback_status, cleanup_status, error_code)
+        rendered = "\n".join(
+            logging.Formatter(codegen._CODEGEN_LOG_FORMAT).format(record) for record in records
+        )
+        assert rendered.isascii()
+        assert "SECRET" not in rendered
+        assert str(tmp_path) not in rendered
+        assert all(record.getMessage().startswith("CODEGEN event=") for record in records)
+        assert all(record.getMessage().isascii() for record in records)
+
+    # rollback 副本的 chmod 本身失败也是恢复失败，必须返回最高优先级的固定码。
+    rollback_chmod_directory = tmp_path / "rollback-chmod-failure"
+    rollback_chmod_targets = _make_batch_targets(
+        rollback_chmod_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    rollback_chmod_modes = dict(
+        zip(rollback_chmod_targets, (0o640, 0o600, 0o664), strict=True)
+    )
+    rollback_chmod_commits: list[Path] = []
+    rollback_chmod_attempts: list[Path] = []
+
+    def _fail_second_commit_before_rollback_chmod(source: Path, destination: Path) -> None:
+        """首个目标提交后让第二个失败，从而进入首个目标的 mode 恢复。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in rollback_chmod_targets:
+            rollback_chmod_commits.append(destination_path)
+            if len(rollback_chmod_commits) == 2:
+                raise OSError(r"D:\codex项目\SECRET\rollback-chmod-commit")
+        os.replace(source, destination)
+
+    def _fail_rollback_chmod(path: Path, mode: int) -> None:
+        """只拒绝 rollback mode 恢复；stage chmod 保持成功以隔离故障原因。"""
+        del mode
+        candidate = Path(path)
+        if candidate.suffix == ".rollback":
+            rollback_chmod_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\rollback-chmod-failure")
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_read_file_mode", lambda path: rollback_chmod_modes[Path(path)])
+        patch.setattr(codegen, "_chmod_file", _fail_rollback_chmod)
+        patch.setattr(codegen, "_replace_file", _fail_second_commit_before_rollback_chmod)
+        with pytest.raises(
+            codegen.CodegenWriteError,
+            match="^CODEGEN_ROLLBACK_FAILED$",
+        ) as rollback_chmod_error:
+            codegen.write_batch(
+                tuple(
+                    (target, f"new-{index}\n")
+                    for index, target in enumerate(rollback_chmod_targets)
+                )
+            )
+    assert rollback_chmod_commits == list(rollback_chmod_targets[:2])
+    assert len(rollback_chmod_attempts) == 1
+    assert (
+        rollback_chmod_error.value.commit_status,
+        rollback_chmod_error.value.rollback_status,
+        rollback_chmod_error.value.cleanup_status,
+    ) == ("partial", "failed", "completed")
+    _assert_no_temporary_residue(rollback_chmod_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_ROLLBACK_FAILED",
+        "partial",
+        "failed",
+        "completed",
+    )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "REPO_ROOT", Path(r"D:\codex项目\missing-validator-schema-root"))
+        with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_READ_FAILED"):
+            codegen.load_required_validator_schema("contracts/schemas/run-spec.v1.schema.json")
+
+    def _fail_required_schemas() -> object:
+        raise codegen.ValidatorSchemaError("VALIDATOR_SCHEMA_READ_FAILED")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "load_required_validator_schemas", _fail_required_schemas)
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert writes == [], "validator schema 失败时不得写入任一生成目标"
+
+    # catalog/validator 的底层异常正文可能含绝对路径；CLI 只能暴露固定 ASCII 分类码。
+    sensitive_error = r"D:\codex项目\SECRET\catalog-or-validator-detail"
+    sanitized_cli_outputs: list[tuple[str, str]] = []
+    sanitized_cli_log_groups: list[list[dict[str, str]]] = []
+    sanitized_failure_cases: tuple[tuple[str, object | None, str], ...] = (
+        ("catalog", None, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-root-shape", [sensitive_error], "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-missing-schemas", {"SECRET": sensitive_error}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-schemas-shape", {"schemas": sensitive_error}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("catalog-entry-shape", {"schemas": [sensitive_error]}, "CODEGEN_CATALOG_LOAD_FAILED"),
+        ("validator", None, "CODEGEN_VALIDATOR_SCHEMA_FAILED"),
+    )
+    for failure_kind, malformed_catalog, _ in sanitized_failure_cases:
+        capsys.readouterr()
+        caplog.clear()
+        writes.clear()
+
+        def _raise_sensitive_catalog() -> object:
+            raise RuntimeError(sensitive_error)
+
+        def _raise_sensitive_validator() -> object:
+            raise codegen.ValidatorSchemaError(sensitive_error)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            patch.setattr(
+                codegen,
+                "write_or_check",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+            )
+            patch.setattr(
+                codegen,
+                "write_batch",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or None,
+            )
+            if failure_kind == "catalog":
+                patch.setattr(codegen, "load_catalog", _raise_sensitive_catalog)
+            elif failure_kind.startswith("catalog-"):
+                patch.setattr(
+                    codegen,
+                    "load_catalog",
+                    lambda catalog_payload=malformed_catalog: catalog_payload,
+                )
+            else:
+                patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+                patch.setattr(codegen, "load_required_validator_schemas", _raise_sensitive_validator)
+            assert codegen.main() == 1
+        captured = capsys.readouterr()
+        sanitized_cli_outputs.append((captured.out, captured.err))
+        parsed_logs, user_lines = _parse_cli_codegen_logs(captured.out)
+        assert user_lines == []
+        sanitized_cli_log_groups.append(parsed_logs)
+        assert writes == [], f"{failure_kind} 失败时不得进入任何写入边界"
+
+    # --check 的缺失与漂移报告同样不得回显目标路径或文件正文，且不得修改输入文件。
+    missing_check_target = tmp_path / "SECRET-missing-contracts.ts"
+    capsys.readouterr()
+    assert not codegen.write_or_check(missing_check_target, "expected", True)
+    missing_check_output = capsys.readouterr()
+    drift_check_target = tmp_path / "SECRET-drift-contracts.ts"
+    drift_check_target.write_text("actual-secret-content", encoding="utf-8")
+    drift_original = drift_check_target.read_bytes()
+    assert not codegen.write_or_check(drift_check_target, "expected", True)
+    drift_check_output = capsys.readouterr()
+    assert drift_check_target.read_bytes() == drift_original
+
+    assert [stderr for _, stderr in sanitized_cli_outputs] == [
+        f"[ERROR] {expected_error_code}\n"
+        for _, _, expected_error_code in sanitized_failure_cases
+    ]
+    for records, expected_error_code in zip(
+        sanitized_cli_log_groups,
+        (case[2] for case in sanitized_failure_cases),
+        strict=True,
+    ):
+        assert [record["event"] for record in records] == ["cli_start", "cli_end"]
+        assert len({record["correlation_id"] for record in records}) == 1
+        assert (
+            records[-1]["commit_status"],
+            records[-1]["rollback_status"],
+            records[-1]["cleanup_status"],
+            records[-1]["error_code"],
+        ) == ("not_started", "not_required", "not_started", expected_error_code)
+        rendered = "\n".join(
+            f"{key}={value}" for record in records for key, value in record.items()
+        )
+        assert rendered.isascii()
+        assert "SECRET" not in rendered
+        assert sensitive_error not in rendered
+    assert (missing_check_output.out, missing_check_output.err) == (
+        "",
+        "[DRIFT] CODEGEN_OUTPUT_MISSING\n",
+    )
+    assert (drift_check_output.out, drift_check_output.err) == (
+        "",
+        "[DRIFT] CODEGEN_OUTPUT_DRIFT\n",
+    )
+    combined_sanitized_output = "".join(
+        stdout + stderr for stdout, stderr in sanitized_cli_outputs
+    ) + "".join((missing_check_output.out, missing_check_output.err, drift_check_output.out, drift_check_output.err))
+    assert "SECRET" not in combined_sanitized_output
+    assert sensitive_error not in combined_sanitized_output
+
+    # 非标准 JSON 常量必须沿真实 main 路径在首次 write_or_check 前稳定停止。
+    non_finite_documents = (
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":NaN}',
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":Infinity}',
+        b'{"$schema":"http://json-schema.org/draft-07/schema#","minimum":-Infinity}',
+    )
+    for raw in non_finite_documents:
+        writes.clear()
+
+        def _load_non_finite_schema(raw_schema: bytes = raw) -> dict[str, object]:
+            codegen.parse_validator_schema(raw_schema)
+            return {}
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", _load_non_finite_schema)
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(
+                codegen,
+                "write_or_check",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+            )
+            patch.setattr(
+                codegen,
+                "write_batch",
+                lambda *args, **kwargs: writes.append((args, kwargs)) or None,
+            )
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            assert codegen.main() == 1
+        assert writes == [], "非有限 JSON 常量不得越过内存生成边界进入任何写入"
+
+    # 第二个目标替换失败时，首个已替换目标必须恢复原始字节；异常消息也不能泄露底层路径。
+    targets = tuple(tmp_path / name for name in ("contracts.ts", "models.py", "contracts.rs"))
+    original_bytes = {
+        target: f"original-{index}".encode("ascii") for index, target in enumerate(targets)
+    }
+    for target, content in original_bytes.items():
+        target.write_bytes(content)
+
+    commit_attempts: list[Path] = []
+    original_replace = os.replace
+
+    def _fail_second_commit_replace(source: Path, destination: Path) -> None:
+        """模拟第二个 stage replace 失败，后续 rollback replace 仍允许执行。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in targets:
+            commit_attempts.append(destination_path)
+            if len(commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\second-replace-failure")
+        original_replace(source, destination)
+
+    expected_write_error = codegen.CodegenWriteError
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        # 先声明目标 seam：旧顺序 write_or_check 实现不会调用它，因此此处应当 RED。
+        patch.setattr(codegen, "_replace_file", _fail_second_commit_replace)
+        with pytest.raises(expected_write_error, match="CODEGEN_WRITE_FAILED") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(targets))
+            )
+
+    assert len(commit_attempts) == 2, "必须实际发生首成功、第二次失败的 replace 注入"
+    assert [target.read_bytes() for target in targets] == [original_bytes[target] for target in targets]
+    assert "SECRET" not in str(error.value)
+    residue = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.endswith(".stage") or path.name.endswith(".rollback")
+    ]
+    assert residue == [], f"失败补偿后不得留下 stage/rollback 临时文件: {residue}"
+    _assert_failed_batch_log(
+        "CODEGEN_WRITE_FAILED",
+        "partial",
+        "completed",
+        "completed",
+    )
+
+
+    # stage 文件即便写入调用返回，也必须通过关闭后的精确回读防止截断内容进入提交阶段。
+    truncated_directory = tmp_path / "truncated-stage"
+    truncated_targets = _make_batch_targets(
+        truncated_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    truncated_originals = tuple(target.read_bytes() for target in truncated_targets)
+    original_fdopen = os.fdopen
+
+    class _TruncatedStageFile:
+        """只截断 stage 写入，保留真实文件描述符关闭与 fsync 行为。"""
+
+        def __init__(self, wrapped: object) -> None:
+            self._wrapped = wrapped
+
+        def __enter__(self) -> _TruncatedStageFile:
+            self._wrapped.__enter__()  # type: ignore[union-attr]
+            return self
+
+        def __exit__(self, *args: object) -> object:
+            return self._wrapped.__exit__(*args)  # type: ignore[union-attr]
+
+        def write(self, data: bytes) -> object:
+            return self._wrapped.write(data[:-1])  # type: ignore[union-attr]
+
+        def flush(self) -> None:
+            self._wrapped.flush()  # type: ignore[union-attr]
+
+        def fileno(self) -> int:
+            return self._wrapped.fileno()  # type: ignore[union-attr,no-any-return]
+
+    def _open_truncated_stage(*args: object, **kwargs: object) -> _TruncatedStageFile:
+        """模拟首个 stage 的短写，但不伪造 flush/close 成功。"""
+        return _TruncatedStageFile(original_fdopen(*args, **kwargs))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.os, "fdopen", _open_truncated_stage)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(truncated_targets))
+            )
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert tuple(target.read_bytes() for target in truncated_targets) == truncated_originals
+    _assert_no_temporary_residue(truncated_directory)
+
+    # mkstemp 成功但 fdopen 本身失败时，描述符仍归生成器所有，必须先关闭才可可靠清理临时文件。
+    fdopen_directory = tmp_path / "fdopen-failure"
+    fdopen_targets = _make_batch_targets(fdopen_directory, (None, None, None))
+    fdopen_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+    original_close = os.close
+
+    def _fdopen_failed(descriptor: int, mode: str) -> object:
+        """模拟 os.fdopen 在接管句柄前失败，保留 descriptor 的所有权给调用方。"""
+        assert mode == "wb"
+        fdopen_descriptors.append(descriptor)
+        raise OSError(r"D:\codex项目\SECRET\fdopen-failure")
+
+    def _record_descriptor_close(descriptor: int) -> None:
+        """记录并执行真实 close，证明失败路径没有遗留 Windows 句柄。"""
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.os, "fdopen", _fdopen_failed)
+        patch.setattr(codegen.os, "close", _record_descriptor_close)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(fdopen_targets))
+            )
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert closed_descriptors == fdopen_descriptors
+    assert all(not target.exists() for target in fdopen_targets)
+    _assert_no_temporary_residue(fdopen_directory)
+
+    # 即使 descriptor close 也失败，仍必须继续尝试临时文件清理，不能因首错短路。
+    close_failure_directory = tmp_path / "close-failure-cleanup"
+    close_failure_directory.mkdir()
+    close_failure_stage = close_failure_directory / ".contracts.ts.synthetic.stage"
+    cleanup_after_close_failure: list[tuple[Path, ...]] = []
+
+    def _fake_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        """避免制造真实未关闭 descriptor，只提供 fdopen 失败路径所需的受控占位。"""
+        return 713, str(close_failure_stage)
+
+    def _close_failed(_: int) -> None:
+        """模拟 close 本身失败，验证外层仍会调用 cleanup。"""
+        raise OSError(r"D:\codex项目\SECRET\close-failure")
+
+    def _record_cleanup(paths: list[Path]) -> bool:
+        """记录 cleanup 调用而不依赖宿主文件锁行为。"""
+        cleanup_after_close_failure.append(tuple(paths))
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen.tempfile, "mkstemp", _fake_mkstemp)
+        patch.setattr(codegen.os, "fdopen", _fdopen_failed)
+        patch.setattr(codegen.os, "close", _close_failed)
+        patch.setattr(codegen, "_cleanup_temporary_files", _record_cleanup)
+        with pytest.raises(codegen._CodegenTemporaryCleanupError):
+            codegen._stage_bytes(close_failure_directory / "contracts.ts", b"new", ".stage")
+    assert cleanup_after_close_failure == [(close_failure_stage,)]
+
+    # 第二个 NEW stage 失败时，第一个 stage 必须清理，三个正式目标完全不可见地保持原值。
+    second_stage_directory = tmp_path / "second-stage-failure"
+    second_stage_targets = _make_batch_targets(
+        second_stage_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    second_stage_originals = tuple(target.read_bytes() for target in second_stage_targets)
+    stage_attempts: list[Path] = []
+    original_stage_bytes = codegen._stage_bytes
+
+    def _fail_second_stage(target: Path, data: bytes, suffix: str) -> Path:
+        """第二个 stage 创建失败，验证此前 stage 的 finally 清理边界。"""
+        stage_attempts.append(target)
+        if len(stage_attempts) == 2:
+            raise OSError(r"D:\codex项目\SECRET\second-stage-failure")
+        return original_stage_bytes(target, data, suffix)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_stage_bytes", _fail_second_stage)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(second_stage_targets))
+            )
+    assert len(stage_attempts) == 2
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert "SECRET" not in str(error.value)
+    assert tuple(target.read_bytes() for target in second_stage_targets) == second_stage_originals
+    _assert_no_temporary_residue(second_stage_directory)
+
+    # 第三个 commit 失败且第一个 reverse restore 失败时，仍需继续尝试其余恢复，且 rollback 码优先。
+    rollback_directory = tmp_path / "rollback-priority"
+    rollback_targets = _make_batch_targets(
+        rollback_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    rollback_originals = tuple(target.read_bytes() for target in rollback_targets)
+    rollback_commits: list[Path] = []
+    rollback_restores: list[Path] = []
+    rollback_cleanup_attempts: list[Path] = []
+    rollback_original_unlink = codegen._unlink_file
+
+    def _fail_commit_and_first_restore(source: Path, destination: Path) -> None:
+        """让第三次提交失败、首次逆序恢复失败，确认其余恢复不会被短路。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in rollback_targets:
+            rollback_commits.append(destination_path)
+            if len(rollback_commits) == 3:
+                raise OSError(r"D:\codex项目\SECRET\third-commit-failure")
+        if source_path.suffix == ".rollback" and destination_path in rollback_targets:
+            rollback_restores.append(destination_path)
+            if destination_path == rollback_targets[1]:
+                raise OSError(r"D:\codex项目\SECRET\rollback-failure")
+        original_replace(source, destination)
+
+    def _fail_first_rollback_cleanup(path: Path) -> None:
+        """让 rollback 已失败时的首次临时清理也失败，验证错误优先级不会反转。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not rollback_cleanup_attempts:
+            rollback_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\rollback-cleanup-failure")
+        rollback_original_unlink(candidate)
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_commit_and_first_restore)
+        patch.setattr(codegen, "_unlink_file", _fail_first_rollback_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_ROLLBACK_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(rollback_targets))
+            )
+    assert rollback_commits == list(rollback_targets)
+    assert rollback_restores == [rollback_targets[1], rollback_targets[0]]
+    assert len(rollback_cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_ROLLBACK_FAILED"
+    assert rollback_targets[0].read_bytes() == rollback_originals[0]
+    _assert_no_temporary_residue(rollback_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_ROLLBACK_FAILED",
+        "partial",
+        "failed",
+        "failed",
+    )
+
+    # 原本不存在的第一目标在首提交成功、第二提交失败后必须恢复为不存在，而不是留下新文件。
+    absent_directory = tmp_path / "absent-target"
+    absent_targets = _make_batch_targets(absent_directory, (None, b"old-python", b"old-rust"))
+    absent_commit_attempts: list[Path] = []
+
+    def _fail_second_absent_commit(source: Path, destination: Path) -> None:
+        """在首个原不存在目标提交后注入第二次提交失败。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in absent_targets:
+            absent_commit_attempts.append(destination_path)
+            if len(absent_commit_attempts) == 2:
+                raise OSError(r"D:\codex项目\SECRET\absent-target-failure")
+        original_replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_second_absent_commit)
+        with pytest.raises(expected_write_error, match="^CODEGEN_WRITE_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(absent_targets))
+            )
+    assert absent_commit_attempts == list(absent_targets[:2])
+    assert str(error.value) == "CODEGEN_WRITE_FAILED"
+    assert not absent_targets[0].exists()
+    assert absent_targets[1].read_bytes() == b"old-python"
+    assert absent_targets[2].read_bytes() == b"old-rust"
+    _assert_no_temporary_residue(absent_directory)
+
+    # 原始写失败叠加 cleanup 瞬时失败时，cleanup 码必须高于 write 码且仍恢复全部旧字节。
+    write_cleanup_directory = tmp_path / "write-cleanup-priority"
+    write_cleanup_targets = _make_batch_targets(
+        write_cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    write_cleanup_originals = tuple(target.read_bytes() for target in write_cleanup_targets)
+    write_cleanup_commits: list[Path] = []
+    write_cleanup_attempts: list[Path] = []
+    write_cleanup_original_unlink = codegen._unlink_file
+
+    def _fail_second_write_cleanup_commit(source: Path, destination: Path) -> None:
+        """制造普通写入失败，使最终错误只能由 cleanup 优先级改变。"""
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.suffix == ".stage" and destination_path in write_cleanup_targets:
+            write_cleanup_commits.append(destination_path)
+            if len(write_cleanup_commits) == 2:
+                raise OSError(r"D:\codex项目\SECRET\write-cleanup-failure")
+        original_replace(source, destination)
+
+    def _fail_first_write_cleanup(path: Path) -> None:
+        """仅让 cleanup 的首次 rollback 删除失败，第二次真实删除必须成功。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not write_cleanup_attempts:
+            write_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\write-cleanup-delete-failure")
+        write_cleanup_original_unlink(candidate)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_replace_file", _fail_second_write_cleanup_commit)
+        patch.setattr(codegen, "_unlink_file", _fail_first_write_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_CLEANUP_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(write_cleanup_targets))
+            )
+    assert write_cleanup_commits == list(write_cleanup_targets[:2])
+    assert len(write_cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_CLEANUP_FAILED"
+    assert tuple(target.read_bytes() for target in write_cleanup_targets) == write_cleanup_originals
+    _assert_no_temporary_residue(write_cleanup_directory)
+
+    # 清理首次失败即使重试成功、临时文件最终为零，也必须 fail-closed 并保持 cleanup 码优先。
+    cleanup_directory = tmp_path / "cleanup-priority"
+    cleanup_targets = _make_batch_targets(
+        cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    cleanup_attempts: list[Path] = []
+    original_unlink = codegen._unlink_file
+
+    def _fail_first_rollback_cleanup(path: Path) -> None:
+        """仅让第一个 rollback 清理瞬时失败，后续重试必须继续并成功。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not cleanup_attempts:
+            cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\cleanup-failure")
+        original_unlink(candidate)
+
+    caplog.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_unlink_file", _fail_first_rollback_cleanup)
+        with pytest.raises(expected_write_error, match="^CODEGEN_CLEANUP_FAILED$") as error:
+            codegen.write_batch(
+                tuple((target, f"new-{index}\n") for index, target in enumerate(cleanup_targets))
+            )
+    assert len(cleanup_attempts) == 1
+    assert str(error.value) == "CODEGEN_CLEANUP_FAILED"
+    assert tuple(target.read_text(encoding="utf-8") for target in cleanup_targets) == (
+        "new-0\n",
+        "new-1\n",
+        "new-2\n",
+    )
+    _assert_no_temporary_residue(cleanup_directory)
+    _assert_failed_batch_log(
+        "CODEGEN_CLEANUP_FAILED",
+        "completed",
+        "not_required",
+        "failed",
+    )
+
+    # 真实 main 调用必须把 batch 的精确终态传到 cli_end，不得用含混占位值。
+    cli_cleanup_directory = tmp_path / "cli-cleanup-status"
+    cli_cleanup_targets = _make_batch_targets(
+        cli_cleanup_directory,
+        (b"old-typescript", b"old-python", b"old-rust"),
+    )
+    cli_cleanup_attempts: list[Path] = []
+    cli_cleanup_original_unlink = codegen._unlink_file
+
+    def _fail_first_cli_cleanup(path: Path) -> None:
+        """在真实 CLI 批次已全部提交后制造 cleanup 故障，第二次重试仍完成清理。"""
+        candidate = Path(path)
+        if candidate.suffix == ".rollback" and not cli_cleanup_attempts:
+            cli_cleanup_attempts.append(candidate)
+            raise OSError(r"D:\codex项目\SECRET\cli-cleanup-failure")
+        cli_cleanup_original_unlink(candidate)
+
+    caplog.clear()
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+        patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+        patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+        patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+        patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+        patch.setattr(codegen, "TS_OUT", cli_cleanup_targets[0])
+        patch.setattr(codegen, "PY_OUT", cli_cleanup_targets[1])
+        patch.setattr(codegen, "RS_OUT", cli_cleanup_targets[2])
+        patch.setattr(codegen, "_unlink_file", _fail_first_cli_cleanup)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    cli_cleanup_output = capsys.readouterr()
+    assert cli_cleanup_output.err == "[ERROR] CODEGEN_CLEANUP_FAILED\n"
+    cli_cleanup_records, cli_cleanup_user_lines = _parse_cli_codegen_logs(cli_cleanup_output.out)
+    assert cli_cleanup_user_lines == []
+    assert [record["event"] for record in cli_cleanup_records] == [
+        "cli_start",
+        "batch_start",
+        "batch_end",
+        "cli_end",
+    ]
+    batch_end_record, cli_end_record = cli_cleanup_records[-2:]
+    assert (
+        cli_end_record["commit_status"],
+        cli_end_record["rollback_status"],
+        cli_end_record["cleanup_status"],
+        cli_end_record["error_code"],
+    ) == (
+        batch_end_record["commit_status"],
+        batch_end_record["rollback_status"],
+        batch_end_record["cleanup_status"],
+        batch_end_record["error_code"],
+    ) == ("completed", "not_required", "failed", "CODEGEN_CLEANUP_FAILED")
+    assert len(cli_cleanup_attempts) == 1
+    _assert_no_temporary_residue(cli_cleanup_directory)
+
+    # CLI 仅接收稳定 ASCII 码；底层 OSError 中的路径和 errno 均不得穿透到 stderr，也不得误报 DONE。
+    for raised_error, expected_code in (
+        ("CODEGEN_WRITE_FAILED", "CODEGEN_WRITE_FAILED"),
+        ("CODEGEN_CLEANUP_FAILED", "CODEGEN_CLEANUP_FAILED"),
+        ("CODEGEN_ROLLBACK_FAILED", "CODEGEN_ROLLBACK_FAILED"),
+        (r"D:\codex项目\SECRET\unexpected-codegen-error", "CODEGEN_WRITE_FAILED"),
+    ):
+        capsys.readouterr()
+
+        def _raise_stable_write_error(
+            _: object,
+            *,
+            correlation_id: str,
+            error_text: str = raised_error,
+        ) -> None:
+            assert re.fullmatch(r"[0-9a-f]{32}", correlation_id)
+            raise codegen.CodegenWriteError(error_text)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+            patch.setattr(codegen, "load_catalog", lambda: {"schemas": [{"codegen": True}]})
+            patch.setattr(codegen, "load_required_validator_schemas", lambda: {})
+            patch.setattr(codegen, "generate_typescript", lambda *args, **kwargs: "typescript")
+            patch.setattr(codegen, "generate_python", lambda *args, **kwargs: "python")
+            patch.setattr(codegen, "generate_rust", lambda *args, **kwargs: "rust")
+            patch.setattr(codegen, "write_batch", _raise_stable_write_error)
+            patch.setattr(codegen.sys, "argv", ["generate.py"])
+            assert codegen.main() == 1
+        captured = capsys.readouterr()
+        assert captured.err.strip() == f"[ERROR] {expected_code}"
+        assert "SECRET" not in captured.err
+        assert "[DONE]" not in captured.out + captured.err
+
+    # --check 的三次读取不得触碰 mkdir/mkstemp/stage/fsync/replace/unlink 等任何写路径。
+    check_calls: list[bool] = []
+
+    def _read_only_check(*args: object, **kwargs: object) -> bool:
+        """记录 --check 调用；只有显式 True 才是允许的只读边界。"""
+        check_mode = kwargs.get("check_mode")
+        if check_mode is None and len(args) >= 3:
+            check_mode = args[2]
+        assert check_mode is True
+        check_calls.append(True)
+        return True
+
+    def _unexpected_write_path(*args: object, **kwargs: object) -> None:
+        """任何写入 seam 被 --check 触发即立即使测试失败。"""
+        raise AssertionError("--check 不得进入写入路径")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "write_or_check", _read_only_check)
+        patch.setattr(codegen, "write_batch", _unexpected_write_path)
+        patch.setattr(codegen, "_stage_bytes", _unexpected_write_path)
+        patch.setattr(codegen, "_chmod_file", _unexpected_write_path)
+        patch.setattr(codegen, "_replace_file", _unexpected_write_path)
+        patch.setattr(codegen, "_unlink_file", _unexpected_write_path)
+        patch.setattr(codegen.tempfile, "mkstemp", _unexpected_write_path)
+        patch.setattr(codegen.os, "fdopen", _unexpected_write_path)
+        patch.setattr(codegen.os, "fsync", _unexpected_write_path)
+        patch.setattr(codegen.os, "close", _unexpected_write_path)
+        patch.setattr(codegen.Path, "mkdir", _unexpected_write_path)
+        patch.setattr(codegen.sys, "argv", ["generate.py", "--check"])
+        assert codegen.main() == 0
+    assert check_calls == [True, True, True]
+
+
+def test_codegen_raw_schema_sha_and_digest_material_preconditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """原始 bytes SHA 必须感知空白漂移；PlanRevision 派生前必须显式保留两项排除字段。"""
+    codegen = _load_codegen_module()
+    schema_relative_path = "contracts/schemas/plan-revision.v1.schema.json"
+    source_bytes = PLAN_REVISION_SCHEMA_PATH.read_bytes()
+    raw_versions = iter((source_bytes, source_bytes + b" \n"))
+
+    # 不创建 pytest 临时目录；严格 loader 必须直接以 read_bytes 返回的原始字节计算 SHA。
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", lambda *args, **kwargs: next(raw_versions))
+        _, original_sha = codegen.load_required_validator_schema(schema_relative_path)
+        _, whitespace_changed_sha = codegen.load_required_validator_schema(schema_relative_path)
+    assert original_sha != whitespace_changed_sha, "权威 schema 原始空白字节变化也必须改变嵌入 SHA"
+
+    missing_digest_property = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    del missing_digest_property["properties"]["planRevisionDigest"]
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_digest_property)
+
+    missing_digest_required = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    missing_digest_required["required"].remove("planRevisionDigest")
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_digest_required)
+
+    missing_signature_property = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    missing_signature_property["properties"].pop("signature", None)
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(missing_signature_property)
+
+    required_signature = _load_json(PLAN_REVISION_SCHEMA_PATH)
+    required_signature["required"].append("signature")
+    with pytest.raises(codegen.ValidatorSchemaError, match="VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED"):
+        codegen.build_plan_revision_digest_material_schema(required_signature)
+
+
+def test_codegen_ordinary_entry_failure_prevents_all_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """普通 catalog entry 失败也必须阻断三语言写入，不能遗留 ERROR 注释生成物。"""
+    codegen = _load_codegen_module()
+
+    # 第一轮：普通 entry 读取失败，验证 main 不会把它降级成注释后写入。
+    writes: list[object] = []
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(
+            codegen,
+            "load_catalog",
+            lambda: {
+                "schemas": [
+                    {
+                        "codegen": True,
+                        "schemaPath": "contracts/schemas/absent.schema.json",
+                        "name": "AbsentDefinition",
+                    }
+                ]
+            },
+        )
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert writes == [], "普通 schema 失败时不得写入任一生成目标"
+
+    # 第二轮：TypeScript 内容已在内存生成后 Python 失败，仍必须保持首次写入前失败。
+    calls: list[str] = []
+    writes.clear()
+
+    def _typescript_generated(*args: object, **kwargs: object) -> str:
+        calls.append("typescript")
+        return "// in-memory TypeScript content"
+
+    def _python_failed(*args: object, **kwargs: object) -> str:
+        calls.append("python")
+        raise codegen.CodegenGenerationError("CODEGEN_GENERATION_FAILED")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(codegen, "_configure_cli_text_output_utf8", lambda: None)
+        patch.setattr(codegen, "generate_typescript", _typescript_generated)
+        patch.setattr(codegen, "generate_python", _python_failed)
+        patch.setattr(codegen, "write_or_check", lambda *args, **kwargs: writes.append((args, kwargs)) or True)
+        patch.setattr(codegen, "write_batch", lambda *args, **kwargs: writes.append((args, kwargs)) or None)
+        patch.setattr(codegen.sys, "argv", ["generate.py"])
+        assert codegen.main() == 1
+    assert calls == ["typescript", "python"]
+    assert writes == [], "任一后续语言内容失败时不得写入已生成的前序内容"
+
+
+def test_event_contract_text_is_lf_and_clean_filter_identity() -> None:
+    """所有触达文本必须 LF；raw blob 与 Git index clean-filter 后字节完全等价。"""
+    for relative_path in EVENT_CONTRACT_TOUCHED_TEXT_PATHS:
+        path = REPO_ROOT / relative_path
+        raw = path.read_bytes()
+        assert b"\r" not in raw, f"事件合同文本仍含 CR/CRLF: {relative_path}"
+        raw_blob = subprocess.run(
+            ["git", "hash-object", "--stdin"],
+            cwd=REPO_ROOT,
+            input=raw,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        clean_blob = subprocess.run(
+            ["git", "hash-object", f"--path={relative_path}", "--stdin"],
+            cwd=REPO_ROOT,
+            input=raw,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        assert clean_blob == raw_blob, f"Git clean filter 改写事件合同字节: {relative_path}"
+        attributes = subprocess.run(
+            ["git", "check-attr", "eol", "--", relative_path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        ).stdout
+        assert attributes.rstrip().endswith(": lf"), f"事件合同缺少 eol=lf: {relative_path}"
+
+
+def test_codegen_embeds_raw_schema_sha_and_check_detects_drift() -> None:
+    """三语言嵌入全部运行时事件 schema；source/content 任一漂移都被 --check 拒绝。"""
+    codegen = _load_codegen_module()
+    entries = [entry for entry in codegen.load_catalog()["schemas"] if entry.get("codegen") is True]
+    source_markers = {
+        "RUN_SPEC_SCHEMA_SOURCE_SHA256": _raw_file_sha256(RUN_SPEC_SCHEMA_PATH),
+        "PLAN_REVISION_SCHEMA_SOURCE_SHA256": _raw_file_sha256(PLAN_REVISION_SCHEMA_PATH),
+        "PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            PREPARED_EVENT_SCHEMA_PATH
+        ),
+        "DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            DURABLE_EVENT_SCHEMA_PATH
+        ),
+        "PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            PREPARED_BATCH_SCHEMA_PATH
+        ),
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256": _raw_file_sha256(
+            AUTHORITATIVE_STATE_EVENT_SCHEMA_PATH
+        ),
+    }
+    generated_contents = {
+        "TypeScript": codegen.generate_typescript(entries),
+        "Python": codegen.generate_python(entries),
+        "Rust": codegen.generate_rust(entries),
+    }
+    validator_schemas = codegen.load_required_validator_schemas()
+    assert set(validator_schemas) == {
+        "runSpec",
+        "planRevision",
+        "planRevisionDigestMaterial",
+        "preparedEvent",
+        "durableEvent",
+        "preparedBatch",
+        "authoritativeStateEvent",
+    }
+    embedded_structures = {
+        "RUN_SPEC_SCHEMA_JSON": validator_schemas["runSpec"][0],
+        "PLAN_REVISION_SCHEMA_JSON": validator_schemas["planRevision"][0],
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON": validator_schemas["planRevisionDigestMaterial"][0],
+        "PREPARED_EVENT_V2_SCHEMA_JSON": validator_schemas["preparedEvent"][0],
+        "DURABLE_EVENT_V2_SCHEMA_JSON": validator_schemas["durableEvent"][0],
+        "PREPARED_BATCH_V2_SCHEMA_JSON": validator_schemas["preparedBatch"][0],
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON": validator_schemas[
+            "authoritativeStateEvent"
+        ][0],
+    }
+    embedded_sha_markers = {
+        name + "_SHA256": "sha256:"
+        + hashlib.sha256(codegen._embedded_schema_json(schema).encode("utf-8")).hexdigest()
+        for name, schema in embedded_structures.items()
+    }
+
+    class _DriftedGeneratedOutput:
+        """只读伪输出文件，模拟嵌入 SHA 被手工篡改后的 --check 输入。"""
+
+        def __init__(self, content: str) -> None:
+            self._content = content
+
+        def exists(self) -> bool:
+            return True
+
+        def read_text(self, *, encoding: str) -> str:
+            assert encoding == "utf-8"
+            return self._content
+
+    def _python_embedded_schema_values(content: str) -> dict[str, dict[str, Any]]:
+        """从 Python 源码 AST 读取字符串常量，证明生成物不在 import 时 JSON 解析。"""
+        values: dict[str, dict[str, Any]] = {}
+        for statement in ast.parse(content).body:
+            if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
+                continue
+            if statement.target.id not in embedded_structures:
+                continue
+            raw_json = ast.literal_eval(statement.value)
+            assert isinstance(raw_json, str)
+            values[statement.target.id] = json.loads(raw_json)
+        return values
+
+    for language, content in generated_contents.items():
+        for marker, source_sha in source_markers.items():
+            assert marker in content, f"{language} 未嵌入 {marker}"
+            assert source_sha in content, f"{language} 未嵌入 {marker} 的原文件 SHA"
+            drifted = content.replace(source_sha, "sha256:" + "0" * 64, 1)
+            assert not codegen.write_or_check(_DriftedGeneratedOutput(drifted), content, check_mode=True)
+        for marker, embedded_sha in embedded_sha_markers.items():
+            assert marker in content, f"{language} 未嵌入 {marker}"
+            assert embedded_sha in content, f"{language} 未嵌入 {marker} 的内容 SHA"
+            drifted = content.replace(embedded_sha, "sha256:" + "0" * 64, 1)
+            assert not codegen.write_or_check(_DriftedGeneratedOutput(drifted), content, check_mode=True)
+        if language == "Python":
+            assert _python_embedded_schema_values(content) == embedded_structures
+        elif language == "TypeScript":
+            for embedded_schema in embedded_structures.values():
+                schema_json_literal = json.dumps(
+                    codegen._embedded_schema_json(embedded_schema), ensure_ascii=False
+                )
+                assert schema_json_literal in content, "TypeScript 未机械嵌入 validator schema JSON 字符串"
+        else:
+            for embedded_schema in embedded_structures.values():
+                assert codegen._embedded_schema_json(embedded_schema) in content, (
+                    f"{language} 未机械嵌入权威/派生 validator schema 结构"
+                )

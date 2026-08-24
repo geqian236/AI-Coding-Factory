@@ -21,9 +21,11 @@
   独立进程读回、容器孤儿存活 inspect、pack roundtrip 校验等**实测事实**，非硬编码。
   receipt 聚合层强制 owner 白名单 + catalog 冻结值匹配 + qualification=FINAL + replay 去重
   + digest 绑定 + receiptId 唯一 + expected/actual 非空（6 负例 fixture fail-closed）。
-- **后移 Phase 1 部分**：完整隔离容器 **Deterministic Verifier**——receipt 的
-  `expected`/`actual`/`artifactDigests` 内容本身由 Verifier 在隔离容器中**实际执行测试**
-  后写入并交叉核验，调用方无法自报 `observed:true`。属 §9.2 容器化执行实现。
+- **总计划归属裁决**：Phase 1 只实现 receipt plumbing 与本阶段的确定性测试（字段绑定、
+  catalog/owner/digest/qualification 机械校验），不提前实现隔离执行器。完整隔离容器
+  **Deterministic Verifier**——由它实际执行测试并写入/交叉核验
+  `expected`/`actual`/`artifactDigests`、使调用方不能自报 `observed:true`——明确保留至
+  **Phase 4 Task 5**。
 - **审核出处**：第二/三轮 P0-6 深层点。
 
 ### B2. TestReceipt 单一真源 — ✅ 已在 Phase 0 消除（第四轮 REVISE item 2）
@@ -41,6 +43,7 @@
 - **不再属 Phase 1**：双源已消除、漂移由测试机械防护，从 backlog 移除。
 
 ### B3. 真实 ENOSPC 认证
+- **状态：未完成**。不得通过模拟磁盘满、合成 PASS 或结构性门禁把它标为已认证。
 - **现状（Phase 0）**：sqlite spike disk-full 子项诚实标 `BLOCKED_UNCERTIFIED`；
   bench.py 支持 `--probe-dir` 指向 VHD；`scripts/spikes/create_enospc_vhd.ps1` 提供
   admin 挂载 ≤16MiB VHD 的完整脚本。
@@ -59,34 +62,62 @@
 - **不再属 Phase 1**：此项已在 Phase 0 验收集 A-3b 认证，从 backlog 移除。
 
 ### B5. 并发实现（Master Spec §11 明确移交）
-- **Phase 0 冻结**：PreparedBatchV2 / DurableEventV2 的**纯函数物化算法** + schema
-  （previousEventDigest 单链、跨批链接续、多 Task manifest 结构、eventDigest 排除自身）。
-- **Phase 1 目标**：SQLite 单写者 coordinator、writer_epoch CAS、多 Task 原子 claim 事务、
-  `ingest_batches` 状态机（CLAIMED→PREPARING→PREPARED→COMMITTED）、竞争批次
-  CAS 落败重建。这些是**有状态运行时**，Phase 0 不实现。
+- **本节点完成的合同前置**：PreparedEventV2 采用 Durable 的六个具体 wire eventType，
+  `MaterializationInput` 明确为非 wire 的单 Task slice，并以独立
+  `CommittedEventAnchor` 逐字段匹配 expected head；三语言 materializer 在输入前/输出后嵌入
+  Prepared/Durable 权威 schema。输入 event 必带 coordinator 派生的 `batchOrdinal`、`runSeq`、
+  `durabilityClass`，无默认值；writer 分配字段一律拒绝。
+- **仍属 Task 7 / 有状态运行时**：SQLite 单写者 coordinator、writer_epoch CAS、多 Task 原子 claim、
+  真实 PreparedBatch manifest/segment 协调、`ingest_batches` 状态机、竞争批次重建与 group commit。
+  本节点没有实现这些存储行为，也不把单 Task 纯函数物化冒充为 PreparedBatchV2 或持久化事务。
 
 ### B6. 授权合同 + 运行时状态机（整体 Phase 1）
-- **Phase 0 实际状态（诚实更正）**：`contracts/schemas/` 下**不存在** intent-authorization /
-  execution-authorization schema 文件。RunSpec 仅含一个普通字符串字段
-  `intentAuthorizationId`（`type: string`，非 `$ref`），用于关联 ID——不导入任何授权合同，
-  故无编译期悬空引用，但**也不构成"Phase 0 已冻结授权 schema"**。第三轮审核 item 4 指出
-  原主张（"Phase 0 冻结 IntentAuthorization/ExecutionAuthorization schema 字段"）无对应
-  schema，属夸大，此处删除该主张。
-- **Phase 1 目标（合同 + 运行时一并实现）**：
-  1. 按 Master Spec §11 L739 新建 `intent-authorization.v1.schema.json`（issued_at/expires_at/
-     revoked_at/revoke_reason/stage_capability_map_version/allowed_capability_set_digest/
-     autonomous_execution_budget_ms/修复·重规划·Attempt 上限）与
-     `execution-authorization.v1.schema.json`（绑定 intent_authorization_id/plan_revision_id/
-     semantic_plan_hash/plan_revision_digest/capability map version+digest/run·step·attempt/
-     owner executor/resource fingerprint/capability scope digest/幂等键/fencing token/
-     control epoch/accepted control command sequence/输入 SHA/max_uses/消费状态），
-     注册 codegen 并加合同测试。
-  2. 授权的**消费/撤销有状态机**（`max_uses` 递减、fencing token 递增、control epoch 校验、
-     consumed 状态 CAS），属 §11 运行时。
+- **本节点已完成的合同前置**：新增 `intent-authorization.v1.schema.json` 与
+  `execution-authorization.v1.schema.json`，以 camelCase 冻结 Intent 的阶段/预算/撤销快照和
+  Execution 的 plan/map digest、action policy snapshot、资源指纹、fencing/control/输入绑定及
+  消费投影；所有 digest-backed 字段均改为闭合 `{artifactId,schemaId,schemaVersion,digest}` ref，
+  `contracts/policies/authorization-snapshot-registry.v1.json` 固定 NFC+RFC8785/JCS 域分离摘要、
+  每字段 schemaId/version、真实 validator 来源与闭合 payload。资源指纹使用 node map 内嵌 schema，
+  action 快照使用 selected action 投影并绑定 node map digest/node/action。输入绑定仍为闭合
+  `baseSha` / `candidateSha` / `contentDigest` 对象（其中 contentDigest 为快照 ref），按节点强制最小
+  SHA/content；且 `nodeType → actionCapability` 与 17-node policy map 精确求交。registry 是 policy，
+  不增加 schema/catalog 计数；既有两份授权 schema 继续由生成器确定性生成 Python/TypeScript/Rust，
+  Python TypedDict 仅将 schema required 字段标为 `Required[T]`，并有 schema、catalog、codegen
+  漂移和 fail-closed 合同测试。CompatibilityManifest v1 已有 `nodeCapabilityMapDigest`，唯一真源为
+  `emit_manifest.py` raw-file SHA-256，禁止换成 compact/sorted JSON 私有 hash。该工作不把 RunSpec
+  的关联字符串误称为早期 `$ref`，也不实现授权运行时。
+  `semanticPlanHash` 快照现在直接承接运行时 `build_semantic_projection` 的完整、post-bootstrap RunSpec
+  语义字段，不再使用缩小样本（`schemaVersion` 为整数、`constraints` 为数组，assumptions/scope/
+  acceptanceCriteria/repository/workPlan/riskProfile 全部冻结）。bootstrap 必须先完成并取得可信 full SHA，
+  之后才生成首个 v1 RunSpec；`repository.baseCommit` 键在 `existing|new` 两种用户来源模式下都必须是
+  40 位小写完整 SHA。不得伪造 `new/null` RunSpec，也不得把 mode 改写为 existing；RunSpec/PlanRevision
+  只在结构化 `nodeType` 字段拒绝 `BOOTSTRAP_REPOSITORY`，并在结构化 `businessPhase` 字段拒绝真实
+  `BOOTSTRAPPING_REPOSITORY`（同时兼容拒绝旧误拼 `BOOTSTRAPPING`），不递归限制 logicalNodeId/gate
+  等自由 ID 字符串。post-bootstrap 的首个计划从 `PLAN`/`PLANNING` 开始。`planRevisionDigest` 快照逐项承接
+  `plan-revision.v1.schema.json`，仅排除自身 digest 与签名，仍包含 DAG、map 版本、nodes、barriers、
+  stageMaps 与 createdAt。合同测试从权威投影/schema 派生 exact-set 断言，并对每个纳入字段的变更
+  重算摘要，防止静态 registry 与后续运行时实现分叉。
+  本轮收紧为机械闭集：`semanticPlanHash`/`planRevisionDigest` 共同采用 `^sha256:[0-9a-f]{64}$`，摘要全零
+  仍格式合法；Git 全零 sentinel 只在 baseline/RunSpec 路径拒绝。`businessPhase` 从 Master Spec §7.1 去除
+  `CREATED`/`PREFLIGHT`/`BOOTSTRAPPING_REPOSITORY` 后精确保留 15 个 post-bootstrap 值。**v1 设计决定**：
+  所有 RunSpec/PlanRevision（含 child replan）均有非空 nodes/barriers，且首 node 为 `PLAN`/`PLANNING`、首
+  barrier 为 `PLANNING`；自由 logicalNodeId/gate 文本不递归禁词。registry baseline metadata 固定为
+  `required=[baseBranch,bootstrapState]`、`optional=[baseSha,bootstrapReceiptId]`：`EXISTS` 必须 non-zero full
+  `baseSha`（receipt 可选），`BOOTSTRAP_REQUIRED` 禁止 sha/receipt。新仓库 baseBranch 默认策略和
+  `bootstrapPending` 显式策略未冻结，不宣称当前合同已唯一规定。生成器写三语言文件时采用同目录
+  stage/rollback 的进程内补偿批次，稳定脱敏错误码优先级为 rollback > cleanup > write；不宣称断电或并发事务。
+- **后续 Task 4/5**：pre-plan bootstrap 目前仅冻结 Task intake、Intent `repo.bootstrap` 包络、目录合同与
+  action receipt 边界，不伪造 PlanRevision-bound ExecutionAuthorization；bootstrap 专用 permit、消费/事务
+  尚未实现且必须 fail closed。授权签发、从 `COMMITTED` 不可变 artifact 解析 ref、核验 artifact ID、
+  schema/version、validator 与重算 digest、Execution/Manifest 实际 node map 值比对、撤销、`maxUses`
+  消费、fencing token/control epoch 校验、CAS、动态 scope/lease/时间比较及真实执行消费仍是有状态
+  运行时；本节点没有伪测数据库 COMMITTED 逻辑，也不是这些流程已完成的声明。
 
 ### B7. durable-event.v2 §10.1 全字段的**运行时填充**（第三轮 REVISE item 4 要求拆分）
-- **Phase 0 冻结（✅）**：schema 含 §10.1 全 32 字段（执行身份、双 span、脱敏证据、
-  processIdentity 等）；纯函数物化器填充 identity/链/摘要字段，golden vector 字节锚定。
+- **本节点完成的合同前置（✅）**：Prepared/Durable 共享身份字段具有 schema 机械约束：完整
+  processIdentity、source/provider 信息、双 span、时间、redaction 与 `stream.*` 的非空 streamId。
+  三语言纯函数物化器填充 writer identity/链/摘要字段，并以 golden vector 字节锚定；`model.summary`
+  因 Provider frameRef 未冻结而 fail-closed，路由 Provider/Task 7 合同前置，禁止猜测 payload ref。
 - **拆分后 Phase 1 部分（durable writer）**：SQLite 单写者把物化后的 DurableEventV2 落库、
   推进 head、group-commit 事务——事件耐久写入路径。
 - **拆分后 Phase 3 部分（adapter / process identity 采集）**：Adapter 运行时真实采集
@@ -94,11 +125,36 @@
   水位、sanitizedStreamSpan 脱敏字节、redactionManifest 实际脱敏证据。属真实 Provider
   数据源接入，依赖 Phase 3 harness/runner。
 
+### B7a. AuthoritativeStateEventV1 持久化验收与兼容性收口
+- **本节点完成的合同前置（✅）**：`AuthoritativeStateEventV1` 以 scope、aggregate、显式 nullable
+  run/step/attempt identity、previousStateVersion/stateVersion、payloadDigest 表示权威状态变化；它允许
+  pre-step/attempt 聚合但禁止伪造执行身份。Draft7 只能校验 const/nullability，不能取代跨字段或
+  跨记录约束。`payloadDigest == sha256(JCS(payload))` 必须由构造器/UoW 重算，schema 的 digest
+  pattern 不能证明 payload 与摘要相等。
+- **Task 1 持久化验收**：`0002_event_store.sql` 必须在同一 UoW 中建立并执行唯一键
+  `(aggregateType, aggregateId, stateVersion)`；同时逐路验证
+  `TASK -> aggregateId == taskId`、`RUN -> aggregateId == runId`、
+  `PHASE_BARRIER -> aggregateId == phase_barriers.barrier_id` 且
+  `phase_barriers.run_id == runId`、`STEP -> aggregateId == stepId`、
+  `ATTEMPT -> aggregateId == attemptId`，并验证 `stateVersion = previousStateVersion + 1`。
+  这些跨字段相等与外表 FK 只能在 Task 1 UoW 执行；不得以 Python-only validator 或 Draft7
+  schema 测试伪称已实现 DB/CAS。
+- **Task 10**：`eventContractSetDigest` 属于 Compatibility Manifest/receipt 的兼容性收口；本节点只
+  登记该后续项，不修改 manifest、receipt 或 Master。
+
 ### B8. node-capability-map 5 字段的**策略引擎消费**
-- **Phase 0 冻结**：node-capability-map schema 含 requiredCapabilities/sideEffectClass 等。
-- **Phase 1 目标**：resource fingerprint schema、幂等键模板、完成事实、授权消费点、
-  retry class 的**策略引擎运行时消费**（Policy Engine 按 nodeType 派生 capability 并校验），
-  属 §6.3 运行时。
+- **本节点已完成的合同前置**：17 种 nodeType 均冻结既有 `requiredCapabilities`/
+  `sideEffectClass` 与五个新增字段：本文件本地 `$defs` 可解析的闭合 resource fingerprint
+  schema、按 capability 独立的 `factory-action-v1` 幂等键输入、外部完成事实、授权消费点及
+  静态 retry envelope。合同测试逐 node/action 精确冻结 required/optional capability、side effect、
+  授权消费点、retry class、key 输入、predicate 与 evidence；并自动穷举每个 selection 的
+  true-缺-overlay/false-携-overlay，以及资源指纹根对象和嵌套对象的未知字段注入。
+  DEPLOY/ACCEPT/ROLLBACK 每个 action key 均绑定 `environment + resourceFingerprintDigest`；
+  `target.guard.clear` 只属于 RECONCILE_TARGET optional，PUBLISH_PR 四个 action 保持 action-local，
+  同步改 key/fact 或换另一个合法 retry class 也会被精确 mutation 门禁拒绝。
+- **后续 Task 4/5**：Policy Engine 按 nodeType/action 派生 capability、验证资源指纹/完成事实、
+  记录 started transaction、处理 `UNKNOWN_STATE/RECONCILING` 并执行 CAS/重试包络，仍属于
+  运行时消费；本节点不提前实现该引擎，也不把静态 retry class 误作 §17 的动态错误类别。
 
 ---
 

@@ -1,383 +1,540 @@
-"""factory_agent.domain.events — PreparedBatchV2 → DurableEventV2 纯函数物化器。
+"""事件 MaterializationInput 到 DurableEventV2 的纯函数物化器。
 
-Phase 0 冻结「纯输入 → 纯输出」的事件身份、摘要链与 §10.1 完整字段集算法。
-GPT 第二轮审核指出早期实现只放 §10.1 子集字段；本修订补齐：
-执行身份（runId/runSeq/stepId/attemptId/source/processIdentity）、
-双 span（sourceTransportSpan/sanitizedStreamSpan）、
-脱敏证据（redactions/redactionManifestDigest/sanitizedProviderFrameDigest/
-mappingPrecision）、schemaVersion、durabilityClass、providerEventId、
-streamId、preparedBatchId、wallTime、monotonicTimeNs、ingestedAt、
-providerVersion、adapterVersion、eventType 改为 §10.1 具体枚举。
-
-物化器与 TypeScript (packages/factory-contracts/src/event.ts) 及 Rust
-(factory_contracts::event) 字节级一致，共用同一 canonical_json 底座
-（NFC + RFC 8785 JCS）。
-
-算法（严格来自 Master Spec §10.1）：
-
-  eventId
-      "evt_" + lowercaseHex(SHA-256(JCS(["factory-event-id-v2", ingestEventId])))
-      仅由 ingestEventId 决定，使崩溃重试得到同一身份（幂等）。
-
-  payloadDigest
-      "sha256:" + lowercaseHex(SHA-256(JCS(payload)))
-
-  redactionManifestDigest
-      "sha256:" + lowercaseHex(SHA-256(JCS(redactions 列表)))
-
-  eventDigest
-      "sha256:" + lowercaseHex(SHA-256(JCS(DurableEventV2 去除 eventDigest 字段后的
-      完整对象)))；previousEventDigest 仍参与计算。previousEventDigest 单链模型：
-      本事件无 head 字段，下一事件的 previousEventDigest 指向前一事件的 eventDigest；
-      genesis 事件 previousEventDigest = "sha256:" + 64 个 0。
-
-物化规则（fail-closed）：
-  - batch.previousHead 必须与 anchor.committedHead 相等（同为 None 或同字符串）。
-  - 批内所有事件的 taskId 必须等于 batch.taskId。
-  - 批至少含一个事件；ingestEventId 批内不得重复。
-  - 每个事件必须含 §10.1 完整字段集（required by durable-event.v2 schema）。
-  - processIdentity 必填子字段不能缺失。
-  - 双 span 必填子字段不能缺失。
-  - taskSeq 由 anchor 单调延续：genesis 从 0 开始，否则从 committedTaskSeq+1 开始。
-  - batchOrdinal 为批次级序号，原样复制到每个 DurableEventV2。
-  - redactions 列表空表示本事件未脱敏；非空则每条必含 patternId/byteRange/replacement。
-
-失败错误码：event-hash-error（不记录完整事件正文，只暴露稳定 error_code 与脱敏明细）。
+本模块只处理单 Task 的非 wire MaterializationInput 切片。它不读取或推进
+数据库 head，不 claim PreparedBatch，也不实现 Task 7 的 group commit；调用方须
+把已提交锚点显式传入，物化器只在 expected pair 与该锚点完全一致时工作。
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import math
+import re
+import unicodedata
+from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 
+# jsonschema 当前没有完整 PEP 561 stubs；只在第三方导入点收窄 mypy 豁免。
+import jsonschema  # type: ignore[import-untyped]
+
+from factory_agent.contracts.generated.models import (
+    DURABLE_EVENT_V2_SCHEMA_JSON,
+    DURABLE_EVENT_V2_SCHEMA_JSON_SHA256,
+    PREPARED_BATCH_V2_SCHEMA_JSON,
+    PREPARED_BATCH_V2_SCHEMA_JSON_SHA256,
+    PREPARED_EVENT_V2_SCHEMA_JSON,
+    PREPARED_EVENT_V2_SCHEMA_JSON_SHA256,
+)
 from factory_agent.errors import FactoryError
 from factory_agent.policy.canonical_json import canonicalize
+from factory_agent.policy.plan_hash import factory_format_checker
 
-# 算法版本：影响输出字节的任何改动都必须同步升级并更新 golden vectors。
+# 任何会影响输出字节的变更都必须同步更新三语言 golden vectors。
 EVENT_HASH_VERSION = "event-hash-v2"
-
-# eventId 域分离标签（数组首元素）。
 _EVENT_ID_DOMAIN = "factory-event-id-v2"
-
-# 摘要输出前缀。
 _SHA256_PREFIX = "sha256:"
-
-# genesis 事件的固定前驱：sha256: + 64 个 0（Master Spec §10.1 全零 predecessor）。
 GENESIS_PREDECESSOR = f"{_SHA256_PREFIX}{'0' * 64}"
-
-# eventDigest 计算时必须排除的字段（仅排除自身摘要，避免自指循环）。
-# previousEventDigest 仍参与计算（Master Spec §10.1）。
 _DIGEST_EXCLUDED_FIELDS: frozenset[str] = frozenset({"eventDigest"})
+_SHA256_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
+_REDACTION_REPLACEMENT = re.compile(r"^\[REDACTED(?::[a-z0-9._-]+)?\]$")
+_DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
+_INVALID_EVENT_INPUT = "INVALID_EVENT_HASH_INPUT"
+_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
-# PreparedEventV2 必需字段（每个 batch.events[i] 必须含）。
-# 全字段集按 §10.1：执行身份、双 span、脱敏、时间、版本。
-_REQUIRED_PREPARED_EVENT_FIELDS: tuple[str, ...] = (
-    # 身份
-    "ingestEventId", "taskId", "runId", "stepId", "attemptId", "source",
-    # 类型与 Provider 引用
-    "eventType", "providerEventId", "sourceSeq", "streamId",
-    # Prepared 关联（preparedBatchId 在 batch 顶层；events 每项含 batchOrdinal）
-    "batchOrdinal",
-    # 双 span
-    "sourceTransportSpan", "sanitizedStreamSpan",
-    # 时间 / 版本
-    "wallTime", "monotonicTimeNs", "ingestedAt", "providerVersion", "adapterVersion",
-    # 受管进程身份
+# PreparedEventV2 是 adapter wire；下列字段均由 Adapter 给出。
+_PREPARED_EVENT_FIELDS: tuple[str, ...] = (
+    "schemaVersion",
+    "taskId",
+    "runId",
+    "stepId",
+    "attemptId",
+    "source",
+    "ingestEventId",
+    "eventType",
+    "providerEventId",
+    "sourceSeq",
+    "streamId",
+    "sourceTransportSpan",
+    "sanitizedStreamSpan",
+    "wallTime",
+    "monotonicTimeNs",
+    "ingestedAt",
+    "providerVersion",
+    "adapterVersion",
     "processIdentity",
-    # Payload / 脱敏
-    "payload", "sanitizedProviderFrameDigest", "redactions",
+    "payload",
+    "sanitizedProviderFrameDigest",
+    "redactions",
 )
 
-# PreparedEventV2 允许出现的字段集（对齐 schema 的 additionalProperties:false）。
-# 出现集合外字段即 fail closed。
-_ALLOWED_PREPARED_EVENT_FIELDS: frozenset[str] = frozenset(_REQUIRED_PREPARED_EVENT_FIELDS) | {
-    "payloadDigest",
-    "redactionManifestDigest",
-    "previousEventDigest",
-    "eventDigest",
+# 这三个字段只可由 coordinator 放入非 wire 的单 Task 输入切片。
+_COORDINATOR_EVENT_FIELDS: tuple[str, ...] = (
+    "batchOrdinal",
     "runSeq",
     "durabilityClass",
-}
+)
+_MATERIALIZATION_INPUT_FIELDS: tuple[str, ...] = (
+    "preparedBatchId",
+    "taskId",
+    "expectedTaskSeq",
+    "expectedEventDigest",
+    "events",
+)
+_COMMITTED_ANCHOR_FIELDS: tuple[str, ...] = (
+    "committedTaskSeq",
+    "committedEventDigest",
+)
+_MATERIALIZATION_EVENT_FIELDS = frozenset((*_PREPARED_EVENT_FIELDS, *_COORDINATOR_EVENT_FIELDS))
+_DURABILITY_CLASSES = frozenset({"side_effect_receipt", "provider_source", "derived"})
 
 
 class EventHashError(FactoryError):
-    """事件物化输入非法（缺字段、类型错误、前驱漂移、重复摄取 ID 等）时抛出。"""
+    """MaterializationInput 或权威嵌入 schema 校验失败时抛出。"""
 
     error_code = "event-hash-error"
 
 
-def _require_mapping(value: object, label: str) -> dict[str, object]:  # noqa: ANN401
-    """校验 value 为字典，否则 fail closed。
-
-    Args:
-        value: 待校验对象。
-        label: 出错时的字段标签（不含敏感内容）。
-
-    Returns:
-        校验通过的字典。
-
-    Raises:
-        EventHashError: value 非字典。
-    """
+def _require_mapping(value: object, label: str) -> dict[str, Any]:
+    """要求对象输入，避免 array/null 被当作对象而产生跨语言行为漂移。"""
     if not isinstance(value, dict):
-        raise EventHashError(f"字段 '{label}' 必须为对象")
+        raise EventHashError(f"{label} 必须为对象")
     return value
 
 
+def _require_exact_keys(
+    value: dict[str, Any],
+    required: tuple[str, ...] | frozenset[str],
+    label: str,
+) -> None:
+    """执行 exact-set 边界：缺字段和未知字段都 fail-closed。"""
+    actual = frozenset(value)
+    expected = frozenset(required)
+    if actual != expected:
+        raise EventHashError(f"{label} 字段集合不符合 MaterializationInput 合同")
+
+
 def _sha256_prefixed(data: bytes) -> str:
-    """计算 SHA-256 并返回 "sha256:<64 位小写十六进制>"。"""
+    """计算 sha256:<lowercase hex>。"""
     return f"{_SHA256_PREFIX}{hashlib.sha256(data).hexdigest()}"
 
 
+def _is_sha256_digest(value: object) -> bool:
+    """判断冻结的 SHA-256 wire 形态，不接受空串、大写或其他摘要算法。"""
+    return isinstance(value, str) and _SHA256_DIGEST.fullmatch(value) is not None
+
+
+def _require_safe_nonnegative_integer(value: object, label: str) -> int:
+    """按 Draft7 数学整数语义校验安全范围，并把 -0/1.0 规范化为 int。"""
+    if isinstance(value, bool):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    if isinstance(value, int):
+        integer = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        integer = int(value)
+    else:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    if integer < 0 or integer > _MAX_SAFE_INTEGER:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    return integer
+
+
+def _checked_safe_add(value: int, increment: int) -> int:
+    """执行 taskSeq 等 writer 序号加法，超过 I-JSON 上界即 fail closed。"""
+    result = value + increment
+    if result > _MAX_SAFE_INTEGER:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    return result
+
+
+def _canonicalize_event_hash(value: object) -> bytes:
+    """在事件边界归一 canonical 异常，禁止泄漏第三方异常正文或 payload。"""
+    try:
+        return canonicalize(value)
+    except EventHashError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 对外只暴露稳定 event-hash-error。
+        raise EventHashError(_INVALID_EVENT_INPUT) from exc
+
+
+def _optional_task_seq(value: object, label: str) -> int | None:
+    """校验显式的 genesis/null 或已提交非负 taskSeq。"""
+    if value is None:
+        return None
+    return _require_safe_nonnegative_integer(value, label)
+
+
+def _optional_digest(value: object, label: str) -> str | None:
+    """校验显式的 genesis/null 或冻结的 SHA-256 digest。"""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _is_sha256_digest(value):
+        raise EventHashError(f"{label} 必须为 sha256 digest 或 null")
+    return value
+
+
+def _require_head_pair(task_seq: int | None, digest: str | None, label: str) -> None:
+    """head 的 genesis 必须是 (null, null)，避免半空锚点歧义。"""
+    if (task_seq is None) != (digest is None):
+        raise EventHashError(f"{label} 的 taskSeq 与 eventDigest 必须同时为 null 或同时存在")
+
+
+def _verify_embedded_schema_integrity(schema_json: str, expected_sha256: str) -> None:
+    """在解析前校验 codegen 内嵌 schema 字节，防止运行时常量漂移。"""
+    actual_sha256 = _sha256_prefixed(schema_json.encode("utf-8"))
+    if not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+
+
+def _build_event_validator(schema_json: str, expected_sha256: str) -> jsonschema.Draft7Validator:
+    """惰性构建可信 Draft7 validator；底层错误不携带不可信 payload。"""
+    try:
+        _verify_embedded_schema_integrity(schema_json, expected_sha256)
+        schema = json.loads(schema_json)
+        if not isinstance(schema, dict) or schema.get("$schema") != _DRAFT7_SCHEMA_URI:
+            raise ValueError("invalid generated draft7 schema")
+        jsonschema.Draft7Validator.check_schema(schema)
+        return jsonschema.Draft7Validator(schema, format_checker=factory_format_checker())
+    except EventHashError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 边界统一为稳定错误码。
+        raise EventHashError(_INVALID_EVENT_INPUT) from exc
+
+
+@lru_cache(maxsize=1)
+def _prepared_event_validator() -> jsonschema.Draft7Validator:
+    """返回 codegen 内嵌的 PreparedEventV2 权威校验器。"""
+    return _build_event_validator(
+        PREPARED_EVENT_V2_SCHEMA_JSON,
+        PREPARED_EVENT_V2_SCHEMA_JSON_SHA256,
+    )
+
+
+@lru_cache(maxsize=1)
+def _durable_event_validator() -> jsonschema.Draft7Validator:
+    """返回 codegen 内嵌的 DurableEventV2 权威校验器。"""
+    return _build_event_validator(
+        DURABLE_EVENT_V2_SCHEMA_JSON,
+        DURABLE_EVENT_V2_SCHEMA_JSON_SHA256,
+    )
+
+
+@lru_cache(maxsize=1)
+def _prepared_batch_validator() -> jsonschema.Draft7Validator:
+    """返回 codegen 内嵌的 PreparedBatchV2 权威校验器。"""
+    return _build_event_validator(
+        PREPARED_BATCH_V2_SCHEMA_JSON,
+        PREPARED_BATCH_V2_SCHEMA_JSON_SHA256,
+    )
+
+
+def _validate_with_authoritative_schema(
+    value: dict[str, Any],
+    validator: jsonschema.Draft7Validator,
+) -> None:
+    """不泄漏事件正文地执行权威 schema 验证。"""
+    if next(validator.iter_errors(value), None) is not None:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+
+
 def event_id(ingest_event_id: str) -> str:
-    """计算幂等 eventId（仅由 ingestEventId 决定）。
-
-    Args:
-        ingest_event_id: Adapter 分配的稳定摄取 ID。
-
-    Returns:
-        形如 "evt_<64 位小写十六进制>" 的事件身份。
-
-    Raises:
-        EventHashError:     ingestEventId 非非空字符串。
-        CanonicalJsonError: 值无法规范化。
-    """
+    """从 Adapter 稳定 ingestEventId 推导幂等 eventId。"""
     if not isinstance(ingest_event_id, str) or not ingest_event_id:
         raise EventHashError("ingestEventId 必须为非空字符串")
-    domain_array = [_EVENT_ID_DOMAIN, ingest_event_id]
-    digest = hashlib.sha256(canonicalize(domain_array)).hexdigest()
+    digest = hashlib.sha256(_canonicalize_event_hash([_EVENT_ID_DOMAIN, ingest_event_id])).hexdigest()
     return f"evt_{digest}"
 
 
-def payload_digest(payload: object) -> str:  # noqa: ANN401
-    """计算 payloadDigest（脱敏后 payload 的 JCS 摘要）。
+def payload_digest(payload: object) -> str:
+    """计算已脱敏 payload 的 JCS SHA-256 摘要。"""
+    return _sha256_prefixed(_canonicalize_event_hash(payload))
 
-    Args:
-        payload: 已脱敏的事件负载对象。
 
-    Returns:
-        形如 "sha256:<64 位小写十六进制>" 的摘要。
+def redaction_manifest_digest(redactions: object) -> str:
+    """计算已脱敏 redactions 列表的 JCS SHA-256 摘要。"""
+    return _sha256_prefixed(_canonicalize_event_hash(redactions))
 
-    Raises:
-        CanonicalJsonError: payload 含非法数字/类型/重复键。
+
+def _validate_materialization_input(
+    raw_input: object,
+    raw_anchor: object,
+) -> tuple[dict[str, Any], dict[str, Any], int | None, str | None]:
+    """校验非 wire 输入和锚点，并返回已配对的已提交 head。"""
+    materialization_input = _require_mapping(raw_input, "input")
+    anchor = _require_mapping(raw_anchor, "anchor")
+    _require_exact_keys(materialization_input, _MATERIALIZATION_INPUT_FIELDS, "input")
+    _require_exact_keys(anchor, _COMMITTED_ANCHOR_FIELDS, "anchor")
+
+    expected_task_seq = _optional_task_seq(materialization_input["expectedTaskSeq"], "input.expectedTaskSeq")
+    expected_event_digest = _optional_digest(materialization_input["expectedEventDigest"], "input.expectedEventDigest")
+    committed_task_seq = _optional_task_seq(anchor["committedTaskSeq"], "anchor.committedTaskSeq")
+    committed_event_digest = _optional_digest(anchor["committedEventDigest"], "anchor.committedEventDigest")
+    _require_head_pair(expected_task_seq, expected_event_digest, "input")
+    _require_head_pair(committed_task_seq, committed_event_digest, "anchor")
+    if expected_task_seq != committed_task_seq or expected_event_digest != committed_event_digest:
+        raise EventHashError("expected head 与已提交 anchor 不一致")
+    return materialization_input, anchor, committed_task_seq, committed_event_digest
+
+
+def _validate_prepared_event_semantics(prepared_event: dict[str, Any]) -> None:
+    """校验 Draft7 无法表达的范围顺序，并统一所有事件数字的安全整数边界。"""
+    prepared_event["schemaVersion"] = _require_safe_nonnegative_integer(
+        prepared_event["schemaVersion"], "schemaVersion"
+    )
+    prepared_event["sourceSeq"] = _require_safe_nonnegative_integer(prepared_event["sourceSeq"], "sourceSeq")
+    prepared_event["monotonicTimeNs"] = _require_safe_nonnegative_integer(
+        prepared_event["monotonicTimeNs"], "monotonicTimeNs"
+    )
+    process_identity = _require_mapping(prepared_event["processIdentity"], "processIdentity")
+    process_identity["pid"] = _require_safe_nonnegative_integer(process_identity["pid"], "processIdentity.pid")
+
+    source_span = _require_mapping(prepared_event["sourceTransportSpan"], "sourceTransportSpan")
+    coordinate = source_span["coordinate"]
+    mapping_precision = source_span["mappingPrecision"]
+    # 坐标轴描述 Provider 原始传输单位，mappingPrecision 描述映射精度；二者不能按同名字面绑定。
+    if coordinate == "none":
+        if mapping_precision != "none" or source_span["start"] is not None or source_span["endExclusive"] is not None:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+    elif coordinate in {"provider_transport_bytes", "provider_transport_chars"}:
+        if mapping_precision == "byte":
+            source_start = _require_safe_nonnegative_integer(source_span["start"], "sourceSpan.start")
+            source_end = _require_safe_nonnegative_integer(source_span["endExclusive"], "sourceSpan.endExclusive")
+            if source_start >= source_end:
+                raise EventHashError(_INVALID_EVENT_INPUT)
+            source_span["start"] = source_start
+            source_span["endExclusive"] = source_end
+        elif mapping_precision in {"field", "frame", "none"}:
+            if source_span["start"] is not None or source_span["endExclusive"] is not None:
+                raise EventHashError(_INVALID_EVENT_INPUT)
+        else:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+    else:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+
+    sanitized_span = _require_mapping(prepared_event["sanitizedStreamSpan"], "sanitizedStreamSpan")
+    sanitized_start = _require_safe_nonnegative_integer(sanitized_span["start"], "sanitizedSpan.start")
+    sanitized_end = _require_safe_nonnegative_integer(sanitized_span["endExclusive"], "sanitizedSpan.endExclusive")
+    if sanitized_start >= sanitized_end:
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    sanitized_span["start"] = sanitized_start
+    sanitized_span["endExclusive"] = sanitized_end
+
+    redactions = prepared_event["redactions"]
+    if not isinstance(redactions, list):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    for redaction in redactions:
+        redaction_object = _require_mapping(redaction, "redaction")
+        byte_range = _require_mapping(redaction_object["byteRange"], "redaction.byteRange")
+        redaction_start = _require_safe_nonnegative_integer(byte_range["start"], "redaction.start")
+        redaction_end = _require_safe_nonnegative_integer(byte_range["endExclusive"], "redaction.endExclusive")
+        replacement = redaction_object["replacement"]
+        if (
+            redaction_start >= redaction_end
+            or not isinstance(replacement, str)
+            or _REDACTION_REPLACEMENT.fullmatch(replacement) is None
+        ):
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        byte_range["start"] = redaction_start
+        byte_range["endExclusive"] = redaction_end
+
+
+def validate_prepared_batch_manifest(raw_manifest: object) -> None:
+    """验证 PreparedBatchV2 wire manifest 的 schema 与跨字段不变量。
+
+    本函数只验证不可变 manifest，不执行 claim、CAS、group commit 或持久化；Task 7
+    才负责用真实 segments 构造 MaterializationInput 并提交。
     """
-    return _sha256_prefixed(canonicalize(payload))
+    manifest = _require_mapping(raw_manifest, "preparedBatch")
+    _validate_with_authoritative_schema(manifest, _prepared_batch_validator())
+    event_count = _require_safe_nonnegative_integer(manifest["eventCount"], "eventCount")
+    first_ordinal = _require_safe_nonnegative_integer(manifest["firstBatchOrdinal"], "firstBatchOrdinal")
+    last_ordinal = _require_safe_nonnegative_integer(manifest["lastBatchOrdinal"], "lastBatchOrdinal")
+    ordered_ingest_ids = manifest["orderedIngestIds"]
+    if (
+        not isinstance(ordered_ingest_ids, list)
+        or last_ordinal < first_ordinal
+        or event_count != len(ordered_ingest_ids)
+        or event_count != last_ordinal - first_ordinal + 1
+    ):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    normalized_ingest_ids: set[str] = set()
+    for ingest_id in ordered_ingest_ids:
+        if not isinstance(ingest_id, str) or not ingest_id:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        normalized_ingest_id = unicodedata.normalize("NFC", ingest_id)
+        if normalized_ingest_id in normalized_ingest_ids:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        normalized_ingest_ids.add(normalized_ingest_id)
 
+    task_ids: set[str] = set()
+    heads = manifest["perTaskExpectedHeads"]
+    if not isinstance(heads, list):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    for raw_head in heads:
+        head = _require_mapping(raw_head, "perTaskExpectedHead")
+        task_id = head["taskId"]
+        head_first = _require_safe_nonnegative_integer(head["firstBatchOrdinal"], "head.firstBatchOrdinal")
+        head_last = _require_safe_nonnegative_integer(head["lastBatchOrdinal"], "head.lastBatchOrdinal")
+        expected_task_seq = _optional_task_seq(head["expectedTaskSeq"], "head.expectedTaskSeq")
+        expected_digest = _optional_digest(head["expectedEventDigest"], "head.expectedEventDigest")
+        _require_head_pair(expected_task_seq, expected_digest, "head")
+        if (
+            not isinstance(task_id, str)
+            or task_id in task_ids
+            or head_first > head_last
+            or head_first < first_ordinal
+            or head_last > last_ordinal
+        ):
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        task_ids.add(task_id)
 
-def redaction_manifest_digest(redactions: list[dict[str, object]]) -> str:
-    """计算 redactionManifestDigest（redactions 列表的 JCS 摘要）。
-
-    Args:
-        redactions: 本事件命中脱敏点列表（schema 见 durable-event.v2）。
-
-    Returns:
-        形如 "sha256:<64 位小写十六进制>" 的摘要。
-
-    Raises:
-        CanonicalJsonError: redactions 含非法数字/类型/重复键。
-    """
-    return _sha256_prefixed(canonicalize(redactions))
-
-
-def _base_task_seq(anchor: dict[str, Any]) -> int:
-    """由 anchor 推导本批次首事件的 taskSeq。
-
-    genesis（committedTaskSeq 为 None）从 0 开始，否则从 committedTaskSeq+1 开始。
-
-    Raises:
-        EventHashError: committedTaskSeq 存在但非整数。
-    """
-    committed = anchor.get("committedTaskSeq")
-    if committed is None:
-        return 0
-    # bool 是 int 子类，必须显式排除，避免 True 被当作 1。
-    if isinstance(committed, bool) or not isinstance(committed, int):
-        raise EventHashError("anchor.committedTaskSeq 必须为整数或 null")
-    if committed < 0:
-        raise EventHashError("anchor.committedTaskSeq 不得为负")
-    return committed + 1
+    segments = manifest["segmentDigests"]
+    if not isinstance(segments, list):
+        raise EventHashError(_INVALID_EVENT_INPUT)
+    for raw_segment in segments:
+        segment = _require_mapping(raw_segment, "segmentDigest")
+        ordinal_range = _require_mapping(segment["ordinalRange"], "segment.ordinalRange")
+        segment_first = _require_safe_nonnegative_integer(ordinal_range["first"], "segment.ordinalRange.first")
+        segment_last = _require_safe_nonnegative_integer(
+            ordinal_range["lastExclusive"], "segment.ordinalRange.lastExclusive"
+        )
+        sanitized_span = _require_mapping(segment["sanitizedSpan"], "segment.sanitizedSpan")
+        sanitized_start = _require_safe_nonnegative_integer(sanitized_span["start"], "segment.sanitizedSpan.start")
+        sanitized_end = _require_safe_nonnegative_integer(
+            sanitized_span["endExclusive"], "segment.sanitizedSpan.endExclusive"
+        )
+        mapping_precision = segment["mappingPrecision"]
+        source_span = segment["sourceSpan"]
+        if mapping_precision == "byte":
+            source_span_object = _require_mapping(source_span, "segment.sourceSpan")
+            source_start = _require_safe_nonnegative_integer(source_span_object["start"], "segment.sourceSpan.start")
+            source_end = _require_safe_nonnegative_integer(
+                source_span_object["endExclusive"], "segment.sourceSpan.endExclusive"
+            )
+            if source_start >= source_end:
+                raise EventHashError(_INVALID_EVENT_INPUT)
+        elif mapping_precision in {"field", "frame", "none"}:
+            if source_span is not None:
+                raise EventHashError(_INVALID_EVENT_INPUT)
+        else:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        if segment_first >= segment_last or sanitized_start >= sanitized_end:
+            raise EventHashError(_INVALID_EVENT_INPUT)
 
 
 def materialize_batch(
-    batch: dict[str, Any],
+    input: dict[str, Any],
     anchor: dict[str, Any],
-    durable_at: str,
 ) -> list[dict[str, Any]]:
-    """把一个 PreparedBatchV2 物化为按序连接的 DurableEventV2 列表（纯函数）。
+    """物化单 Task MaterializationInput 为已校验 DurableEventV2 列表。
 
-    每个 PreparedEventV2 必须含 §10.1 全字段集；物化器直通到 DurableEventV2
-    （schema 见 durable-event.v2）。本函数不臆造任何字段——缺任一必填即
-    EventHashError（fail-closed）。
-
-    Args:
-        batch:      PreparedBatchV2 简化输入：{taskId, preparedBatchId, events[],
-                    batchOrdinal, previousHead}。events[] 每项含 §10.1 全字段集
-                    （不含 schemaVersion/durabilityClass/eventId/taskSeq/payloadDigest/
-                    previousEventDigest/eventDigest/redactionManifestDigest —— 这些由
-                    物化器派生）。
-        anchor:     该 Task 当前已提交锚点 {committedTaskSeq, committedHead}。
-        durable_at: 本批次耐久化完成时间（RFC3339）。仍写入 wallTime 之外的
-                    ingestedAt 取 durable_at（见实现）。
-
-    Returns:
-        与 batch.events 同序的 DurableEventV2 字典列表，含 §10.1 完整字段集
-        且 taskSeq / previousEventDigest 链式连接。
-
-    Raises:
-        EventHashError:     缺字段 / 未知字段 / 前驱漂移 / taskId 不一致 /
-                            ingestEventId 重复 / processIdentity 不合规。
-        CanonicalJsonError: 任一字段值无法规范化。
+    MaterializationInput 不是 PreparedBatchV2 wire manifest：它只含一个 Task 的
+    已 claim slice 与 coordinator 派生字段。Task 7 以后才会从真实 manifest/segments
+    构造此输入并负责 CAS、claim、持久化和多 Task 原子性。
     """
-    batch = _require_mapping(batch, "batch")
-    anchor = _require_mapping(anchor, "anchor")
+    (
+        materialization_input,
+        _anchor,
+        committed_task_seq,
+        committed_event_digest,
+    ) = _validate_materialization_input(input, anchor)
 
-    task_id = batch.get("taskId")
+    task_id = materialization_input["taskId"]
+    prepared_batch_id = materialization_input["preparedBatchId"]
+    events = materialization_input["events"]
     if not isinstance(task_id, str) or not task_id:
-        raise EventHashError("batch.taskId 必须为非空字符串")
-
-    prepared_batch_id = batch.get("preparedBatchId")
+        raise EventHashError("input.taskId 必须为非空字符串")
     if not isinstance(prepared_batch_id, str) or not prepared_batch_id:
-        raise EventHashError("batch.preparedBatchId 必须为非空字符串")
+        raise EventHashError("input.preparedBatchId 必须为非空字符串")
+    if not isinstance(events, list) or not events:
+        raise EventHashError("input.events 必须为非空数组")
 
-    events = batch.get("events")
-    if not isinstance(events, list) or len(events) == 0:
-        raise EventHashError("batch.events 必须为非空数组")
-
-    batch_ordinal = batch.get("batchOrdinal")
-    if isinstance(batch_ordinal, bool) or not isinstance(batch_ordinal, int):
-        raise EventHashError("batch.batchOrdinal 必须为整数")
-
-    # 前驱校验：batch.previousHead 必须与 anchor.committedHead 完全一致。
-    batch_prev = batch.get("previousHead")
-    committed_head = anchor.get("committedHead")
-    if batch_prev != committed_head:
-        raise EventHashError(
-            "前驱漂移：batch.previousHead 与 anchor.committedHead 不一致，拒绝物化"
-        )
-
-    base_seq = _base_task_seq(anchor)
-    prev_event_digest = GENESIS_PREDECESSOR if committed_head is None else committed_head
-
+    base_task_seq = 0 if committed_task_seq is None else _checked_safe_add(committed_task_seq, 1)
+    previous_event_digest = GENESIS_PREDECESSOR if committed_event_digest is None else committed_event_digest
     durable_events: list[dict[str, Any]] = []
-    seen_ingest: set[str] = set()
+    seen_ingest_ids: set[str] = set()
+    previous_batch_ordinal: int | None = None
 
     for index, raw_event in enumerate(events):
-        event = _require_mapping(raw_event, f"events[{index}]")
-        # 必需字段校验
-        for field in _REQUIRED_PREPARED_EVENT_FIELDS:
-            if field not in event:
-                raise EventHashError(
-                    f"events[{index}] 缺少必需字段 '{field}'（{EVENT_HASH_VERSION}）"
-                )
-        # 未知字段 fail closed（§10.1 schema 未声明字段不得混入 v2 hash）
-        unknown = set(event.keys()) - _ALLOWED_PREPARED_EVENT_FIELDS
-        if unknown:
-            raise EventHashError(
-                f"events[{index}] 含未声明字段 {sorted(unknown)}，拒绝混入 v2 hash"
-            )
+        event = _require_mapping(raw_event, f"input.events[{index}]")
+        _require_exact_keys(
+            event,
+            _MATERIALIZATION_EVENT_FIELDS,
+            f"input.events[{index}]",
+        )
+        if event["taskId"] != task_id:
+            raise EventHashError("切片内 event.taskId 与 input.taskId 不一致")
 
-        ingest_id = event["ingestEventId"]
-        if not isinstance(ingest_id, str) or not ingest_id:
-            raise EventHashError(f"events[{index}].ingestEventId 必须为非空字符串")
-        if ingest_id in seen_ingest:
-            raise EventHashError(f"批内 ingestEventId 重复：'{ingest_id}'")
-        seen_ingest.add(ingest_id)
+        # 先投影回 wire PreparedEventV2，再交给三端同源嵌入 schema 验证。
+        prepared_event = deepcopy({field: event[field] for field in _PREPARED_EVENT_FIELDS})
+        _validate_with_authoritative_schema(prepared_event, _prepared_event_validator())
+        _validate_prepared_event_semantics(prepared_event)
 
-        event_task = event["taskId"]
-        if event_task != task_id:
-            raise EventHashError(
-                f"events[{index}].taskId 与 batch.taskId 不一致，拒绝物化"
-            )
+        ingest_event_id = event["ingestEventId"]
+        if not isinstance(ingest_event_id, str) or not ingest_event_id:
+            raise EventHashError(_INVALID_EVENT_INPUT)
+        # NFC 等价 ingest ID 也会导出相同 eventId，必须在进入 hash 前拒绝。
+        normalized_ingest_id = unicodedata.normalize("NFC", ingest_event_id)
+        if normalized_ingest_id in seen_ingest_ids:
+            raise EventHashError("切片内 ingestEventId 重复")
+        seen_ingest_ids.add(normalized_ingest_id)
 
-        # processIdentity 必填子字段校验（schema required 重复保险）
-        pi = event["processIdentity"]
-        if not isinstance(pi, dict):
-            raise EventHashError(f"events[{index}].processIdentity 必须为对象")
-        for sub in (
-            "executorId", "hostId", "runtime", "executableDigest",
-            "pid", "processStartTime", "jobObjectId",
-        ):
-            if sub not in pi:
-                raise EventHashError(
-                    f"events[{index}].processIdentity 缺子字段 '{sub}'"
-                )
+        batch_ordinal = event["batchOrdinal"]
+        run_seq = event["runSeq"]
+        durability_class = event["durabilityClass"]
+        batch_ordinal = _require_safe_nonnegative_integer(batch_ordinal, "event.batchOrdinal")
+        if previous_batch_ordinal is not None and batch_ordinal <= previous_batch_ordinal:
+            raise EventHashError("单 Task slice 的 batchOrdinal 必须严格递增")
+        previous_batch_ordinal = batch_ordinal
+        run_seq = _require_safe_nonnegative_integer(run_seq, "event.runSeq")
+        if not isinstance(durability_class, str) or durability_class not in _DURABILITY_CLASSES:
+            raise EventHashError("event.durabilityClass 不在 DurableEventV2 枚举内")
 
-        # 双 span 必填子字段校验
-        sts = event["sourceTransportSpan"]
-        sss = event["sanitizedStreamSpan"]
-        if not isinstance(sts, dict) or not isinstance(sss, dict):
-            raise EventHashError(
-                f"events[{index}].sourceTransportSpan/sanitizedStreamSpan 必须为对象"
-            )
-        for sub in ("coordinate", "start", "endExclusive", "mappingPrecision"):
-            if sub not in sts:
-                raise EventHashError(
-                    f"events[{index}].sourceTransportSpan 缺子字段 '{sub}'"
-                )
-        for sub in ("segmentId", "start", "endExclusive"):
-            if sub not in sss:
-                raise EventHashError(
-                    f"events[{index}].sanitizedStreamSpan 缺子字段 '{sub}'"
-                )
-
-        task_seq = base_seq + index
-
-        # 派生字段
-        redactions = event["redactions"]
-        if not isinstance(redactions, list):
-            raise EventHashError(f"events[{index}].redactions 必须为数组")
-
+        # writer 仅分配与已提交锚点有关的字段；Adapter 字段一律逐字复制。
         durable: dict[str, Any] = {
-            # 版本 / 等级
-            "schemaVersion": 2,
-            "durabilityClass": event.get("durabilityClass", "derived"),
-            # 身份（执行身份链）
-            "eventId": event_id(ingest_id),
+            "schemaVersion": prepared_event["schemaVersion"],
+            "durabilityClass": durability_class,
+            "eventId": event_id(ingest_event_id),
             "taskId": task_id,
-            "taskSeq": task_seq,
-            "runId": event["runId"],
-            "runSeq": event.get("runSeq", 0),
-            "stepId": event["stepId"],
-            "attemptId": event["attemptId"],
-            "source": event["source"],
-            # Provider 引用
-            "ingestEventId": ingest_id,
-            "eventType": event["eventType"],
-            "providerEventId": event["providerEventId"],
-            "sourceSeq": event["sourceSeq"],
-            "streamId": event["streamId"],
-            # Prepared 关联
+            "taskSeq": _checked_safe_add(base_task_seq, index),
+            "runId": prepared_event["runId"],
+            "runSeq": run_seq,
+            "stepId": prepared_event["stepId"],
+            "attemptId": prepared_event["attemptId"],
+            "source": prepared_event["source"],
+            "ingestEventId": ingest_event_id,
+            "eventType": prepared_event["eventType"],
+            "providerEventId": prepared_event["providerEventId"],
+            "sourceSeq": prepared_event["sourceSeq"],
+            "streamId": prepared_event["streamId"],
             "preparedBatchId": prepared_batch_id,
-            "batchOrdinal": event["batchOrdinal"],
-            # 双 span
-            "sourceTransportSpan": sts,
-            "sanitizedStreamSpan": sss,
-            # 时间 / 版本
-            "wallTime": event["wallTime"],
-            "monotonicTimeNs": event["monotonicTimeNs"],
-            "ingestedAt": event.get("ingestedAt", durable_at),
-            "providerVersion": event["providerVersion"],
-            "adapterVersion": event["adapterVersion"],
-            # 受管进程身份
-            "processIdentity": pi,
-            # Payload / 脱敏
-            "payload": event["payload"],
-            "sanitizedProviderFrameDigest": event["sanitizedProviderFrameDigest"],
-            "payloadDigest": payload_digest(event["payload"]),
-            # 链
-            "previousEventDigest": prev_event_digest,
-            "redactions": redactions,
-            "redactionManifestDigest": redaction_manifest_digest(redactions),
+            "batchOrdinal": batch_ordinal,
+            "sourceTransportSpan": prepared_event["sourceTransportSpan"],
+            "sanitizedStreamSpan": prepared_event["sanitizedStreamSpan"],
+            "wallTime": prepared_event["wallTime"],
+            "monotonicTimeNs": prepared_event["monotonicTimeNs"],
+            "ingestedAt": prepared_event["ingestedAt"],
+            "providerVersion": prepared_event["providerVersion"],
+            "adapterVersion": prepared_event["adapterVersion"],
+            "processIdentity": prepared_event["processIdentity"],
+            "payload": prepared_event["payload"],
+            "sanitizedProviderFrameDigest": prepared_event["sanitizedProviderFrameDigest"],
+            "payloadDigest": payload_digest(prepared_event["payload"]),
+            "previousEventDigest": previous_event_digest,
+            "redactions": prepared_event["redactions"],
+            "redactionManifestDigest": redaction_manifest_digest(prepared_event["redactions"]),
         }
+        durable["eventDigest"] = _sha256_prefixed(
+            _canonicalize_event_hash(
+                {key: value for key, value in durable.items() if key not in _DIGEST_EXCLUDED_FIELDS}
+            )
+        )
 
-        # eventDigest = JCS(去除 eventDigest 字段后完整对象) 的 SHA-256。
-        digest_input = {
-            k: v for k, v in durable.items() if k not in _DIGEST_EXCLUDED_FIELDS
-        }
-        event_digest = _sha256_prefixed(canonicalize(digest_input))
-        durable["eventDigest"] = event_digest
-
+        # digest 已落入输出后再执行 DurableEventV2 schema，阻断任何构造漂移。
+        _validate_with_authoritative_schema(durable, _durable_event_validator())
         durable_events.append(durable)
-        prev_event_digest = event_digest  # 下一事件 previousEventDigest 指向前一事件 eventDigest。
+        previous_event_digest = durable["eventDigest"]
 
     return durable_events

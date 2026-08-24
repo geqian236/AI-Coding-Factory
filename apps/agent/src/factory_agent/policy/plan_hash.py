@@ -30,8 +30,23 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
+import re
+from functools import lru_cache
 from typing import Any
 
+# jsonschema 当前未提供 PEP 561 stubs；只在该第三方 import 处精确抑制，不放宽全局 mypy。
+import jsonschema  # type: ignore[import-untyped]
+
+from factory_agent.contracts.generated.models import (
+    PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON,
+    PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256,
+    PLAN_REVISION_SCHEMA_JSON,
+    PLAN_REVISION_SCHEMA_JSON_SHA256,
+    RUN_SPEC_SCHEMA_JSON,
+    RUN_SPEC_SCHEMA_JSON_SHA256,
+)
 from factory_agent.errors import FactoryError
 from factory_agent.policy.canonical_json import canonicalize
 
@@ -67,6 +82,29 @@ _DIGEST_EXCLUDED_FIELDS: frozenset[str] = frozenset({"planRevisionDigest", "sign
 # 摘要输出前缀。
 _SHA256_PREFIX = "sha256:"
 
+# 跨语言只接受可移植 RFC3339 子集；pattern 负责 wire 形态，本函数再核验日历和 UTC offset。
+_FACTORY_RFC3339_DATE_TIME = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-5][0-9]"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
+)
+_STABLE_VALIDATION_DETAIL = "INVALID_PLAN_HASH_INPUT"
+_DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
+_KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
+_SINGLE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "if",
+        "then",
+        "else",
+        "not",
+        "propertyNames",
+    }
+)
+_SCHEMA_MAP_KEYWORDS = frozenset({"properties", "patternProperties", "definitions", "$defs"})
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+
 
 class PlanHashError(FactoryError):
     """计划哈希输入非法（缺字段、类型错误等）时抛出。"""
@@ -74,13 +112,178 @@ class PlanHashError(FactoryError):
     error_code = "plan-hash-error"
 
 
-def _require_mapping(value: object, label: str) -> dict[str, object]:  # noqa: ANN401
+def is_factory_rfc3339_date_time(value: object) -> bool:
+    """校验 Factory 冻结的 RFC3339 子集，拒绝 leap-second、year 0000 与不合法日历/offset。"""
+    if not isinstance(value, str):
+        return True
+    match = _FACTORY_RFC3339_DATE_TIME.fullmatch(value)
+    if match is None:
+        return False
+
+    # 权威 pattern 故意只定义非捕获分组；按冻结 ASCII wire 位置取值，避免运行时 regex
+    # 捕获组形态成为跨语言差异源。
+    year, month, day = int(value[0:4]), int(value[5:7]), int(value[8:10])
+    hour, minute = int(value[11:13]), int(value[14:16])
+    if year == 0 or month < 1 or month > 12 or hour > 23 or minute > 59:
+        return False
+    days_in_month = 29 if month == 2 and year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28
+    if month != 2:
+        days_in_month = 30 if month in {4, 6, 9, 11} else 31
+    if day < 1 or day > days_in_month:
+        return False
+
+    zone_start = 19
+    if value[zone_start] == ".":
+        zone_start += 1
+        while zone_start < len(value) and value[zone_start].isdigit():
+            zone_start += 1
+    zone = value[zone_start:]
+    if zone.casefold() == "z":
+        return True
+    offset_hour, offset_minute = int(zone[1:3]), int(zone[4:6])
+    return offset_hour <= 23 and offset_minute <= 59
+
+
+def factory_format_checker() -> jsonschema.FormatChecker:
+    """创建与 TS/Rust 同名 date-time 校验器；不依赖可选第三方 format extras。"""
+    checker = jsonschema.FormatChecker()
+    checker.checks("date-time")(is_factory_rfc3339_date_time)
+    return checker
+
+
+def _reject_duplicate_schema_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """拒绝生成常量中的重复 JSON key，避免损坏 schema 被 json.loads 静默覆盖。"""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate generated schema key")
+        result[key] = value
+    return result
+
+
+def _walk_validator_subschema(value: object) -> None:
+    """仅沿 Draft7 schema 位置遍历，拒绝外部 ref/未知 format 而不误判用户字段名。"""
+    if isinstance(value, bool) or not isinstance(value, dict):
+        return
+
+    reference = value.get("$ref")
+    if reference is not None and (not isinstance(reference, str) or not reference.startswith("#")):
+        raise ValueError("external schema reference")
+    format_name = value.get("format")
+    if format_name is not None and (
+        not isinstance(format_name, str) or format_name not in _KNOWN_VALIDATOR_FORMATS
+    ):
+        raise ValueError("unknown schema format")
+
+    for keyword in _SINGLE_SCHEMA_KEYWORDS:
+        if keyword in value:
+            _walk_validator_subschema(value[keyword])
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        schema_map = value.get(keyword)
+        if isinstance(schema_map, dict):
+            for child_schema in schema_map.values():
+                _walk_validator_subschema(child_schema)
+    items = value.get("items")
+    if isinstance(items, list):
+        for child_schema in items:
+            _walk_validator_subschema(child_schema)
+    elif items is not None:
+        _walk_validator_subschema(items)
+    for keyword in _SCHEMA_ARRAY_KEYWORDS:
+        schemas = value.get(keyword)
+        if isinstance(schemas, list):
+            for child_schema in schemas:
+                _walk_validator_subschema(child_schema)
+    dependencies = value.get("dependencies")
+    if isinstance(dependencies, dict):
+        for dependency in dependencies.values():
+            if isinstance(dependency, (bool, dict)):
+                _walk_validator_subschema(dependency)
+
+
+def _parse_generated_validator_schema(schema_json: str) -> dict[str, Any]:
+    """惰性解析 codegen 原始 JSON，并在编译前锁死 Draft7/ref/format 边界。"""
+    schema = json.loads(schema_json, object_pairs_hook=_reject_duplicate_schema_keys)
+    if not isinstance(schema, dict) or schema.get("$schema") != _DRAFT7_SCHEMA_URI:
+        raise ValueError("invalid generated draft7 schema")
+    _walk_validator_subschema(schema)
+    jsonschema.Draft7Validator.check_schema(schema)
+    return schema
+
+
+def _verify_embedded_schema_integrity(schema_json: str, expected_sha256: str) -> None:
+    """在 JSON 解析前验证生成常量的 UTF-8 内容身份，任意字节漂移均 fail closed。"""
+    if not isinstance(schema_json, str) or not isinstance(expected_sha256, str):
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL)
+    actual_sha256 = _SHA256_PREFIX + hashlib.sha256(schema_json.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL)
+
+
+def _build_validator(schema_json: str, expected_sha256: str) -> jsonschema.Draft7Validator:
+    """惰性解析/编译 codegen schema，初始化异常也必须归一化为稳定哈希错误。"""
+    try:
+        _verify_embedded_schema_integrity(schema_json, expected_sha256)
+        schema = _parse_generated_validator_schema(schema_json)
+        return jsonschema.Draft7Validator(schema, format_checker=factory_format_checker())
+    except PlanHashError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 纯函数边界不泄露 schema 或底层异常正文。
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL) from exc
+
+
+@lru_cache(maxsize=1)
+def _run_spec_validator() -> jsonschema.Draft7Validator:
+    """按需构建 RunSpec validator，避免生成模块 import-time 解析失败逃逸。"""
+    return _build_validator(RUN_SPEC_SCHEMA_JSON, RUN_SPEC_SCHEMA_JSON_SHA256)
+
+
+@lru_cache(maxsize=1)
+def _plan_revision_validator() -> jsonschema.Draft7Validator:
+    """按需构建完整 PlanRevision validator，摘要字段剥离前先校验原始 wire。"""
+    return _build_validator(PLAN_REVISION_SCHEMA_JSON, PLAN_REVISION_SCHEMA_JSON_SHA256)
+
+
+@lru_cache(maxsize=1)
+def _plan_revision_digest_material_validator() -> jsonschema.Draft7Validator:
+    """按需构建 PlanRevision digest material validator，确保仅排除两项字段。"""
+    return _build_validator(
+        PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON,
+        PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256,
+    )
+
+
+def _validate_wire(value: object, validator: jsonschema.Draft7Validator) -> None:
+    """执行完整权威 schema；不可信 wire 一律只返回稳定脱敏错误分类。"""
+    try:
+        if next(validator.iter_errors(value), None) is not None:
+            raise PlanHashError(_STABLE_VALIDATION_DETAIL)
+    except PlanHashError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - validator 细节不得随纯函数错误外泄。
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL) from exc
+
+
+def _validate_run_spec(value: object) -> None:
+    """RunSpec 必须在任何语义投影前通过完整 schema，禁止 partial projection 绕过。"""
+    _validate_wire(value, _run_spec_validator())
+
+
+def _validate_plan_revision_digest_material(value: object) -> None:
+    """摘要 material 只允许由权威 PlanRevision schema 机械派生的字段集合。"""
+    _validate_wire(value, _plan_revision_digest_material_validator())
+
+
+def _validate_plan_revision(value: object) -> None:
+    """完整 PlanRevision 必须在摘要字段剥离前通过权威 full schema。"""
+    _validate_wire(value, _plan_revision_validator())
+
+
+def _require_mapping(value: object) -> dict[str, Any]:
     """校验 value 为字典，否则 fail closed。
 
     Args:
         value: 待校验对象。
-        label: 出错时的字段标签（不含敏感内容）。
-
     Returns:
         校验通过的字典。
 
@@ -88,20 +291,16 @@ def _require_mapping(value: object, label: str) -> dict[str, object]:  # noqa: A
         PlanHashError: value 非字典。
     """
     if not isinstance(value, dict):
-        raise PlanHashError(f"字段 '{label}' 必须为对象")
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL)
     return value
 
 
-def _project_subset(
-    source: dict[str, Any], fields: tuple[str, ...], label: str
-) -> dict[str, Any]:
+def _project_subset(source: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
     """从 source 提取 fields 指定的字段子集，缺字段即 fail closed。
 
     Args:
         source: 源字典。
         fields: 必须存在的字段名元组。
-        label:  出错时的对象标签。
-
     Returns:
         仅含指定字段的新字典。
 
@@ -111,12 +310,12 @@ def _project_subset(
     projected: dict[str, Any] = {}
     for name in fields:
         if name not in source:
-            raise PlanHashError(f"{label} 缺少语义字段 '{name}'（{PLAN_HASH_VERSION}）")
+            raise PlanHashError(_STABLE_VALIDATION_DETAIL)
         projected[name] = source[name]
     return projected
 
 
-def build_semantic_projection(plan: dict[str, Any]) -> dict[str, Any]:
+def build_semantic_projection(plan: object) -> dict[str, Any]:
     """构造 semanticPlanHash 的字段投影（不含任何谱系/时间/ID/hash 字段）。
 
     Args:
@@ -128,21 +327,22 @@ def build_semantic_projection(plan: dict[str, Any]) -> dict[str, Any]:
     Raises:
         PlanHashError: 缺少必需语义字段或子对象结构非法。
     """
-    plan = _require_mapping(plan, "plan")
-    projection = _project_subset(plan, _SEMANTIC_TOP_FIELDS, "plan")
+    _validate_run_spec(plan)
+    plan_mapping = _require_mapping(plan)
+    projection = _project_subset(plan_mapping, _SEMANTIC_TOP_FIELDS)
 
     # repository：仅纳入 mode/root/baseBranch/baseCommit。
-    repository = _require_mapping(plan.get("repository"), "repository")
-    projection["repository"] = _project_subset(repository, _REPO_FIELDS, "repository")
+    repository = _require_mapping(plan_mapping.get("repository"))
+    projection["repository"] = _project_subset(repository, _REPO_FIELDS)
 
     # workPlan：仅纳入 dagVersion/nodes/barriers。
-    work_plan = _require_mapping(plan.get("workPlan"), "workPlan")
-    projection["workPlan"] = _project_subset(work_plan, _WORKPLAN_FIELDS, "workPlan")
+    work_plan = _require_mapping(plan_mapping.get("workPlan"))
+    projection["workPlan"] = _project_subset(work_plan, _WORKPLAN_FIELDS)
 
     return projection
 
 
-def semantic_plan_hash(plan: dict[str, Any]) -> str:
+def semantic_plan_hash(plan: object) -> str:
     """计算 semanticPlanHash（跨修订版本稳定的计划语义身份）。
 
     Args:
@@ -152,15 +352,17 @@ def semantic_plan_hash(plan: dict[str, Any]) -> str:
         形如 "sha256:<64 位小写十六进制>" 的摘要。
 
     Raises:
-        PlanHashError:      语义字段缺失或结构非法。
-        CanonicalJsonError: 字段值含非法数字/类型/重复键。
+        PlanHashError: 语义字段缺失、结构非法或字段值无法规范化。
     """
     projection = build_semantic_projection(plan)
-    digest = hashlib.sha256(canonicalize(projection)).hexdigest()
+    try:
+        digest = hashlib.sha256(canonicalize(projection)).hexdigest()
+    except Exception as exc:  # noqa: BLE001 - hash API 只能输出稳定脱敏错误。
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL) from exc
     return f"{_SHA256_PREFIX}{digest}"
 
 
-def plan_revision_digest(revision: dict[str, Any]) -> str:
+def plan_revision_digest(revision: object) -> str:
     """计算 planRevisionDigest（完整不可变修订记录身份）。
 
     对「除 planRevisionDigest 与 signature 外」的完整 PlanRevision 做同一
@@ -174,13 +376,21 @@ def plan_revision_digest(revision: dict[str, Any]) -> str:
         形如 "sha256:<64 位小写十六进制>" 的摘要。
 
     Raises:
-        PlanHashError:      revision 非对象。
-        CanonicalJsonError: 字段值含非法数字/类型/重复键。
+        PlanHashError: revision 非对象、结构非法或字段值无法规范化。
     """
-    revision = _require_mapping(revision, "revision")
-    # 排除自身摘要值与签名，其余字段全部纳入。
-    material = {k: v for k, v in revision.items() if k not in _DIGEST_EXCLUDED_FIELDS}
-    digest = hashlib.sha256(canonicalize(material)).hexdigest()
+    _validate_plan_revision(revision)
+    revision_mapping = _require_mapping(revision)
+    # full schema 已保证摘要必填、签名可选；此处精确剥离两项，禁止先删后验掩盖非法值。
+    material = dict(revision_mapping)
+    del material["planRevisionDigest"]
+    if "signature" in material:
+        del material["signature"]
+    _validate_plan_revision_digest_material(material)
+    # 纯函数没有日志出口；稳定错误由后续应用入口脱敏记录，本层不声称已实现 runtime 日志。
+    try:
+        digest = hashlib.sha256(canonicalize(material)).hexdigest()
+    except Exception as exc:  # noqa: BLE001 - hash API 只能输出稳定脱敏错误。
+        raise PlanHashError(_STABLE_VALIDATION_DETAIL) from exc
     return f"{_SHA256_PREFIX}{digest}"
 
 
@@ -202,8 +412,7 @@ def barrier_id(
         形如 "bar_<64 位小写十六进制>" 的身份。
 
     Raises:
-        PlanHashError:      参数类型非法。
-        CanonicalJsonError: 参数值无法规范化。
+        PlanHashError: 参数类型非法或参数值无法规范化。
     """
     if not isinstance(run_id, str) or not run_id:
         raise PlanHashError("run_id 必须为非空字符串")

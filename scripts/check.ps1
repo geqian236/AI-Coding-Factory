@@ -31,6 +31,7 @@ $REPO_ROOT = Split-Path $PSScriptRoot -Parent
 # 二进制（对方删除即假失败，对方尚存即假通过）。Get-WorktreeTargetDir 按规范化
 # $REPO_ROOT 的 SHA-256 摘要派生独立 target；与 dev.ps1 / phase0-acceptance.ps1 同源。
 . (Join-Path $PSScriptRoot "_worktree-target.ps1")
+. (Join-Path $PSScriptRoot "_rust-gnu-binutils.ps1")
 # GPT 第十三轮 P1-1：uv 锁定 Python 探针抽成共享函数 Get-UvLockedPythonVersion
 # （scripts/_python-probe.ps1），本门禁前置探针、phase0-acceptance.ps1 的 B-2、回归测试
 # 三处共用同一实现；任一入口回退到有漏洞的 2>&1 / 去掉严格解析都能被测试锁定。
@@ -210,26 +211,77 @@ Invoke-GateCheck "14-rust-test" {
     if (-not $_projRoot) {
         throw "gate-14 fail-closed: 找不到 AI-Coding-Factory-Data 项目根（$REPO_ROOT 的任何祖先），拒绝回退到 D:\acf-dev 等允许根外路径"
     }
-    $_dataRoot = Join-Path $_projRoot "AI-Coding-Factory-Data\dev"
-    $env:CARGO_HOME = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $_dataRoot "cargo-home" }
-    $env:RUSTUP_HOME = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $_dataRoot "rustup-home" }
-    # 只前置 CARGO_HOME\bin（rustup shim 所在），不前置 gnu 工具链 bin：
-    # 否则 cargo/rustc 解析成 gnu 工具链里的真实 exe，不认 +toolchain 语法
-    # （报 "no such command: +stable-..."）。shim 才能分发 +toolchain。
-    $env:PATH = "$env:CARGO_HOME\bin;$env:PATH"
-    # 第九轮 P0：per-worktree target（非共享 cargo-target），与 dev.ps1 /
-    # phase0-acceptance.ps1 同一 Get-WorktreeTargetDir，隔离跨 worktree 编译产物。
-    $env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $REPO_ROOT -DataRoot $_dataRoot
-    # 根因修复（第五轮 REVISE 后诊断）：ld.lld 路径必须从字面 $env:RUSTUP_HOME 拼接，
-    # 绝不从 `rustc --print sysroot` 的 stdout 捕获。前置门禁（node/pnpm/vitest）会把
-    # [Console]::OutputEncoding 改成 GBK；随后 rustc stdout 捕获到的含 CJK 的 sysroot
-    # 被 GBK 破坏（D:\codex项目 -> D:\codex椤圭洰）→ linker 路径 exists=False →
-    # "linker not found (os error 3)" → build-script link 失败 exit 101。此故障只在
-    # 完整 check.ps1 序列冷跑时出现（隔离跑编码未被污染故通过），是 heisenbug 的根因。
-    # $env:RUSTUP_HOME 是进程环境变量、字节正确，与 dev.ps1 / Set-RustGnuEnv 同源做法。
-    $gnuToolchain = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu"
-    $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = Join-Path $gnuToolchain "lib\rustlib\x86_64-pc-windows-gnu\bin\gcc-ld\ld.lld.exe"
-    cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked
+    # GNU dlltool / binutils 仍会把输入路径交给窄字符 CreateProcess；即使 ld.lld 已经
+    # Unicode-safe，只要 import-lib 生成阶段看到 D:\codex项目 这样的 CJK 参数仍会失败。
+    # 因此 Rust gate 使用临时 subst 盘符提供 ASCII 视图，但物理文件仍落在 D:\codex项目 下。
+    $substDrive = $null
+    foreach ($candidate in @("Q:", "R:", "S:", "T:")) {
+        if (-not (Test-Path -LiteralPath "$candidate\")) {
+            $substDrive = $candidate
+            break
+        }
+    }
+    if (-not $substDrive) {
+        throw "gate-14 fail-closed: 没有可用临时盘符用于 Rust ASCII 路径视图"
+    }
+    $createdSubst = $false
+    $oldLocation = Get-Location
+    $oldCargoHome = $env:CARGO_HOME
+    $oldRustupHome = $env:RUSTUP_HOME
+    $oldCargoTarget = $env:CARGO_TARGET_DIR
+    $oldPath = $env:PATH
+    $oldLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
+    $oldRustFlags = $env:RUSTFLAGS
+    try {
+        cmd /c "subst $substDrive `"$($_projRoot)`""
+        if ($LASTEXITCODE -ne 0) {
+            throw "gate-14 fail-closed: subst $substDrive -> $_projRoot failed"
+        }
+        $createdSubst = $true
+        $relativeRepo = $REPO_ROOT.Substring($_projRoot.Length).TrimStart("\")
+        $repoRootAscii = Join-Path "$substDrive\" $relativeRepo
+        $_dataRoot = Join-Path "$substDrive\" "AI-Coding-Factory-Data\dev"
+        $env:CARGO_HOME = Join-Path $_dataRoot "cargo-home"
+        $env:RUSTUP_HOME = Join-Path $_dataRoot "rustup-home"
+        $env:CARGO_TARGET_DIR = Get-WorktreeTargetDir -WorktreeRoot $repoRootAscii -DataRoot $_dataRoot
+        $gnuToolchain = Join-Path $env:RUSTUP_HOME "toolchains\stable-x86_64-pc-windows-gnu"
+        $rustBin = Join-Path $gnuToolchain "lib\rustlib\x86_64-pc-windows-gnu\bin"
+        $selfContainedBin = Join-Path $rustBin "self-contained"
+        $rustLld = Join-Path $rustBin "rust-lld.exe"
+        $dlltool = Join-Path $selfContainedBin "dlltool.exe"
+        if (-not (Test-Path -LiteralPath $dlltool)) {
+            throw "gate-14 fail-closed: dlltool not found at '$dlltool'"
+        }
+        if (-not (Test-Path -LiteralPath $rustLld)) {
+            throw "gate-14 fail-closed: rust-lld not found at '$rustLld'"
+        }
+        $assemblerBin = Ensure-RustGnuAssemblerBundle -DataRoot $_dataRoot
+        $assembler = Join-Path $assemblerBin "as.exe"
+        $dlltoolWrapper = New-RustGnuDlltoolWrapper -DataRoot $_dataRoot -DlltoolPath $dlltool -AssemblerPath $assembler
+        # 只前置 rustup shim 与 self-contained binutils；不前置完整 toolchain bin，
+        # 避免真实 cargo.exe 遮蔽 shim 后不识别 +toolchain 语法。
+        $env:PATH = "$env:CARGO_HOME\bin;$selfContainedBin;$assemblerBin;$oldPath"
+        $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $rustLld
+        $rustFlagPatch = "-C link-self-contained=yes -C dlltool=$dlltoolWrapper"
+        $env:RUSTFLAGS = if ($oldRustFlags) { "$oldRustFlags $rustFlagPatch" } else { $rustFlagPatch }
+        Set-Location -LiteralPath $repoRootAscii
+        cargo +stable-x86_64-pc-windows-gnu test -p factory-contracts --locked
+        $cargoExit = $LASTEXITCODE
+        if ($cargoExit -ne 0) {
+            throw "gate-14 cargo failed (exit $cargoExit)"
+        }
+    } finally {
+        Set-Location $oldLocation
+        $env:CARGO_HOME = $oldCargoHome
+        $env:RUSTUP_HOME = $oldRustupHome
+        $env:CARGO_TARGET_DIR = $oldCargoTarget
+        $env:PATH = $oldPath
+        $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = $oldLinker
+        $env:RUSTFLAGS = $oldRustFlags
+        if ($createdSubst) {
+            cmd /c "subst $substDrive /D" | Out-Null
+        }
+    }
 }
 
 # Bootstrap-dev 必须能跑 -VerifyOnly（plan-validation 引用已删除）

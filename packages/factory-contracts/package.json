@@ -4,6 +4,9 @@
   "description": "AI Coding Factory — TypeScript contract types (generated from JSON Schema)",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
+  "dependencies": {
+    "ajv": "8.20.0"
+  },
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vitest run",

@@ -2,13 +2,12 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://factory.local/contracts/schemas/prepared-batch.v2.schema.json",
   "title": "PreparedBatchV2",
-  "description": "预备事件批次 manifest（§10.1 + §11）。由不可变 manifest + 一个或多个自描述脱敏 stream segment 组成。manifest 至少含 preparedBatchId、按 batchOrdinal 排列的全量稳定 ingestEventId、每个 Task 唯一的 expectedCommittedHead 与 ordinal 范围、segment digest 列表、总事件数/长度、schema/coordinator 版本、完整尾标。跨 Task 事件可交错；同一 Task 至多一个未提交批次。",
+  "description": "不可变预备事件批次 manifest（§10.1 + §11）。由不可变 manifest + 一个或多个自描述脱敏 stream segment 组成；不携带可变数据库状态。manifest 至少含 preparedBatchId、按 batchOrdinal 排列的全量稳定 ingestEventId、每个 Task 唯一的提交锚点与 ordinal 范围、segment digest 列表、总事件数/长度、schema/coordinator 版本、完整尾标。跨 Task 事件可交错；同一 Task 至多一个未提交批次。",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "preparedBatchId",
     "writerEpoch",
-    "state",
     "orderedIngestIds",
     "perTaskExpectedHeads",
     "segmentDigests",
@@ -30,16 +29,13 @@
     "writerEpoch": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "claim 时的 writer epoch（用于竞争检测）。"
-    },
-    "state": {
-      "type": "string",
-      "enum": ["CLAIMED", "PREPARING", "PREPARED", "COMMITTED"],
-      "description": "批次状态机（§11 ingest_batches）。正常转换仅 CLAIMED → PREPARING → PREPARED → COMMITTED；旧 epoch pre-commit 状态只能由 Reconciler CAS 为 ABANDONED。COMMITTED/ABANDONED 均为终态。"
     },
     "orderedIngestIds": {
       "type": "array",
       "minItems": 1,
+      "uniqueItems": true,
       "items": {
         "type": "string",
         "minLength": 1
@@ -49,7 +45,7 @@
     "perTaskExpectedHeads": {
       "type": "array",
       "minItems": 1,
-      "description": "每个 Task 唯一的 expectedCommittedHead 锚点 + 批内 ordinal 范围（§11 ingest_batch_task_heads）。",
+      "description": "每个 Task 唯一的 `expectedTaskSeq` / `expectedEventDigest` 锚点与批内 ordinal 范围（§11 ingest_batch_task_heads）；`expectedEventDigest` 显式可空。",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -66,26 +62,49 @@
             "minLength": 1
           },
           "expectedTaskSeq": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 0,
-            "description": "该 Task 锚点处的 taskSeq（CAS 重放基线）。"
+            "maximum": 9007199254740991,
+            "description": "`expectedTaskSeq` 是该 Task 的 CAS 重放基线；genesis 显式为 null。"
           },
           "expectedEventDigest": {
             "type": ["string", "null"],
-            "pattern": "^sha256:[a-f0-9]{64}$|^$",
-            "description": "该 Task 锚点处的 eventDigest（genesis 为 null 或全零 predecessor）。"
+            "pattern": "^sha256:[a-f0-9]{64}$",
+            "description": "`expectedEventDigest` 显式可空：genesis 为 null，否则仅允许该 Task 锚点的 sha256；不接受空字符串。"
           },
           "firstBatchOrdinal": {
             "type": "integer",
             "minimum": 0,
+            "maximum": 9007199254740991,
             "description": "该 Task 在本批内的首事件 batchOrdinal。"
           },
           "lastBatchOrdinal": {
             "type": "integer",
             "minimum": 0,
+            "maximum": 9007199254740991,
             "description": "该 Task 在本批内的末事件 batchOrdinal。"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {"expectedTaskSeq": {"type": "null"}},
+              "required": ["expectedTaskSeq"]
+            },
+            "then": {
+              "properties": {"expectedEventDigest": {"type": "null"}}
+            }
+          },
+          {
+            "if": {
+              "properties": {"expectedEventDigest": {"type": "null"}},
+              "required": ["expectedEventDigest"]
+            },
+            "then": {
+              "properties": {"expectedTaskSeq": {"type": "null"}}
+            }
+          }
+        ]
       }
     },
     "segmentDigests": {
@@ -122,8 +141,8 @@
             "additionalProperties": false,
             "required": ["first", "lastExclusive"],
             "properties": {
-              "first": {"type": "integer", "minimum": 0},
-              "lastExclusive": {"type": "integer", "minimum": 1}
+              "first": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              "lastExclusive": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
             }
           },
           "mappingPrecision": {
@@ -131,21 +150,26 @@
             "enum": ["byte", "field", "frame", "none"]
           },
           "sourceSpan": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["start", "endExclusive"],
-            "properties": {
-              "start": {"type": ["integer", "null"], "minimum": 0},
-              "endExclusive": {"type": ["integer", "null"], "minimum": 0}
-            }
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start", "endExclusive"],
+                "properties": {
+                  "start": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+                  "endExclusive": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+                }
+              },
+              {"type": "null"}
+            ]
           },
           "sanitizedSpan": {
             "type": "object",
             "additionalProperties": false,
             "required": ["start", "endExclusive"],
             "properties": {
-              "start": {"type": "integer", "minimum": 0},
-              "endExclusive": {"type": "integer", "minimum": 0}
+              "start": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              "endExclusive": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
             }
           },
           "contentDigest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
@@ -153,28 +177,50 @@
           "predecessorDigest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
           "completeFooterDigest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
           "adapterVersion": {"type": "string"}
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {"mappingPrecision": {"const": "byte"}},
+              "required": ["mappingPrecision"]
+            },
+            "then": {"properties": {"sourceSpan": {"type": "object"}}}
+          },
+          {
+            "if": {
+              "properties": {
+                "mappingPrecision": {"enum": ["field", "frame", "none"]}
+              },
+              "required": ["mappingPrecision"]
+            },
+            "then": {"properties": {"sourceSpan": {"type": "null"}}}
+          }
+        ]
       },
       "description": "segment digest 列表。"
     },
     "eventCount": {
       "type": "integer",
       "minimum": 1,
+      "maximum": 9007199254740991,
       "description": "总事件数。"
     },
     "payloadBytes": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "总 payload 字节数。"
     },
     "firstBatchOrdinal": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "本批首事件 batchOrdinal。"
     },
     "lastBatchOrdinal": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "本批末事件 batchOrdinal。"
     },
     "oldestIngestedAt": {

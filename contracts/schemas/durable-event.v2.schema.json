@@ -68,6 +68,7 @@
     "taskSeq": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "任务内单调递增序号（由物化器分配，CAS 持久）。UI cursor 用 (taskId, taskSeq)。"
     },
     "runId": {
@@ -78,6 +79,7 @@
     "runSeq": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "单 Run 内诊断序号（不能跨 Run 唯一）。"
     },
     "stepId": {
@@ -112,7 +114,7 @@
         "tool.result",
         "state.changed"
       ],
-      "description": "具体事件类型（§10.1）。model.summary 必带 summaryOrigin=provider_public + providerEventId + sanitizedProviderFrameRef + sanitizedProviderFrameDigest。"
+      "description": "具体事件类型（§10.1）。model.summary 的 Provider frameRef 形状尚未冻结，Adapter/物化器本轮不会接受该输入；本 schema 不臆造 ref 字段。"
     },
     "providerEventId": {
       "type": ["string", "null"],
@@ -121,11 +123,12 @@
     "sourceSeq": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "Provider 来源端序号（用于去重与对齐）。"
     },
     "streamId": {
       "type": ["string", "null"],
-      "description": "Provider stream 稳定 ID（stream.* 事件必填；非 stream 事件 null）。"
+      "description": "Provider stream 稳定 ID；stream.segment.committed/stream.terminated 必须为非空字符串。"
     },
     "preparedBatchId": {
       "type": "string",
@@ -135,39 +138,83 @@
     "batchOrdinal": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "所属 PreparedBatch 内的事件序号（与 manifest 的 orderedIngestIds 一致）。"
     },
     "sourceTransportSpan": {
       "type": "object",
       "additionalProperties": false,
       "required": ["coordinate", "start", "endExclusive", "mappingPrecision"],
-      "description": "源传输 span：内存中以原始传输字节精确计数。credential/secret/PII 仅存 providerEventId/sourceSeq 与诚实的 mappingPrecision（byte|field|frame|none），精确字节起止不能进普通事件。",
+      "description": "源传输 span：coordinate 表示 Provider 传输坐标轴，mappingPrecision 表示映射精度，两者相互独立。transport 坐标仅在 byte 精度下携带非空范围；field/frame/none 精度不携带 offset。",
       "properties": {
         "coordinate": {
           "type": "string",
-          "enum": [
-            "provider_transport_bytes",
-            "provider_transport_chars",
-            "none"
-          ],
-          "description": "坐标轴。provider_transport_bytes=原始字节；provider_transport_chars=字符偏移；none=无意义。"
+          "enum": ["provider_transport_bytes", "provider_transport_chars", "none"],
+          "description": "Provider 原始传输坐标轴；不得使用 mappingPrecision 的 byte/field/frame 名称冒充坐标。"
         },
         "start": {
           "type": ["integer", "null"],
           "minimum": 0,
-          "description": "起始字节/字符偏移（不含）。坐标轴=none 时必须为 null。"
+          "maximum": 9007199254740991,
+          "description": "transport 坐标且 mappingPrecision=byte 时的起始偏移；其他组合必须为 null。"
         },
         "endExclusive": {
           "type": ["integer", "null"],
           "minimum": 0,
-          "description": "结束字节/字符偏移（不含）。坐标轴=none 时必须为 null。"
+          "maximum": 9007199254740991,
+          "description": "transport 坐标且 mappingPrecision=byte 时的结束偏移（不含）；其他组合必须为 null。"
         },
         "mappingPrecision": {
           "type": "string",
           "enum": ["byte", "field", "frame", "none"],
           "description": "精度（§10.4）：credential 默认不高于 field/frame；stream.segment.* 一般为 byte 或 frame。"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "coordinate": {"enum": ["provider_transport_bytes", "provider_transport_chars"]},
+              "mappingPrecision": {"const": "byte"}
+            },
+            "required": ["coordinate", "mappingPrecision"]
+          },
+          "then": {
+            "properties": {
+              "start": {"type": "integer"},
+              "endExclusive": {"type": "integer"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "coordinate": {"enum": ["provider_transport_bytes", "provider_transport_chars"]},
+              "mappingPrecision": {"enum": ["field", "frame", "none"]}
+            },
+            "required": ["coordinate", "mappingPrecision"]
+          },
+          "then": {
+            "properties": {
+              "start": {"type": "null"},
+              "endExclusive": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"coordinate": {"const": "none"}},
+            "required": ["coordinate"]
+          },
+          "then": {
+            "properties": {
+              "start": {"type": "null"},
+              "endExclusive": {"type": "null"},
+              "mappingPrecision": {"const": "none"}
+            }
+          }
+        }
+      ]
     },
     "sanitizedStreamSpan": {
       "type": "object",
@@ -183,11 +230,13 @@
         "start": {
           "type": "integer",
           "minimum": 0,
+          "maximum": 9007199254740991,
           "description": "脱敏 segment 内字节偏移（不含）。"
         },
         "endExclusive": {
           "type": "integer",
           "minimum": 0,
+          "maximum": 9007199254740991,
           "description": "脱敏 segment 内字节偏移（不含）。"
         }
       }
@@ -200,6 +249,7 @@
     "monotonicTimeNs": {
       "type": "integer",
       "minimum": 0,
+      "maximum": 9007199254740991,
       "description": "单调时钟纳秒。"
     },
     "ingestedAt": {
@@ -225,9 +275,12 @@
         "executableDigest",
         "pid",
         "processStartTime",
-        "jobObjectId"
+        "jobObjectId",
+        "wslDistro",
+        "containerId",
+        "imageDigest"
       ],
-      "description": "受管进程身份（§10.1）：用于 RUNNING 真实性校验（PID/Job Object/WSL/container exec）。",
+      "description": "受管进程身份（§10.1）：runtime 仅为 local-windows 或 wsl-docker，并按分支提供完整进程证据。",
       "properties": {
         "executorId": {
           "type": "string",
@@ -241,7 +294,7 @@
         },
         "runtime": {
           "type": "string",
-          "enum": ["local-windows", "wsl-docker", "wsl-process", "container"],
+          "enum": ["local-windows", "wsl-docker"],
           "description": "运行时类型。"
         },
         "executableDigest": {
@@ -252,6 +305,7 @@
         "pid": {
           "type": "integer",
           "minimum": 0,
+          "maximum": 9007199254740991,
           "description": "进程 PID。"
         },
         "processStartTime": {
@@ -261,21 +315,49 @@
         },
         "jobObjectId": {
           "type": ["string", "null"],
-          "description": "Windows Job Object ID（local-windows 必填；wsl/container 可为 null）。"
+          "minLength": 1,
+          "description": "Windows Job Object ID（local-windows 必填；wsl-docker 必须为 null）。"
         },
         "wslDistro": {
           "type": ["string", "null"],
-          "description": "WSL distro 名（runtime=wsl-* 必填；否则 null）。"
+          "minLength": 1,
+          "description": "WSL distro 名（wsl-docker 必填；local-windows 必须为 null）。"
         },
         "containerId": {
           "type": ["string", "null"],
-          "description": "容器 ID（runtime=container 必填）。"
+          "minLength": 1,
+          "description": "容器 ID（wsl-docker 必填；local-windows 必须为 null）。"
         },
         "imageDigest": {
           "type": ["string", "null"],
-          "description": "容器镜像 digest（runtime=container 必填）。"
+          "minLength": 1,
+          "description": "容器镜像 digest（wsl-docker 必填；local-windows 必须为 null）。"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"runtime": {"const": "local-windows"}}, "required": ["runtime"]},
+          "then": {
+            "properties": {
+              "jobObjectId": {"type": "string", "minLength": 1},
+              "wslDistro": {"type": "null"},
+              "containerId": {"type": "null"},
+              "imageDigest": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"runtime": {"const": "wsl-docker"}}, "required": ["runtime"]},
+          "then": {
+            "properties": {
+              "jobObjectId": {"type": "null"},
+              "wslDistro": {"type": "string", "minLength": 1},
+              "containerId": {"type": "string", "minLength": 1},
+              "imageDigest": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
     },
     "payload": {
       "type": "object",
@@ -284,7 +366,7 @@
     "sanitizedProviderFrameDigest": {
       "type": ["string", "null"],
       "pattern": "^sha256:[a-f0-9]{64}$",
-      "description": "已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃。model.summary 必填，其它 null。"
+      "description": "已脱敏 Provider frame 的 SHA-256。原始 frame 在脱敏后立即丢弃；model.summary 的完整引用合同尚未冻结。"
     },
     "payloadDigest": {
       "type": "string",
@@ -318,12 +400,13 @@
             "additionalProperties": false,
             "required": ["start", "endExclusive"],
             "properties": {
-              "start": {"type": "integer", "minimum": 0},
-              "endExclusive": {"type": "integer", "minimum": 0}
+              "start": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              "endExclusive": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
             }
           },
           "replacement": {
             "type": "string",
+            "pattern": "^\\[REDACTED(?::[a-z0-9._-]+)?\\]$",
             "description": "替换值（[REDACTED] / [REDACTED:uncertain] / 类型化标记）。"
           }
         }
@@ -335,5 +418,47 @@
       "pattern": "^sha256:[a-f0-9]{64}$",
       "description": "redactions 列表内容的 SHA-256 摘要。"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": ["stream.segment.committed", "stream.terminated"]
+          }
+        },
+        "required": ["eventType"]
+      },
+      "then": {
+        "properties": {
+          "streamId": {"type": "string", "minLength": 1}
+        },
+        "required": ["streamId"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"eventType": {"const": "state.changed"}},
+        "required": ["eventType"]
+      },
+      "then": {
+        "properties": {
+          "durabilityClass": {"const": "authoritative_state"},
+          "source": {"const": "orchestrator"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"durabilityClass": {"const": "authoritative_state"}},
+        "required": ["durabilityClass"]
+      },
+      "then": {
+        "properties": {
+          "eventType": {"const": "state.changed"},
+          "source": {"const": "orchestrator"}
+        }
+      }
+    }
+  ]
 }

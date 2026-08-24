@@ -10,12 +10,24 @@ contracts/codegen/generate.py
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import json
+import logging
+import os
+import stat
 import sys
+import tempfile
+import time
+import uuid
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, NamedTuple, NoReturn
+
+import jsonschema
 
 # 仓库根目录（相对于本脚本所在 contracts/codegen/）
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +37,302 @@ CATALOG_PATH = REPO_ROOT / "contracts" / "codegen" / "catalog.v1.json"
 TS_OUT = REPO_ROOT / "packages" / "factory-contracts" / "src" / "generated" / "contracts.ts"
 PY_OUT = REPO_ROOT / "apps" / "agent" / "src" / "factory_agent" / "contracts" / "generated" / "models.py"
 RS_OUT = REPO_ROOT / "crates" / "factory-contracts" / "src" / "generated" / "contracts.rs"
+
+# 计划哈希的运行时 validator 只能从这两份权威 schema 机械生成，不能复用普通类型生成的
+# per-entry ERROR 注释降级路径。任一读取/解析/结构检查失败都必须阻断三语言生成。
+RUN_SPEC_VALIDATOR_SCHEMA_PATH = "contracts/schemas/run-spec.v1.schema.json"
+PLAN_REVISION_VALIDATOR_SCHEMA_PATH = "contracts/schemas/plan-revision.v1.schema.json"
+# 事件物化器在输入与输出边界都必须使用权威 schema，而不是手写字段表替代。
+PREPARED_EVENT_VALIDATOR_SCHEMA_PATH = "contracts/schemas/prepared-event.v2.schema.json"
+DURABLE_EVENT_VALIDATOR_SCHEMA_PATH = "contracts/schemas/durable-event.v2.schema.json"
+PREPARED_BATCH_VALIDATOR_SCHEMA_PATH = "contracts/schemas/prepared-batch.v2.schema.json"
+AUTHORITATIVE_STATE_EVENT_VALIDATOR_SCHEMA_PATH = (
+    "contracts/schemas/authoritative-state-event.v1.schema.json"
+)
+_DRAFT7_SCHEMA_URI = "http://json-schema.org/draft-07/schema#"
+
+
+class _AuthorizationSchemaMetadata(NamedTuple):
+    """冻结一项授权 schema 在 catalog、文档与生成常量间的完整身份。"""
+
+    bundle_key: str
+    schema_path: str
+    schema_id: str
+    schema_version: int
+    draft_uri: str
+    document_id: str
+    title: str
+
+
+# 授权 schema 的身份属于冻结合同；catalog 只提供待核对输入，不能自行改写这张表。
+_AUTHORIZATION_SCHEMA_METADATA: Mapping[str, _AuthorizationSchemaMetadata] = MappingProxyType(
+    {
+        "IntentAuthorization": _AuthorizationSchemaMetadata(
+            bundle_key="intentAuthorization",
+            schema_path="contracts/schemas/intent-authorization.v1.schema.json",
+            schema_id="intent-authorization.v1",
+            schema_version=1,
+            draft_uri=_DRAFT7_SCHEMA_URI,
+            document_id="https://factory.local/contracts/schemas/intent-authorization.v1.schema.json",
+            title="IntentAuthorization",
+        ),
+        "ExecutionAuthorization": _AuthorizationSchemaMetadata(
+            bundle_key="executionAuthorization",
+            schema_path="contracts/schemas/execution-authorization.v1.schema.json",
+            schema_id="execution-authorization.v1",
+            schema_version=1,
+            draft_uri=_DRAFT7_SCHEMA_URI,
+            document_id="https://factory.local/contracts/schemas/execution-authorization.v1.schema.json",
+            title="ExecutionAuthorization",
+        ),
+    }
+)
+AUTHORIZATION_CODEGEN_NAMES: Mapping[str, str] = MappingProxyType(
+    {name: metadata.bundle_key for name, metadata in _AUTHORIZATION_SCHEMA_METADATA.items()}
+)
+KNOWN_VALIDATOR_FORMATS = frozenset({"date-time"})
+
+# Draft7 中每类子 schema 的位置。按关键字感知地遍历，避免把 `properties` 中用户
+# 自定义的 `format`、`$ref` 字段名误认为 schema keyword。
+_SINGLE_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "if",
+        "then",
+        "else",
+        "not",
+        "propertyNames",
+    }
+)
+_SCHEMA_MAP_KEYWORDS = frozenset({"properties", "patternProperties", "definitions", "$defs"})
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+_DEFAULT_NEW_FILE_MODE = 0o644
+
+# 纯 schema/hash/类型渲染帮助函数保持无日志；只有 CLI 与 write_batch 副作用边界发出脱敏记录。
+_LOGGER = logging.getLogger("factory.contracts.codegen")
+_CODEGEN_LOG_FORMAT = (
+    "CODEGEN event=%(event)s correlation_id=%(correlation_id)s elapsed_ms=%(elapsed_ms)d "
+    "target_count=%(target_count)d commit_status=%(commit_status)s "
+    "rollback_status=%(rollback_status)s cleanup_status=%(cleanup_status)s "
+    "error_code=%(error_code)s"
+)
+_CODEGEN_LOG_STATUS_VALUES = frozenset(
+    {
+        "pending",
+        "completed",
+        "partial",
+        "failed",
+        "not_started",
+        "not_required",
+        "not_applicable",
+        "unknown",
+    }
+)
+
+
+def _new_correlation_id() -> str:
+    """为一次 CLI/批次生成仅含小写十六进制的关联 ID，不携带宿主或目标身份。"""
+    return uuid.uuid4().hex
+
+
+def _safe_correlation_id(candidate: str | None) -> str:
+    """仅复用合法 lowerhex ID；任何外来文本都替换为新 ID，禁止路径或 secret 进入日志。"""
+    if (
+        isinstance(candidate, str)
+        and len(candidate) == 32
+        and all(character in "0123456789abcdef" for character in candidate)
+    ):
+        return candidate
+    return _new_correlation_id()
+
+
+def _log_codegen_event(
+    event: str,
+    correlation_id: str,
+    elapsed_ms: int,
+    target_count: int,
+    commit_status: str,
+    rollback_status: str,
+    cleanup_status: str,
+    error_code: str,
+    *,
+    level: int = logging.INFO,
+) -> None:
+    """先构造完整固定 ASCII message，再发送记录，不让 formatter 依赖外加字段。"""
+    fields: dict[str, str | int] = {
+        "event": event,
+        "correlation_id": correlation_id,
+        "elapsed_ms": elapsed_ms,
+        "target_count": target_count,
+        "commit_status": commit_status,
+        "rollback_status": rollback_status,
+        "cleanup_status": cleanup_status,
+        "error_code": error_code,
+    }
+    message = _CODEGEN_LOG_FORMAT % fields
+    _LOGGER.log(
+        level,
+        message,
+        # 库式直接调用仍保留结构化属性供宿主检索，CLI formatter 只读 message。
+        extra=fields,
+    )
+
+
+class _ExactLoggerNameFilter(logging.Filter):
+    """仅接受生成器命名 logger 本身，阻止子 logger/外部记录进入 CLI sink。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """精确比较 logger name，不使用前缀或层级匹配。"""
+        return record.name == _LOGGER.name
+
+
+@contextmanager
+def _cli_logging_scope() -> Iterator[None]:
+    """CLI 期间仅临时接管命名 logger，退出时完整恢复宿主状态。"""
+    previous_handlers = list(_LOGGER.handlers)
+    previous_level = _LOGGER.level
+    previous_propagate = _LOGGER.propagate
+    cli_handler = logging.StreamHandler(sys.stdout)
+    cli_handler.setFormatter(logging.Formatter("%(message)s"))
+    cli_handler.addFilter(_ExactLoggerNameFilter())
+
+    # 不触碰 root logger；仅在作用域内替换本 logger 的三项可变配置。
+    _LOGGER.handlers = [cli_handler]
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+    try:
+        yield
+    finally:
+        _LOGGER.handlers = []
+        try:
+            cli_handler.close()
+        finally:
+            _LOGGER.handlers = previous_handlers
+            _LOGGER.setLevel(previous_level)
+            _LOGGER.propagate = previous_propagate
+
+
+def _start_cli_logging() -> tuple[str, int]:
+    """在参数已安全解析后建立 CLI 日志生命周期，并返回同一关联 ID/起点。"""
+    correlation_id = _new_correlation_id()
+    started_ns = time.monotonic_ns()
+    _log_codegen_event(
+        "cli_start",
+        correlation_id,
+        0,
+        3,
+        "pending",
+        "not_required",
+        "pending",
+        "NONE",
+    )
+    return correlation_id, started_ns
+
+
+def _finish_cli(
+    correlation_id: str,
+    started_ns: int,
+    exit_code: int,
+    error_code: str,
+    commit_status: str,
+    rollback_status: str,
+    cleanup_status: str,
+) -> int:
+    """以固定字段闭合 CLI 日志并返回原退出码，不接收路径或异常对象。"""
+    _log_codegen_event(
+        "cli_end",
+        correlation_id,
+        (time.monotonic_ns() - started_ns) // 1_000_000,
+        3,
+        commit_status,
+        rollback_status,
+        cleanup_status,
+        error_code,
+        level=logging.ERROR if exit_code else logging.INFO,
+    )
+    return exit_code
+
+
+class ValidatorSchemaError(RuntimeError):
+    """运行时 validator schema 不能安全嵌入生成物时的稳定失败分类。"""
+
+
+class CodegenGenerationError(RuntimeError):
+    """普通 catalog 类型生成失败时的稳定失败分类，禁止生成 ERROR 注释占位。"""
+
+
+class CodegenArgumentError(RuntimeError):
+    """CLI 参数非法时的稳定分类，不携带 argv 或 argparse 正文。"""
+
+
+class _CodegenArgumentParser(argparse.ArgumentParser):
+    """将 argparse 默认 usage/argv 回显收敛为固定异常；--help 仍保持标准成功退出。"""
+
+    def error(self, message: str) -> NoReturn:
+        """忽略可能包含敏感 argv 的正文，仅抛出稳定 ASCII 错误码。"""
+        del message
+        raise CodegenArgumentError("CODEGEN_ARGUMENT_INVALID")
+
+
+class CodegenWriteError(RuntimeError):
+    """三语言批次失败的脱敏结果，仅携带 CLI 可安全记录的固定状态。"""
+
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        commit_status: str = "unknown",
+        rollback_status: str = "unknown",
+        cleanup_status: str = "unknown",
+    ) -> None:
+        """保留错误码供白名单映射，并将外来状态限制在固定 ASCII 闭集。"""
+        super().__init__(error_code)
+        self.commit_status = _stable_codegen_log_status(commit_status)
+        self.rollback_status = _stable_codegen_log_status(rollback_status)
+        self.cleanup_status = _stable_codegen_log_status(cleanup_status)
+
+
+_CODEGEN_WRITE_ERROR_CODES = frozenset(
+    {
+        "CODEGEN_WRITE_FAILED",
+        "CODEGEN_CLEANUP_FAILED",
+        "CODEGEN_ROLLBACK_FAILED",
+    }
+)
+_CLI_ERROR_CODES = _CODEGEN_WRITE_ERROR_CODES | frozenset(
+    {
+        "CODEGEN_CATALOG_LOAD_FAILED",
+        "CODEGEN_CATALOG_EMPTY",
+        "CODEGEN_VALIDATOR_SCHEMA_FAILED",
+        "CODEGEN_GENERATION_FAILED",
+        "CODEGEN_ARGUMENT_INVALID",
+    }
+)
+
+
+def _emit_cli_error(error_code: str) -> None:
+    """只向 CLI 暴露固定 ASCII 白名单码，禁止异常正文或路径跨越入口边界。"""
+    stable_code = error_code if error_code in _CLI_ERROR_CODES else "CODEGEN_GENERATION_FAILED"
+    print(f"[ERROR] {stable_code}", file=sys.stderr)
+
+
+def _stable_codegen_write_error_code(error: CodegenWriteError) -> str:
+    """CLI 只允许白名单错误码跨越入口边界，未知异常文本一律脱敏为写入失败。"""
+    error_code = str(error)
+    if error_code in _CODEGEN_WRITE_ERROR_CODES:
+        return error_code
+    return "CODEGEN_WRITE_FAILED"
+
+
+def _stable_codegen_log_status(candidate: str) -> str:
+    """日志状态只允许固定闭集，任何外来正文都脱敏为 unknown。"""
+    return candidate if candidate in _CODEGEN_LOG_STATUS_VALUES else "unknown"
+
+
+class _CodegenTemporaryCleanupError(RuntimeError):
+    """同目录临时文件清理失败时的内部分类，供外层选择稳定错误码。"""
 
 # JSON Schema → TypeScript 类型映射
 TS_TYPE_MAP: dict[str, str] = {
@@ -116,6 +424,22 @@ def load_catalog() -> dict[str, Any]:
         return json.load(f)  # type: ignore[no-any-return]
 
 
+def _catalog_codegen_entries(catalog: object) -> list[dict[str, Any]]:
+    """从权威 catalog 精确提取 codegen entries；wire 形状漂移立即失败。"""
+    if not isinstance(catalog, dict) or "schemas" not in catalog:
+        raise TypeError("catalog root/schemas shape is invalid")
+    catalog_schemas = catalog["schemas"]
+    if not isinstance(catalog_schemas, list):
+        raise TypeError("catalog schemas must be array")
+    entries: list[dict[str, Any]] = []
+    for schema_entry in catalog_schemas:
+        if not isinstance(schema_entry, dict):
+            raise TypeError("catalog schema entry must be object")
+        if schema_entry.get("codegen") is True:
+            entries.append(schema_entry)
+    return entries
+
+
 def load_schema(schema_path_str: str) -> dict[str, Any]:
     """从 catalog 中的相对路径加载 JSON Schema。"""
     schema_path = REPO_ROOT / schema_path_str
@@ -123,6 +447,289 @@ def load_schema(schema_path_str: str) -> dict[str, Any]:
         raise FileNotFoundError(f"Schema 文件不存在: {schema_path}")
     with schema_path.open(encoding="utf-8") as f:
         return json.load(f)  # type: ignore[no-any-return]
+
+
+def _reject_duplicate_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """JSON object hook：任何层级重复 key 都必须在 schema 编译前稳定失败。"""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_DUPLICATE_KEY")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_json_constant(_constant: str) -> NoReturn:
+    """拒绝 Python JSON 扩展常量，确保权威 schema 只接受标准 JSON 数字。"""
+    raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON")
+
+
+def _walk_validator_subschema(value: object) -> None:
+    """按 Draft7 schema keyword 遍历子 schema，拒绝外部 ref 与未知 format。
+
+    不通用递归 dict 的全部 value：`properties`/`definitions` 是名称到 schema 的映射，
+    其中的名称可合法地叫 `format` 或 `$ref`，不能被错当成 keyword。
+    """
+    if isinstance(value, bool):
+        return
+    if not isinstance(value, dict):
+        # 子 schema 的非 object/bool 形态再交给 Draft7 meta-schema 分类，不能静默跳过。
+        return
+
+    reference = value.get("$ref")
+    if reference is not None and (not isinstance(reference, str) or not reference.startswith("#")):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_EXTERNAL_REF")
+
+    format_name = value.get("format")
+    if format_name is not None and (
+        not isinstance(format_name, str) or format_name not in KNOWN_VALIDATOR_FORMATS
+    ):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_UNKNOWN_FORMAT")
+
+    for keyword in _SINGLE_SCHEMA_KEYWORDS:
+        if keyword in value:
+            _walk_validator_subschema(value[keyword])
+
+    for keyword in _SCHEMA_MAP_KEYWORDS:
+        schema_map = value.get(keyword)
+        if isinstance(schema_map, dict):
+            for child_schema in schema_map.values():
+                _walk_validator_subschema(child_schema)
+
+    items = value.get("items")
+    if isinstance(items, list):
+        for child_schema in items:
+            _walk_validator_subschema(child_schema)
+    elif items is not None:
+        _walk_validator_subschema(items)
+
+    for keyword in _SCHEMA_ARRAY_KEYWORDS:
+        schemas = value.get(keyword)
+        if isinstance(schemas, list):
+            for child_schema in schemas:
+                _walk_validator_subschema(child_schema)
+
+    dependencies = value.get("dependencies")
+    if isinstance(dependencies, dict):
+        for dependency in dependencies.values():
+            # Draft7 dependency 可以是 string 数组；只有 schema 形态才继续遍历。
+            if isinstance(dependency, (bool, dict)):
+                _walk_validator_subschema(dependency)
+
+
+def _validate_validator_schema_object(schema: dict[str, Any]) -> None:
+    """验证权威/派生 schema 是精确 Draft7 且不含运行时可解析的外部资源。"""
+    if schema.get("$schema") != _DRAFT7_SCHEMA_URI:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_UNSUPPORTED_DRAFT7")
+    _walk_validator_subschema(schema)
+    try:
+        jsonschema.Draft7Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_DRAFT7") from exc
+
+
+def parse_validator_schema(raw: bytes) -> dict[str, Any]:
+    """严格按无 BOM UTF-8→无重复键 JSON→精确 Draft7 解析 validator schema。"""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_UTF8")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_UTF8") from exc
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except ValidatorSchemaError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_ROOT_NOT_OBJECT")
+
+    _validate_validator_schema_object(parsed)
+    return parsed
+
+
+def load_required_validator_schema(schema_path_str: str) -> tuple[dict[str, Any], str]:
+    """读取一个权威 validator schema，并返回对象与原始字节 SHA-256。"""
+    schema_path = REPO_ROOT / schema_path_str
+    try:
+        raw = schema_path.read_bytes()
+    except OSError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_READ_FAILED") from exc
+    schema = parse_validator_schema(raw)
+    return schema, "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def build_plan_revision_digest_material_schema(plan_revision_schema: dict[str, Any]) -> dict[str, Any]:
+    """从权威 PlanRevision schema 机械删除仅摘要排除的字段，得到 digest material schema。"""
+    material = copy.deepcopy(plan_revision_schema)
+    properties = material.get("properties")
+    required = material.get("required")
+    # 摘要派生不能把权威 digest 字段本身缺失误当作「已排除」：它必须原本同时受
+    # properties 与 required 约束，之后才允许仅删除 digest/signature 两项。
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(required, list)
+        or "planRevisionDigest" not in properties
+        or "signature" not in properties
+        or "planRevisionDigest" not in required
+        or "signature" in required
+        or required.count("planRevisionDigest") != 1
+    ):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED")
+
+    # 两个排除字段必须先由 full schema 明确定义；这里精确删除，禁止 silent pop 掩盖源合同漂移。
+    del properties["planRevisionDigest"]
+    del properties["signature"]
+    required.remove("planRevisionDigest")
+    return material
+
+
+def load_required_validator_schemas() -> dict[str, tuple[dict[str, Any], str]]:
+    """一次性加载并派生所有运行时 validator schema；任一步失败均不返回半份 bundle。"""
+    run_spec_schema, run_spec_sha256 = load_required_validator_schema(RUN_SPEC_VALIDATOR_SCHEMA_PATH)
+    plan_revision_schema, plan_revision_sha256 = load_required_validator_schema(
+        PLAN_REVISION_VALIDATOR_SCHEMA_PATH
+    )
+    prepared_event_schema, prepared_event_sha256 = load_required_validator_schema(
+        PREPARED_EVENT_VALIDATOR_SCHEMA_PATH
+    )
+    durable_event_schema, durable_event_sha256 = load_required_validator_schema(
+        DURABLE_EVENT_VALIDATOR_SCHEMA_PATH
+    )
+    prepared_batch_schema, prepared_batch_sha256 = load_required_validator_schema(
+        PREPARED_BATCH_VALIDATOR_SCHEMA_PATH
+    )
+    authoritative_state_event_schema, authoritative_state_event_sha256 = (
+        load_required_validator_schema(AUTHORITATIVE_STATE_EVENT_VALIDATOR_SCHEMA_PATH)
+    )
+    digest_material_schema = build_plan_revision_digest_material_schema(plan_revision_schema)
+    try:
+        _validate_validator_schema_object(digest_material_schema)
+    except ValidatorSchemaError as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_DIGEST_MATERIAL_FAILED") from exc
+    return {
+        "runSpec": (run_spec_schema, run_spec_sha256),
+        "planRevision": (plan_revision_schema, plan_revision_sha256),
+        "planRevisionDigestMaterial": (digest_material_schema, plan_revision_sha256),
+        "preparedEvent": (prepared_event_schema, prepared_event_sha256),
+        "durableEvent": (durable_event_schema, durable_event_sha256),
+        "preparedBatch": (prepared_batch_schema, prepared_batch_sha256),
+        "authoritativeStateEvent": (
+            authoritative_state_event_schema,
+            authoritative_state_event_sha256,
+        ),
+    }
+
+
+def load_required_authorization_validator_schemas(
+    codegen_entries: list[dict[str, Any]],
+) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+    """把 catalog 与 schema 文档逐字段绑定到冻结授权身份，漂移时不读取错误目标。"""
+    loaded: dict[str, tuple[dict[str, Any], str, int, str]] = {}
+    entries_by_name: dict[str, dict[str, Any]] = {}
+    for entry in codegen_entries:
+        name = entry.get("name")
+        if name not in _AUTHORIZATION_SCHEMA_METADATA:
+            continue
+        if name in entries_by_name:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        entries_by_name[name] = entry
+
+    if frozenset(entries_by_name) != frozenset(_AUTHORIZATION_SCHEMA_METADATA):
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+
+    for name, metadata in _AUTHORIZATION_SCHEMA_METADATA.items():
+        entry = entries_by_name[name]
+        if entry.get("schemaPath") != metadata.schema_path or entry.get("schemaId") != metadata.schema_id:
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        schema, _source_sha256 = load_required_validator_schema(metadata.schema_path)
+        if (
+            schema.get("$schema") != metadata.draft_uri
+            or schema.get("$id") != metadata.document_id
+            or schema.get("title") != metadata.title
+        ):
+            raise ValidatorSchemaError("VALIDATOR_SCHEMA_AUTHORIZATION_CATALOG_FAILED")
+        loaded[metadata.bundle_key] = (
+            schema,
+            metadata.schema_id,
+            metadata.schema_version,
+            metadata.schema_path,
+        )
+    # 顶层 bundle 在一次生成批次内不可替换 entry；三语言 renderer 共享同一对象快照。
+    return MappingProxyType(loaded)
+
+
+class _LazyAuthorizationSchemas(Mapping[str, tuple[dict[str, Any], str, int, str]]):
+    """同一生成批次内惰性加载并复用授权 schema 快照。
+
+    惰性仅用于隔离未消费 renderer 的测试 seam；真实 renderer 首次访问即执行
+    exact-set 与 Draft7 校验，失败仍会在任何生成物写入前 fail closed。
+    """
+
+    def __init__(self, codegen_entries: list[dict[str, Any]] | None) -> None:
+        """绑定显式 entries；None 专用于 direct renderer 的权威 catalog 惰性来源。"""
+        self._codegen_entries = None if codegen_entries is None else list(codegen_entries)
+        self._loaded: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None
+
+    @classmethod
+    def from_authoritative_catalog(cls) -> _LazyAuthorizationSchemas:
+        """构造 direct renderer provider；未被消费时绝不提前读取 catalog/schema。"""
+        return cls(None)
+
+    def _materialize(self) -> Mapping[str, tuple[dict[str, Any], str, int, str]]:
+        """首次消费时严格加载；成功后三语言始终共享同一 Mapping。"""
+        if self._loaded is None:
+            # direct renderer 兼容入口只能回到权威 catalog；显式 [] 则保留为坏 catalog，
+            # 继续由 exact-set 校验 fail closed，二者不能互相回退。
+            entries = self._codegen_entries
+            if entries is None:
+                entries = _catalog_codegen_entries(load_catalog())
+            self._loaded = load_required_authorization_validator_schemas(entries)
+        return self._loaded
+
+    def __getitem__(self, key: str) -> tuple[dict[str, Any], str, int, str]:
+        """按生成常量 key 取授权 schema 记录，并在首次调用触发加载。"""
+        return self._materialize()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        """迭代已验证 bundle 的闭集 key，首次调用同样触发加载。"""
+        return iter(self._materialize())
+
+    def __len__(self) -> int:
+        """返回已验证 bundle 的 exact-set 大小，未加载时先 fail closed 物化。"""
+        return len(self._materialize())
+
+
+def _embedded_schema_json(schema: dict[str, Any]) -> str:
+    """生成标准且稳定的 JSON；任何不可序列化值都归一为无敏感信息的稳定错误。"""
+    try:
+        return json.dumps(
+            schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValidatorSchemaError("VALIDATOR_SCHEMA_INVALID_JSON") from exc
+
+
+def _embedded_schema_sha256(schema_json: str) -> str:
+    """计算嵌入 JSON 字符串的 UTF-8 内容身份；它与权威原文件 SHA 各司其职。"""
+    return "sha256:" + hashlib.sha256(schema_json.encode("utf-8")).hexdigest()
+
+
+def _rust_raw_string(text: str) -> str:
+    """选择不会与 schema 文本冲突的 Rust raw-string 定界符。"""
+    hashes = "#"
+    while f'"{hashes}' in text:
+        hashes += "#"
+    return f'r{hashes}"{text}"{hashes}'
 
 
 def get_schema_properties(
@@ -178,7 +785,7 @@ def prop_ts_type(prop: dict[str, Any]) -> str:
     return TS_TYPE_MAP.get(str(prop_type), "unknown")
 
 
-def prop_py_type(prop: dict[str, Any], optional: bool = False) -> str:
+def prop_py_type(prop: dict[str, Any]) -> str:
     """将 schema property 定义转换为 Python 类型字符串。"""
     if "oneOf" in prop or "anyOf" in prop:
         variants = prop.get("oneOf", prop.get("anyOf", []))
@@ -212,15 +819,20 @@ def prop_py_type(prop: dict[str, Any], optional: bool = False) -> str:
         return f"list[{item_type}]"
     if prop_type == "object":
         return "dict[str, Any]"
-    result = PY_TYPE_MAP.get(str(prop_type), "Any")
-    if optional:
-        return f"Optional[{result}]"
-    return result
+    return PY_TYPE_MAP.get(str(prop_type), "Any")
 
 
 def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
     """将 schema property 定义转换为 Rust 类型字符串。"""
     if "const" in prop:
+        const_value = prop["const"]
+        # Rust 生成类型必须保留 JSON const 的基础类型；schemaVersion=2 不能被降级为 String。
+        if isinstance(const_value, bool):
+            return "bool"
+        if isinstance(const_value, int):
+            return "i64"
+        if isinstance(const_value, float):
+            return "f64"
         return "String"
     if "enum" in prop:
         return "String"
@@ -252,7 +864,127 @@ def prop_rs_type(prop: dict[str, Any], optional: bool = False) -> str:
     return f"Option<{rs}>" if optional else rs
 
 
+def load_codegen_entry_definition(
+    entry: dict[str, Any],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> tuple[str, dict[str, Any], list[str]]:
+    """加载一个普通 catalog entry；授权类型必须复用本批次的唯一 schema 快照。"""
+    try:
+        name = entry["name"]
+        schema_path = entry["schemaPath"]
+        if not isinstance(name, str) or not isinstance(schema_path, str):
+            raise TypeError("catalog entry name/schemaPath must be strings")
+        schema: dict[str, Any] | None = None
+        authorization_key = AUTHORIZATION_CODEGEN_NAMES.get(name)
+        if authorization_schemas is not None and authorization_key is not None:
+            cached_schema, cached_id, _cached_version, cached_path = authorization_schemas[authorization_key]
+            # catalog 与运行时常量共用一份身份；漂移时不得退回磁盘重读。
+            if schema_path != cached_path or entry.get("schemaId") != cached_id:
+                raise TypeError("authorization catalog identity mismatch")
+            schema = cached_schema
+        if schema is None:
+            schema = load_schema(schema_path)
+        definition_key = entry.get("definitionKey")
+        if definition_key is not None and not isinstance(definition_key, str):
+            raise TypeError("catalog entry definitionKey must be string")
+        props, required = get_schema_properties(schema, definition_key)
+        return name, props, required
+    except CodegenGenerationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 普通生成失败不能泄露路径/底层正文，也不能降级。
+        raise CodegenGenerationError("CODEGEN_GENERATION_FAILED") from exc
+
+
+def render_codegen_entry(
+    entry: dict[str, Any],
+    renderer: Callable[[str, dict[str, Any], list[str]], str],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> str:
+    """渲染单一 entry；授权类型与常量共享同一深度校验后的 schema 对象。"""
+    try:
+        name, props, required = load_codegen_entry_definition(entry, authorization_schemas)
+        return renderer(name, props, required)
+    except CodegenGenerationError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 不输出 schema/path/第三方异常正文。
+        raise CodegenGenerationError("CODEGEN_GENERATION_FAILED") from exc
+
+
 # ────────────────────────────── TypeScript ──────────────────────────────
+
+
+def generate_ts_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
+    """生成 TypeScript 运行时 validator 常量；原始 SHA 与派生 material 同时被冻结。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
+    return [
+        "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        f'export const RUN_SPEC_SCHEMA_SOURCE_SHA256 = "{run_spec_sha256}";',
+        f"export const RUN_SPEC_SCHEMA_JSON = {json.dumps(run_spec_json, ensure_ascii=False)};",
+        f'export const RUN_SPEC_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(run_spec_json)}";',
+        f'export const PLAN_REVISION_SCHEMA_SOURCE_SHA256 = "{plan_revision_sha256}";',
+        f"export const PLAN_REVISION_SCHEMA_JSON = {json.dumps(plan_revision_json, ensure_ascii=False)};",
+        f'export const PLAN_REVISION_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(plan_revision_json)}";',
+        "// 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        "export const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON = "
+        f"{json.dumps(digest_material_json, ensure_ascii=False)};",
+        "export const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(digest_material_json)}";',
+        "// 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        f'export const PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256 = "{prepared_event_sha256}";',
+        f"export const PREPARED_EVENT_V2_SCHEMA_JSON = {json.dumps(prepared_event_json, ensure_ascii=False)};",
+        f'export const PREPARED_EVENT_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(prepared_event_json)}";',
+        f'export const DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256 = "{durable_event_sha256}";',
+        f"export const DURABLE_EVENT_V2_SCHEMA_JSON = {json.dumps(durable_event_json, ensure_ascii=False)};",
+        f'export const DURABLE_EVENT_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(durable_event_json)}";',
+        f'export const PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256 = "{prepared_batch_sha256}";',
+        f"export const PREPARED_BATCH_V2_SCHEMA_JSON = {json.dumps(prepared_batch_json, ensure_ascii=False)};",
+        f'export const PREPARED_BATCH_V2_SCHEMA_JSON_SHA256 = "{_embedded_schema_sha256(prepared_batch_json)}";',
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256 = "
+        f'"{authoritative_state_event_sha256}";',
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON = "
+        f"{json.dumps(authoritative_state_event_json, ensure_ascii=False)};",
+        "export const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(authoritative_state_event_json)}";',
+        "// 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'export const INTENT_AUTHORIZATION_SCHEMA_ID = "{intent_authorization_id}";',
+        f"export const INTENT_AUTHORIZATION_SCHEMA_VERSION = {intent_authorization_version};",
+        f"export const INTENT_AUTHORIZATION_SCHEMA_JSON = {json.dumps(intent_authorization_json, ensure_ascii=False)};",
+        "export const INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(intent_authorization_json)}";',
+        f'export const EXECUTION_AUTHORIZATION_SCHEMA_ID = "{execution_authorization_id}";',
+        f"export const EXECUTION_AUTHORIZATION_SCHEMA_VERSION = {execution_authorization_version};",
+        "export const EXECUTION_AUTHORIZATION_SCHEMA_JSON = "
+        f"{json.dumps(execution_authorization_json, ensure_ascii=False)};",
+        "export const EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256 = "
+        f'"{_embedded_schema_sha256(execution_authorization_json)}";',
+        "",
+    ]
 
 
 def generate_ts_interface(name: str, props: dict[str, Any], required: list[str]) -> str:
@@ -270,8 +1002,15 @@ def generate_ts_interface(name: str, props: dict[str, Any], required: list[str])
     return "\n".join(lines)
 
 
-def generate_typescript(entries: list[dict[str, Any]]) -> str:
+def generate_typescript(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> str:
     """生成完整 TypeScript 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         "// 此文件由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "// 源 schema: contracts/schemas/*.schema.json",
@@ -281,25 +1020,115 @@ def generate_typescript(entries: list[dict[str, Any]]) -> str:
         "// @ts-nocheck",
         "",
     ]
+    sections.extend(generate_ts_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            iface = generate_ts_interface(entry["name"], props, required)
-            sections.append(iface)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"// ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        iface = render_codegen_entry(entry, generate_ts_interface, authorization_schemas)
+        sections.append(iface)
+        sections.append("")
     return "\n".join(sections)
 
 
 # ────────────────────────────── Python ──────────────────────────────
 
 
+def generate_py_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
+    """生成 Python 原始 schema JSON；计划模块惰性解析，避免 import-time 逃逸。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
+    return [
+        "# 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        f'RUN_SPEC_SCHEMA_SOURCE_SHA256: Final[str] = "{run_spec_sha256}"',
+        f"RUN_SPEC_SCHEMA_JSON: Final[str] = {run_spec_json!r}",
+        f'RUN_SPEC_SCHEMA_JSON_SHA256: Final[str] = "{_embedded_schema_sha256(run_spec_json)}"',
+        f'PLAN_REVISION_SCHEMA_SOURCE_SHA256: Final[str] = "{plan_revision_sha256}"',
+        f"PLAN_REVISION_SCHEMA_JSON: Final[str] = {plan_revision_json!r}",
+        f'PLAN_REVISION_SCHEMA_JSON_SHA256: Final[str] = "{_embedded_schema_sha256(plan_revision_json)}"',
+        "# 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        (
+            "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON: Final[str] = "
+            f"{digest_material_json!r}"
+        ),
+        (
+            "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(digest_material_json)}"'
+        ),
+        "# 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        f'PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{prepared_event_sha256}"',
+        f"PREPARED_EVENT_V2_SCHEMA_JSON: Final[str] = {prepared_event_json!r}",
+        (
+            "PREPARED_EVENT_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(prepared_event_json)}"'
+        ),
+        f'DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{durable_event_sha256}"',
+        f"DURABLE_EVENT_V2_SCHEMA_JSON: Final[str] = {durable_event_json!r}",
+        (
+            "DURABLE_EVENT_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(durable_event_json)}"'
+        ),
+        f'PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256: Final[str] = "{prepared_batch_sha256}"',
+        f"PREPARED_BATCH_V2_SCHEMA_JSON: Final[str] = {prepared_batch_json!r}",
+        (
+            "PREPARED_BATCH_V2_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(prepared_batch_json)}"'
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256: Final[str] = "
+            f'"{authoritative_state_event_sha256}"'
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON: Final[str] = "
+            f"{authoritative_state_event_json!r}"
+        ),
+        (
+            "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(authoritative_state_event_json)}"'
+        ),
+        "# 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'INTENT_AUTHORIZATION_SCHEMA_ID: Final[str] = "{intent_authorization_id}"',
+        f"INTENT_AUTHORIZATION_SCHEMA_VERSION: Final[int] = {intent_authorization_version}",
+        f"INTENT_AUTHORIZATION_SCHEMA_JSON: Final[str] = {intent_authorization_json!r}",
+        (
+            "INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(intent_authorization_json)}"'
+        ),
+        f'EXECUTION_AUTHORIZATION_SCHEMA_ID: Final[str] = "{execution_authorization_id}"',
+        f"EXECUTION_AUTHORIZATION_SCHEMA_VERSION: Final[int] = {execution_authorization_version}",
+        f"EXECUTION_AUTHORIZATION_SCHEMA_JSON: Final[str] = {execution_authorization_json!r}",
+        (
+            "EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256: Final[str] = "
+            f'"{_embedded_schema_sha256(execution_authorization_json)}"'
+        ),
+        "",
+    ]
+
+
 def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> str:
-    """生成单个 Python TypedDict 类定义。"""
+    """生成单个 Python TypedDict 类定义，逐字段保留 schema 的 required 语义。"""
     lines = [
         f"class {name}(TypedDict, total=False):",
         '    """由 generate.py 自动生成，禁止手动修改。"""',
@@ -309,7 +1138,11 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
         return "\n".join(lines)
     for field, prop_def in props.items():
         is_required = field in required
-        py_type = prop_py_type(prop_def, optional=not is_required)
+        # total=False 让未包装字段保持 optional；只有 schema.required 中的字段使用
+        # Required[T]，避免生成类型把安全必填字段静默降级为可省略。
+        py_type = prop_py_type(prop_def)
+        if is_required:
+            py_type = f"Required[{py_type}]"
         desc = prop_def.get("description", "")
         if desc:
             lines.append(f"    # {desc}")
@@ -317,40 +1150,162 @@ def generate_py_class(name: str, props: dict[str, Any], required: list[str]) -> 
     return "\n".join(lines)
 
 
-def generate_python(entries: list[dict[str, Any]]) -> str:
+def generate_python(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> str:
     """生成完整 Python 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         '"""',
         "此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "源 schema: contracts/schemas/*.schema.json",
         "算法版本: v1",
         '"""',
-        "from __future__ import annotations",
-        "",
-        "from typing import Any, Literal, Optional, TypedDict, Union",
+        "from typing import Any, Final, Literal, Optional, Required, TypedDict, Union",
         "",
         "__all__ = [",
     ]
-    names = [e["name"] for e in entries]
+    # 先验证全部普通 entry；若其中一个失败，不能先构造部分 Python 文件再落盘。
+    names = [load_codegen_entry_definition(entry, authorization_schemas)[0] for entry in entries]
+    names = [
+        "RUN_SPEC_SCHEMA_SOURCE_SHA256",
+        "RUN_SPEC_SCHEMA_JSON",
+        "RUN_SPEC_SCHEMA_JSON_SHA256",
+        "PLAN_REVISION_SCHEMA_SOURCE_SHA256",
+        "PLAN_REVISION_SCHEMA_JSON",
+        "PLAN_REVISION_SCHEMA_JSON_SHA256",
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON",
+        "PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256",
+        "PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256",
+        "PREPARED_EVENT_V2_SCHEMA_JSON",
+        "PREPARED_EVENT_V2_SCHEMA_JSON_SHA256",
+        "DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256",
+        "DURABLE_EVENT_V2_SCHEMA_JSON",
+        "DURABLE_EVENT_V2_SCHEMA_JSON_SHA256",
+        "PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256",
+        "PREPARED_BATCH_V2_SCHEMA_JSON",
+        "PREPARED_BATCH_V2_SCHEMA_JSON_SHA256",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON",
+        "AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256",
+        "INTENT_AUTHORIZATION_SCHEMA_ID",
+        "INTENT_AUTHORIZATION_SCHEMA_VERSION",
+        "INTENT_AUTHORIZATION_SCHEMA_JSON",
+        "INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256",
+        "EXECUTION_AUTHORIZATION_SCHEMA_ID",
+        "EXECUTION_AUTHORIZATION_SCHEMA_VERSION",
+        "EXECUTION_AUTHORIZATION_SCHEMA_JSON",
+        "EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256",
+        *names,
+    ]
     for n in names:
         sections.append(f'    "{n}",')
     sections.append("]")
     sections.append("")
+    sections.extend(generate_py_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            cls = generate_py_class(entry["name"], props, required)
-            sections.append(cls)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"# ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        cls = render_codegen_entry(entry, generate_py_class, authorization_schemas)
+        sections.append(cls)
+        sections.append("")
     return "\n".join(sections)
 
 
 # ────────────────────────────── Rust ──────────────────────────────
+
+
+def generate_rs_validator_schema_constants(
+    validator_schemas: dict[str, tuple[dict[str, Any], str]],
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]],
+) -> list[str]:
+    """生成 Rust 运行时 validator 常量；JSON 保持原始 schema 结构并在运行时解析。"""
+    run_spec_schema, run_spec_sha256 = validator_schemas["runSpec"]
+    plan_revision_schema, plan_revision_sha256 = validator_schemas["planRevision"]
+    digest_material_schema, _ = validator_schemas["planRevisionDigestMaterial"]
+    prepared_event_schema, prepared_event_sha256 = validator_schemas["preparedEvent"]
+    durable_event_schema, durable_event_sha256 = validator_schemas["durableEvent"]
+    prepared_batch_schema, prepared_batch_sha256 = validator_schemas["preparedBatch"]
+    authoritative_state_event_schema, authoritative_state_event_sha256 = validator_schemas[
+        "authoritativeStateEvent"
+    ]
+    intent_authorization_schema, intent_authorization_id, intent_authorization_version, _intent_path = (
+        authorization_schemas["intentAuthorization"]
+    )
+    execution_authorization_schema, execution_authorization_id, execution_authorization_version, _execution_path = (
+        authorization_schemas["executionAuthorization"]
+    )
+    run_spec_json = _embedded_schema_json(run_spec_schema)
+    plan_revision_json = _embedded_schema_json(plan_revision_schema)
+    digest_material_json = _embedded_schema_json(digest_material_schema)
+    prepared_event_json = _embedded_schema_json(prepared_event_schema)
+    durable_event_json = _embedded_schema_json(durable_event_schema)
+    prepared_batch_json = _embedded_schema_json(prepared_batch_schema)
+    authoritative_state_event_json = _embedded_schema_json(authoritative_state_event_schema)
+    intent_authorization_json = _embedded_schema_json(intent_authorization_schema)
+    execution_authorization_json = _embedded_schema_json(execution_authorization_schema)
+    return [
+        "// 运行时 validator 由权威 schema 机械嵌入；禁止手写字段表。",
+        "pub const RUN_SPEC_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{run_spec_sha256}";',
+        f"pub const RUN_SPEC_SCHEMA_JSON: &str = {_rust_raw_string(run_spec_json)};",
+        "pub const RUN_SPEC_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(run_spec_json)}";',
+        "pub const PLAN_REVISION_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{plan_revision_sha256}";',
+        (
+            "pub const PLAN_REVISION_SCHEMA_JSON: &str = "
+            f"{_rust_raw_string(plan_revision_json)};"
+        ),
+        "pub const PLAN_REVISION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(plan_revision_json)}";',
+        "// 仅 planRevisionDigest/signature 从摘要 material 排除，其他字段仍由权威 schema 约束。",
+        (
+            "pub const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON: &str = "
+            f"{_rust_raw_string(digest_material_json)};"
+        ),
+        "pub const PLAN_REVISION_DIGEST_MATERIAL_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(digest_material_json)}";',
+        "// 事件物化器输入/输出均使用本组权威 schema，禁止以手写字段表替代。",
+        "pub const PREPARED_EVENT_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{prepared_event_sha256}";',
+        "pub const PREPARED_EVENT_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(prepared_event_json)};",
+        "pub const PREPARED_EVENT_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(prepared_event_json)}";',
+        "pub const DURABLE_EVENT_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{durable_event_sha256}";',
+        "pub const DURABLE_EVENT_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(durable_event_json)};",
+        "pub const DURABLE_EVENT_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(durable_event_json)}";',
+        "pub const PREPARED_BATCH_V2_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{prepared_batch_sha256}";',
+        "pub const PREPARED_BATCH_V2_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(prepared_batch_json)};",
+        "pub const PREPARED_BATCH_V2_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(prepared_batch_json)}";',
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_SOURCE_SHA256: &str =\n"
+        f'    "{authoritative_state_event_sha256}";',
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON: &str = "
+        f"{_rust_raw_string(authoritative_state_event_json)};",
+        "pub const AUTHORITATIVE_STATE_EVENT_V1_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(authoritative_state_event_json)}";',
+        "// 授权 parser 直接消费这些 digest-bound schema 常量，禁止运行时回读磁盘或手写字段表。",
+        f'pub const INTENT_AUTHORIZATION_SCHEMA_ID: &str = "{intent_authorization_id}";',
+        f"pub const INTENT_AUTHORIZATION_SCHEMA_VERSION: u32 = {intent_authorization_version};",
+        f"pub const INTENT_AUTHORIZATION_SCHEMA_JSON: &str = {_rust_raw_string(intent_authorization_json)};",
+        "pub const INTENT_AUTHORIZATION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(intent_authorization_json)}";',
+        f'pub const EXECUTION_AUTHORIZATION_SCHEMA_ID: &str = "{execution_authorization_id}";',
+        f"pub const EXECUTION_AUTHORIZATION_SCHEMA_VERSION: u32 = {execution_authorization_version};",
+        f"pub const EXECUTION_AUTHORIZATION_SCHEMA_JSON: &str = {_rust_raw_string(execution_authorization_json)};",
+        "pub const EXECUTION_AUTHORIZATION_SCHEMA_JSON_SHA256: &str =\n"
+        f'    "{_embedded_schema_sha256(execution_authorization_json)}";',
+        "",
+    ]
 
 
 def to_snake_case(name: str) -> str:
@@ -385,8 +1340,15 @@ def generate_rs_struct(name: str, props: dict[str, Any], required: list[str]) ->
     return "\n".join(lines)
 
 
-def generate_rust(entries: list[dict[str, Any]]) -> str:
+def generate_rust(
+    entries: list[dict[str, Any]],
+    validator_schemas: dict[str, tuple[dict[str, Any], str]] | None = None,
+    authorization_schemas: Mapping[str, tuple[dict[str, Any], str, int, str]] | None = None,
+) -> str:
     """生成完整 Rust 文件内容。"""
+    validator_schemas = validator_schemas or load_required_validator_schemas()
+    if authorization_schemas is None:
+        authorization_schemas = _LazyAuthorizationSchemas.from_authoritative_catalog()
     sections = [
         "//! 此模块由 contracts/codegen/generate.py 自动生成，禁止手动修改。",
         "//! 源 schema: contracts/schemas/*.schema.json",
@@ -396,17 +1358,11 @@ def generate_rust(entries: list[dict[str, Any]]) -> str:
         "#![allow(unused_imports)]",
         "",
     ]
+    sections.extend(generate_rs_validator_schema_constants(validator_schemas, authorization_schemas))
     for entry in entries:
-        try:
-            schema = load_schema(entry["schemaPath"])
-            definition_key: str | None = entry.get("definitionKey")
-            props, required = get_schema_properties(schema, definition_key)
-            struct_def = generate_rs_struct(entry["name"], props, required)
-            sections.append(struct_def)
-            sections.append("")
-        except Exception as exc:  # noqa: BLE001
-            sections.append(f"// ERROR generating {entry['name']}: {exc}")
-            sections.append("")
+        struct_def = render_codegen_entry(entry, generate_rs_struct, authorization_schemas)
+        sections.append(struct_def)
+        sections.append("")
     return "\n".join(sections)
 
 
@@ -418,6 +1374,200 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _replace_file(source: Path, destination: Path) -> None:
+    """封装可注入的原子替换边界，测试可在指定 replace 次序制造 I/O 故障。"""
+    os.replace(source, destination)
+
+
+def _read_file_mode(path: Path) -> int:
+    """只保留目标的 POSIX permission bits，避免文件类型位被复制到 stage。"""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _chmod_file(path: Path, mode: int) -> None:
+    """封装可注入的 mode 恢复边界；失败必须进入同一批次补偿状态机。"""
+    os.chmod(path, mode)
+
+
+def _unlink_file(path: Path) -> None:
+    """删除未消费的同目录临时文件；已被 replace 消费时视为正常无副作用。"""
+    path.unlink(missing_ok=True)
+
+
+def _cleanup_temporary_files(paths: list[Path]) -> bool:
+    """尽力清理全部临时文件；首次失败即使重试成功也必须向调用方报告。"""
+    cleanup_failed = False
+    for path in paths:
+        for attempt in range(2):
+            try:
+                _unlink_file(path)
+                break
+            except Exception:  # noqa: BLE001 - 清理时必须继续尝试其他临时文件。
+                cleanup_failed = True
+                if attempt == 1:
+                    break
+    return cleanup_failed
+
+
+def _stage_bytes(target: Path, data: bytes, suffix: str) -> Path:
+    """在目标同目录完成 flush、关闭和回读校验，避免未完成文件参与 replace。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=suffix,
+    )
+    staged_path = Path(raw_path)
+    descriptor_owned = True
+    try:
+        # fdopen 成功后句柄所有权转移给文件对象；若 fdopen 自身失败则仍需显式 close 原 descriptor。
+        staged_file = os.fdopen(descriptor, "wb")
+        descriptor_owned = False
+        # Windows 不能 replace 仍被本进程打开的文件，因此 with 结束后才进行回读和后续替换。
+        with staged_file:
+            staged_file.write(data)
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+        if staged_path.read_bytes() != data:
+            raise OSError("staged file readback mismatch")
+        return staged_path
+    except Exception as exc:  # noqa: BLE001 - 临时文件失败必须先补偿后再向上层归类。
+        close_failed = False
+        if descriptor_owned:
+            try:
+                # mkstemp 成功、fdopen 失败时必须先释放 Windows 句柄，否则 unlink 不能作为可靠补偿。
+                os.close(descriptor)
+            except Exception:  # noqa: BLE001 - 关闭失败与临时文件清理同属 fail-closed 的 cleanup 失败。
+                close_failed = True
+        # close 已失败也不能短路 cleanup；所有已登记临时路径都必须继续 best-effort 补偿。
+        cleanup_failed = _cleanup_temporary_files([staged_path])
+        if close_failed or cleanup_failed:
+            raise _CodegenTemporaryCleanupError from exc
+        raise
+
+
+def write_batch(
+    outputs: tuple[tuple[Path, str], ...],
+    *,
+    correlation_id: str | None = None,
+) -> None:
+    """以同目录 stage/rollback 补偿方式写入三语言生成物，绝不接受部分成功。"""
+    batch_correlation_id = _safe_correlation_id(correlation_id)
+    started_ns = time.monotonic_ns()
+    _log_codegen_event(
+        "batch_start",
+        batch_correlation_id,
+        0,
+        len(outputs),
+        "pending",
+        "not_required",
+        "pending",
+        "NONE",
+    )
+    staged_paths: list[Path] = []
+    rollback_paths: list[Path] = []
+    snapshots: dict[Path, tuple[bool, Path | None, int]] = {}
+    committed_targets: list[Path] = []
+    failure_code: str | None = None
+    rollback_attempted = False
+    rollback_failed = False
+
+    try:
+        # 所有新内容先独立落盘并 fsync/readback；任何失败都还未触碰正式生成物。
+        for target, content in outputs:
+            staged_paths.append(_stage_bytes(target, content.encode("utf-8"), ".stage"))
+
+        # 仅当所有新文件均已就绪后，才为原存在目标创建可恢复的同目录 rollback 副本。
+        for target, _ in outputs:
+            try:
+                original_bytes = target.read_bytes()
+            except FileNotFoundError:
+                snapshots[target] = (False, None, _DEFAULT_NEW_FILE_MODE)
+            else:
+                original_mode = _read_file_mode(target)
+                rollback_path = _stage_bytes(target, original_bytes, ".rollback")
+                rollback_paths.append(rollback_path)
+                snapshots[target] = (True, rollback_path, original_mode)
+
+        # 固定 TS→Python→Rust 的调用顺序；replace 失败时下面只补偿已经成功的目标。
+        for (target, _), staged_path in zip(outputs, staged_paths, strict=True):
+            # mkstemp 固定从 0600 起步；replace 前恢复旧 mode，新目标则采用明确的安全默认 0644。
+            _, _, target_mode = snapshots[target]
+            _chmod_file(staged_path, target_mode)
+            _replace_file(staged_path, target)
+            committed_targets.append(target)
+    except _CodegenTemporaryCleanupError:
+        failure_code = "CODEGEN_CLEANUP_FAILED"
+    except Exception:  # noqa: BLE001 - 不暴露 errno、路径或底层异常正文。
+        rollback_attempted = bool(committed_targets)
+        for target in reversed(committed_targets):
+            existed, snapshot_rollback_path, original_mode = snapshots[target]
+            try:
+                if existed:
+                    if snapshot_rollback_path is None:
+                        raise OSError("missing rollback snapshot")
+                    # rollback 副本同样由 mkstemp 创建，恢复前必须先还原原目标 mode。
+                    _chmod_file(snapshot_rollback_path, original_mode)
+                    _replace_file(snapshot_rollback_path, target)
+                else:
+                    _unlink_file(target)
+            except Exception:  # noqa: BLE001 - 一个回滚失败不能阻止其余目标继续补偿。
+                rollback_failed = True
+        failure_code = "CODEGEN_ROLLBACK_FAILED" if rollback_failed else "CODEGEN_WRITE_FAILED"
+
+    cleanup_failed = _cleanup_temporary_files(staged_paths + rollback_paths)
+    # 错误优先级固定为 rollback > cleanup > 原始写入，调用方只能收到稳定、脱敏的代码。
+    final_error_code: str | None
+    if failure_code == "CODEGEN_ROLLBACK_FAILED":
+        final_error_code = failure_code
+    elif failure_code == "CODEGEN_CLEANUP_FAILED" or cleanup_failed:
+        final_error_code = "CODEGEN_CLEANUP_FAILED"
+    else:
+        final_error_code = failure_code
+    if final_error_code is not None:
+        if len(committed_targets) == len(outputs):
+            commit_status = "completed"
+        elif committed_targets:
+            commit_status = "partial"
+        else:
+            commit_status = "not_started"
+        rollback_status = (
+            "failed" if rollback_failed else "completed" if rollback_attempted else "not_required"
+        )
+        cleanup_status = (
+            "failed"
+            if failure_code == "CODEGEN_CLEANUP_FAILED" or cleanup_failed
+            else "completed"
+        )
+        _log_codegen_event(
+            "batch_end",
+            batch_correlation_id,
+            (time.monotonic_ns() - started_ns) // 1_000_000,
+            len(outputs),
+            commit_status,
+            rollback_status,
+            cleanup_status,
+            final_error_code,
+            level=logging.ERROR,
+        )
+        raise CodegenWriteError(
+            final_error_code,
+            commit_status=commit_status,
+            rollback_status=rollback_status,
+            cleanup_status=cleanup_status,
+        )
+    _log_codegen_event(
+        "batch_end",
+        batch_correlation_id,
+        (time.monotonic_ns() - started_ns) // 1_000_000,
+        len(outputs),
+        "completed",
+        "not_required",
+        "completed",
+        "NONE",
+    )
+
+
 def write_or_check(path: Path, content: str, check_mode: bool) -> bool:
     """
     check_mode=False 时写入文件并返回 True。
@@ -425,20 +1575,172 @@ def write_or_check(path: Path, content: str, check_mode: bool) -> bool:
     """
     if check_mode:
         if not path.exists():
-            print(f"[DRIFT] 文件不存在: {path}", file=sys.stderr)
+            print("[DRIFT] CODEGEN_OUTPUT_MISSING", file=sys.stderr)
             return False
         existing = path.read_text(encoding="utf-8")
         if existing != content:
-            print(f"[DRIFT] 文件内容已漂移: {path}", file=sys.stderr)
-            print(f"  期望 SHA-256: {content_hash(content)}", file=sys.stderr)
-            print(f"  实际 SHA-256: {content_hash(existing)}", file=sys.stderr)
+            print("[DRIFT] CODEGEN_OUTPUT_DRIFT", file=sys.stderr)
             return False
         return True
-    # 写入模式：确保父目录存在，写入内容
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8", newline="\n")
-    print(f"[OK] 已写入: {path}")
+    # 兼容单文件调用，但仍走同一补偿写入边界，避免产生另一条非原子写路径。
+    write_batch(((path, content),))
     return True
+
+
+def _run_codegen_cli(check_mode: bool) -> int:
+    """在已建立的命名 logger 作用域内执行生成/检查流程并闭合 CLI 日志。"""
+    cli_correlation_id, cli_started_ns = _start_cli_logging()
+
+    # 加载并筛选 catalog；JSON 可解析不代表 wire 形状可信，任何结构异常都收敛到同一码。
+    try:
+        codegen_entries = _catalog_codegen_entries(load_catalog())
+    except Exception:
+        _emit_cli_error("CODEGEN_CATALOG_LOAD_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_CATALOG_LOAD_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    if not codegen_entries:
+        _emit_cli_error("CODEGEN_CATALOG_EMPTY")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_CATALOG_EMPTY",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    # 先在内存中严格加载 schema 并生成三语言完整内容；任一 validator 失败时绝不进入写入阶段。
+    try:
+        validator_schemas = load_required_validator_schemas()
+        # 同一惰性 provider 传给三语言；真实 renderer 首次消费时严格加载，
+        # 后续语言复用同一快照，而未消费的测试 seam 不额外引入 catalog 前置。
+        authorization_schemas = _LazyAuthorizationSchemas(codegen_entries)
+        ts_content = generate_typescript(codegen_entries, validator_schemas, authorization_schemas)
+        py_content = generate_python(codegen_entries, validator_schemas, authorization_schemas)
+        rs_content = generate_rust(codegen_entries, validator_schemas, authorization_schemas)
+    except ValidatorSchemaError:
+        _emit_cli_error("CODEGEN_VALIDATOR_SCHEMA_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_VALIDATOR_SCHEMA_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+    except CodegenGenerationError:
+        _emit_cli_error("CODEGEN_GENERATION_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_GENERATION_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+    except Exception:  # noqa: BLE001 - 内存生成阶段不能把未分类异常降级成部分写入。
+        _emit_cli_error("CODEGEN_GENERATION_FAILED")
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_GENERATION_FAILED",
+            "not_started",
+            "not_required",
+            "not_started",
+        )
+
+    # --check 只读逐文件比较；写入模式必须作为一个可补偿的三目标批次执行。
+    try:
+        if check_mode:
+            results = (
+                write_or_check(TS_OUT, ts_content, True),
+                write_or_check(PY_OUT, py_content, True),
+                write_or_check(RS_OUT, rs_content, True),
+            )
+        else:
+            write_batch(
+                (
+                    (TS_OUT, ts_content),
+                    (PY_OUT, py_content),
+                    (RS_OUT, rs_content),
+                ),
+                correlation_id=cli_correlation_id,
+            )
+            results = (True, True, True)
+    except CodegenWriteError as exc:
+        error_code = _stable_codegen_write_error_code(exc)
+        _emit_cli_error(error_code)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            error_code,
+            exc.commit_status,
+            exc.rollback_status,
+            exc.cleanup_status,
+        )
+    except Exception:  # noqa: BLE001 - I/O 中途失败不得输出 [DONE] 或泄露内部路径。
+        _emit_cli_error("CODEGEN_WRITE_FAILED")
+        boundary_status = "not_applicable" if check_mode else "unknown"
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_WRITE_FAILED",
+            boundary_status,
+            boundary_status,
+            boundary_status,
+        )
+    ok = all(results)
+
+    if check_mode:
+        if ok:
+            print("[OK] 三语言生成树无漂移。")
+        else:
+            print("[FAIL] CODEGEN_DRIFT_DETECTED", file=sys.stderr)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            0 if ok else 1,
+            "NONE" if ok else "CODEGEN_DRIFT_DETECTED",
+            "not_applicable",
+            "not_applicable",
+            "not_applicable",
+        )
+
+    if not ok:
+        print("[FAIL] CODEGEN_WRITE_INCOMPLETE", file=sys.stderr)
+        return _finish_cli(
+            cli_correlation_id,
+            cli_started_ns,
+            1,
+            "CODEGEN_WRITE_INCOMPLETE",
+            "unknown",
+            "unknown",
+            "unknown",
+        )
+    print("[DONE] 三语言类型文件生成完成。")
+    return _finish_cli(
+        cli_correlation_id,
+        cli_started_ns,
+        0,
+        "NONE",
+        "completed",
+        "not_required",
+        "completed",
+    )
 
 
 def main() -> int:
@@ -450,7 +1752,7 @@ def main() -> int:
         _emit_cli_text_encoding_failure()
         return 2
 
-    parser = argparse.ArgumentParser(
+    parser = _CodegenArgumentParser(
         description="确定性代码生成器：从 catalog.v1.json 生成三语言类型定义。"
     )
     parser.add_argument(
@@ -458,42 +1760,26 @@ def main() -> int:
         action="store_true",
         help="检查模式：校验输出是否与磁盘一致，不一致则失败且不修改文件。",
     )
-    args = parser.parse_args()
-    check_mode: bool = args.check
-
-    # 加载 catalog
     try:
-        catalog = load_catalog()
-    except Exception as exc:
-        print(f"[ERROR] 无法加载 catalog: {exc}", file=sys.stderr)
-        return 1
+        args = parser.parse_args()
+    except CodegenArgumentError:
+        # 非法 argv 也需要成对 CLI 日志，但作用域不得泄漏到 root/宿主。
+        with _cli_logging_scope():
+            cli_correlation_id, cli_started_ns = _start_cli_logging()
+            _emit_cli_error("CODEGEN_ARGUMENT_INVALID")
+            return _finish_cli(
+                cli_correlation_id,
+                cli_started_ns,
+                2,
+                "CODEGEN_ARGUMENT_INVALID",
+                "not_started",
+                "not_required",
+                "not_started",
+            )
 
-    # 筛选 codegen=true 的条目
-    codegen_entries = [s for s in catalog.get("schemas", []) if s.get("codegen") is True]
-    if not codegen_entries:
-        print("[ERROR] catalog 中没有 codegen=true 的条目", file=sys.stderr)
-        return 1
-
-    # 生成各语言内容
-    ts_content = generate_typescript(codegen_entries)
-    py_content = generate_python(codegen_entries)
-    rs_content = generate_rust(codegen_entries)
-
-    # 写入或检查
-    ok = True
-    ok = write_or_check(TS_OUT, ts_content, check_mode) and ok
-    ok = write_or_check(PY_OUT, py_content, check_mode) and ok
-    ok = write_or_check(RS_OUT, rs_content, check_mode) and ok
-
-    if check_mode:
-        if ok:
-            print("[OK] 三语言生成树无漂移。")
-        else:
-            print("[FAIL] 检测到漂移，请重新运行 generate.py 更新输出。", file=sys.stderr)
-        return 0 if ok else 1
-
-    print("[DONE] 三语言类型文件生成完成。")
-    return 0
+    # --help 会在此前以 SystemExit(0) 返回，因此不会留下孤立 cli_start。
+    with _cli_logging_scope():
+        return _run_codegen_cli(args.check)
 
 
 if __name__ == "__main__":
