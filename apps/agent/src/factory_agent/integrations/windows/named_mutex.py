@@ -13,7 +13,11 @@ import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+
+# Linux typeshed 会隐藏 WinDLL/WinError/get_last_error；只对这些 Windows-only
+# 成员使用 Any 视图，运行时仍是原 ctypes 模块，属性求值与错误语义不变。
+_WINDOWS_CTYPES: Any = ctypes
 
 WAIT_OBJECT_0 = 0x00000000
 WAIT_ABANDONED_0 = 0x00000080
@@ -140,8 +144,8 @@ class _RealWin32Api:
     """真实 Win32 调用封装；生产逻辑只通过窄接口调用，便于测试注入 fake。"""
 
     def __init__(self) -> None:
-        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._kernel32 = _WINDOWS_CTYPES.WinDLL("kernel32", use_last_error=True)
+        self._advapi32 = _WINDOWS_CTYPES.WinDLL("advapi32", use_last_error=True)
 
         self._close_handle = self._kernel32.CloseHandle
         self._close_handle.argtypes = [ctypes.c_void_p]
@@ -183,7 +187,7 @@ class _RealWin32Api:
         converter.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
         converter.restype = ctypes.c_bool
         if not converter(sddl, 1, ctypes.byref(descriptor), None):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         attributes = _SecurityAttributesStruct(
             ctypes.sizeof(_SecurityAttributesStruct),
             descriptor,
@@ -208,11 +212,11 @@ class _RealWin32Api:
             _MUTEX_REQUIRED_RIGHTS | _READ_CONTROL,
         )
         if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         if not self._set_handle_information(ctypes.c_void_p(handle), _HANDLE_FLAG_INHERIT, 0):
-            last_error = ctypes.get_last_error()
+            last_error = _WINDOWS_CTYPES.get_last_error()
             self.close(int(handle))
-            raise ctypes.WinError(last_error)
+            raise _WINDOWS_CTYPES.WinError(last_error)
         return int(handle)
 
     def verify_current_user_dacl(self, handle: int) -> bool:
@@ -255,7 +259,7 @@ class _RealWin32Api:
             ctypes.byref(descriptor),
         )
         if result != 0:
-            raise ctypes.WinError(result)
+            raise _WINDOWS_CTYPES.WinError(result)
         try:
             owner_sid = self._sid_to_string(owner)
             allowed: list[tuple[str, int]] = []
@@ -282,14 +286,14 @@ class _RealWin32Api:
 
     def release(self, handle: int) -> None:
         if not self._release_mutex(ctypes.c_void_p(handle)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
 
     def close(self, handle: int) -> None:
         if not self._close_handle(ctypes.c_void_p(handle)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
 
     def get_last_error(self) -> int:
-        return int(ctypes.get_last_error())
+        return int(_WINDOWS_CTYPES.get_last_error())
 
     def _get_current_user_sid(self) -> str:
         if self._current_sid is not None:
@@ -299,7 +303,7 @@ class _RealWin32Api:
         open_process_token.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p)]
         open_process_token.restype = ctypes.c_bool
         if not open_process_token(self._kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         try:
             get_token_information = self._advapi32.GetTokenInformation
             get_token_information.argtypes = [
@@ -314,7 +318,7 @@ class _RealWin32Api:
             get_token_information(token, 1, None, 0, ctypes.byref(needed))
             buffer = ctypes.create_string_buffer(needed.value)
             if not get_token_information(token, 1, buffer, needed, ctypes.byref(needed)):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
             sid_pointer = ctypes.c_void_p.from_buffer(buffer).value
             self._current_sid = self._sid_to_string(ctypes.c_void_p(sid_pointer))
             return self._current_sid
@@ -327,7 +331,7 @@ class _RealWin32Api:
         converter.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
         converter.restype = ctypes.c_bool
         if not converter(sid, ctypes.byref(out)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         try:
             return str(out.value)
         finally:
@@ -340,13 +344,13 @@ class _RealWin32Api:
         getter.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ushort), ctypes.POINTER(ctypes.c_ulong)]
         getter.restype = ctypes.c_bool
         if not getter(descriptor, ctypes.byref(control), ctypes.byref(revision)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         return bool(control.value & _SE_DACL_PROTECTED)
 
     def _is_handle_inheritable(self, handle: int) -> bool:
         flags = ctypes.c_ulong()
         if not self._get_handle_information(ctypes.c_void_p(handle), ctypes.byref(flags)):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         return bool(flags.value & _HANDLE_FLAG_INHERIT)
 
     def _read_dacl(self, dacl: ctypes.c_void_p) -> tuple[list[tuple[str, int]], list[str]]:
@@ -355,7 +359,7 @@ class _RealWin32Api:
         get_acl_information.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
         get_acl_information.restype = ctypes.c_bool
         if not get_acl_information(dacl, ctypes.byref(info), ctypes.sizeof(info), 2):
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
         allowed: list[tuple[str, int]] = []
         denied: list[str] = []
         get_ace = self._advapi32.GetAce
@@ -364,10 +368,10 @@ class _RealWin32Api:
         for index in range(info.AceCount):
             ace_ptr = ctypes.c_void_p()
             if not get_ace(dacl, index, ctypes.byref(ace_ptr)):
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise _WINDOWS_CTYPES.WinError(_WINDOWS_CTYPES.get_last_error())
             ace_address = ace_ptr.value
             if ace_address is None:
-                raise ctypes.WinError(_ERROR_INVALID_HANDLE)
+                raise _WINDOWS_CTYPES.WinError(_ERROR_INVALID_HANDLE)
             header = ctypes.cast(ace_ptr, ctypes.POINTER(_AceHeader)).contents
             if header.AceType == 0:
                 allowed_ace = ctypes.cast(ace_ptr, ctypes.POINTER(_AccessAllowedAce)).contents

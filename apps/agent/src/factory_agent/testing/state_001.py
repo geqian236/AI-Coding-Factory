@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from factory_agent.application.transition_service import StateScenarioEvidenceError
 from factory_agent.observability.logging import get_logger
@@ -26,6 +27,10 @@ from factory_agent.testing.required_test_catalog import (
     load_catalog,
     scenario_contract_digest,
 )
+
+# Linux typeshed 不暴露 CREATE_NO_WINDOW；Any 视图只跨过静态平台差异，
+# 条件表达式仍保证仅在 Windows 运行时读取该常量。
+_WINDOWS_SUBPROCESS: Any = subprocess
 
 LOGGER = get_logger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -178,7 +183,7 @@ def _run_fixed_group(
     environment["PYTHONPATH"] = str(_REPO_ROOT / "apps" / "agent" / "src")
     environment["TEMP"] = str(run_root)
     environment["TMP"] = str(run_root)
-    creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    creation_flags = _WINDOWS_SUBPROCESS.CREATE_NO_WINDOW if os.name == "nt" else 0
     started = time.monotonic()
     output = b""
     return_code = 124
