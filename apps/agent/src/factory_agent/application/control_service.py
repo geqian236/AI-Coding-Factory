@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Callable
@@ -13,6 +14,7 @@ from factory_agent.application.transition_service import (
     append_authoritative_state_event,
 )
 from factory_agent.domain.control import ControlCommand, ControlCommandReceiptPhase, ControlCommandType
+from factory_agent.domain.events import payload_digest
 from factory_agent.domain.workflow import Attempt, Run, RunDesiredState, RunObservedState
 from factory_agent.errors import FactoryError
 from factory_agent.observability.logging import get_logger
@@ -175,6 +177,85 @@ class ControlService:
             payload={"drainState": updated.drain_state.value, "interruptCommandId": updated.interrupt_command_id},
         )
 
+    @staticmethod
+    def _require_replay_projection(
+        *,
+        controls: SqliteControlRepository,
+        run: Run,
+        command: ControlCommand,
+        receipts: tuple[ControlReceiptEvent, ...],
+    ) -> ControlReceiptEvent:
+        """复验历史 command、唯一 ACK、Run CAS 与 state.changed 的同一提交事实。"""
+        acknowledgements = tuple(
+            receipt for receipt in receipts if receipt.phase is ControlCommandReceiptPhase.ACKNOWLEDGED
+        )
+        if len(acknowledgements) != 1:
+            raise ControlRequestError("accepted command acknowledgement is missing or ambiguous")
+        acknowledgement = acknowledgements[0]
+        if (
+            acknowledgement.command_id != command.command_id
+            or acknowledgement.receipt_seq != 0
+            or acknowledgement.attempt_id != command.acknowledged_attempt_id
+            or command.accepted_state_version != command.expected_state_version + 1
+            or run.state_version < command.accepted_state_version
+            or run.control_command_seq < command.command_seq
+            or (
+                run.control_command_seq == command.command_seq
+                and run.desired_state is not _desired_target(command.command_type)
+            )
+        ):
+            raise ControlRequestError("accepted command projection is inconsistent")
+
+        projection = controls.get_run_state_event_projection(
+            run_id=command.run_id,
+            state_version=command.accepted_state_version,
+        )
+        try:
+            canonical_raw = None if projection is None else projection["canonical_state_event"]
+            if not isinstance(canonical_raw, (bytes, bytearray, memoryview)):
+                raise TypeError
+            canonical_bytes = bytes(canonical_raw)
+            canonical = json.loads(canonical_bytes.decode("utf-8"))
+        except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+            raise ControlRequestError("accepted command state event is missing or invalid") from None
+        expected_payload = {
+            "desiredState": _desired_target(command.command_type).value,
+            "controlCommandSeq": command.command_seq,
+        }
+        if (
+            not isinstance(canonical, dict)
+            or projection is None
+            or projection["schema_version"] != 1
+            or projection["task_id"] != run.task_id
+            or projection["scope"] != "RUN"
+            or projection["aggregate_type"] != "RUN"
+            or projection["aggregate_id"] != command.run_id
+            or projection["run_id"] != command.run_id
+            or projection["step_id"] is not None
+            or projection["attempt_id"] is not None
+            or projection["previous_state_version"] != command.expected_state_version
+            or projection["state_version"] != command.accepted_state_version
+            or projection["payload_digest"] != payload_digest(expected_payload)
+            or canonical.get("stateEventId") != projection["state_event_id"]
+            or canonical.get("schemaVersion") != 1
+            or canonical.get("eventType") != "state.changed"
+            or canonical.get("durabilityClass") != "authoritative_state"
+            or canonical.get("taskId") != run.task_id
+            or canonical.get("scope") != "RUN"
+            or canonical.get("aggregateType") != "RUN"
+            or canonical.get("aggregateId") != command.run_id
+            or canonical.get("runId") != command.run_id
+            or canonical.get("stepId") is not None
+            or canonical.get("attemptId") is not None
+            or canonical.get("previousStateVersion") != command.expected_state_version
+            or canonical.get("stateVersion") != command.accepted_state_version
+            or canonical.get("payload") != expected_payload
+            or canonical.get("payloadDigest") != projection["payload_digest"]
+        ):
+            # command/ACK 只是接受前缀；只有完整 Run CAS↔event 事实才能证明提交成功。
+            raise ControlRequestError("accepted command state event projection is inconsistent")
+        return acknowledgement
+
     def _accept(self, unit_of_work: SqliteUnitOfWork, request: ControlCommandRequest) -> ControlAcceptance:
         """在一个同步 UoW callback 内接受或幂等读取命令。"""
         workflow = SqliteWorkflowRepository(unit_of_work)
@@ -191,9 +272,13 @@ class ControlService:
         active_attempt = workflow.get_active_attempt_for_run(run.run_id)
         if existing is not None:
             receipts = controls.list_receipts(existing.command_id)
-            if not receipts:
-                raise ControlRequestError("accepted command is missing its acknowledgement receipt")
-            return ControlAcceptance(command=existing, receipt=receipts[0], idempotent_replay=True)
+            acknowledgement = self._require_replay_projection(
+                controls=controls,
+                run=run,
+                command=existing,
+                receipts=receipts,
+            )
+            return ControlAcceptance(command=existing, receipt=acknowledgement, idempotent_replay=True)
 
         if run.observed_state is RunObservedState.TERMINATED:
             # 终止态没有可恢复的控制面；幂等命令也不能重新打开已终止 Run。

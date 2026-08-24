@@ -87,12 +87,8 @@ _COMMITTED_ANCHOR_FIELDS: tuple[str, ...] = (
     "committedTaskSeq",
     "committedEventDigest",
 )
-_MATERIALIZATION_EVENT_FIELDS = frozenset(
-    (*_PREPARED_EVENT_FIELDS, *_COORDINATOR_EVENT_FIELDS)
-)
-_DURABILITY_CLASSES = frozenset(
-    {"side_effect_receipt", "provider_source", "derived"}
-)
+_MATERIALIZATION_EVENT_FIELDS = frozenset((*_PREPARED_EVENT_FIELDS, *_COORDINATOR_EVENT_FIELDS))
+_DURABILITY_CLASSES = frozenset({"side_effect_receipt", "provider_source", "derived"})
 
 
 class EventHashError(FactoryError):
@@ -247,9 +243,7 @@ def event_id(ingest_event_id: str) -> str:
     """从 Adapter 稳定 ingestEventId 推导幂等 eventId。"""
     if not isinstance(ingest_event_id, str) or not ingest_event_id:
         raise EventHashError("ingestEventId 必须为非空字符串")
-    digest = hashlib.sha256(
-        _canonicalize_event_hash([_EVENT_ID_DOMAIN, ingest_event_id])
-    ).hexdigest()
+    digest = hashlib.sha256(_canonicalize_event_hash([_EVENT_ID_DOMAIN, ingest_event_id])).hexdigest()
     return f"evt_{digest}"
 
 
@@ -270,29 +264,16 @@ def _validate_materialization_input(
     """校验非 wire 输入和锚点，并返回已配对的已提交 head。"""
     materialization_input = _require_mapping(raw_input, "input")
     anchor = _require_mapping(raw_anchor, "anchor")
-    _require_exact_keys(
-        materialization_input, _MATERIALIZATION_INPUT_FIELDS, "input"
-    )
+    _require_exact_keys(materialization_input, _MATERIALIZATION_INPUT_FIELDS, "input")
     _require_exact_keys(anchor, _COMMITTED_ANCHOR_FIELDS, "anchor")
 
-    expected_task_seq = _optional_task_seq(
-        materialization_input["expectedTaskSeq"], "input.expectedTaskSeq"
-    )
-    expected_event_digest = _optional_digest(
-        materialization_input["expectedEventDigest"], "input.expectedEventDigest"
-    )
-    committed_task_seq = _optional_task_seq(
-        anchor["committedTaskSeq"], "anchor.committedTaskSeq"
-    )
-    committed_event_digest = _optional_digest(
-        anchor["committedEventDigest"], "anchor.committedEventDigest"
-    )
+    expected_task_seq = _optional_task_seq(materialization_input["expectedTaskSeq"], "input.expectedTaskSeq")
+    expected_event_digest = _optional_digest(materialization_input["expectedEventDigest"], "input.expectedEventDigest")
+    committed_task_seq = _optional_task_seq(anchor["committedTaskSeq"], "anchor.committedTaskSeq")
+    committed_event_digest = _optional_digest(anchor["committedEventDigest"], "anchor.committedEventDigest")
     _require_head_pair(expected_task_seq, expected_event_digest, "input")
     _require_head_pair(committed_task_seq, committed_event_digest, "anchor")
-    if (
-        expected_task_seq != committed_task_seq
-        or expected_event_digest != committed_event_digest
-    ):
+    if expected_task_seq != committed_task_seq or expected_event_digest != committed_event_digest:
         raise EventHashError("expected head 与已提交 anchor 不一致")
     return materialization_input, anchor, committed_task_seq, committed_event_digest
 
@@ -302,36 +283,24 @@ def _validate_prepared_event_semantics(prepared_event: dict[str, Any]) -> None:
     prepared_event["schemaVersion"] = _require_safe_nonnegative_integer(
         prepared_event["schemaVersion"], "schemaVersion"
     )
-    prepared_event["sourceSeq"] = _require_safe_nonnegative_integer(
-        prepared_event["sourceSeq"], "sourceSeq"
-    )
+    prepared_event["sourceSeq"] = _require_safe_nonnegative_integer(prepared_event["sourceSeq"], "sourceSeq")
     prepared_event["monotonicTimeNs"] = _require_safe_nonnegative_integer(
         prepared_event["monotonicTimeNs"], "monotonicTimeNs"
     )
     process_identity = _require_mapping(prepared_event["processIdentity"], "processIdentity")
-    process_identity["pid"] = _require_safe_nonnegative_integer(
-        process_identity["pid"], "processIdentity.pid"
-    )
+    process_identity["pid"] = _require_safe_nonnegative_integer(process_identity["pid"], "processIdentity.pid")
 
     source_span = _require_mapping(prepared_event["sourceTransportSpan"], "sourceTransportSpan")
     coordinate = source_span["coordinate"]
     mapping_precision = source_span["mappingPrecision"]
     # 坐标轴描述 Provider 原始传输单位，mappingPrecision 描述映射精度；二者不能按同名字面绑定。
     if coordinate == "none":
-        if (
-            mapping_precision != "none"
-            or source_span["start"] is not None
-            or source_span["endExclusive"] is not None
-        ):
+        if mapping_precision != "none" or source_span["start"] is not None or source_span["endExclusive"] is not None:
             raise EventHashError(_INVALID_EVENT_INPUT)
     elif coordinate in {"provider_transport_bytes", "provider_transport_chars"}:
         if mapping_precision == "byte":
-            source_start = _require_safe_nonnegative_integer(
-                source_span["start"], "sourceSpan.start"
-            )
-            source_end = _require_safe_nonnegative_integer(
-                source_span["endExclusive"], "sourceSpan.endExclusive"
-            )
+            source_start = _require_safe_nonnegative_integer(source_span["start"], "sourceSpan.start")
+            source_end = _require_safe_nonnegative_integer(source_span["endExclusive"], "sourceSpan.endExclusive")
             if source_start >= source_end:
                 raise EventHashError(_INVALID_EVENT_INPUT)
             source_span["start"] = source_start
@@ -344,15 +313,9 @@ def _validate_prepared_event_semantics(prepared_event: dict[str, Any]) -> None:
     else:
         raise EventHashError(_INVALID_EVENT_INPUT)
 
-    sanitized_span = _require_mapping(
-        prepared_event["sanitizedStreamSpan"], "sanitizedStreamSpan"
-    )
-    sanitized_start = _require_safe_nonnegative_integer(
-        sanitized_span["start"], "sanitizedSpan.start"
-    )
-    sanitized_end = _require_safe_nonnegative_integer(
-        sanitized_span["endExclusive"], "sanitizedSpan.endExclusive"
-    )
+    sanitized_span = _require_mapping(prepared_event["sanitizedStreamSpan"], "sanitizedStreamSpan")
+    sanitized_start = _require_safe_nonnegative_integer(sanitized_span["start"], "sanitizedSpan.start")
+    sanitized_end = _require_safe_nonnegative_integer(sanitized_span["endExclusive"], "sanitizedSpan.endExclusive")
     if sanitized_start >= sanitized_end:
         raise EventHashError(_INVALID_EVENT_INPUT)
     sanitized_span["start"] = sanitized_start
@@ -364,12 +327,8 @@ def _validate_prepared_event_semantics(prepared_event: dict[str, Any]) -> None:
     for redaction in redactions:
         redaction_object = _require_mapping(redaction, "redaction")
         byte_range = _require_mapping(redaction_object["byteRange"], "redaction.byteRange")
-        redaction_start = _require_safe_nonnegative_integer(
-            byte_range["start"], "redaction.start"
-        )
-        redaction_end = _require_safe_nonnegative_integer(
-            byte_range["endExclusive"], "redaction.endExclusive"
-        )
+        redaction_start = _require_safe_nonnegative_integer(byte_range["start"], "redaction.start")
+        redaction_end = _require_safe_nonnegative_integer(byte_range["endExclusive"], "redaction.endExclusive")
         replacement = redaction_object["replacement"]
         if (
             redaction_start >= redaction_end
@@ -390,12 +349,8 @@ def validate_prepared_batch_manifest(raw_manifest: object) -> None:
     manifest = _require_mapping(raw_manifest, "preparedBatch")
     _validate_with_authoritative_schema(manifest, _prepared_batch_validator())
     event_count = _require_safe_nonnegative_integer(manifest["eventCount"], "eventCount")
-    first_ordinal = _require_safe_nonnegative_integer(
-        manifest["firstBatchOrdinal"], "firstBatchOrdinal"
-    )
-    last_ordinal = _require_safe_nonnegative_integer(
-        manifest["lastBatchOrdinal"], "lastBatchOrdinal"
-    )
+    first_ordinal = _require_safe_nonnegative_integer(manifest["firstBatchOrdinal"], "firstBatchOrdinal")
+    last_ordinal = _require_safe_nonnegative_integer(manifest["lastBatchOrdinal"], "lastBatchOrdinal")
     ordered_ingest_ids = manifest["orderedIngestIds"]
     if (
         not isinstance(ordered_ingest_ids, list)
@@ -420,16 +375,10 @@ def validate_prepared_batch_manifest(raw_manifest: object) -> None:
     for raw_head in heads:
         head = _require_mapping(raw_head, "perTaskExpectedHead")
         task_id = head["taskId"]
-        head_first = _require_safe_nonnegative_integer(
-            head["firstBatchOrdinal"], "head.firstBatchOrdinal"
-        )
-        head_last = _require_safe_nonnegative_integer(
-            head["lastBatchOrdinal"], "head.lastBatchOrdinal"
-        )
+        head_first = _require_safe_nonnegative_integer(head["firstBatchOrdinal"], "head.firstBatchOrdinal")
+        head_last = _require_safe_nonnegative_integer(head["lastBatchOrdinal"], "head.lastBatchOrdinal")
         expected_task_seq = _optional_task_seq(head["expectedTaskSeq"], "head.expectedTaskSeq")
-        expected_digest = _optional_digest(
-            head["expectedEventDigest"], "head.expectedEventDigest"
-        )
+        expected_digest = _optional_digest(head["expectedEventDigest"], "head.expectedEventDigest")
         _require_head_pair(expected_task_seq, expected_digest, "head")
         if (
             not isinstance(task_id, str)
@@ -447,16 +396,12 @@ def validate_prepared_batch_manifest(raw_manifest: object) -> None:
     for raw_segment in segments:
         segment = _require_mapping(raw_segment, "segmentDigest")
         ordinal_range = _require_mapping(segment["ordinalRange"], "segment.ordinalRange")
-        segment_first = _require_safe_nonnegative_integer(
-            ordinal_range["first"], "segment.ordinalRange.first"
-        )
+        segment_first = _require_safe_nonnegative_integer(ordinal_range["first"], "segment.ordinalRange.first")
         segment_last = _require_safe_nonnegative_integer(
             ordinal_range["lastExclusive"], "segment.ordinalRange.lastExclusive"
         )
         sanitized_span = _require_mapping(segment["sanitizedSpan"], "segment.sanitizedSpan")
-        sanitized_start = _require_safe_nonnegative_integer(
-            sanitized_span["start"], "segment.sanitizedSpan.start"
-        )
+        sanitized_start = _require_safe_nonnegative_integer(sanitized_span["start"], "segment.sanitizedSpan.start")
         sanitized_end = _require_safe_nonnegative_integer(
             sanitized_span["endExclusive"], "segment.sanitizedSpan.endExclusive"
         )
@@ -464,9 +409,7 @@ def validate_prepared_batch_manifest(raw_manifest: object) -> None:
         source_span = segment["sourceSpan"]
         if mapping_precision == "byte":
             source_span_object = _require_mapping(source_span, "segment.sourceSpan")
-            source_start = _require_safe_nonnegative_integer(
-                source_span_object["start"], "segment.sourceSpan.start"
-            )
+            source_start = _require_safe_nonnegative_integer(source_span_object["start"], "segment.sourceSpan.start")
             source_end = _require_safe_nonnegative_integer(
                 source_span_object["endExclusive"], "segment.sourceSpan.endExclusive"
             )
@@ -508,14 +451,8 @@ def materialize_batch(
     if not isinstance(events, list) or not events:
         raise EventHashError("input.events 必须为非空数组")
 
-    base_task_seq = (
-        0 if committed_task_seq is None else _checked_safe_add(committed_task_seq, 1)
-    )
-    previous_event_digest = (
-        GENESIS_PREDECESSOR
-        if committed_event_digest is None
-        else committed_event_digest
-    )
+    base_task_seq = 0 if committed_task_seq is None else _checked_safe_add(committed_task_seq, 1)
+    previous_event_digest = GENESIS_PREDECESSOR if committed_event_digest is None else committed_event_digest
     durable_events: list[dict[str, Any]] = []
     seen_ingest_ids: set[str] = set()
     previous_batch_ordinal: int | None = None
@@ -583,23 +520,15 @@ def materialize_batch(
             "adapterVersion": prepared_event["adapterVersion"],
             "processIdentity": prepared_event["processIdentity"],
             "payload": prepared_event["payload"],
-            "sanitizedProviderFrameDigest": prepared_event[
-                "sanitizedProviderFrameDigest"
-            ],
+            "sanitizedProviderFrameDigest": prepared_event["sanitizedProviderFrameDigest"],
             "payloadDigest": payload_digest(prepared_event["payload"]),
             "previousEventDigest": previous_event_digest,
             "redactions": prepared_event["redactions"],
-            "redactionManifestDigest": redaction_manifest_digest(
-                prepared_event["redactions"]
-            ),
+            "redactionManifestDigest": redaction_manifest_digest(prepared_event["redactions"]),
         }
         durable["eventDigest"] = _sha256_prefixed(
             _canonicalize_event_hash(
-                {
-                    key: value
-                    for key, value in durable.items()
-                    if key not in _DIGEST_EXCLUDED_FIELDS
-                }
+                {key: value for key, value in durable.items() if key not in _DIGEST_EXCLUDED_FIELDS}
             )
         )
 

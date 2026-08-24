@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from itertools import product
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
-from factory_agent.application.transition_service import (
-    StateScenarioEvidenceError,
-    build_state_001_partial_receipt,
-)
 from factory_agent.domain.workflow import (
     AchievedStage,
     AttemptOutcome,
@@ -350,26 +348,25 @@ def test_attempt_termination_rejects_terminal_rewrite_or_invalid_outcome(
         )
 
 
-def test_state_001_contribution_can_only_emit_unique_partial_subcheck() -> None:
-    """Task 2 只生成 Phase 1 PARTIAL，不得冒充正式 STATE-001 FINAL receipt。"""
-    checks = {
-        "five_dimensions": True,
-        "observed_legal_illegal": True,
-        "barrier_settled_passed": True,
-        "unknown_settle_timeout": True,
-        "milestone_evidence": True,
-        "fast_pause_resume": True,
-        "cas_competition": True,
-    }
-    receipt = build_state_001_partial_receipt(checks)
-    assert receipt == {
-        "subcheckId": "phase1-task2-state-control-v1",
-        "contributesTo": "STATE-001",
-        "qualification": "PARTIAL",
-        "status": "PASS",
-        "passedChecks": tuple(checks),
-    }
-    assert "testId" not in receipt
-    assert "finalPassOwner" not in receipt
-    with pytest.raises(StateScenarioEvidenceError):
-        build_state_001_partial_receipt({**checks, "cas_competition": False})
+@pytest.mark.asyncio
+async def test_state_001_fixed_scenario_emits_catalog_bound_final_receipt() -> None:
+    """固定 runner 必须执行真实场景并签发 catalog 绑定的 FINAL receipt。"""
+    try:
+        from factory_agent.testing.state_001 import run_state_001_rule_scenario
+    except ModuleNotFoundError:
+        pytest.fail("STATE-001 fixed scenario runner is missing")
+
+    d_temp_root = Path(r"D:\codex项目\.t")
+    d_temp_root.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix="state-001-unit-", dir=d_temp_root) as isolated:
+        isolated_root = Path(isolated)
+        receipt = await run_state_001_rule_scenario(temp_root=isolated_root)
+    assert not isolated_root.exists()
+
+    assert receipt.testId == "STATE-001"
+    assert receipt.qualification == "FINAL"
+    assert receipt.finalPassOwner == "codex-reviewer"
+    assert receipt.requiredReplays == 1
+    assert receipt.scenarioContractDigest == ("sha256:1e13c80a4032d2d6cc823e36db10bd1ee83f49a823dd9e888f0ca2ef8a7d3685")
+    assert receipt.result == "PASS"
+    assert receipt.validate() == []

@@ -119,6 +119,29 @@ class SqliteControlRepository:
         columns = tuple(item[0] for item in cursor.description)
         return tuple(_receipt_from_record(dict(zip(columns, row, strict=True))) for row in cursor.fetchall())
 
+    def get_run_state_event_projection(
+        self,
+        *,
+        run_id: str,
+        state_version: int,
+    ) -> dict[str, object] | None:
+        """读取控制命令对应的唯一 Run 状态事件；完整语义由应用层复验。"""
+        cursor = self._connection.execute(
+            "SELECT state_event_id,schema_version,task_id,scope,aggregate_type,aggregate_id,run_id,"
+            "step_id,attempt_id,previous_state_version,state_version,payload_digest,canonical_state_event "
+            "FROM authoritative_state_events "
+            "WHERE aggregate_type='RUN' AND aggregate_id=? AND run_id=? AND state_version=?",
+            (run_id, run_id, state_version),
+        )
+        rows = cursor.fetchmany(2)
+        if not rows:
+            return None
+        if len(rows) != 1:
+            # schema 唯一键本应阻止重复；若存储边界失守，读取也必须 fail closed。
+            raise ControlReceiptRecordError("control run state event projection is not unique")
+        columns = tuple(item[0] for item in cursor.description)
+        return dict(zip(columns, rows[0], strict=True))
+
     def append_receipt(
         self,
         *,

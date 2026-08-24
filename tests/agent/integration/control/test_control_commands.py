@@ -2657,6 +2657,55 @@ async def test_request_id_is_idempotent_and_receipts_are_append_only() -> None:
         connection.close()
 
 
+@pytest.mark.asyncio
+async def test_idempotent_replay_rejects_orphan_command_ack_without_run_projection() -> None:
+    """孤儿 command+ACK 不能伪装成已提交重放，且拒绝事务不得产生新投影。"""
+    connection = _connection()
+    try:
+        issued_at = "2026-08-14T08:00:00+00:00"
+        _insert(
+            connection,
+            "control_commands",
+            {
+                "command_id": "command-orphan-1",
+                "run_id": "run-control-1",
+                "command_seq": 1,
+                "request_id": "request-pause-1",
+                "command_type": ControlCommandType.SOFT_PAUSE.value,
+                "actor_id": "actor-control-1",
+                "expected_state_version": 0,
+                "accepted_state_version": 1,
+                "issued_at": issued_at,
+                "acknowledged_attempt_id": None,
+                "reason_digest": SHA_A,
+            },
+        )
+        _insert(
+            connection,
+            "control_command_receipt_events",
+            {
+                "command_receipt_event_id": "receipt-orphan-1",
+                "command_id": "command-orphan-1",
+                "receipt_seq": 0,
+                "phase": ControlCommandReceiptPhase.ACKNOWLEDGED.value,
+                "attempt_id": None,
+                "state_event_id": None,
+                "evidence_digest": None,
+                "previous_receipt_digest": None,
+                "created_at": issued_at,
+            },
+        )
+        before = _transaction_projection_snapshot(connection)
+
+        with pytest.raises(ControlRequestError) as caught:
+            await _service(connection).submit(_request())
+
+        assert caught.value.error_code == "INVALID_CONTROL_REQUEST"
+        assert _transaction_projection_snapshot(connection) == before
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     ("field", "invalid"),
     [(field, invalid) for field in ("command_id", "attempt_id") for invalid in ("", b"identity", ["identity"])],
