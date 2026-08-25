@@ -804,6 +804,9 @@ class SqliteUnitOfWork:
         self._failure_probe = failure_probe
         self._pending_cas: list[_PendingCas] = []
         self._pending_events: list[dict[str, object]] = []
+        # 依赖 authoritative state event 外键的追加写入必须排在 state event INSERT
+        # 之后、COMMIT 之前；回调仍属于同一个 UoW，任一失败都会由 coordinator 回滚。
+        self._pending_post_state_event_writes: list[Callable[[], None]] = []
         self.workflow = WorkflowRepository(self)
         self.events = EventRepository(self)
         self.authorization = AuthorizationRepository(connection)
@@ -838,6 +841,10 @@ class SqliteUnitOfWork:
                 error_code="INVALID_AUTHORITATIVE_STATE_EVENT",
             )
             raise StateEventValidationError("invalid authoritative state event") from None
+
+    def _register_post_state_event_write(self, writer: Callable[[], None]) -> None:
+        """登记必须在 authoritative state event 落库后执行的同事务追加写入。"""
+        self._pending_post_state_event_writes.append(writer)
 
     def precommit(self) -> None:
         """核对数量、schema/digest、身份/lineage/version 后才插入 authoritative lane。"""
@@ -931,6 +938,11 @@ class SqliteUnitOfWork:
                     "canonical_state_event": canonical,
                 },
             )
+        for writer in self._pending_post_state_event_writes:
+            # 预算时钟事件通过 state_event_id 外键绑定当前 state.changed；故意保留
+            # 独立故障点，验证 clock insert 失败时 CAS、state event 和 clock 链整体回滚。
+            self._failure_probe("before_budget_clock_event_insert")
+            writer()
         # 这里仍未向 SQLite 发送 COMMIT；注入故障必须走可回滚的已知失败分支，
         # 不能被 coordinator 误判成提交结果未知。
         self._failure_probe("before_commit")
@@ -949,6 +961,7 @@ class SqliteUnitOfWork:
         paired_count = len(self._pending_cas)
         self._pending_cas.clear()
         self._pending_events.clear()
+        self._pending_post_state_event_writes.clear()
         LOGGER.info(
             "sqlite_transaction_committed",
             operation="sqlite_transaction",
@@ -965,6 +978,7 @@ class SqliteUnitOfWork:
         paired_count = len(self._pending_cas)
         self._pending_cas.clear()
         self._pending_events.clear()
+        self._pending_post_state_event_writes.clear()
         LOGGER.warning(
             "sqlite_transaction_rolled_back",
             operation="sqlite_transaction",

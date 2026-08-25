@@ -605,13 +605,16 @@ class WriteCoordinator:
             sqlite_commit_ms = max(0.0, (end_ns - precommit_ns) / 1_000_000) if precommit_ns else 0.0
             duration_ms = max(0.0, (end_ns - ticket.queued_ns) / 1_000_000)
             # 事务日志只输出稳定白名单字段；调用方 context 可能包含 SQL、payload 或
-            # operation 等业务对象，不能透传到日志事件中。日志失败不能改变事务结果。
+            # operation 等业务对象，不能透传到日志事件中。request/trace 只取关联 ID，
+            # 让预算等入口的事务日志与 service/repository 日志保持同一条可检索链路。
             logger.info(
                 event,
                 operation=ticket.operation,
                 correlation_id=str(context.get("correlation_id", "")),
+                request_id=None if context.get("request_id") is None else str(context["request_id"]),
                 task_id=str(context.get("task_id", "")),
                 run_id=str(context.get("run_id", "")),
+                trace_id=None if context.get("trace_id") is None else str(context["trace_id"]),
                 queue_depth=self.queue_depth,
                 writer_queue_ms=writer_queue_ms,
                 sqlite_commit_ms=sqlite_commit_ms,

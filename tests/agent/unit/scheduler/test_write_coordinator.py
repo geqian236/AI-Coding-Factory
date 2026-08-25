@@ -1392,8 +1392,10 @@ async def test_poisoning_failure_settles_pre_admitted_pending_with_same_cause_on
         ticket_records = [record for record in captured if record.get("correlation_id") == correlations[index]]
         assert ticket_records
         assert {record.get("operation") for record in ticket_records} == {operations[index]}
+        assert {record.get("request_id") for record in ticket_records} == {"request-log-sensitive"}
         assert {record.get("task_id") for record in ticket_records} == {"task-log-sensitive"}
         assert {record.get("run_id") for record in ticket_records} == {"run-log-sensitive"}
+        assert {record.get("trace_id") for record in ticket_records} == {"trace-log-sensitive"}
         failure_records = [record for record in ticket_records if record.get("status") == "failure"]
         assert failure_records
         assert {record.get("error_code") for record in failure_records} == {error_code}
@@ -1440,8 +1442,10 @@ LOG_FIELDS = {
     "event",
     "operation",
     "correlation_id",
+    "request_id",
     "task_id",
     "run_id",
+    "trace_id",
     "queue_depth",
     "writer_queue_ms",
     "sqlite_commit_ms",
@@ -1464,8 +1468,10 @@ def _secret_context(correlation_id: str) -> dict[str, object]:
     """capture 与真实 renderer 共用同一嵌套敏感语料，禁止两套降级 fixture。"""
     return {
         "correlation_id": correlation_id,
+        "request_id": "request-log-sensitive",
         "task_id": "task-log-sensitive",
         "run_id": "run-log-sensitive",
+        "trace_id": "trace-log-sensitive",
         "payload": {"authorization": SECRET_VALUES[0], "pat": SECRET_VALUES[1]},
         "sql": {"parameters": [SECRET_VALUES[2]]},
         "operation": {"nested_jwt": SECRET_VALUES[3]},
@@ -1480,6 +1486,8 @@ def _assert_log_record_shape(record: dict[str, object]) -> None:
     assert isinstance(record["event"], str)
     for field in ("operation", "correlation_id", "task_id", "run_id"):
         assert isinstance(record[field], str) and record[field]
+    for field in ("request_id", "trace_id"):
+        assert record[field] is None or isinstance(record[field], str)
     assert isinstance(record["queue_depth"], int) and record["queue_depth"] >= 0
     assert isinstance(record["status"], str)
     assert record["error_code"] is None or isinstance(record["error_code"], str)
